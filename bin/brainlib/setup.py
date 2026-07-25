@@ -7,6 +7,8 @@ exercises it daily — and most people will hand this whole thing to an agent.
 """
 import json
 import shutil
+import subprocess
+from pathlib import Path
 
 from . import osbackend
 
@@ -127,3 +129,59 @@ def phase_check(which=None, run=None) -> Result:
                       + "\n  ".join(lines))
 
     return Result("ok", "every prerequisite is present")
+
+
+def _git_out(repo, *args) -> str:
+    done = subprocess.run(["git", *args], cwd=str(repo),
+                          capture_output=True, text=True)
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def phase_backup(dest, repo_name: str, want_remote: bool,
+                 run=None, which=None) -> Result:
+    """Set up the private remote, and report what is ACTUALLY true afterwards.
+
+    On 2026-07-25 this was read from `gh`'s exit code. `gh repo create
+    --source . --remote origin --push` adds the remote BEFORE it pushes, so a
+    push failure returns non-zero with a remote sitting right there. The
+    installer announced 'no remote yet — LOCAL ONLY', its own visibility check
+    then read git and said the opposite, and the run ended with doctor RED.
+
+    Nothing below trusts an exit code for the question 'is there a remote'.
+    Git is asked, every time.
+    """
+    dest = Path(dest)
+    run = run or (lambda argv, **kw: subprocess.run(
+        argv, cwd=str(dest), capture_output=True, text=True))
+    which = which or shutil.which
+
+    origin = _git_out(dest, "remote", "get-url", "origin")
+
+    if want_remote and not origin and which("gh"):
+        run(["gh", "repo", "create", repo_name, "--private",
+             "--source", ".", "--remote", "origin", "--push"])
+        # Ask git, not gh. This line is the fix.
+        origin = _git_out(dest, "remote", "get-url", "origin")
+
+    if not origin:
+        return Result(
+            "skipped",
+            "no remote — your notes exist on this machine only and are not backed up",
+            remedy=f"gh repo create {repo_name} --private --source . --push")
+
+    upstream = _git_out(dest, "rev-parse", "--abbrev-ref",
+                        "--symbolic-full-name", "@{u}")
+    if not upstream:
+        branch = _git_out(dest, "rev-parse", "--abbrev-ref", "HEAD") or "main"
+        pushed = subprocess.run(["git", "push", "-u", "origin", branch],
+                                cwd=str(dest), capture_output=True, text=True)
+        if pushed.returncode != 0:
+            lines = (pushed.stderr or "").strip().splitlines()
+            reason = lines[-1] if lines else "git push failed"
+            return Result(
+                "failed",
+                f"the remote {origin} exists but nothing has been pushed to it, so "
+                f"nothing is backed up: {reason}",
+                remedy=f"cd {dest} && git push -u origin {branch}")
+
+    return Result("ok", f"backed up to {origin}")

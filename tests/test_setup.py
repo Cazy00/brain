@@ -5,6 +5,7 @@ never touch the developer's real brain, real HOME, or real keychain.
 """
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -361,6 +362,86 @@ class TestCheckPhase(unittest.TestCase):
 
         self.assertIn("hashint", result.remedy)
         self.assertIn("nohint", result.remedy)
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", *args], cwd=str(repo),
+                          capture_output=True, text=True)
+
+
+def _make_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.email", "t@example.com")
+    _git(path, "config", "user.name", "T")
+    _git(path, "config", "commit.gpgsign", "false")
+    (path / "f.txt").write_text("x", encoding="utf-8")
+    _git(path, "add", "-A")
+    _git(path, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "first")
+    return path
+
+
+class TestBackupPhase(unittest.TestCase):
+    """The 2026-07-25 regression, pinned.
+
+    `gh repo create --source . --remote origin --push` ADDS the remote and then
+    pushes. A failure at the push step leaves the remote in place, so a
+    non-zero exit says nothing about whether a remote exists. install.sh read
+    the exit code, reported 'no remote yet — LOCAL ONLY', and then its own
+    visibility check read git and printed the opposite. The install finished
+    with doctor RED.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.repo = _make_repo(self.base / "brain")
+        self.origin = self.base / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(self.origin)],
+                       capture_output=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_remote_added_but_push_failed_is_recovered_not_reported_as_absent(self):
+        # Exactly the half-finished state gh leaves behind.
+        _git(self.repo, "remote", "add", "origin", str(self.origin))
+
+        def fake_gh(argv, **kwargs):
+            # gh already ran and failed; it must not run again.
+            raise AssertionError("must not re-run gh when a remote already exists")
+
+        result = setupmod.phase_backup(self.repo, "my-brain", want_remote=True,
+                                       run=fake_gh, which=lambda t: "/usr/bin/gh")
+        self.assertEqual(result.status, "ok", result.detail)
+        upstream = _git(self.repo, "rev-parse", "--abbrev-ref",
+                        "--symbolic-full-name", "@{u}").stdout.strip()
+        self.assertEqual(upstream, "origin/main",
+                         "the phase must push -u so doctor is not left red")
+
+    def test_no_remote_is_a_skip_not_a_failure_and_says_how_to_fix_it(self):
+        result = setupmod.phase_backup(self.repo, "my-brain", want_remote=False,
+                                       run=lambda *a, **k: None,
+                                       which=lambda t: None)
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("gh repo create", result.remedy)
+
+    def test_a_remote_that_cannot_be_pushed_to_fails_loudly(self):
+        _git(self.repo, "remote", "add", "origin",
+             str(self.base / "does-not-exist.git"))
+        result = setupmod.phase_backup(self.repo, "my-brain", want_remote=True,
+                                       run=lambda *a, **k: None,
+                                       which=lambda t: None)
+        self.assertEqual(result.status, "failed")
+        self.assertTrue(result.remedy)
+
+    def test_an_already_tracking_repo_is_left_alone(self):
+        _git(self.repo, "remote", "add", "origin", str(self.origin))
+        _git(self.repo, "push", "-u", "-q", "origin", "main")
+        result = setupmod.phase_backup(self.repo, "my-brain", want_remote=True,
+                                       run=lambda *a, **k: None,
+                                       which=lambda t: None)
+        self.assertEqual(result.status, "ok")
 
 
 if __name__ == "__main__":
