@@ -46,6 +46,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 K = ROOT / "knowledge"
 
+# bin/ on sys.path is what makes brainlib importable without a package
+# install — see bin/brainlib/__init__.py. Explicit rather than relying on
+# sys.path[0] (which already holds it for `python3 bin/brain`) because this
+# file is also exec'd directly by tests/test_brain.py's load_brain_module(),
+# where sys.path[0] belongs to the test runner, not to this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from brainlib import osbackend
+
 CANONICAL = ("decisions", "topics", "projects", "people", "life", "reference")
 FOLDER_KIND = {
     "decisions": "decision",
@@ -4022,8 +4030,18 @@ def cmd_template(argv: list) -> int:
     return 0
 
 
-PLIST_DIR = Path.home() / "Library" / "LaunchAgents"
-SCHEDULES = {"doctor": "com.secondbrain.doctor", "consolidate": "com.secondbrain.consolidate"}
+# What each named schedule actually runs, and when. Weekday follows
+# osbackend's convention (1-7, Monday=1) so it can be handed straight to
+# whichever backend osbackend.scheduler() returns; consolidate's Sunday
+# 18:00 and doctor's daily 21:00 are what setup/schedules/*.plist.template
+# used to encode. Per-platform naming (com.secondbrain.X on macOS, X.timer
+# on Linux, the raw name in Windows Task Scheduler) is the backend's own
+# concern now, not brain's — see bin/brainlib/osbackend.py.
+SCHEDULES = {
+    "doctor": {"argv_tail": ["doctor-notify"], "when": {"hour": 21, "minute": 0}},
+    "consolidate": {"argv_tail": ["consolidate"],
+                    "when": {"weekday": 7, "hour": 18, "minute": 0}},
+}
 
 
 def github_repo_slug(remote: str) -> str:
@@ -4084,21 +4102,21 @@ def remote_visibility(remote: str) -> str:
     return "unknown"
 
 
-def schedule_serves_this_repo(label: str) -> bool:
-    """Is the installed launchd job for THIS brain, or for a different one?
+def schedule_serves_this_repo(name: str) -> bool:
+    """Is the installed `name` schedule THIS brain's, or a different one's?
 
-    The label is machine-global, so merely finding the plist proves nothing —
-    a brain that has been moved, renamed, or is simply the second one on this
-    machine would see another brain's job and report itself scheduled. That is
-    the worst kind of green: consolidation is the only thing that drains the
-    inbox, so a false 'scheduled' means the inbox grows forever and the one
-    check that would have said so is the check that lied.
+    A schedule's identifier (a launchd label, a systemd unit name, a Task
+    Scheduler task name) is machine-global, so merely finding it installed
+    proves nothing — a brain that has been moved, renamed, or is simply the
+    second one on this machine would see another brain's job and report
+    itself scheduled. That is the worst kind of green: consolidation is the
+    only thing that drains the inbox, so a false 'scheduled' means the inbox
+    grows forever and the one check that would have said so is the check that
+    lied. osbackend.scheduler() picks whichever backend this platform
+    actually uses, so this same check is accurate on macOS, Linux and
+    Windows rather than only where PLIST_DIR happens to mean something.
     """
-    plist = PLIST_DIR / f"{label}.plist"
-    try:
-        return str(ROOT) in plist.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
+    return osbackend.scheduler().serves(name, str(ROOT))
 # There was a `remove_legacy_schedules()` here that unloaded two launchd jobs
 # named after the author, left over from before this system was generalised.
 # Exactly one machine on earth ever had them, they are gone from it, and this
@@ -4151,12 +4169,22 @@ def cmd_plugin(argv: list) -> int:
 
 
 def cmd_schedule(argv: list) -> int:
+    """install|uninstall|status, entirely delegated to osbackend.scheduler().
+
+    bin/brain used to render a plist from setup/schedules/*.plist.template and
+    call `launchctl` directly, which is the whole reason this command only
+    ever worked on macOS. Now it just supplies POLICY — which subcommand each
+    named schedule runs, and on what cadence (SCHEDULES above) — and the
+    platform-specific MECHANISM of expressing and installing that lives in
+    the backend, so this same function works on Linux and Windows too.
+    """
     action = argv[0] if argv else "status"
+    backend = osbackend.scheduler()
     if action == "status":
-        for name, label in SCHEDULES.items():
-            if not (PLIST_DIR / f"{label}.plist").exists():
+        for name in SCHEDULES:
+            if backend.status(name) != "installed":
                 print(f"  {name}: not installed")
-            elif schedule_serves_this_repo(label):
+            elif schedule_serves_this_repo(name):
                 print(f"  {name}: installed")
             else:
                 print(f"  {name}: installed, but for a DIFFERENT brain — "
@@ -4170,25 +4198,31 @@ def cmd_schedule(argv: list) -> int:
         targets.append("consolidate")
     if action == "uninstall":
         targets = list(SCHEDULES)
+    # launchd agents and systemd --user units both start with almost no
+    # environment, so without an explicit PATH a nightly job cannot see
+    # Homebrew-installed gitleaks/age and reports them permanently "not
+    # installed" — this is the one thing setup/schedules/*.plist.template
+    # existed to carry, and the backend is now the only place that needs it.
+    job_env = {"PATH": f"{Path.home()}/.local/bin:/opt/homebrew/bin:"
+                       "/usr/local/bin:/usr/bin:/bin"}
     for name in targets:
-        label = SCHEDULES[name]
-        plist = PLIST_DIR / f"{label}.plist"
         if action == "uninstall":
-            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
-            if plist.exists():
-                plist.unlink()
+            backend.uninstall(name)
             print(f"removed schedule: {name}")
             continue
-        template = (ROOT / "setup" / "schedules" / f"{label}.plist.template").read_text(encoding="utf-8")
-        rendered = (template
-                    .replace("{{PYTHON}}", sys.executable)
-                    .replace("{{REPO}}", str(ROOT))
-                    .replace("{{HOME}}", str(Path.home())))
-        PLIST_DIR.mkdir(parents=True, exist_ok=True)
-        plist.write_text(rendered, encoding="utf-8")
-        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
-        subprocess.run(["launchctl", "load", str(plist)], capture_output=True)
-        print(f"installed schedule: {name} ({plist})")
+        spec = SCHEDULES[name]
+        job_argv = [sys.executable, str(ROOT / "bin" / "brain")] + spec["argv_tail"]
+        outcome = backend.install(name, job_argv, spec["when"], cwd=str(ROOT),
+                                  env=job_env,
+                                  log=str(ROOT / ".cache" / f"{name}-launchd.log"))
+        if outcome.startswith("installed ("):
+            # The backend's sentence already names exactly where it wrote the
+            # job — splice the schedule name into that same sentence rather
+            # than re-deriving the path here too, which would put the path in
+            # two places able to drift apart.
+            print(f"installed schedule: {name} {outcome[len('installed '):]}")
+        else:
+            print(f"schedule '{name}' not installed — {outcome}")
     return 0
 
 
@@ -4843,10 +4877,9 @@ def cmd_doctor() -> int:
     # The inbox only drains if consolidation actually runs. Worth its own line
     # because a missing consolidate job is otherwise invisible: every other
     # check stays green while captures pile up with nowhere to go.
-    consolidate_label = SCHEDULES["consolidate"]
-    if schedule_serves_this_repo(consolidate_label):
+    if schedule_serves_this_repo("consolidate"):
         print("  [ok ] weekly consolidation scheduled")
-    elif (PLIST_DIR / f"{consolidate_label}.plist").exists():
+    elif osbackend.scheduler().status("consolidate") == "installed":
         print("  [RED] weekly consolidation is scheduled for a DIFFERENT brain — "
               "this one never drains; bin/brain schedule install --with-consolidate")
         ok = False
@@ -4882,7 +4915,7 @@ def cmd_doctor() -> int:
             pass
         if trusted:
             print("  [ok ] consolidation permissions active (workspace trusted)")
-        elif schedule_serves_this_repo(SCHEDULES["consolidate"]):
+        elif schedule_serves_this_repo("consolidate"):
             ok = False
             print("  [RED] workspace NOT trusted — .claude/settings.json is ignored, so "
                   "consolidation cannot run bin/brain and will hand-write notes. Open "

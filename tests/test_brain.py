@@ -3358,17 +3358,27 @@ class RemoteVisibilityTests(unittest.TestCase):
 
 
 class ScheduleOwnershipTests(unittest.TestCase):
-    """launchd labels are machine-global. Finding the plist proves a job exists,
-    never that it serves THIS brain — and consolidation is the only thing that
-    drains the inbox, so a false 'scheduled' means it silently never drains."""
+    """A schedule's identifier (a launchd label, a systemd unit name, a Task
+    Scheduler task name) is machine-global. Finding it installed proves a job
+    exists, never that it serves THIS brain — and consolidation is the only
+    thing that drains the inbox, so a false 'scheduled' means it silently
+    never drains."""
 
     def setUp(self):
         self.tmp = temp_dir()
         self.addCleanup(cleanup_temp, self.tmp)
         self.module = load_brain_module()
-        self.plists = Path(self.tmp.name) / "LaunchAgents"
-        self.plists.mkdir()
-        self.module.PLIST_DIR = self.plists
+        fake_home = Path(self.tmp.name) / "home"
+        self.plists = fake_home / "Library" / "LaunchAgents"
+        self.plists.mkdir(parents=True)
+        # schedule_serves_this_repo now goes through osbackend.scheduler(),
+        # whose LaunchdScheduler computes its plist directory from Path.home()
+        # at construction time — there is no more bin/brain-level PLIST_DIR
+        # constant to patch, so redirecting HOME lands the fixture in the same
+        # place the real code looks. Same pattern dewire_against uses below.
+        self.real_home = self.module.Path.home
+        self.module.Path.home = staticmethod(lambda: fake_home)
+        self.addCleanup(setattr, self.module.Path, "home", self.real_home)
         self.module.ROOT = Path(self.tmp.name) / "this-brain"
         self.module.ROOT.mkdir()
 
@@ -3379,17 +3389,17 @@ class ScheduleOwnershipTests(unittest.TestCase):
     def test_a_job_for_another_brain_is_not_this_brains_job(self):
         self._write_plist(Path(self.tmp.name) / "some-other-brain")
         self.assertFalse(
-            self.module.schedule_serves_this_repo("com.secondbrain.consolidate"),
+            self.module.schedule_serves_this_repo("consolidate"),
             "another brain's schedule was claimed as this one's")
 
     def test_a_job_for_this_brain_counts(self):
         self._write_plist(self.module.ROOT)
         self.assertTrue(
-            self.module.schedule_serves_this_repo("com.secondbrain.consolidate"))
+            self.module.schedule_serves_this_repo("consolidate"))
 
     def test_no_plist_at_all_is_not_scheduled(self):
         self.assertFalse(
-            self.module.schedule_serves_this_repo("com.secondbrain.consolidate"))
+            self.module.schedule_serves_this_repo("consolidate"))
 
 
 class HelpDoesNotActTests(unittest.TestCase):
