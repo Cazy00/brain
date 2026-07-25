@@ -224,6 +224,20 @@ class TestResult(unittest.TestCase):
     def test_ok_needs_no_remedy(self):
         self.assertEqual(setupmod.Result("ok", "done").remedy, "")
 
+    def test_a_whitespace_only_remedy_is_still_no_remedy(self):
+        # An agent cannot run whitespace. "   " must be rejected exactly like
+        # "" — otherwise the guard above is trivially defeated.
+        with self.assertRaises(ValueError):
+            setupmod.Result("failed", "something broke", remedy="   ")
+
+    def test_a_non_string_detail_is_coerced_for_the_contract(self):
+        # A phase that reports failure via Result("failed", exc, ...) and
+        # forgets str(exc) must still produce a readable contract — the
+        # reporting boundary (as_dict/render_json) is the one place this
+        # module cannot afford to raise.
+        result = setupmod.Result("ok", ValueError("oops"))
+        self.assertEqual(result.as_dict()["detail"], "oops")
+
 
 class TestJsonContract(unittest.TestCase):
     def test_every_phase_appears_with_the_agreed_keys(self):
@@ -249,6 +263,32 @@ class TestJsonContract(unittest.TestCase):
         results = {name: setupmod.Result("ok", 'he said "hi"\nand left')
                    for name in setupmod.PHASES}
         json.loads(setupmod.render_json(results))
+
+    def test_an_unrecognized_key_raises(self):
+        # A key outside PHASES is a typo or a forgotten PHASES entry in OUR
+        # code. Silently dropping it from "phases" while still letting it
+        # flip the top-level status to failed is worse than a loud crash: it
+        # reports a failure the agent can never find and never fix.
+        results = {"typo_phase": setupmod.Result("failed", "oops", remedy="fix it")}
+        with self.assertRaises(ValueError):
+            setupmod.overall_status(results)
+        with self.assertRaises(ValueError):
+            setupmod.render_json(results)
+
+    def test_a_partial_results_dict_reports_correctly(self):
+        # `brain setup --only check` (Task 11) runs exactly one phase and
+        # produces a results dict with exactly one entry. Fewer keys than
+        # PHASES is legitimate and must keep reporting normally — only an
+        # EXTRA, unrecognized key is a bug.
+        results = {"check": setupmod.Result("ok", "check done")}
+        payload = json.loads(setupmod.render_json(results))
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(list(payload["phases"]), ["check"])
+
+    def test_an_empty_results_dict_is_ok_with_no_phases(self):
+        # Nothing having run yet is not the same as something having broken.
+        payload = json.loads(setupmod.render_json({}))
+        self.assertEqual(payload, {"status": "ok", "phases": {}})
 
 
 if __name__ == "__main__":
