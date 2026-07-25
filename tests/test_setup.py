@@ -4,6 +4,7 @@ Anything that WRITES runs in a sandbox with HOME redirected. These tests must
 never touch the developer's real brain, real HOME, or real keychain.
 """
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 sys.path.insert(0, str(ROOT / "bin"))
 from brainlib import picker  # noqa: E402
+from brainlib import setup as setupmod  # noqa: E402
 
 
 class _FakeTTY(io.StringIO):
@@ -207,6 +209,46 @@ class TestChooseInteractive(unittest.TestCase):
         stream = _FakeTTY(f"{type_a_path}\n{busy}\n{type_a_path}\n{good}\n")
         chosen = picker.choose(self.home, self.cwd, stream=stream)
         self.assertEqual(chosen, good)
+
+
+class TestResult(unittest.TestCase):
+    def test_status_must_be_one_of_three(self):
+        with self.assertRaises(ValueError):
+            setupmod.Result("weird", "detail")
+
+    def test_a_failure_without_a_remedy_is_a_bug(self):
+        # An agent acts on `remedy`. A failure it cannot act on is a dead end.
+        with self.assertRaises(ValueError):
+            setupmod.Result("failed", "something went wrong")
+
+    def test_ok_needs_no_remedy(self):
+        self.assertEqual(setupmod.Result("ok", "done").remedy, "")
+
+
+class TestJsonContract(unittest.TestCase):
+    def test_every_phase_appears_with_the_agreed_keys(self):
+        results = {name: setupmod.Result("ok", f"{name} done")
+                   for name in setupmod.PHASES}
+        payload = json.loads(setupmod.render_json(results))
+        self.assertEqual(list(payload["phases"]), list(setupmod.PHASES))
+        for phase in setupmod.PHASES:
+            self.assertEqual({"status", "detail", "remedy"},
+                             set(payload["phases"][phase]))
+
+    def test_overall_is_failed_when_any_phase_failed(self):
+        results = {name: setupmod.Result("ok", "fine") for name in setupmod.PHASES}
+        results["backup"] = setupmod.Result("failed", "no remote", remedy="git push")
+        self.assertEqual(json.loads(setupmod.render_json(results))["status"], "failed")
+
+    def test_overall_is_ok_when_phases_are_merely_skipped(self):
+        results = {name: setupmod.Result("ok", "fine") for name in setupmod.PHASES}
+        results["backup"] = setupmod.Result("skipped", "no remote wanted")
+        self.assertEqual(json.loads(setupmod.render_json(results))["status"], "ok")
+
+    def test_output_is_valid_json_even_with_quotes_in_details(self):
+        results = {name: setupmod.Result("ok", 'he said "hi"\nand left')
+                   for name in setupmod.PHASES}
+        json.loads(setupmod.render_json(results))
 
 
 if __name__ == "__main__":
