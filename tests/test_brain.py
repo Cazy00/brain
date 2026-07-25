@@ -673,7 +673,13 @@ class InitTests(unittest.TestCase):
         real_dir.mkdir(parents=True)
         (real_dir / "keepme.txt").write_text("precious", encoding="utf-8")
         result = self.init()
-        self.assertIn("is not a symlink", result.stdout,
+        # Wording owned by osbackend.link_dir() (task 4: skill linking now
+        # goes through the shared symlink/junction/copy backend) rather than
+        # cmd_init itself — "is not a symlink" was the old inline message;
+        # the backend's is more general (a copy can be legitimately ours too,
+        # via the marker file) but makes the same promise: say why, don't
+        # just fail silently.
+        self.assertIn("was not created by brain", result.stdout,
                       "init must say why it skipped, not just fail")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertTrue((real_dir / "keepme.txt").is_file(), "init destroyed existing content")

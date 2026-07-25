@@ -1465,33 +1465,29 @@ def cmd_init(argv: list) -> int:
             failures.append(f"could not render {skill.relative_to(ROOT)}: {exc}")
             print(f"  [3/5] FAILED          {exc}")
 
-    # 4. symlink the skill into ~/.claude/skills/ so /brain works in any session.
-    # Only once there is a rendered SKILL.md to point at — a link into a
-    # directory Claude finds no skill in is worse than no link at all.
+    # 4. link the skill into ~/.claude/skills/ so /brain works in any session.
+    # Delegated to osbackend.link_dir(): a symlink where the OS allows one, a
+    # Windows junction when it does not (a Windows symlink needs Developer
+    # Mode or admin; a junction needs neither), a marked copy as the last
+    # resort. Only once there is a rendered SKILL.md to point at — a link into
+    # a directory Claude finds no skill in is worse than no link at all.
     link = Path.home() / ".claude" / "skills" / "brain"
     if not skill.is_file():
         failures.append(f"no rendered {skill.name} to link — fix step 3, then re-run init")
         print(f"  [4/5] SKIPPED         nothing to link (no {skill.name})")
     else:
-        try:
-            link.parent.mkdir(parents=True, exist_ok=True)
-            if link.is_symlink():
-                if link.resolve() == skill_dir.resolve():
-                    print("  [4/5] skill linked    already correct")
-                else:
-                    link.unlink()
-                    link.symlink_to(skill_dir)
-                    print("  [4/5] skill relinked  " + str(link))
-            elif link.exists():
-                failures.append(f"{link} exists and is not a symlink — move it aside, "
-                                "re-run init")
-                print(f"  [4/5] SKIPPED         {link} exists and is not a symlink")
-            else:
-                link.symlink_to(skill_dir)
-                print("  [4/5] skill linked    " + str(link))
-        except OSError as exc:
-            failures.append(f"could not link {link}: {exc}")
-            print(f"  [4/5] FAILED          {exc}")
+        method, message = osbackend.link_dir(link, skill_dir)
+        if method == "failed":
+            failures.append(message)
+            print(f"  [4/5] FAILED          {message}")
+        elif message.startswith("linked "):
+            # osbackend's sentence already names exactly where it linked —
+            # splice just the path in after the shared label rather than
+            # repeating the word, the same trick cmd_schedule already uses
+            # for the scheduler backend's "installed (...)" sentence.
+            print("  [4/5] skill linked    " + message[len("linked "):])
+        else:
+            print(f"  [4/5] skill linked    {message}")
 
     # 5. register the MCP server at user scope — brain tools in ANY directory.
     # `claude mcp add` REFUSES when an entry exists and never updates it, and it

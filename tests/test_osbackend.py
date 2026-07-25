@@ -434,6 +434,40 @@ class TestCredmanDeleteDrift(unittest.TestCase):
         self.assertEqual(self.store.get("brain-vault-key"), "")
 
 
+class TestLinkDir(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.target = self.base / "target"
+        self.target.mkdir()
+        (self.target / "SKILL.md").write_text("skill", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_creates_something_that_reads_through(self):
+        method, message = osbackend.link_dir(self.base / "link", self.target)
+        self.assertIn(method, {"symlink", "junction", "copy"})
+        self.assertEqual((self.base / "link" / "SKILL.md").read_text(encoding="utf-8"),
+                         "skill")
+        self.assertTrue(message)
+
+    def test_relinking_an_existing_correct_link_is_a_no_op(self):
+        osbackend.link_dir(self.base / "link", self.target)
+        method, message = osbackend.link_dir(self.base / "link", self.target)
+        self.assertIn("already", message.lower())
+
+    def test_refuses_a_real_directory_it_did_not_create(self):
+        stranger = self.base / "link"
+        stranger.mkdir()
+        (stranger / "someone-elses.md").write_text("x", encoding="utf-8")
+        method, message = osbackend.link_dir(stranger, self.target)
+        # Never clobber a directory this system did not put there — on the
+        # copy path that is somebody's files.
+        self.assertEqual(method, "failed")
+        self.assertTrue((stranger / "someone-elses.md").exists())
+
+
 if sys.platform == "win32":
     # chmod is a no-op on Windows, so the 0600 assertion cannot hold there.
     TestFileKeystore.test_stored_file_is_not_group_or_world_readable = \

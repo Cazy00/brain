@@ -679,3 +679,59 @@ def keystore_for(family: str) -> Keystore:
 
 def keystore() -> Keystore:
     return keystore_for(os_family())
+
+
+# A marker file dropped beside a COPY so a later run can tell its own copy from
+# a directory somebody else created. Without it, the copy path has no safe way
+# to refuse, and "overwrite whatever is there" is how you delete a stranger's
+# skill folder.
+_COPY_MARKER = ".brain-managed-copy"
+
+
+def link_dir(link, target) -> tuple:
+    """Make `link` resolve to `target`. Returns (method, message).
+
+    Three methods in descending order of goodness. A Windows SYMLINK needs
+    Developer Mode or admin; a Windows JUNCTION needs neither, which is why it
+    is preferred there over asking people to change a system setting. A copy is
+    last because it goes stale, so `doctor` has to be able to notice one.
+    """
+    link, target = Path(link), Path(target)
+
+    if link.is_symlink():
+        try:
+            if link.resolve() == target.resolve():
+                return "symlink", "already correct"
+        except OSError:
+            pass
+        link.unlink()
+    elif link.exists():
+        if (link / _COPY_MARKER).exists():
+            if (link / _COPY_MARKER).read_text(encoding="utf-8").strip() == str(target):
+                return "copy", "already correct (copy)"
+            shutil.rmtree(link)
+        else:
+            return "failed", (f"{link} already exists and was not created by brain — "
+                              "move it aside, then run this again")
+
+    link.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return "symlink", f"linked {link}"
+    except (OSError, NotImplementedError):
+        pass
+
+    if os_family() == "windows":
+        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                              capture_output=True, text=True)
+        if done.returncode == 0:
+            return "junction", f"junction created at {link}"
+
+    try:
+        shutil.copytree(target, link)
+        (link / _COPY_MARKER).write_text(str(target), encoding="utf-8")
+        return "copy", (f"copied to {link} — neither a symlink nor a junction was "
+                        "possible, so this will go stale; `brain doctor` will say when")
+    except OSError as exc:
+        return "failed", f"could not link or copy {link}: {exc}"
