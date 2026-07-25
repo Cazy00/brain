@@ -71,3 +71,48 @@ def render_json(results: dict) -> str:
         "phases": {name: results[name].as_dict()
                    for name in PHASES if name in results},
     }, indent=2)
+
+
+import shutil
+
+from . import osbackend
+
+
+def phase_check(which=None, run=None) -> Result:
+    """Report what is missing and what it costs. Install NOTHING.
+
+    `run` is accepted only so a test can prove it is never called: a
+    piped-curl script that installs system packages unprompted assumes more
+    trust than this should, and corporate machines forbid it outright.
+    """
+    which = which or shutil.which
+    missing_hard, missing_soft = [], []
+    for tool, spec in osbackend.PREREQS.items():
+        if tool == "python3":
+            continue                    # we are running on it
+        if which(tool):
+            continue
+        (missing_hard if spec["hard"] else missing_soft).append(tool)
+
+    if missing_hard:
+        lines = []
+        for tool in missing_hard:
+            hint = osbackend.install_hint(tool)
+            lines.append(f"{tool} — {osbackend.PREREQS[tool]['why']}"
+                         + (f"\n    install it with:  {hint}" if hint else ""))
+        remedy = "; ".join(filter(None, (osbackend.install_hint(t)
+                                         for t in missing_hard))) \
+            or f"install: {', '.join(missing_hard)}"
+        return Result("failed", "missing required tool(s):\n  " + "\n  ".join(lines),
+                      remedy=remedy)
+
+    if missing_soft:
+        lines = []
+        for tool in missing_soft:
+            hint = osbackend.install_hint(tool)
+            lines.append(f"{tool} not installed — {osbackend.PREREQS[tool]['why']}"
+                         + (f"\n    add it later with:  {hint}" if hint else ""))
+        return Result("ok", "everything required is present.\n  "
+                      + "\n  ".join(lines))
+
+    return Result("ok", "every prerequisite is present")

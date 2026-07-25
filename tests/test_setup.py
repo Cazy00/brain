@@ -291,5 +291,33 @@ class TestJsonContract(unittest.TestCase):
         self.assertEqual(payload, {"status": "ok", "phases": {}})
 
 
+class TestCheckPhase(unittest.TestCase):
+    def test_missing_hard_dependency_fails_with_a_remedy(self):
+        result = setupmod.phase_check(which=lambda tool: None)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("git", result.detail)
+        self.assertTrue(result.remedy)
+
+    def test_missing_optional_dependency_does_not_fail_the_phase(self):
+        # Everything present except gh.
+        result = setupmod.phase_check(which=lambda tool: None if tool == "gh" else "/x")
+        self.assertEqual(result.status, "ok")
+
+    def test_optional_dependency_reports_the_consequence_not_the_name(self):
+        result = setupmod.phase_check(which=lambda tool: None if tool == "age" else "/x")
+        self.assertIn("vault", result.detail.lower())
+
+    def test_nothing_is_ever_installed(self):
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("check must never execute a package manager")
+
+        result = setupmod.phase_check(which=lambda tool: None, run=fake_run)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.status, "failed")
+
+
 if __name__ == "__main__":
     unittest.main()
