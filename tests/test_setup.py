@@ -9,10 +9,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 
 sys.path.insert(0, str(ROOT / "bin"))
+from brainlib import osbackend  # noqa: E402
 from brainlib import picker  # noqa: E402
 from brainlib import setup as setupmod  # noqa: E402
 
@@ -317,6 +319,48 @@ class TestCheckPhase(unittest.TestCase):
         result = setupmod.phase_check(which=lambda tool: None, run=fake_run)
         self.assertEqual(calls, [])
         self.assertEqual(result.status, "failed")
+
+    def test_remedy_survives_when_no_package_manager_is_present(self):
+        # On every machine that actually has brew/apt/dnf/pacman/winget, the
+        # `... or f"install: {...}"` fallback at the tail of the missing_hard
+        # branch is dead code as far as any test can tell — install_hint()
+        # always returns a real command first. The one machine class where it
+        # is NOT dead code is exactly the one named in phase_check's own
+        # docstring (corporate machines that forbid installers), and that is
+        # also the machine class most likely to be missing prerequisites in
+        # the first place. Forcing package_manager() to "" here — rather than
+        # trusting whatever happens to be on the machine running this suite —
+        # is what makes this deterministic everywhere, the same reasoning
+        # TestLinkDirNeverRaises in test_osbackend.py already applies to
+        # platform-dependent failures.
+        with mock.patch.object(osbackend, "package_manager", return_value=""):
+            result = setupmod.phase_check(which=lambda tool: None)
+        self.assertEqual(result.status, "failed")
+        self.assertTrue(result.remedy.strip())
+
+    def test_remedy_never_drops_a_hard_tool_that_lacks_an_install_hint(self):
+        # Real PREREQS has exactly one non-skipped hard tool (git), so this
+        # substitutes two fake ones to reach the "some tools have a hint, some
+        # don't" case: remedy must still name EVERY missing hard tool, not
+        # just the ones install_hint() could resolve, because remedy — not
+        # detail — is the field an agent acts on (Result's own docstring).
+        # install_hint() is mocked directly, not just PREREQS, so the result
+        # does not depend on which package manager, if any, is actually
+        # installed on the machine running this suite.
+        fake_prereqs = {
+            "hashint": {"hard": True, "why": "test-only tool", "pkg": {}},
+            "nohint": {"hard": True, "why": "test-only tool", "pkg": {}},
+        }
+
+        def fake_hint(tool):
+            return "brew install hashint" if tool == "hashint" else ""
+
+        with mock.patch.object(osbackend, "PREREQS", fake_prereqs), \
+             mock.patch.object(osbackend, "install_hint", side_effect=fake_hint):
+            result = setupmod.phase_check(which=lambda tool: None)
+
+        self.assertIn("hashint", result.remedy)
+        self.assertIn("nohint", result.remedy)
 
 
 if __name__ == "__main__":

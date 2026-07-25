@@ -6,6 +6,9 @@ Two implementations would mean the agent path rots silently, because nobody
 exercises it daily — and most people will hand this whole thing to an agent.
 """
 import json
+import shutil
+
+from . import osbackend
 
 PHASES = ("check", "place", "create", "backup", "verify")
 
@@ -73,11 +76,6 @@ def render_json(results: dict) -> str:
     }, indent=2)
 
 
-import shutil
-
-from . import osbackend
-
-
 def phase_check(which=None, run=None) -> Result:
     """Report what is missing and what it costs. Install NOTHING.
 
@@ -88,8 +86,17 @@ def phase_check(which=None, run=None) -> Result:
     which = which or shutil.which
     missing_hard, missing_soft = [], []
     for tool, spec in osbackend.PREREQS.items():
+        # Skipped, never checked via which(): this process EXECUTING is
+        # already stronger proof of a working Python 3.9+ than a PATH lookup
+        # could add — and on this repo's own Windows entry point, checking
+        # would be actively WRONG, not merely redundant. brain.cmd invokes
+        # `python "%~dp0bin\brain" %*`, not `python3`, and the stock
+        # python.org Windows installer never puts a `python3.exe` on PATH.
+        # Un-skipped, this would report a false "missing hard dependency" on
+        # a Windows machine that is unmistakably running Python 3.9+ right
+        # now, via the very interpreter executing this line.
         if tool == "python3":
-            continue                    # we are running on it
+            continue
         if which(tool):
             continue
         (missing_hard if spec["hard"] else missing_soft).append(tool)
@@ -100,9 +107,13 @@ def phase_check(which=None, run=None) -> Result:
             hint = osbackend.install_hint(tool)
             lines.append(f"{tool} — {osbackend.PREREQS[tool]['why']}"
                          + (f"\n    install it with:  {hint}" if hint else ""))
-        remedy = "; ".join(filter(None, (osbackend.install_hint(t)
-                                         for t in missing_hard))) \
-            or f"install: {', '.join(missing_hard)}"
+        # Every missing hard tool must appear in `remedy`, not just the ones
+        # install_hint() can resolve — an agent acts on `remedy` alone (see
+        # Result's docstring), and a tool silently dropped here because it
+        # merely lacks a known package name looks, to that agent, like a
+        # problem it already fully addressed.
+        remedy = "; ".join(osbackend.install_hint(t) or f"install: {t}"
+                           for t in missing_hard)
         return Result("failed", "missing required tool(s):\n  " + "\n  ".join(lines),
                       remedy=remedy)
 
