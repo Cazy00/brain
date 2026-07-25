@@ -353,6 +353,44 @@ class TestCredmanFallback(unittest.TestCase):
         self.assertIn("CredentialManager", self.store.describe())
 
 
+class TestCredmanFallbackDrift(unittest.TestCase):
+    """Review finding on TestCredmanFallback: _module_available() is
+    re-evaluated on every call with no record of where a name was actually
+    written, so a set() while the module is missing followed by a get()
+    after it becomes available (installing the module later is the ORDINARY
+    way a stock Windows box ever gets it, not a corner case) went straight to
+    the primary lookup, found nothing there, and returned "" for a secret
+    that really was sitting in self.fallback — the exact "your vault key is
+    gone" failure the class exists to prevent, reached via drift instead of
+    permanent absence.
+
+    _module_available is forced to a MUTABLE flag (not a fixed lambda, unlike
+    TestCredmanFallback above) so it can flip mid-test. _primary_get is ALSO
+    forced, to simulate "module available, Get-StoredCredential found
+    nothing" — get()'s only path to a real subprocess call is through
+    _primary_get, so overriding it, not just _module_available, is what keeps
+    this test from ever executing real `powershell` regardless of which
+    availability state it exercises: the never-touch-the-real-keystore
+    property has to survive a test that deliberately flips available=True,
+    not just one that holds it fixed at False."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fallback = osbackend.FileKeystore(Path(self.tmp.name))
+        self.store = osbackend.CredmanKeystore(fallback=fallback)
+        self.available = False
+        self.store._module_available = lambda: self.available
+        self.store._primary_get = lambda name: ""
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_value_written_while_unavailable_is_still_readable_once_available(self):
+        self.assertTrue(self.store.set("brain-vault-key", "abc123"))
+        self.available = True
+        self.assertEqual(self.store.get("brain-vault-key"), "abc123")
+
+
 if sys.platform == "win32":
     # chmod is a no-op on Windows, so the 0600 assertion cannot hold there.
     TestFileKeystore.test_stored_file_is_not_group_or_world_readable = \

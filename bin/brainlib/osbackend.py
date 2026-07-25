@@ -531,13 +531,29 @@ class CredmanKeystore(Keystore):
     `serve` token, that misreading is not a shrug, it is silent data loss.
 
     So get/set/delete all consult the SAME probe (_module_available) before
-    touching cmdkey or PowerShell, and fall back TOGETHER to self.fallback (a
-    FileKeystore) when it says no. "Together" is the point: if set() kept
-    writing through cmdkey while only get() fell back to the file, a value
-    written while the module was missing would still read back as "" later
-    (nothing would ever have reached the file) — same bug, one layer down.
-    Consulting one probe from all three methods is what keeps a value
-    findable down whichever path it was written.
+    touching cmdkey or PowerShell: set()/delete() use it to choose where a
+    value goes, and fall back to self.fallback (a FileKeystore) when it says
+    no. If that were the whole story, a value written through cmdkey while
+    only get() ever fell back to the file would still read back as "" later
+    — same bug, one layer down.
+
+    It is not the whole story, because _module_available() is re-evaluated on
+    every call with no record of where a name was actually written. The
+    module getting installed later is the ORDINARY way a stock Windows box
+    ever acquires it — not a corner case — so "written while unavailable,
+    read after becoming available" is a realistic sequence. get() therefore
+    also falls through to self.fallback whenever the primary
+    (Get-StoredCredential) lookup comes back empty, on the chance a set()
+    that ran before the module appeared put it there instead.
+
+    This is a ONE-WAY guarantee, not a symmetric one, and deliberately so:
+    the opposite drift — written via cmdkey while the module WAS present,
+    read after it is later removed — cannot be recovered by the same trick
+    or any other available here. That set() had no reason to also write
+    self.fallback (cmdkey succeeded), so there is no copy to fall through
+    to, and a cmdkey-stored secret cannot be read back at all without the
+    module. That direction stays a real, structural gap: named here, not
+    fixed.
     """
     kind = "credman"
 
@@ -571,17 +587,32 @@ class CredmanKeystore(Keystore):
     def set_argv(self, name: str, value: str) -> list:
         return ["cmdkey", f"/generic:brain:{name}", "/user:brain", f"/pass:{value}"]
 
-    def get(self, name: str) -> str:
-        if not self._module_available():
-            return self.fallback.get(name)
+    def _primary_get(self, name: str) -> str:
         # cmdkey stores but will not print a secret back. PowerShell's
-        # CredentialManager surface is the documented way to read one.
+        # CredentialManager surface is the documented way to read one. Split
+        # out from get() so a drift test can simulate "module available, but
+        # nothing found there" by overriding this one method, without ever
+        # invoking a real subprocess (see TestCredmanFallbackDrift).
         done = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              f"(Get-StoredCredential -Target 'brain:{name}')"
              ".GetNetworkCredential().Password"],
             capture_output=True, text=True)
         return done.stdout.strip() if done.returncode == 0 else ""
+
+    def get(self, name: str) -> str:
+        if not self._module_available():
+            return self.fallback.get(name)
+        primary = self._primary_get(name)
+        if primary:
+            return primary
+        # The module is available NOW, but the value may have been written
+        # by set() at a time when it was NOT (see the class docstring: this
+        # drift is ordinary, not a corner case). A miss on the primary
+        # lookup falls through to self.fallback on the chance set() put it
+        # there, rather than being reported as absence. One-way: see the
+        # class docstring for the direction this cannot help.
+        return self.fallback.get(name)
 
     def set(self, name: str, value: str) -> bool:
         if not self._module_available():
