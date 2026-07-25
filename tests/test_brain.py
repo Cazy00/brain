@@ -3371,6 +3371,21 @@ class ScheduleOwnershipTests(unittest.TestCase):
         fake_home = Path(self.tmp.name) / "home"
         self.plists = fake_home / "Library" / "LaunchAgents"
         self.plists.mkdir(parents=True)
+        # schedule_serves_this_repo goes through osbackend.scheduler(), which
+        # picks a backend by asking osbackend.os_family() about the REAL host.
+        # This fixture only ever writes a launchd-style plist, so it lines up
+        # when os_family() says "macos" — true on the Mac this suite was
+        # written on — but the identical code asking a Linux CI runner (what
+        # .github/workflows/gate.yml actually runs on ubuntu-latest) truthfully
+        # gets "linux", scheduler() hands back a SystemdScheduler, and serves()
+        # looks for ~/.config/systemd/user/consolidate.service — a file this
+        # fixture never writes — so the same assertion fails there. Pinning
+        # os_family() here makes the backend choice depend only on the fixture
+        # below, never on which OS happens to be running the test.
+        self.real_os_family = self.module.osbackend.os_family
+        self.module.osbackend.os_family = lambda: "macos"
+        self.addCleanup(setattr, self.module.osbackend, "os_family",
+                        self.real_os_family)
         # schedule_serves_this_repo now goes through osbackend.scheduler(),
         # whose LaunchdScheduler computes its plist directory from Path.home()
         # at construction time — there is no more bin/brain-level PLIST_DIR

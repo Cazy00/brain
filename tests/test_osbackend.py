@@ -155,6 +155,36 @@ class TestSchedulerServes(unittest.TestCase):
         self.assertIn("/v", argv)
 
 
+class TestSchtasksUnavailable(unittest.TestCase):
+    """serves()/status()/uninstall() must return the same graceful 'no
+    scheduler' value install() already returns when schtasks is absent —
+    true today on every machine this suite actually runs on (macOS dev boxes,
+    ubuntu-latest CI), but forced here rather than relied upon: this file's
+    own module docstring promises nothing in it depends on which platform
+    tool is actually installed, so a real Windows runner added later must not
+    flip these tests' premise out from under them. Before this fix,
+    subprocess.run(["schtasks", ...]) raised an uncaught FileNotFoundError
+    instead of returning gracefully."""
+
+    def setUp(self):
+        self.backend = osbackend.SchtasksScheduler()
+        # Instance-attribute override, same trick as backend.agents/.units
+        # above: shadows the bound method so available() is False regardless
+        # of whether schtasks actually exists on whatever machine runs this.
+        self.backend.available = lambda: False
+
+    def test_serves_returns_false_without_raising(self):
+        self.assertFalse(self.backend.serves("doctor", "/repo/x"))
+
+    def test_status_reports_unavailable_without_raising(self):
+        self.assertEqual(self.backend.status("doctor"),
+                         "no scheduler available on this platform")
+
+    def test_uninstall_reports_unavailable_without_raising(self):
+        self.assertEqual(self.backend.uninstall("doctor"),
+                         "no scheduler available on this platform — nothing to remove")
+
+
 class TestLaunchdRenderExtras(unittest.TestCase):
     """cwd/env/log are optional — TestSystemdUnits' 3-arg render_units() call
     above must keep working unchanged — but a REAL brain job needs all three:

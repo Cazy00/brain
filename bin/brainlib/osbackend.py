@@ -346,16 +346,28 @@ class SchtasksScheduler(Scheduler):
         return f"installed (Task Scheduler: {name})"
 
     def uninstall(self, name: str) -> str:
+        # Same guard as install() above: subprocess.run raises an uncaught
+        # FileNotFoundError when `schtasks` is not on PATH, which is every
+        # non-Windows machine — including the macOS/Linux boxes doctor and
+        # this test suite run on. available() is the same shutil.which check
+        # install() already trusts, so a missing binary is the ordinary
+        # "no scheduler here" case, not a crash.
+        if not self.available():
+            return super().uninstall(name)
         done = subprocess.run(["schtasks", "/delete", "/f", "/tn", name],
                               capture_output=True, text=True)
         return "removed" if done.returncode == 0 else "was not installed"
 
     def status(self, name: str) -> str:
+        if not self.available():          # see uninstall() above
+            return super().status(name)
         done = subprocess.run(["schtasks", "/query", "/tn", name],
                               capture_output=True, text=True)
         return "installed" if done.returncode == 0 else "not installed"
 
     def serves(self, name: str, marker: str) -> bool:
+        if not self.available():          # see uninstall() above
+            return super().serves(name, marker)
         done = subprocess.run(self.query_argv(name), capture_output=True, text=True)
         if done.returncode != 0:
             return False
