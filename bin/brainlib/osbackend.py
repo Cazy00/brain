@@ -695,8 +695,30 @@ def link_dir(link, target) -> tuple:
     Developer Mode or admin; a Windows JUNCTION needs neither, which is why it
     is preferred there over asking people to change a system setting. A copy is
     last because it goes stale, so `doctor` has to be able to notice one.
+
+    Never raises. Every filesystem call below that can fail with OSError
+    (unlink, the marker read, rmtree, mkdir — the symlink/copytree attempts
+    already caught their own) is wrapped and turned into a ("failed", message)
+    return instead — the same "a sentence, never an exception" contract
+    Scheduler and Keystore already keep in this module. cmd_init has no
+    try/except around its call into this function, so an uncaught OSError
+    here used to produce a raw traceback instead of a [4/5] FAILED line, and
+    skip step 5 and the final summary entirely — on exactly the
+    permission-denied or locked-file cases this function exists to handle.
     """
     link, target = Path(link), Path(target)
+    # None means link did not already exist — a fresh, first-time link. Set
+    # to a string below whenever something WAS already there and is about to
+    # be replaced, so the success messages further down can name what
+    # changed. Naming it is the one on-screen signal that a link just got
+    # silently re-pointed away from a DIFFERENT brain — the incident this
+    # repo's own CLAUDE.md warns about (`init` run from a scratch checkout
+    # re-points the global skill symlink, "silently hijacking the skill for
+    # every session on this machine") — so it is worth carrying even for the
+    # rarer copy-replaces-copy case, not just the symlink one that incident
+    # actually involved. Plan 2's `retire` is expected to read this same
+    # distinction back out of the message.
+    old_target = None
 
     if link.is_symlink():
         try:
@@ -704,21 +726,51 @@ def link_dir(link, target) -> tuple:
                 return "symlink", "already correct"
         except OSError:
             pass
-        link.unlink()
+        # os.readlink, not a second resolve(): resolve() above may already
+        # have failed (a broken symlink whose old target no longer exists),
+        # and readlink still reports the raw stored path even then.
+        try:
+            old_target = os.readlink(str(link))
+        except OSError:
+            old_target = "an unreadable location"
+        try:
+            link.unlink()
+        except OSError as exc:
+            return "failed", f"could not remove the existing link at {link}: {exc}"
     elif link.exists():
-        if (link / _COPY_MARKER).exists():
-            if (link / _COPY_MARKER).read_text(encoding="utf-8").strip() == str(target):
-                return "copy", "already correct (copy)"
-            shutil.rmtree(link)
-        else:
+        try:
+            has_marker = (link / _COPY_MARKER).exists()
+        except OSError:
+            has_marker = False
+        if not has_marker:
             return "failed", (f"{link} already exists and was not created by brain — "
                               "move it aside, then run this again")
+        try:
+            old_target = (link / _COPY_MARKER).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            return "failed", f"could not read {link / _COPY_MARKER}: {exc}"
+        if old_target == str(target):
+            return "copy", "already correct (copy)"
+        try:
+            shutil.rmtree(link)
+        except OSError as exc:
+            return "failed", f"could not remove the existing copy at {link}: {exc}"
 
-    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return "failed", f"could not create {link.parent}: {exc}"
+
+    # Appended to every success message below whenever this replaced
+    # something rather than creating it fresh — empty string otherwise, so a
+    # first-time link's wording is byte-for-byte what it was before this
+    # distinction existed.
+    was = f" — was pointing at {old_target}" if old_target is not None else ""
 
     try:
         link.symlink_to(target, target_is_directory=True)
-        return "symlink", f"linked {link}"
+        verb = "relinked" if old_target is not None else "linked"
+        return "symlink", f"{verb} {link}{was}"
     except (OSError, NotImplementedError):
         pass
 
@@ -726,12 +778,12 @@ def link_dir(link, target) -> tuple:
         done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
                               capture_output=True, text=True)
         if done.returncode == 0:
-            return "junction", f"junction created at {link}"
+            return "junction", f"junction created at {link}{was}"
 
     try:
         shutil.copytree(target, link)
         (link / _COPY_MARKER).write_text(str(target), encoding="utf-8")
-        return "copy", (f"copied to {link} — neither a symlink nor a junction was "
+        return "copy", (f"copied to {link}{was} — neither a symlink nor a junction was "
                         "possible, so this will go stale; `brain doctor` will say when")
     except OSError as exc:
         return "failed", f"could not link or copy {link}: {exc}"

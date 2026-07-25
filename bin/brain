@@ -1486,6 +1486,16 @@ def cmd_init(argv: list) -> int:
             # repeating the word, the same trick cmd_schedule already uses
             # for the scheduler backend's "installed (...)" sentence.
             print("  [4/5] skill linked    " + message[len("linked "):])
+        elif message.startswith("relinked "):
+            # Distinct label restored: a link silently re-pointed away from a
+            # DIFFERENT brain is the exact incident CLAUDE.md warns about
+            # ("brain init run from a scratch checkout... silently hijacking
+            # the skill for every session on this machine") — this is the one
+            # place that gets reported, so it must not read identically to an
+            # ordinary fresh link. osbackend's message also names the old
+            # target being replaced, which the old "skill relinked" line
+            # never did.
+            print("  [4/5] skill relinked  " + message[len("relinked "):])
         else:
             print(f"  [4/5] skill linked    {message}")
 

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 from brainlib import osbackend  # noqa: E402
@@ -466,6 +467,197 @@ class TestLinkDir(unittest.TestCase):
         # copy path that is somebody's files.
         self.assertEqual(method, "failed")
         self.assertTrue((stranger / "someone-elses.md").exists())
+
+
+class TestLinkDirNeverRaises(unittest.TestCase):
+    """Task 4 review, Finding 1: link_dir() must return ("failed", message)
+    for every OSError it can hit, never propagate one — cmd_init has no
+    try/except around its call to link_dir(), so an uncaught OSError there
+    previously produced a raw traceback instead of a [4/5] FAILED line, and
+    skipped step 5 and the final summary entirely. That matters most on
+    exactly the cases this feature exists for: a locked file, a read-only
+    filesystem, permission denied.
+
+    Real chmod-based permission failures are flaky across platforms (root
+    ignores them; Windows doesn't have the same model) and this suite must
+    stay meaningful on all three, so each call site is forced to fail
+    directly via unittest.mock instead — deterministic everywhere."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.target = self.base / "target"
+        self.target.mkdir()
+        (self.target / "SKILL.md").write_text("skill", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unlink_failure_on_a_stale_symlink_is_reported_not_raised(self):
+        link = self.base / "link"
+        other = self.base / "other-target"
+        other.mkdir()
+        link.symlink_to(other, target_is_directory=True)
+        with mock.patch.object(Path, "unlink", side_effect=OSError("locked")):
+            method, message = osbackend.link_dir(link, self.target)
+        self.assertEqual(method, "failed")
+        self.assertIn("locked", message)
+
+    def test_marker_read_failure_is_reported_not_raised(self):
+        link = self.base / "link"
+        link.mkdir()
+        (link / osbackend._COPY_MARKER).write_text(str(self.target), encoding="utf-8")
+        with mock.patch.object(Path, "read_text", side_effect=OSError("denied")):
+            method, message = osbackend.link_dir(link, self.target)
+        self.assertEqual(method, "failed")
+        self.assertIn("denied", message)
+
+    def test_rmtree_failure_on_a_stale_copy_is_reported_not_raised(self):
+        link = self.base / "link"
+        link.mkdir()
+        (link / osbackend._COPY_MARKER).write_text(str(self.base / "elsewhere"),
+                                                    encoding="utf-8")
+        with mock.patch("shutil.rmtree", side_effect=OSError("in use")):
+            method, message = osbackend.link_dir(link, self.target)
+        self.assertEqual(method, "failed")
+        self.assertIn("in use", message)
+
+    def test_mkdir_failure_is_reported_not_raised(self):
+        link = self.base / "nested" / "link"
+        with mock.patch.object(Path, "mkdir", side_effect=OSError("read-only fs")):
+            method, message = osbackend.link_dir(link, self.target)
+        self.assertEqual(method, "failed")
+        self.assertIn("read-only fs", message)
+
+
+class TestLinkDirRepointing(unittest.TestCase):
+    """Task 4 review, Finding 2: a link silently re-pointed away from a
+    DIFFERENT brain must say so distinctly and name what it replaced. This
+    repo's own CLAUDE.md names the exact incident: `brain init` run from a
+    scratch or template checkout re-points the global skill symlink at that
+    checkout, "silently hijacking the skill for every session on this
+    machine." The old inline cmd_init code had a distinct "skill relinked"
+    label but never said what it was relinked FROM; this is stronger than
+    that, not just a restore."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.target = self.base / "target"
+        self.target.mkdir()
+        (self.target / "SKILL.md").write_text("skill", encoding="utf-8")
+        self.other_target = self.base / "other-brain"
+        self.other_target.mkdir()
+        (self.other_target / "SKILL.md").write_text("someone else's skill",
+                                                     encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_relinking_a_symlink_that_points_elsewhere_names_the_old_target(self):
+        link = self.base / "link"
+        link.symlink_to(self.other_target, target_is_directory=True)
+        method, message = osbackend.link_dir(link, self.target)
+        self.assertEqual(method, "symlink")
+        self.assertIn("relinked", message.lower())
+        self.assertIn(str(self.other_target), message)
+        self.assertEqual((link / "SKILL.md").read_text(encoding="utf-8"), "skill")
+
+    def test_relinking_a_stale_copy_names_the_old_target(self):
+        link = self.base / "link"
+        link.mkdir()
+        (link / osbackend._COPY_MARKER).write_text(str(self.other_target),
+                                                    encoding="utf-8")
+        (link / "SKILL.md").write_text("someone else's skill", encoding="utf-8")
+        method, message = osbackend.link_dir(link, self.target)
+        self.assertIn(str(self.other_target), message)
+        self.assertEqual((link / "SKILL.md").read_text(encoding="utf-8"), "skill")
+
+    def test_fresh_link_does_not_claim_to_be_a_relink(self):
+        # Regression guard on the distinction itself: "relinked" must appear
+        # ONLY when something existing actually got replaced, never on a
+        # plain first-time link — otherwise the signal Finding 2 restores is
+        # meaningless noise on the common case.
+        link = self.base / "link"
+        method, message = osbackend.link_dir(link, self.target)
+        self.assertNotIn("relinked", message.lower())
+
+
+class TestLinkDirStaleMarkerMismatch(unittest.TestCase):
+    """Task 4 review, Finding 4: the shutil.rmtree(link) branch (reached when
+    an existing copy's marker names a DIFFERENT target than the one
+    requested) was new in the original task-4 commit and had no covering
+    test at all — a bare rmtree with no test is not something to ship,
+    regardless of whether the code happens to be correct."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.old_target = self.base / "old-target"
+        self.old_target.mkdir()
+        (self.old_target / "SKILL.md").write_text("old skill", encoding="utf-8")
+        self.new_target = self.base / "new-target"
+        self.new_target.mkdir()
+        (self.new_target / "SKILL.md").write_text("new skill", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_stale_copy_is_removed_and_replaced(self):
+        link = self.base / "link"
+        link.mkdir()
+        (link / osbackend._COPY_MARKER).write_text(str(self.old_target),
+                                                    encoding="utf-8")
+        (link / "SKILL.md").write_text("old skill", encoding="utf-8")
+        (link / "leftover-from-old-copy.txt").write_text("stale", encoding="utf-8")
+
+        method, message = osbackend.link_dir(link, self.new_target)
+
+        self.assertIn(method, {"symlink", "junction", "copy"})
+        self.assertEqual((link / "SKILL.md").read_text(encoding="utf-8"), "new skill")
+        # The stale file from the OLD copy must be gone, not merely
+        # shadowed — this is the one thing a bare shutil.rmtree(link) has to
+        # get right, and the reason this branch cannot ship untested.
+        self.assertFalse((link / "leftover-from-old-copy.txt").exists())
+
+
+class TestLinkDirCopyFallback(unittest.TestCase):
+    """Task 4 review, Minor finding: the copy and junction fallback paths are
+    the entire reason link_dir exists, but neither macOS nor Linux can reach
+    them naturally in a temp dir — Path.symlink_to just succeeds there.
+    test_creates_something_that_reads_through (TestLinkDir, above) accepts
+    any of the three methods but in practice only ever observes "symlink" on
+    this suite's actual platforms. Forcing symlink_to to fail is the only way
+    to exercise the copy path, its marker write, and the "already correct
+    (copy)" branch from any machine this suite runs on."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.target = self.base / "target"
+        self.target.mkdir()
+        (self.target / "SKILL.md").write_text("skill", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_falls_back_to_a_marked_copy_when_symlink_is_unavailable(self):
+        link = self.base / "link"
+        with mock.patch.object(Path, "symlink_to", side_effect=OSError("no dev mode")):
+            method, message = osbackend.link_dir(link, self.target)
+        self.assertEqual(method, "copy")
+        self.assertEqual((link / "SKILL.md").read_text(encoding="utf-8"), "skill")
+        self.assertEqual((link / osbackend._COPY_MARKER).read_text(encoding="utf-8"),
+                         str(self.target))
+        self.assertIn("go stale", message)
+
+    def test_an_existing_correct_copy_is_a_no_op(self):
+        link = self.base / "link"
+        with mock.patch.object(Path, "symlink_to", side_effect=OSError("no dev mode")):
+            osbackend.link_dir(link, self.target)
+            method, message = osbackend.link_dir(link, self.target)
+        self.assertEqual(method, "copy")
+        self.assertIn("already correct", message.lower())
 
 
 if sys.platform == "win32":
