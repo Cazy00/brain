@@ -391,6 +391,49 @@ class TestCredmanFallbackDrift(unittest.TestCase):
         self.assertEqual(self.store.get("brain-vault-key"), "abc123")
 
 
+class TestCredmanDeleteDrift(unittest.TestCase):
+    """Second review finding on the same drift: get()'s fallthrough above
+    means a value surviving unnoticed in self.fallback is not just stale, it
+    is RETURNED again on the next get() — so delete() picking only one
+    backend (whichever cmdkey/module state looks live right now) is no
+    longer an inert gap, it is "deleted, but still readable", a revocation
+    bypass for a vault key or a `serve` token. Concretely: set() while the
+    module is unavailable writes into self.fallback; the module gets
+    installed later (ordinary, not a corner case — see
+    TestCredmanFallbackDrift); delete() now takes the _module_available()
+    branch and only clears cmdkey, which never had anything; the fallback
+    copy survives; get() falls through to it and hands the "deleted" secret
+    back.
+
+    Same forcing technique as TestCredmanFallbackDrift, extended to
+    delete()'s own subprocess call: _module_available flips mid-test via a
+    mutable flag, and BOTH _primary_get and _primary_delete are forced so
+    that neither of the two methods capable of reaching a real subprocess
+    call (get()'s Get-StoredCredential, delete()'s cmdkey) can do so while
+    this test deliberately exercises the available=True branch."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fallback = osbackend.FileKeystore(Path(self.tmp.name))
+        self.store = osbackend.CredmanKeystore(fallback=fallback)
+        self.available = False
+        self.store._module_available = lambda: self.available
+        self.store._primary_get = lambda name: ""
+        # cmdkey has nothing to remove in this scenario — the value was
+        # never written through it — so stub the result rather than run the
+        # real binary, same reasoning as _primary_get above.
+        self.store._primary_delete = lambda name: False
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_deleted_after_becoming_available_does_not_come_back(self):
+        self.assertTrue(self.store.set("brain-vault-key", "abc123"))
+        self.available = True
+        self.store.delete("brain-vault-key")
+        self.assertEqual(self.store.get("brain-vault-key"), "")
+
+
 if sys.platform == "win32":
     # chmod is a no-op on Windows, so the 0600 assertion cannot hold there.
     TestFileKeystore.test_stored_file_is_not_group_or_world_readable = \

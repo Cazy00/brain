@@ -554,6 +554,27 @@ class CredmanKeystore(Keystore):
     to, and a cmdkey-stored secret cannot be read back at all without the
     module. That direction stays a real, structural gap: named here, not
     fixed.
+
+    delete() closes the matching gap on the writing side: once the module is
+    available it clears BOTH self.fallback and cmdkey unconditionally,
+    rather than picking whichever one looks live right now, because get()'s
+    fallthrough above is exactly what would hand a stale fallback copy back
+    out AFTER delete() reported success — "deleted, but still readable" is a
+    revocation bypass, not a shrug, for a vault key or a `serve` token.
+    Clearing both costs nothing when only one was ever written to: deleting
+    against an absent name is a free no-op on either backend.
+
+    delete() has its OWN one-way limit, mirroring get()'s: a value written
+    via cmdkey while the module WAS available, deleted after the module is
+    later removed, is not cleared from Credential Manager — the unavailable
+    branch above only ever touches self.fallback, because that is the only
+    place delete() COULD have written it if it had run earlier in that same
+    unavailable state. This does not reopen the revocation-bypass risk the
+    fix above closes: get() in that same unavailable state also only reads
+    self.fallback, so the un-cleared cmdkey entry is unreadable through this
+    class either, not silently returned. It is a real gap all the same — an
+    orphaned OS-level credential this class can no longer see or remove —
+    named here, not fixed, for the same reason the get() gap above is not.
     """
     kind = "credman"
 
@@ -620,11 +641,30 @@ class CredmanKeystore(Keystore):
         return subprocess.run(self.set_argv(name, value),
                               capture_output=True).returncode == 0
 
+    def _primary_delete(self, name: str) -> bool:
+        # Split out from delete() for the same reason _primary_get is split
+        # out of get(): a drift test needs to exercise the
+        # _module_available()==True branch without ever invoking a real
+        # subprocess (see TestCredmanDeleteDrift).
+        return subprocess.run(["cmdkey", f"/delete:brain:{name}"],
+                              capture_output=True).returncode == 0
+
     def delete(self, name: str) -> bool:
         if not self._module_available():
             return self.fallback.delete(name)
-        return subprocess.run(["cmdkey", f"/delete:brain:{name}"],
-                              capture_output=True).returncode == 0
+        # Clear BOTH backends once the module is available, not just cmdkey:
+        # a value may have been written to self.fallback by a set() that ran
+        # before the module appeared (see the class docstring), and get()'s
+        # own fallthrough is exactly what would hand that stale copy back
+        # AFTER this delete reported success — "deleted, but still
+        # readable" is a revocation bypass for a vault key or a `serve`
+        # token, not a shrug. Unlike set()'s single-path choice, this is not
+        # a permanent trade-off: deleting against an absent fallback file is
+        # free (FileKeystore.delete just returns False), so it costs nothing
+        # on a machine that never touched the fallback at all.
+        removed_native = self._primary_delete(name)
+        removed_fallback = self.fallback.delete(name)
+        return removed_native or removed_fallback
 
 
 def keystore_for(family: str) -> Keystore:
