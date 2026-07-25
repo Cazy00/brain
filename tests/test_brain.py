@@ -30,7 +30,7 @@ MCP = ROOT / "bin" / "brain-mcp"
 K = ROOT / "knowledge"
 
 SANDBOX_IGNORE = shutil.ignore_patterns(
-    ".git", ".cache", "graphify-out", "node_modules", ".DS_Store")
+    ".git", ".cache", "graphify-out", "node_modules", ".DS_Store", "__pycache__")
 
 
 def temp_dir():

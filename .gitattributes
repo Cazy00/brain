@@ -1,0 +1,18 @@
+# Line endings are load-bearing here, and the failure they cause is silent.
+#
+# A CRLF checkout of a `#!/bin/sh` file corrupts the shebang: the kernel looks
+# for an interpreter named "/bin/sh\r", does not find it, and the hook simply
+# does not run. The commit gate would be DOWN on every Windows machine with no
+# error anyone would read. Git for Windows ships bash, so the hooks themselves
+# are portable — only this is not.
+.githooks/* text eol=lf
+bin/* text eol=lf
+
+# The reverse, for the one file that must be CRLF: cmd.exe misparses a .cmd
+# with LF endings.
+*.cmd text eol=crlf
+
+# Never let Git guess about binaries.
+*.png binary
+*.jpg binary
+*.age binary
