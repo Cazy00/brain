@@ -1771,11 +1771,12 @@ def phase_backup(dest, repo_name: str, want_remote: bool,
         pushed = subprocess.run(["git", "push", "-u", "origin", branch],
                                 cwd=str(dest), capture_output=True, text=True)
         if pushed.returncode != 0:
+            lines = (pushed.stderr or "").strip().splitlines()
+            reason = lines[-1] if lines else "git push failed"
             return Result(
                 "failed",
                 f"the remote {origin} exists but nothing has been pushed to it, so "
-                f"nothing is backed up: "
-                f"{(pushed.stderr or '').strip().splitlines()[-1:] or ['push failed']}"[0],
+                f"nothing is backed up: {reason}",
                 remedy=f"cd {dest} && git push -u origin {branch}")
 
     return Result("ok", f"backed up to {origin}")
@@ -2072,6 +2073,17 @@ def run_setup(argv: list, home=None, cwd=None, source=None) -> int:
 
     results, dest = {}, None
     wanted = (only,) if only else PHASES
+    if only and only not in PHASES:
+        print(f"unknown phase {only!r} — one of: {', '.join(PHASES)}", file=sys.stderr)
+        return 2
+    # Every phase after `place` needs a destination. Running one of them alone
+    # is a legitimate repair, so ask where the brain is rather than crashing on
+    # a None that came from a phase that was never run.
+    if only in ("create", "backup", "verify") and not requested:
+        print("--only " + only + " needs --dir <path>", file=sys.stderr)
+        return 2
+    if requested:
+        dest = picker.expand(str(requested), home, cwd)
 
     for name in PHASES:
         if name not in wanted:
