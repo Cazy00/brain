@@ -214,5 +214,151 @@ class TestLaunchdRenderExtras(unittest.TestCase):
                       "/repo/.cache/doctor-launchd.log</string>", xml)
 
 
+class TestLaunchdUninstallUnavailable(unittest.TestCase):
+    """Deferred from Task 2's review (carried into this task's brief): the
+    same defect class TestSchtasksUnavailable covers above, in
+    LaunchdScheduler.uninstall() instead of SchtasksScheduler's. Before the
+    fix it called subprocess.run(["launchctl", ...]) with no available()
+    guard, so a host lacking launchctl hit an uncaught FileNotFoundError on
+    `brain schedule uninstall` instead of the graceful sentence install()
+    already returned. status() is a plain path check with no subprocess call
+    behind it, so it is not at risk and is untouched by this fix."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.backend = osbackend.LaunchdScheduler()
+        # Belt and braces with the available() override below: even if this
+        # ever ran against the buggy pre-fix code, redirecting .agents means
+        # the subprocess call it makes unloads a path inside a throwaway temp
+        # dir, never anything under the real ~/Library/LaunchAgents.
+        self.backend.agents = Path(self.tmp.name)
+        self.backend.available = lambda: False
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_uninstall_reports_unavailable_without_raising(self):
+        self.assertEqual(self.backend.uninstall("doctor"),
+                         "no scheduler available on this platform — nothing to remove")
+
+
+class TestSystemdUninstallUnavailable(unittest.TestCase):
+    """See TestLaunchdUninstallUnavailable above — SystemdScheduler.uninstall()
+    had the identical unguarded subprocess.run(["systemctl", ...]) call."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.backend = osbackend.SystemdScheduler()
+        # Same belt-and-braces reasoning as the launchd test above, redirected
+        # to the systemd user-unit directory instead.
+        self.backend.units = Path(self.tmp.name)
+        self.backend.available = lambda: False
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_uninstall_reports_unavailable_without_raising(self):
+        self.assertEqual(self.backend.uninstall("doctor"),
+                         "no scheduler available on this platform — nothing to remove")
+
+
+class TestKeystoreSelection(unittest.TestCase):
+    def test_each_family_gets_its_own_backend(self):
+        self.assertEqual(osbackend.keystore_for("macos").kind, "keychain")
+        self.assertEqual(osbackend.keystore_for("windows").kind, "credman")
+        # Linux picks secret-tool when present and falls back to a 0600 file.
+        self.assertIn(osbackend.keystore_for("linux").kind, {"secret-tool", "file"})
+
+    def test_every_backend_describes_itself_for_the_user(self):
+        for family in ("macos", "linux", "windows"):
+            self.assertTrue(osbackend.keystore_for(family).describe())
+
+
+class TestKeychainArgv(unittest.TestCase):
+    """Never executed here. Running `security` for real would read or write the
+    developer's actual login keychain, which a test must never do."""
+
+    def test_get_argv_asks_for_the_password_value(self):
+        argv = osbackend.KeychainKeystore().get_argv("brain-vault-key")
+        self.assertIn("find-generic-password", argv)
+        self.assertIn("brain-vault-key", argv)
+        self.assertIn("-w", argv)
+
+
+class TestCredmanArgv(unittest.TestCase):
+    def test_set_argv_carries_name_and_value(self):
+        argv = osbackend.CredmanKeystore().set_argv("brain-serve-token", "s3cr3t")
+        joined = " ".join(argv)
+        self.assertIn("brain-serve-token", joined)
+        self.assertIn("s3cr3t", joined)
+
+
+class TestFileKeystore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = osbackend.FileKeystore(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_roundtrip(self):
+        self.assertTrue(self.store.set("token", "abc123"))
+        self.assertEqual(self.store.get("token"), "abc123")
+
+    def test_missing_reads_as_empty_not_an_error(self):
+        self.assertEqual(self.store.get("nothing-here"), "")
+
+    def test_stored_file_is_not_group_or_world_readable(self):
+        self.store.set("token", "abc123")
+        mode = (Path(self.tmp.name) / "token").stat().st_mode & 0o077
+        self.assertEqual(mode, 0, "secret file must be 0600")
+
+    def test_delete_removes_it(self):
+        self.store.set("token", "abc123")
+        self.assertTrue(self.store.delete("token"))
+        self.assertEqual(self.store.get("token"), "")
+
+
+class TestCredmanFallback(unittest.TestCase):
+    """CredmanKeystore.get() must never silently return "" for a secret that
+    really IS stored just because the CredentialManager PowerShell module
+    happens to be missing — see the class docstring for why that is data
+    loss, not a shrug. This exercises the fallback path by forcing
+    _module_available() directly rather than relying on this Mac's ambient
+    (real, but incidental) lack of `powershell` — same "forced, not relied
+    upon" reasoning as TestSchtasksUnavailable above."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fallback = osbackend.FileKeystore(Path(self.tmp.name))
+        self.store = osbackend.CredmanKeystore(fallback=fallback)
+        self.store._module_available = lambda: False
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_roundtrip_uses_the_fallback_when_the_module_is_missing(self):
+        self.assertTrue(self.store.set("brain-vault-key", "abc123"))
+        self.assertEqual(self.store.get("brain-vault-key"), "abc123")
+
+    def test_missing_reads_as_empty_not_a_lie(self):
+        self.assertEqual(self.store.get("nothing-here"), "")
+
+    def test_delete_removes_it_from_the_fallback(self):
+        self.store.set("brain-vault-key", "abc123")
+        self.assertTrue(self.store.delete("brain-vault-key"))
+        self.assertEqual(self.store.get("brain-vault-key"), "")
+
+    def test_describe_says_the_module_is_missing(self):
+        self.assertIn("CredentialManager", self.store.describe())
+
+
+if sys.platform == "win32":
+    # chmod is a no-op on Windows, so the 0600 assertion cannot hold there.
+    TestFileKeystore.test_stored_file_is_not_group_or_world_readable = \
+        unittest.skip("POSIX permissions do not apply on Windows")(
+            TestFileKeystore.test_stored_file_is_not_group_or_world_readable)
+
+
 if __name__ == "__main__":
     unittest.main()

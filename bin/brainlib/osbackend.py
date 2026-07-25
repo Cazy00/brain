@@ -205,6 +205,16 @@ class LaunchdScheduler(Scheduler):
         return f"installed ({path})"
 
     def uninstall(self, name: str) -> str:
+        # Same guard as install() above, and the same fix already applied to
+        # SchtasksScheduler below: subprocess.run raises an uncaught
+        # FileNotFoundError when the platform tool is missing. launchctl
+        # ships with every real Mac, so this mainly guards a stripped-down or
+        # sandboxed environment reporting itself as macOS — but install()
+        # already refuses to assume that can't happen, and this class's own
+        # base (Scheduler) promises unavailable is a normal state everywhere,
+        # not just in install().
+        if not self.available():
+            return super().uninstall(name)
         path = self.plist_path(name)
         subprocess.run(["launchctl", "unload", str(path)], capture_output=True)
         if path.exists():
@@ -283,6 +293,13 @@ class SystemdScheduler(Scheduler):
         return f"installed ({self.units / (name + '.timer')})"
 
     def uninstall(self, name: str) -> str:
+        # Same guard as install() above — see LaunchdScheduler.uninstall()
+        # for the full reasoning. A Linux box without systemd (minimal
+        # containers, some embedded distros, WSL1) would otherwise hit an
+        # uncaught FileNotFoundError here instead of the graceful sentence
+        # every other unavailable path on this class already returns.
+        if not self.available():
+            return super().uninstall(name)
         subprocess.run(["systemctl", "--user", "disable", "--now", f"{name}.timer"],
                        capture_output=True)
         removed = False
@@ -381,3 +398,213 @@ def scheduler_for(family: str) -> Scheduler:
 
 def scheduler() -> Scheduler:
     return scheduler_for(os_family())
+
+
+class Keystore:
+    """Where a secret lives on this machine.
+
+    Never the repo: `brain lint` refuses credentials in tracked files and that
+    rule is not being weakened. Every method fails soft — a machine with no
+    keystore must still be able to run everything that does not need one.
+    """
+    kind = "none"
+
+    def describe(self) -> str:
+        return "no OS keystore available — secrets must be supplied by hand"
+
+    def get(self, name: str) -> str:
+        return ""
+
+    def set(self, name: str, value: str) -> bool:
+        return False
+
+    def delete(self, name: str) -> bool:
+        return False
+
+
+class KeychainKeystore(Keystore):
+    kind = "keychain"
+
+    def describe(self) -> str:
+        return "macOS Keychain"
+
+    def get_argv(self, name: str) -> list:
+        return ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+                "-s", name, "-w"]
+
+    def set_argv(self, name: str, value: str) -> list:
+        return ["security", "add-generic-password", "-U", "-a",
+                os.environ.get("USER", ""), "-s", name, "-w", value]
+
+    def get(self, name: str) -> str:
+        done = subprocess.run(self.get_argv(name), capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def set(self, name: str, value: str) -> bool:
+        return subprocess.run(self.set_argv(name, value),
+                              capture_output=True).returncode == 0
+
+    def delete(self, name: str) -> bool:
+        return subprocess.run(
+            ["security", "delete-generic-password", "-a",
+             os.environ.get("USER", ""), "-s", name],
+            capture_output=True).returncode == 0
+
+
+class SecretToolKeystore(Keystore):
+    kind = "secret-tool"
+
+    def describe(self) -> str:
+        return "the freedesktop secret service (secret-tool)"
+
+    def get(self, name: str) -> str:
+        done = subprocess.run(["secret-tool", "lookup", "service", "brain",
+                               "account", name], capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def set(self, name: str, value: str) -> bool:
+        done = subprocess.run(["secret-tool", "store", "--label", f"brain {name}",
+                               "service", "brain", "account", name],
+                              input=value, capture_output=True, text=True)
+        return done.returncode == 0
+
+    def delete(self, name: str) -> bool:
+        return subprocess.run(["secret-tool", "clear", "service", "brain",
+                               "account", name], capture_output=True).returncode == 0
+
+
+class FileKeystore(Keystore):
+    """The fallback: a 0600 file under ~/.config/brain/secrets/.
+
+    Weaker than a real keystore and it says so. It exists because a headless
+    Linux box frequently has no secret service at all, and refusing to store
+    anything there would make the vault and `serve` simply unavailable.
+    """
+    kind = "file"
+
+    def __init__(self, directory=None):
+        self.dir = Path(directory) if directory else \
+            Path.home() / ".config" / "brain" / "secrets"
+
+    def describe(self) -> str:
+        return f"a 0600 file under {self.dir} (no OS keystore found)"
+
+    def get(self, name: str) -> str:
+        path = self.dir / name
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def set(self, name: str, value: str) -> bool:
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            path = self.dir / name
+            # Create with the right mode BEFORE writing. Writing first and
+            # chmod-ing after leaves the secret world-readable for the window
+            # between the two, which is exactly when a backup job runs.
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(value)
+            return True
+        except OSError:
+            return False
+
+    def delete(self, name: str) -> bool:
+        try:
+            (self.dir / name).unlink()
+            return True
+        except OSError:
+            return False
+
+
+class CredmanKeystore(Keystore):
+    """Windows Credential Manager.
+
+    cmdkey can WRITE a credential but famously cannot print one back out —
+    reading needs `Get-StoredCredential` from the `CredentialManager`
+    PowerShell module, which is NOT installed on a stock Windows box (nothing
+    ships it, nothing installs it automatically; confirm this on the Windows
+    CI runner in a later task — it cannot be checked from here). A get() that
+    returns "" whenever that module simply happens to be missing would be
+    indistinguishable from "no secret was ever stored" — for a vault key or a
+    `serve` token, that misreading is not a shrug, it is silent data loss.
+
+    So get/set/delete all consult the SAME probe (_module_available) before
+    touching cmdkey or PowerShell, and fall back TOGETHER to self.fallback (a
+    FileKeystore) when it says no. "Together" is the point: if set() kept
+    writing through cmdkey while only get() fell back to the file, a value
+    written while the module was missing would still read back as "" later
+    (nothing would ever have reached the file) — same bug, one layer down.
+    Consulting one probe from all three methods is what keeps a value
+    findable down whichever path it was written.
+    """
+    kind = "credman"
+
+    def __init__(self, fallback=None):
+        # Injectable so tests can point the fallback at a temp directory
+        # instead of this machine's real ~/.config/brain/secrets.
+        self.fallback = fallback if fallback is not None else FileKeystore()
+
+    def describe(self) -> str:
+        if self._module_available():
+            return "Windows Credential Manager"
+        return ("Windows Credential Manager, but the CredentialManager "
+                "PowerShell module is not installed, so reads and writes use "
+                f"{self.fallback.describe()} instead")
+
+    def _module_available(self) -> bool:
+        # Get-Module -ListAvailable only inspects what is installed locally;
+        # it never touches Credential Manager itself, so running it to
+        # CHOOSE a backend is safe to call unconditionally. The `powershell`
+        # PATH check comes first so a non-Windows machine (every dev box and
+        # this test suite) answers False without spawning a process at all.
+        if not shutil.which("powershell"):
+            return False
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "if (Get-Module -ListAvailable -Name CredentialManager) "
+             "{ exit 0 } else { exit 1 }"],
+            capture_output=True)
+        return done.returncode == 0
+
+    def set_argv(self, name: str, value: str) -> list:
+        return ["cmdkey", f"/generic:brain:{name}", "/user:brain", f"/pass:{value}"]
+
+    def get(self, name: str) -> str:
+        if not self._module_available():
+            return self.fallback.get(name)
+        # cmdkey stores but will not print a secret back. PowerShell's
+        # CredentialManager surface is the documented way to read one.
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-StoredCredential -Target 'brain:{name}')"
+             ".GetNetworkCredential().Password"],
+            capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def set(self, name: str, value: str) -> bool:
+        if not self._module_available():
+            return self.fallback.set(name, value)
+        return subprocess.run(self.set_argv(name, value),
+                              capture_output=True).returncode == 0
+
+    def delete(self, name: str) -> bool:
+        if not self._module_available():
+            return self.fallback.delete(name)
+        return subprocess.run(["cmdkey", f"/delete:brain:{name}"],
+                              capture_output=True).returncode == 0
+
+
+def keystore_for(family: str) -> Keystore:
+    if family == "macos":
+        return KeychainKeystore()
+    if family == "windows":
+        return CredmanKeystore()
+    if family == "linux":
+        return SecretToolKeystore() if shutil.which("secret-tool") else FileKeystore()
+    return Keystore()
+
+
+def keystore() -> Keystore:
+    return keystore_for(os_family())
