@@ -15,6 +15,23 @@ sys.path.insert(0, str(ROOT / "bin"))
 from brainlib import picker  # noqa: E402
 
 
+class _FakeTTY(io.StringIO):
+    """A StringIO that claims to be a real terminal, so choose() takes the
+    interactive branch instead of returning the default immediately. There is
+    no other way to drive that branch under test — a real terminal cannot be
+    scripted, and the test runner's own stdin is never a TTY either."""
+    def isatty(self):
+        return True
+
+
+class _RaisingIsATty(io.StringIO):
+    """isatty() that raises instead of returning False — what a CLOSED file
+    object actually does (ValueError: I/O operation on closed file). choose()
+    must treat this the same as a plain False, not let the exception escape."""
+    def isatty(self):
+        raise ValueError("I/O operation on closed file")
+
+
 class TestLineEndingPolicy(unittest.TestCase):
     """A CRLF checkout corrupts a `#!/bin/sh` shebang. Git for Windows ships
     bash, so the hooks themselves are fine — only the line endings are fatal,
@@ -97,7 +114,9 @@ class TestRejectReason(unittest.TestCase):
     def test_a_file_is_rejected(self):
         target = self.base / "afile"
         target.write_text("x", encoding="utf-8")
-        self.assertTrue(picker.reject_reason(target))
+        reason = picker.reject_reason(target)
+        self.assertIn("is a file, not a directory", reason,
+                      "the rejection must say WHY, not just that it failed")
 
 
 class TestExpand(unittest.TestCase):
@@ -122,6 +141,72 @@ class TestChooseWithoutATty(unittest.TestCase):
         chosen = picker.choose(Path("/home/x"), Path("/work"),
                                stream=io.StringIO(""), default=Path("/home/x/brain"))
         self.assertEqual(chosen, Path("/home/x/brain"))
+
+    def test_a_raising_isatty_is_treated_as_not_a_tty(self):
+        # A closed file's isatty() raises rather than returning False. Letting
+        # that escape choose() would defeat its one job — never block without
+        # a confirmed terminal — by crashing instead of falling back to the
+        # default. Failing fast beats hanging, but it is still not the
+        # graceful fallback this function's docstring promises.
+        chosen = picker.choose(Path("/home/x"), Path("/work"),
+                               stream=_RaisingIsATty(""), default=Path("/home/x/brain"))
+        self.assertEqual(chosen, Path("/home/x/brain"))
+
+
+class TestChooseInteractive(unittest.TestCase):
+    """Drives the TTY branch of choose() with a scripted fake terminal.
+
+    Menu rendering, digit selection, the type-a-path sub-prompt and
+    reject-then-retry all live inside that branch, and it has zero coverage
+    otherwise — a real terminal cannot be scripted, so _FakeTTY (isatty() ==
+    True over a StringIO of scripted lines) is the only way to reach it.
+    Options still come from candidates() against a temp directory, and
+    nothing here reads or writes the real HOME.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.cwd = self.home / "cwd"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_valid_digit_selects_that_candidate(self):
+        options = picker.candidates(self.home, self.cwd)
+        chosen = picker.choose(self.home, self.cwd, stream=_FakeTTY("1\n"))
+        self.assertEqual(chosen, options[0][0])
+
+    def test_an_out_of_range_digit_is_rejected_not_treated_as_a_path(self):
+        # Before the fix, the bare `else: chosen = expand(raw, home, cwd)`
+        # meant a fat-fingered "99" silently became the literal path
+        # `<cwd>/99` and was accepted outright, because reject_reason() lets
+        # through any path that simply doesn't exist yet. An out-of-range
+        # digit must instead be refused and the menu re-shown — so it takes a
+        # SECOND, valid line to produce a result at all.
+        options = picker.candidates(self.home, self.cwd)
+        chosen = picker.choose(self.home, self.cwd, stream=_FakeTTY("99\n1\n"))
+        self.assertEqual(chosen, options[0][0])
+        self.assertNotEqual(chosen, self.cwd / "99")
+
+    def test_the_type_a_path_option_accepts_a_typed_path(self):
+        options = picker.candidates(self.home, self.cwd)
+        type_a_path = len(options) + 1
+        target = self.home / "elsewhere"
+        chosen = picker.choose(self.home, self.cwd,
+                               stream=_FakeTTY(f"{type_a_path}\n{target}\n"))
+        self.assertEqual(chosen, target)
+
+    def test_a_rejected_path_reprompts_and_a_valid_path_then_succeeds(self):
+        busy = self.home / "busy"
+        busy.mkdir()
+        (busy / "f1.txt").write_text("x", encoding="utf-8")
+        options = picker.candidates(self.home, self.cwd)
+        type_a_path = len(options) + 1
+        good = self.home / "elsewhere"
+        stream = _FakeTTY(f"{type_a_path}\n{busy}\n{type_a_path}\n{good}\n")
+        chosen = picker.choose(self.home, self.cwd, stream=stream)
+        self.assertEqual(chosen, good)
 
 
 if __name__ == "__main__":

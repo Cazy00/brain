@@ -11,8 +11,6 @@ import os
 import sys
 from pathlib import Path
 
-from . import osbackend
-
 # Cloud roots worth offering, with the consequence of choosing one. Offered
 # ONLY when the directory actually exists — listing a Dropbox folder to
 # somebody who has no Dropbox is noise that makes the real options harder to see.
@@ -141,7 +139,17 @@ def choose(home, cwd, stream=None, default=None) -> Path:
     default = Path(default) if default else options[0][0]
     stream = stream if stream is not None else sys.stdin
 
-    if not (hasattr(stream, "isatty") and stream.isatty()):
+    try:
+        interactive = hasattr(stream, "isatty") and stream.isatty()
+    except Exception:
+        # A closed file's isatty() raises ValueError instead of returning
+        # False — and nothing guarantees some other stream-like object won't
+        # raise something else entirely. Never-block-without-a-terminal is
+        # the one guarantee this function makes, so any failure to CONFIRM a
+        # real terminal must fail toward the same safe default a plain False
+        # would give, not escape as an exception.
+        interactive = False
+    if not interactive:
         return default
 
     restore = _enable_completion()
@@ -156,14 +164,29 @@ def choose(home, cwd, stream=None, default=None) -> Path:
             raw = stream.readline().strip()
             if not raw:
                 chosen = default
-            elif raw.isdigit() and 1 <= int(raw) <= len(options):
-                chosen = options[int(raw) - 1][0]
-            elif raw.isdigit() and int(raw) == len(options) + 1:
-                print("  Path: ", end="", flush=True)
-                typed = stream.readline().strip()
-                if not typed:
+            elif raw.isdigit():
+                # A digit is ALWAYS a menu reference, never a literal path —
+                # including when it is out of range. The previous version
+                # fell through to expand() here, so a fat-fingered "99"
+                # silently became the literal path <cwd>/99 and was accepted
+                # outright (reject_reason() allows anything that doesn't yet
+                # exist). A path that happens to be nothing but digits (a
+                # folder literally named "42") still works — just not typed
+                # bare at this prompt; use "type a path" below, where
+                # whatever is typed is never reinterpreted as a menu number.
+                n = int(raw)
+                if 1 <= n <= len(options):
+                    chosen = options[n - 1][0]
+                elif n == len(options) + 1:
+                    print("  Path: ", end="", flush=True)
+                    typed = stream.readline().strip()
+                    if not typed:
+                        continue
+                    chosen = expand(typed, home, cwd)
+                else:
+                    print(f"\n  Cannot use that: {n} is not one of the options "
+                          f"above — pick a number from 1 to {len(options) + 1}.")
                     continue
-                chosen = expand(typed, home, cwd)
             else:
                 chosen = expand(raw, home, cwd)
 
