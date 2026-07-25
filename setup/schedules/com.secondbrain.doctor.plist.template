@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.secondbrain.doctor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON}}</string>
+    <string>{{REPO}}/bin/brain</string>
+    <string>doctor-notify</string>
+  </array>
+  <key>WorkingDirectory</key><string>{{REPO}}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd starts with a bare PATH; without this the nightly doctor cannot
+         see gitleaks/age (Homebrew) and reports them permanently "not installed". -->
+    <key>PATH</key>
+    <string>{{HOME}}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>21</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>{{REPO}}/.cache/doctor-launchd.log</string>
+  <key>StandardErrorPath</key><string>{{REPO}}/.cache/doctor-launchd.log</string>
+</dict>
+</plist>

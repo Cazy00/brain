@@ -1,0 +1,28 @@
+#!/bin/sh
+# brain pre-commit — the content gate.
+# Blocks ONLY on real content errors (schema, secrets, integrity). Fails OPEN
+# with a loud warning if the toolchain itself is broken, so a dead environment
+# never blocks capture. Never blocks on backlog or staleness.
+
+out=$(python3 bin/brain lint --staged 2>&1)
+code=$?
+if [ "$code" -eq 1 ]; then
+  echo "$out"
+  echo ""
+  echo "commit blocked: fix the errors above, then commit again (bin/brain lint)"
+  exit 1
+elif [ "$code" -ne 0 ]; then
+  echo "$out"
+  echo "WARNING: brain lint could not run (exit $code) — committing anyway."
+  echo "WARNING: the content gate is DOWN. Fix it: python3 bin/brain lint"
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --no-banner >/dev/null 2>&1; then
+    echo "commit blocked: gitleaks detected a possible secret in staged changes."
+    echo "Inspect with: gitleaks protect --staged -v"
+    exit 1
+  fi
+fi
+
+exit 0

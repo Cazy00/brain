@@ -1,0 +1,20 @@
+{
+  "name": "cazy00",
+  "description": "A permanent second brain for your AI: markdown in git, reachable from any agent.",
+  "owner": {
+    "name": "Almuntaser Alsarmi"
+  },
+  "plugins": [
+    {
+      "name": "brain",
+      "displayName": "brain",
+      "source": "./plugins/brain",
+      "description": "Search, read and capture to your permanent second brain from any Claude Code session.",
+      "category": "productivity",
+      "keywords": ["knowledge", "memory", "notes", "second-brain", "markdown", "git"],
+      "license": "MIT",
+      "homepage": "https://github.com/Cazy00/brain",
+      "repository": "https://github.com/Cazy00/brain"
+    }
+  ]
+}

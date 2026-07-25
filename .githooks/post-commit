@@ -1,0 +1,50 @@
+#!/bin/sh
+# brain post-commit — mechanical backup.
+# Pushes asynchronously after every commit so the brain never lives only on
+# this machine. Silent no-op when offline or when no remote is configured;
+# `bin/brain doctor` reports unpushed commits either way.
+#
+# The redirects and </dev/null MUST be on the subshell itself, not on the
+# commands inside it. A programmatic caller (bin/brain capture, the MCP server)
+# runs `git commit` with its output captured through a pipe; a background
+# subshell that inherits that pipe keeps it open, so the caller blocks until the
+# reindex AND the network push finish — making "asynchronous" backup fully
+# synchronous, and making every capture wait on the network.
+(
+  python3 bin/brain index --quiet
+
+  # Push ONLY to a genuine off-machine remote.
+  #
+  # `git clone ~/brain` sets origin to the source repo, so a copy made to
+  # experiment in would auto-push its experiments straight back into the real
+  # brain — including throwaway branches. That is not a backup by any reading,
+  # and it silently mutates the thing it was cloned from. A local path is
+  # therefore never pushed to; `bin/brain doctor` reports the situation so a
+  # brain whose only "remote" is a directory is not mistaken for a backed-up one.
+  # NEVER auto-push a consolidation branch.
+  #
+  # consolidate/* is machine-written knowledge that has not been audited yet.
+  # The consolidation prompt tells the pass to commit its own output, so without
+  # this guard that commit fires post-commit, which pushes the branch to a public
+  # remote BEFORE the auditor has looked at it — the gate would be bypassed by
+  # its own author, silently. `bin/brain consolidate` pushes the branch itself
+  # once the audit passes, and `bin/brain doctor` reports any branch left behind.
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+  case "$branch" in
+    consolidate/*) exit 0 ;;
+  esac
+
+  url=$(git remote get-url origin 2>/dev/null) || url=""
+  if [ -n "$url" ]; then
+    path=${url#file://}
+    case "$url" in
+      file://*)      local_remote=yes ;;
+      /*|./*|../*|~*) local_remote=yes ;;
+      *://*)         local_remote=no ;;   # https://, ssh://, git://
+      *:*)           local_remote=no ;;   # scp-style git@host:owner/repo.git
+      *)             local_remote=yes ;;  # bare relative path
+    esac
+    [ -d "$path" ] && local_remote=yes
+    [ "$local_remote" = "no" ] && git push --quiet origin HEAD
+  fi
+) </dev/null >/dev/null 2>&1 &

@@ -1,0 +1,32 @@
+{
+  "name": "brain",
+  "displayName": "brain",
+  "version": "1.0.0",
+  "description": "Search, read and capture to your permanent second brain — markdown notes in a git repo you own.",
+  "author": {
+    "name": "Almuntaser Alsarmi",
+    "url": "https://github.com/Cazy00"
+  },
+  "homepage": "https://github.com/Cazy00/brain",
+  "repository": "https://github.com/Cazy00/brain",
+  "license": "MIT",
+  "keywords": ["knowledge", "memory", "notes", "second-brain", "markdown", "git"],
+  "userConfig": {
+    "brain_path": {
+      "type": "directory",
+      "title": "Your brain repository",
+      "description": "Absolute path to your brain — the git clone that contains bin/brain-mcp. Install one first with: curl -fsSL https://raw.githubusercontent.com/Cazy00/brain/main/install.sh | sh",
+      "required": true,
+      "default": "~/brain"
+    }
+  },
+  "mcpServers": {
+    "brain": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/brain-mcp-launch",
+      "args": [],
+      "env": {
+        "BRAIN_PATH": "${user_config.brain_path}"
+      }
+    }
+  }
+}

@@ -1,0 +1,38 @@
+name: gate
+# Content gate: on every push, re-run lint + gitleaks + tests
+# server-side, so nothing that slipped past a local hook lands
+# unnoticed.
+#
+# A daily dead-man 'pulse' job — fail, and so email you, if no
+# commit reaches GitHub in 3 days — was REMOVED from this template
+# copy: on a repo nobody commits to it would just email a red build
+# every day. Re-enable it once this is your live brain; SETUP.md
+# ("Backup alarm") has the block to paste back.
+
+on:
+  push:
+    branches: ["**"]
+jobs:
+  gate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: brain lint
+        run: python3 bin/brain lint
+      - name: gitleaks
+        run: |
+          curl -sSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks detect --source . --no-banner --redact
+
+  tests:
+    # Lint proves the NOTES are well-formed; these prove the TOOLBELT works —
+    # bootstrap on a clean clone, read containment, MCP survival.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: runtime tests
+        run: python3 -m unittest discover -s tests -v

@@ -1,0 +1,44 @@
+#!/bin/sh
+# Launch the MCP server that lives in the USER'S brain repo.
+#
+# The plugin deliberately does not ship its own copy of bin/brain-mcp. The
+# server and the notes it serves are versioned together in one repo — that is
+# the whole single-source-of-truth discipline this project runs on — and a
+# plugin-local copy would drift the moment either side updated. So the plugin
+# is wiring, and the toolbelt stays where the knowledge is.
+#
+# BRAIN_PATH arrives from the plugin's `brain_path` userConfig. It is passed
+# through LITERALLY: a value of "~/brain" arrives with the tilde unexpanded,
+# because no shell has touched it. Expanding it here is not a nicety — without
+# it the default configuration points at a directory that cannot exist.
+
+set -eu
+
+BRAIN_PATH="${BRAIN_PATH:-$HOME/brain}"
+
+case "$BRAIN_PATH" in
+    "~")   BRAIN_PATH="$HOME" ;;
+    "~/"*) BRAIN_PATH="$HOME/${BRAIN_PATH#"~/"}" ;;
+    '$HOME'/*) BRAIN_PATH="$HOME/${BRAIN_PATH#'$HOME'/}" ;;
+esac
+
+SERVER="$BRAIN_PATH/bin/brain-mcp"
+
+if [ ! -x "$SERVER" ]; then
+    # stderr is where Claude Code surfaces a server that would not start, so
+    # this has to say what is wrong AND how to fix it — a bare "no such file"
+    # reads as a broken plugin rather than an unconfigured one.
+    cat >&2 <<EOF
+brain plugin: no brain repository at "$BRAIN_PATH"
+  (looked for $SERVER)
+
+If your brain is somewhere else, point the plugin at it:
+  /plugin configure brain
+
+If you do not have one yet, install it first:
+  curl -fsSL https://raw.githubusercontent.com/Cazy00/brain/main/install.sh | sh
+EOF
+    exit 1
+fi
+
+exec "$SERVER"

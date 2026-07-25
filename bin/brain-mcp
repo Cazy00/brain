@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""brain-mcp — minimal MCP stdio server exposing the second brain to any agent.
+
+Zero dependencies and no vendor SDK: speaks newline-delimited JSON-RPC 2.0 over
+stdio, so any MCP client that can spawn a process consumes it unmodified. It
+shells out to bin/brain for the actual work, which is what makes retrieval
+behavior identical on the CLI, over MCP, and across every client — the ranking
+and the trust signals are deterministic code, not model judgement. Disposable by
+design — if this dies, the brain degrades to grep over current files.
+"""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BRAIN = str(ROOT / "bin" / "brain")
+
+TOOLS = [
+    {
+        "name": "brain_search",
+        "description": (
+            "Search the user's permanent second brain — their decisions, projects, people, "
+            "reference notes, and life context. Use this BEFORE answering any question "
+            "about the user's past decisions, preferences, projects, or personal history. "
+            "Returns CURRENT knowledge only (superseded notes are structurally excluded). "
+            "If a query misses, retry with 2-3 lexical variants before concluding the "
+            "brain has nothing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Lexical search query."},
+                "scope": {"type": "string", "enum": ["canonical", "all"],
+                          "description": "'all' additionally searches the journal and the "
+                                         "unprocessed inbox (results tagged provisional)."},
+                "limit": {"type": "integer", "description": "Max hits (default 8)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "brain_read",
+        "description": (
+            "Read one note from the brain in full, by id or repo-relative path, with its "
+            "supersede history resolved — if the note was replaced, the CURRENT version is "
+            "returned along with the chain of what replaced what."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id_or_path": {"type": "string",
+                               "description": "Note id (frontmatter) or path like "
+                                              "knowledge/decisions/2026-07-22-x.md"},
+            },
+            "required": ["id_or_path"],
+        },
+    },
+    {
+        "name": "brain_links",
+        "description": (
+            "Show the [[wikilink]] graph around one note: which notes REFER TO it "
+            "(backlinks) and which it points at. Use this to answer 'what else is "
+            "connected to X' or to gather everything the brain knows around a subject — "
+            "search finds notes by wording, this finds them by relationship, including "
+            "notes that never repeat the search term."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id_or_path": {"type": "string",
+                               "description": "Note id (frontmatter) or repo-relative path."},
+            },
+            "required": ["id_or_path"],
+        },
+    },
+    {
+        "name": "brain_recent",
+        "description": "List notes recently added or touched in the brain (default: last 7 days).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"days": {"type": "integer", "description": "Look-back window in days."}},
+        },
+    },
+    {
+        "name": "brain_capture",
+        "description": (
+            "Save a thought, fact, or decision into the brain's inbox, committed and "
+            "auto-backed-up to GitHub immediately. Use when the user says 'remember this' "
+            "or states something durable worth keeping. Text should be self-contained "
+            "with absolute dates."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The content to save."},
+                "commit": {
+                    "type": "boolean",
+                    "description": (
+                        "Commit and auto-push the capture (default true). Pass false to "
+                        "write it to inbox/ only, leaving it on this machine for review "
+                        "before it reaches the remote. The text is scanned for "
+                        "credentials either way."
+                    ),
+                },
+            },
+            "required": ["text"],
+        },
+    },
+]
+
+
+TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
+MAX_ARG_CHARS = 100_000  # a note or query longer than this is a bug or an abuse
+
+
+def run_cli(args):
+    return subprocess.run(
+        [sys.executable, BRAIN, *args], capture_output=True, text=True, cwd=ROOT, timeout=120
+    )
+
+
+def validate_args(name, args):
+    """Check args against the tool's declared inputSchema BEFORE using them.
+
+    A malformed call must come back as a tool error the model can read and
+    retry — never as an exception that kills the server for every other
+    session sharing it. Returns (clean_args, None) or (None, message).
+    """
+    schema = TOOLS_BY_NAME[name].get("inputSchema", {})
+    props = schema.get("properties", {})
+    if not isinstance(args, dict):
+        return None, "arguments must be a JSON object"
+    for field in schema.get("required", []):
+        if field not in args or args[field] is None \
+                or (isinstance(args[field], str) and not args[field].strip()):
+            return None, f"missing required argument {field!r}"
+    clean = {}
+    required = set(schema.get("required", []))
+    for field, spec in props.items():
+        if field not in args:
+            continue
+        value = args[field]
+        # An explicit null on an OPTIONAL argument means "not supplied" — fall
+        # back to the default rather than failing a whole search over it.
+        if value is None and field not in required:
+            continue
+        expected = spec.get("type")
+        if expected == "string":
+            if not isinstance(value, str):
+                return None, f"argument {field!r} must be a string, got {type(value).__name__}"
+            if len(value) > MAX_ARG_CHARS:
+                return None, (f"argument {field!r} is {len(value)} chars — the cap is "
+                              f"{MAX_ARG_CHARS}")
+        elif expected == "integer":
+            # Models routinely send "8" for a number; accept the digit string
+            # rather than refusing to search over a formatting nit.
+            if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+                value = int(value)
+            # bool is an int subclass in Python; a JSON true is not a count.
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None, f"argument {field!r} must be an integer, got {type(value).__name__}"
+        elif expected == "boolean":
+            # Same tolerance as the integer branch, and for the same reason:
+            # models send "false" as a string. Coerce the unambiguous spellings
+            # and refuse the rest — silently accepting a truthy "false" would
+            # commit and push a capture the caller asked to hold back.
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in ("true", "false"):
+                    value = lowered == "true"
+            if not isinstance(value, bool):
+                return None, f"argument {field!r} must be a boolean, got {type(value).__name__}"
+        if "enum" in spec and value not in spec["enum"]:
+            return None, f"argument {field!r} must be one of {spec['enum']}"
+        clean[field] = value
+    return clean, None
+
+
+def call_tool(name, args):
+    # isinstance first: a non-string name (dict/list) is unhashable and would
+    # raise on the membership test instead of reporting an unknown tool.
+    if not isinstance(name, str) or name not in TOOLS_BY_NAME:
+        return {"content": [{"type": "text", "text": f"unknown tool {name!r}"}], "isError": True}
+    args, problem = validate_args(name, args)
+    if problem:
+        return {"content": [{"type": "text", "text": f"invalid arguments for {name}: {problem}"}],
+                "isError": True}
+    if name == "brain_search":
+        cli = ["search", "--limit", str(args.get("limit", 8))]
+        if args.get("scope") == "all":
+            cli += ["--scope", "all"]
+        cli += ["--", args["query"]]      # query text, never parsed as flags
+    elif name == "brain_read":
+        cli = ["read", args["id_or_path"]]
+    elif name == "brain_links":
+        cli = ["links", args["id_or_path"]]
+    elif name == "brain_recent":
+        cli = ["recent", "--days", str(args.get("days", 7))]
+    elif name == "brain_capture":
+        # Default stays True: committing is what backs the note up, and an
+        # uncommitted note dirties the tree, which blocks the consolidation pass
+        # that is the inbox's only drain. The flag exists so a caller CAN hold a
+        # capture back from the remote deliberately.
+        cli = ["capture", args["text"]]
+        if args.get("commit", True):
+            cli.append("--commit")
+    try:
+        run = run_cli(cli)
+    except Exception as exc:
+        return {"content": [{"type": "text", "text": f"brain tool failed: {exc!r}. "
+                             f"Fallback: search the files directly with rg in {ROOT} "
+                             "(archive/ and vault/ are excluded by .rgignore)."}],
+                "isError": True}
+    text = (run.stdout + ("\n" + run.stderr if run.stderr.strip() else "")).strip() or "(no output)"
+    return {"content": [{"type": "text", "text": text}], "isError": run.returncode != 0}
+
+
+def reply(msg_id, result=None, error=None):
+    out = {"jsonrpc": "2.0", "id": msg_id}
+    if error is not None:
+        out["error"] = error
+    else:
+        out["result"] = result
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+
+
+def dispatch(msg):
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    if method == "initialize":
+        reply(msg_id, {
+            "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "brain", "version": "1.0.0"},
+        })
+    elif method == "tools/list":
+        reply(msg_id, {"tools": TOOLS})
+    elif method == "tools/call":
+        args = params.get("arguments")
+        reply(msg_id, call_tool(params.get("name", ""), args if args is not None else {}))
+    elif method == "ping":
+        reply(msg_id, {})
+    elif msg_id is not None:
+        reply(msg_id, error={"code": -32601, "message": f"method not found: {method}"})
+    # notifications (no id) are ignored by design
+
+
+MAX_LINE_CHARS = 10_000_000  # a single request larger than this is not real traffic
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line or len(line) > MAX_LINE_CHARS:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            # Deliberately broad: an unparseable line is skipped per JSON-RPC
+            # (there is no id to answer). json.loads raises more than
+            # JSONDecodeError — deeply nested input raises RecursionError,
+            # which used to take the whole server down with it.
+            continue
+        if not isinstance(msg, dict):
+            continue
+        # Top-level containment: one malformed request must never take the
+        # server down with it — every other session is sharing it.
+        try:
+            dispatch(msg)
+        except Exception as exc:
+            msg_id = msg.get("id")
+            if msg_id is not None:
+                reply(msg_id, error={"code": -32603, "message": f"internal error: {exc!r}"})
+
+
+if __name__ == "__main__":
+    main()

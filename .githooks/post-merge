@@ -1,0 +1,26 @@
+#!/bin/sh
+# brain post-merge — the merge-shaped entry point to the same mechanical backup.
+#
+# `git merge` does NOT run post-commit. It runs THIS hook, and it runs it for
+# both shapes of merge: the merge commit made by --no-ff, and a plain
+# fast-forward. Without this file a merge moved HEAD and nothing pushed at all,
+# so the only copy of that work sat on this machine until some later ordinary
+# commit happened to carry it along — the exact silent lag a mechanical backup
+# exists to prevent, and invisible while it happens because nothing fails.
+# Observed for real: merging a capture branch left main two commits ahead of
+# the remote with no indication until `bin/brain doctor` was run by hand.
+#
+# `git pull` fires this hook too, which is right on both counts: the search
+# index wants rebuilding once notes arrive from the remote, and the push is a
+# harmless no-op when the branch is already in sync.
+#
+# Delegate, never copy. post-commit carries the consolidate/* guard that keeps
+# unaudited machine-written knowledge off the remote until the auditor has seen
+# it. A second copy of that logic here would be a second thing to keep in step,
+# and the failure mode of the two drifting apart is an audit gate that is
+# bypassed silently — the worst kind. One implementation, two entry points.
+#
+# Still covered by no hook at all: `git cherry-pick` and `git rebase` fire
+# nothing, so they leave the same lag. Neither is a normal way to write to this
+# brain, and `bin/brain doctor` reports the unpushed commits either way.
+exec sh "$(dirname "$0")/post-commit"

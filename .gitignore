@@ -1,0 +1,26 @@
+# Derived state — always rebuildable, never authoritative
+.cache/
+graphify-out/
+
+# Machine-local wiring: these hold THIS clone's absolute paths and are
+# regenerated per machine by 'bin/brain init'. The .template stays tracked.
+.mcp.json
+/setup/skills/brain/SKILL.md
+
+# Secrets and machine-local files — never committed
+.env
+.env.*
+!.env.example
+*.local.md
+
+# Claude workspace state. settings.json IS tracked — the headless consolidation
+# pass needs its permission allowlist, and a machine without it silently falls
+# back to an agent that cannot run bin/brain. The rest is per-machine.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# OS noise
+.DS_Store
+
+# Python bytecode (from py_compile checks)
+__pycache__/

@@ -1,0 +1,11 @@
+# Controlled topic vocabulary — one topic per line: "topic: alias, alias".
+# Every note's `topics:` entries must come from this list. Adding a topic is a
+# deliberate one-line commit; that discipline is what keeps scoped search
+# working for decades (tags must not fragment into ml / ML / machine-learning).
+#
+# These four are the vocabulary this system needs to describe ITSELF. Replace
+# and extend them with your own — that is the first real thing you will do here.
+brain: second-brain, knowledge-base, memory
+ai-tooling: agents, mcp, llm, tooling
+retrieval: search, indexing, findability, ranking
+conventions: schema, note-format, structure, frontmatter

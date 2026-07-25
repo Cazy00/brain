@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "allow": [
+      "Bash(bin/brain new *)",
+      "Bash(bin/brain lint)",
+      "Bash(bin/brain lint *)",
+      "Bash(bin/brain search *)",
+      "Bash(bin/brain read *)",
+      "Bash(bin/brain links *)",
+      "Bash(bin/brain recent *)",
+      "Bash(bin/brain supersede *)",
+      "Bash(bin/brain index)",
+      "Bash(bin/brain index *)",
+      "Bash(python3 bin/brain *)",
+      "Bash(rg *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git rev-parse *)"
+    ]
+  }
+}

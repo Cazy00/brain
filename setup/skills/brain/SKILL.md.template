@@ -1,0 +1,60 @@
+---
+name: brain
+description: "Search or save to your permanent second brain (~/brain). Use for any question about the user's decisions, projects, people, preferences, or history, and whenever they say 'remember this'. Trigger: /brain"
+---
+
+# /brain
+
+The user's permanent second brain lives at `{{REPO}}`. Its own
+`AGENTS.md` is the authoritative protocol — read it before writing anything.
+
+## Retrieving
+
+1. Prefer the MCP tools if connected: `brain_search` (current knowledge only,
+   retry with 2-3 lexical variants before concluding a miss), `brain_read`
+   (full note with supersede history), `brain_links` (what references a note
+   and what it references — use after a good hit to pull in its neighbours,
+   which search may miss because they never repeat the term), `brain_recent`.
+2. No MCP? Work directly: `cd {{REPO}}`, start from
+   `knowledge/index.md`, search with `rg` (archive/, vault/, journal/ and
+   inbox/ are already excluded — results are current canonical by
+   construction) or `bin/brain search "..."`.
+3. Only present `status: current` content as true today. Archived notes are
+   history — cite them only as "previously…".
+
+## What earns a note
+
+Full policy: "What earns a note" in the repo's AGENTS.md. In short — capture
+the WHY, not the what. The what is recoverable from git, files and calendars;
+the reasoning is gone within a week.
+
+- Capture freely: a decision AND the alternatives rejected; a stated preference
+  or constraint; a fact about the user's world that can't be inferred; an answer
+  that cost real effort.
+- Never: anything derivable from code or public docs, transient state,
+  credentials, or a restatement of what was just done.
+- Ask first, every time: a named person's private life, health, finances or
+  relationships — captures leave this machine unreviewed on commit, git
+  history is permanent, and `bin/brain template` publishes a derived copy.
+  The remote being private is not the same as the person having consented.
+
+Capture is cheap because inbox/ sits outside default search and consolidation
+deletes the noise; canonical notes are expensive because they rank in every
+future search. Capture generously, promote strictly.
+
+Offer, don't nag: when something passes the bar mid-conversation, say so in one
+line and carry on. Do not save the offer for the end of the session — by then
+the reasoning is already gone.
+
+## Saving
+
+- Quick fact or thought: `brain_capture` tool, or
+  `bin/brain capture "..." --commit` — lands in inbox/, committed and pushed.
+- Structured note: `bin/brain new <kind> "<title>" --topics a,b`, fill body
+  and aliases, then `bin/brain lint` and commit.
+- A fact CHANGED: follow the supersede protocol in the repo's AGENTS.md —
+  never edit meaning in place, never delete.
+
+## Health
+
+`bin/brain doctor` — hooks, backup freshness, index, inbox backlog, lint.
