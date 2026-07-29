@@ -107,6 +107,10 @@ brain connect --all --apply       # register the server with every client found
 brain connect --routing --apply   # the rule that makes agents reach for it
 ```
 
+Only using this on one computer? That is everything. Reaching it from other
+devices is a separate, optional step — `brain serve`, and
+[SETUP.md](SETUP.md) Part 8.
+
 ### Prerequisites
 
 Nothing is ever installed for you. Setup prints the exact command and what you
@@ -223,7 +227,14 @@ trusting.
   search that ignores this repo's ignore rules and would return superseded and
   unconsolidated notes as current, stripped of their trust signals. Retrieval
   goes through the brain's own tools.
-- **Local only.** No web or mobile — the MCP server runs on your machine.
+- **Remote access is bearer-token only, and opt-in.** `brain serve` puts the
+  same tools on HTTP behind a token you mint, refuses to start without one, and
+  binds loopback unless told otherwise. It works with Claude Code and anything
+  else that can set a request header; it does **not** work with claude.ai on the
+  web, Desktop or mobile, whose per-user custom connector flow takes OAuth
+  credentials and not a token (checked 2026-07-29). Closing that means OAuth
+  2.1, which is not built. There is no read-only mode: `brain_capture` writes,
+  and it is reachable over that transport.
 - **The privacy rule is instruction-enforced.** "Ask before recording anything
   about a person's private life" is followed by the model, not enforced by code,
   and commits auto-push. Weaker harnesses will eventually get this wrong.

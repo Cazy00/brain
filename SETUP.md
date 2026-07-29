@@ -9,7 +9,7 @@ any of them is a legitimate place to stop, not an abandoned install.
 ```
 brain setup      you have a brain. Notes work. It is backed up.
 brain connect    your agents can reach it.
-brain serve      it is reachable from other devices.       (not built yet)
+brain serve      it is reachable from other devices.       (opt-in, Part 8)
 brain retire     all of the above, gracefully undone.
 ```
 
@@ -349,10 +349,10 @@ anything left uncommitted.
 
 ### claude.ai web and mobile
 
-Not supported yet — they cannot run local processes. `brain serve` is the
-planned answer (host `brain-mcp` behind HTTP as a custom connector) and is not
-built. It carries its own security review because a tunnel that publishes an
-unauthenticated origin would expose a **write** tool.
+Not supported. They cannot run a local process, and the remote transport
+(`brain serve`, Part 8) authenticates with a bearer token, which claude.ai's
+per-user custom connector flow does not accept — see that part for the detail
+and the date it was checked.
 
 ---
 
@@ -557,23 +557,80 @@ and starter vocabulary over your real notes. Cherry-pick paths, as above.
 
 ---
 
-## Troubleshooting
+## Part 8 — `brain serve` (optional, and most people never need it)
 
-| Symptom | Fix |
-|---|---|
-| Brain tools don't appear in a session | Sessions load MCP at start — open a new session. `bin/brain connect` says what this machine is wired to; `--apply` re-wires it. |
-| An agent answers from the wrong notes | `bin/brain connect` — look for `WIRED TO A DIFFERENT brain`. A second clone or a moved brain leaves the old path registered. |
-| `--apply` refused | It printed why, and the snippet to paste instead. A config with comments in it is the usual cause: JSON with comments parses for the client and not for us, and rewriting it would delete them. |
-| Desktop chat doesn't show the tools | Config path/JSON typo, or app not restarted (Cmd-Q, not just closing the window). The command must be an absolute path. |
-| `commit blocked` with lint errors | That's the system working. Read the errors — each says exactly what to fix. `bin/brain lint` re-checks. |
-| `WARNING: the content gate is DOWN` | Lint itself crashed (not your content). Run `python3 bin/brain lint` to see why; commits still work meanwhile. |
-| Push rejected: `workflow scope` | Push once from a terminal (`git push`), or `gh auth refresh -s workflow`. |
-| Doctor: `no upstream tracking` | `git push -u origin main` once. |
-| Doctor: `not pushed — backup is behind; run: git push` | You're offline or the remote rejects; `git push` when back online. |
-| `claude: command not found` | Install Claude Code, then `bin/brain connect claude-code --apply`. |
-| Consolidation does nothing on schedule | The `claude` CLI must be logged in for headless runs; run `bin/brain consolidate` manually once to check. |
+Everything above runs on one machine. `serve` is for when you want the brain
+from a second one — a phone, a laptop that is not this one, a machine you are
+sitting at somewhere else. If that is not a thing you want, skip this part
+entirely; nothing else in the system depends on it.
 
-## Part 8 — `brain retire`
+```sh
+bin/brain serve --new-token     # mint a token, store it, print it ONCE
+bin/brain serve                 # listen on 127.0.0.1:8787
+```
+
+It serves the **same tools** as the local stdio server, over HTTP, behind a
+bearer token. Same tool layer, one code path — a remote brain that answered
+differently from the local one would be worse than no remote brain.
+
+### Read this before you expose it
+
+- **`brain_capture` is reachable over this transport, and it writes.** Whoever
+  holds the token can add notes to your brain, which are committed and pushed
+  automatically. That is the whole tool surface, not a subset. There is no
+  read-only mode yet.
+- **It refuses to start without a token.** A refusal, not a warning. It will
+  not mint one silently: a credential nobody saw is a credential nobody knows
+  to protect.
+- **The token lives in this machine's keystore** — Keychain, Credential
+  Manager, the secret service, or a 0600 file — never in the repo, never in a
+  config file, never in a URL.
+- **The default bind is loopback.** `--bind 0.0.0.0` works and prints exactly
+  what it is exposing before it serves.
+- **Browser origins are refused.** Any request carrying an `Origin` header is
+  rejected, because no legitimate client of this server is a browser and a web
+  page can otherwise make your browser talk to `127.0.0.1`.
+- **There is no TLS here, on purpose.** See the tunnel contract below.
+- **There is no rate limiting.** Worth knowing before a public bind.
+
+### Connecting a client
+
+Claude Code, verified against its current documentation on 2026-07-29:
+
+```sh
+claude mcp add --transport http brain http://127.0.0.1:8787/mcp \
+  --header "Authorization: Bearer $BRAIN_TOKEN"
+```
+
+Any client that lets you set a request header works the same way. Clients that
+do not — including **claude.ai on the web, Claude Desktop and mobile** — cannot
+use this. Checked against Anthropic's connector documentation on 2026-07-29:
+adding a custom connector by URL offers OAuth Client ID and Client Secret only;
+a fixed bearer token is supported through `static_headers`, which is in beta and
+is entered by an **organization administrator**, not by an individual. Closing
+that gap means implementing OAuth 2.1 with dynamic client registration, which is
+a much larger piece and is not built.
+
+### The tunnel contract
+
+Reaching the server from outside your machine needs something in front of it.
+Which tunnel is your choice and this project takes no position on it. What it
+must do:
+
+1. **Terminate TLS.** The brain speaks plain HTTP; anything crossing a network
+   must be wrapped by the thing in front.
+2. **Forward to this port**, path and all — the endpoint is `/mcp`.
+3. **Preserve the `Authorization` header.** A tunnel that strips or rewrites it
+   makes every request a 401.
+4. **Add no `Origin` header.** The server refuses requests that carry one.
+
+And one thing it must not be relied upon for: **authentication.** A tunnel that
+publishes an unauthenticated origin to a public hostname is one mis-scoped
+route, one bypass policy, or one other path to the origin away from exposing
+the whole brain. The check inside the server travels with the server; a policy
+in front of it does not.
+
+## Part 9 — `brain retire`
 
 To unwire a single machine while keeping the brain:
 
@@ -611,3 +668,24 @@ without markers, is named and left alone rather than guessed at.
 `bin/brain retire --explain` lists everything it preserves, in full. Reinstall
 fresh with Part 1; delete the retired copy by hand once the new brain passes
 `doctor`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Brain tools don't appear in a session | Sessions load MCP at start — open a new session. `bin/brain connect` says what this machine is wired to; `--apply` re-wires it. |
+| An agent answers from the wrong notes | `bin/brain connect` — look for `WIRED TO A DIFFERENT brain`. A second clone or a moved brain leaves the old path registered. |
+| `--apply` refused | It printed why, and the snippet to paste instead. A config with comments in it is the usual cause: JSON with comments parses for the client and not for us, and rewriting it would delete them. |
+| Desktop chat doesn't show the tools | Config path/JSON typo, or app not restarted (Cmd-Q, not just closing the window). The command must be an absolute path. |
+| `commit blocked` with lint errors | That's the system working. Read the errors — each says exactly what to fix. `bin/brain lint` re-checks. |
+| `WARNING: the content gate is DOWN` | Lint itself crashed (not your content). Run `python3 bin/brain lint` to see why; commits still work meanwhile. |
+| Push rejected: `workflow scope` | Push once from a terminal (`git push`), or `gh auth refresh -s workflow`. |
+| Doctor: `no upstream tracking` | `git push -u origin main` once. |
+| Doctor: `not pushed — backup is behind; run: git push` | You're offline or the remote rejects; `git push` when back online. |
+| `claude: command not found` | Install Claude Code, then `bin/brain connect claude-code --apply`. |
+| Consolidation does nothing on schedule | The `claude` CLI must be logged in for headless runs; run `bin/brain consolidate` manually once to check. |
+| `brain serve` refuses to start | It has no token. `bin/brain serve --new-token` mints one and prints it once. |
+| Every request to `brain serve` is a 401 | The header is missing, rewritten, or the token is stale. A tunnel that does not preserve `Authorization` looks exactly like a wrong token. Mint a new one and re-register the client if you are unsure which. |
+| Every request to `brain serve` is a 403 | Something is adding an `Origin` header — a browser, or a proxy that inserts one. This server refuses browser origins by design; `--allow-origin` takes one explicitly. |

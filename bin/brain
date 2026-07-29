@@ -2084,6 +2084,10 @@ def connect_report(as_json: bool = False) -> int:
     print("  brain connect --all --apply       write it for every client found here")
     print("  brain connect --routing --apply   add the block that makes agents reach "
           "for it")
+    # Exactly one line, deliberately. Most people are local-only forever and
+    # must never have to read about tunnels or tokens to finish setting this up.
+    print("\n  Only using this on this computer? That is everything. Reaching it from")
+    print("  other devices is separate and optional: brain serve --help")
     return 0
 
 
