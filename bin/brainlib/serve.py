@@ -243,12 +243,35 @@ class _Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------------- guards
 
     def _refuse(self, status: int, message: str, headers=None) -> None:
+        """Answer and CLOSE. Every path through here is a refusal.
+
+        The close is load-bearing, not tidiness. Refusals happen before the
+        request body is read — deliberately, because reading a 10 MB body in
+        order to reject it is the denial of service the size cap exists to
+        prevent — so those bytes are still sitting in the socket. On a
+        kept-alive HTTP/1.1 connection they are then parsed as the next request
+        line, and the client's next, entirely valid request comes back 400 or
+        501. One wrong token poisons the connection.
+
+        Found 2026-07-29 by putting a real tunnel in front of this server. It
+        was invisible to every test here because they open one connection per
+        request; a proxy pools them, which is precisely the deployment `serve`
+        exists for.
+
+        Draining the body instead would also work, and is worse: it means
+        reading whatever an unauthenticated caller chose to send. Closing costs
+        an attacker a fresh handshake per guess, which stacks with the limiter.
+        """
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # send_header already sets close_connection for this value; setting it
+        # too says the intent out loud rather than relying on that side effect.
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 

@@ -224,6 +224,88 @@ class TestTransportConformance(ServeCase):
         self.assertEqual(status, 200)
 
 
+class TestConnectionReuse(ServeCase):
+    """HTTP/1.1 keep-alive — which every real client and every proxy does.
+
+    Found 2026-07-29 by running a Cloudflare quick tunnel in front of this
+    server rather than by reasoning about it. Every other test in this file
+    opens one connection per request and closes it, so the whole class of bug
+    below was structurally invisible here: the transport was only ever exercised
+    in the one pattern real traffic does not use.
+    """
+
+    def reusing_one_connection(self, first, second):
+        """(status of the first, status of the second) down ONE connection."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        self.addCleanup(conn.close)
+        statuses = []
+        for bearer, body in (first, second):
+            headers = {"Content-Type": "application/json"}
+            if bearer is not None:
+                headers["Authorization"] = f"Bearer {bearer}"
+            # http.client reconnects by itself if the server closed the socket,
+            # which is exactly what a well-behaved client does.
+            conn.request("POST", serve.ENDPOINT,
+                         body=json.dumps(body).encode("utf-8"), headers=headers)
+            response = conn.getresponse()
+            response.read()
+            statuses.append(response.status)
+        return statuses
+
+    def test_a_refused_request_does_not_poison_the_next_one(self):
+        """The bug this class exists for.
+
+        A POST refused on authentication returns before its body is read — on
+        purpose, because reading a 10 MB body in order to reject it is the
+        denial of service the size cap exists to prevent. Those bytes stay in
+        the socket, and on a kept-alive connection they are parsed as the next
+        request line: the client's next, entirely valid request comes back 400
+        or 501. One wrong token and the connection is useless.
+        """
+        first, second = self.reusing_one_connection(
+            ("wrong", PING), (BEARER, PING))
+        self.assertEqual(first, 401)
+        self.assertEqual(second, 200,
+                         "a valid request was misparsed from the previous "
+                         "request's unread body")
+
+    def test_an_origin_refusal_does_not_poison_the_next_one(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        self.addCleanup(conn.close)
+        conn.request("POST", serve.ENDPOINT, body=json.dumps(PING).encode("utf-8"),
+                     headers={"Authorization": f"Bearer {BEARER}",
+                              "Content-Type": "application/json",
+                              "Origin": "https://evil.example"})
+        first = conn.getresponse()
+        first.read()
+        self.assertEqual(first.status, 403)
+
+        conn.request("POST", serve.ENDPOINT, body=json.dumps(PING).encode("utf-8"),
+                     headers={"Authorization": f"Bearer {BEARER}",
+                              "Content-Type": "application/json"})
+        second = conn.getresponse()
+        second.read()
+        self.assertEqual(second.status, 200)
+
+    def test_a_refusal_says_it_is_closing_the_connection(self):
+        """Asserted on the header, so the fix cannot be quietly undone.
+
+        Draining the body instead would work too, and is worse: it means
+        reading whatever an unauthenticated caller chose to send, which is the
+        thing the size cap refuses to do.
+        """
+        status, headers, _body = self.request(PING, bearer="wrong")
+        self.assertEqual(status, 401)
+        self.assertEqual(headers.get("Connection", "").lower(), "close")
+
+    def test_a_successful_request_still_keeps_the_connection(self):
+        # The fix must not turn every call into a new TCP connection — that is
+        # a handshake per tool call, over a tunnel, from a phone.
+        status, headers, _body = self.request(PING)
+        self.assertEqual(status, 200)
+        self.assertNotEqual(headers.get("Connection", "").lower(), "close")
+
+
 class TestItIsTheSameBrain(ServeCase):
     """One tool layer, two transports. The whole reason brainlib/mcp.py
     exists is that these two lists cannot be allowed to differ."""
