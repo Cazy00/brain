@@ -1,6 +1,6 @@
 # Connect, Retire and the Docs — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Finish the setup UX redesign. `brain connect` stops printing snippets for a human to paste and starts writing them, safely, into files this system did not create. `brain reset` becomes `brain retire` and stops reading like a warning label. README and SETUP.md are rewritten to document what was built rather than what was planned.
 
@@ -44,14 +44,14 @@ Deferred out of the previous plan's self-review. Small, independent, and it clea
 - Modify: `bin/brainlib/setup.py` (`run_setup`)
 - Test: `tests/test_setup.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `TestSetupEndToEnd`, assert that a `--no-repo` run's stderr names the flag as the cause and carries the `gh repo create` remedy — and that a run which did NOT opt out is not given that block, because there the red is a genuine surprise.
 
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement** — a `want_remote is False and overall_status(results) == "failed"` branch after the phase loop, before the return.
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Commit** — `setup: say why a --no-repo install ends red`
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement** — a `want_remote is False and overall_status(results) == "failed"` branch after the phase loop, before the return.
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Commit** — `setup: say why a --no-repo install ends red`
 
 ---
 

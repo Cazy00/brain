@@ -778,6 +778,48 @@ class TestSetupEndToEnd(unittest.TestCase):
         self.assertEqual(_git(dest, "config", "core.hooksPath").stdout.strip(),
                          ".githooks")
 
+    def test_a_deliberate_local_only_install_is_told_why_it_ends_red(self):
+        """The exit code is right. The silence around it was not.
+
+        --no-repo builds a working brain and then exits 1, because verify hands
+        doctor's verdict straight out and doctor calls a brain with no
+        off-machine copy [RED]. Neither half moves: an unbacked-up brain really
+        is unhealthy, AGENTS.md calls a backup gap "worth seeing, not an
+        untidiness to hide", and the scheduled watchdog only fires on a
+        non-zero exit. What was missing is that the person who typed --no-repo
+        was shown the word "failed" with nothing connecting it to the flag they
+        chose.
+        """
+        dest = self.base / "brain"
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            code = setupmod.run_setup(["--dir", str(dest), "--no-repo", "--yes"],
+                                      home=self.home, cwd=self.base, source=ROOT)
+        self.assertEqual(code, 1)
+        text = err.getvalue()
+        self.assertIn("--no-repo", text, "the flag that caused this is not named")
+        self.assertIn("gh repo create", text, "no command that fixes it")
+
+    def test_a_red_nobody_asked_for_gets_no_such_reassurance(self):
+        """The complement, and the reason the branch is guarded rather than
+        printed on every failure: a red line the user did NOT choose is a
+        surprise, and explaining it away as expected is the worst thing this
+        output could do.
+
+        Runs --only verify, which never reaches phase_backup — deliberate.
+        Without --no-repo, phase_backup would run `gh repo create` against
+        whatever GitHub account the developer is logged into, from a test.
+        """
+        dest = self.base / "brain"
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            setupmod.run_setup(["--dir", str(dest), "--no-repo", "--yes", "--json"],
+                               home=self.home, cwd=self.base, source=ROOT)
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            setupmod.run_setup(["--only", "verify", "--dir", str(dest)],
+                               home=self.home, cwd=self.base, source=ROOT)
+        self.assertNotIn("--no-repo", err.getvalue())
+
     def test_setup_wires_nothing_into_the_users_home(self):
         # The hazard this whole command inherits: `brain init` re-points the
         # global ~/.claude/skills/brain symlink at whatever checkout ran it, so

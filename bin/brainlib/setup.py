@@ -396,8 +396,31 @@ def run_setup(argv: list, home=None, cwd=None, source=None) -> int:
             say(f"            fix: {result.remedy}")
             break
 
+    def status_of(name: str) -> str:
+        result = results.get(name)
+        return result.status if result else ""
+
     if as_json:
         print(render_json(results))
+    elif (dest and not only and not want_remote
+          and status_of("backup") == "skipped" and status_of("verify") == "failed"):
+        # The verdict stays, and so does the word "failed". A brain that
+        # exists on one disk really is unhealthy — AGENTS.md calls a backup gap
+        # "worth seeing, not an untidiness to hide", and the scheduled watchdog
+        # only fires on a non-zero exit, so softening this would take the one
+        # alarm that matters offline. What was missing is the sentence
+        # connecting the verdict to the flag that caused it. Guarded to exactly
+        # that case: a red line nobody asked for is a surprise, and explaining
+        # a surprise away as expected is the worst thing this output could do.
+        say(f"\n  The brain itself is built and working, at {dest}.")
+        say("\n  What is not done is the backup. You passed --no-repo, so there is no "
+            "remote,\n  and doctor calls a brain that exists on one disk only RED "
+            "rather than healthy.\n  That is why this exits non-zero: the state is "
+            "exactly the one you asked for, and\n  it is still not a state this "
+            "system will call finished.")
+        say("\n  When you want the backup:")
+        say(f"    cd {dest} && gh repo create {repo_name} --private --source . --push")
+        say(f"    brain setup --only verify --dir {dest}")
     elif dest and not only and overall_status(results) == "ok":
         # "and it is backed up" is safe to say unconditionally here only
         # because verify ran and passed: doctor calls a remote-less brain RED,
