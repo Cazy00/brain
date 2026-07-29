@@ -80,7 +80,18 @@ bearer token is supported through `static_headers`, which is **beta** and is
 entered by an **organization administrator**, not an individual. So a personal
 bearer-token server is not consumable there.
 
-Claude Code works today and the exact command is in SETUP.md Part 8.
+**Re-checked 2026-07-29, later the same day**, because this entry says to do
+that before starting and a cheap check that closes a large item is worth more
+than the item. Unchanged: the individual "add a custom connector by URL" flow
+still documents only *"an OAuth Client ID and OAuth Client Secret for your
+server"*, with no bearer-token or static-header path offered to a person on a
+personal plan. Re-check again before anyone starts building; the answer today
+is that nothing has moved.
+
+Claude Code works today and the exact command is in SETUP.md Part 8 — including
+through a tunnel, which was verified end to end on 2026-07-29
+(`setup/runbooks/tunnel-cloudflare.md`). Reachability is not what blocks this
+item, and no amount of tunnelling will unblock it.
 
 **Done looks like:** OAuth 2.1 with dynamic client registration or a Client ID
 Metadata Document, plus protected-resource metadata and a `401` carrying
