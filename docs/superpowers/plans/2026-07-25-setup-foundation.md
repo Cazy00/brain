@@ -1812,7 +1812,7 @@ a remote existed, then left doctor RED because nothing was ever pushed."
   - `phase_create(source: Path, dest: Path) -> Result`
   - `phase_verify(dest: Path, run=None) -> Result`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_setup.py
@@ -1877,12 +1877,12 @@ class TestCreatePhase(unittest.TestCase):
         self.assertEqual(subject, "brain: start")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL with `AttributeError: module 'brainlib.setup' has no attribute 'phase_place'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to `bin/brainlib/setup.py`:
 
@@ -1972,12 +1972,12 @@ def phase_verify(dest, run=None) -> Result:
 
 Add `import sys` to the module's imports.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 32 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/brainlib/setup.py tests/test_setup.py
@@ -1997,7 +1997,7 @@ git commit -m "setup: place, create and verify phases"
 - Consumes: every phase from Tasks 8–10.
 - Produces: `run_setup(argv: list, home=None, cwd=None, source=None) -> int`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_setup.py
@@ -2035,12 +2035,12 @@ class TestSetupCli(unittest.TestCase):
         self.assertEqual(before, sorted(p.name for p in ROOT.iterdir()))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL — `unknown command 'setup'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append `run_setup` to `bin/brainlib/setup.py`:
 
@@ -2125,17 +2125,17 @@ In `bin/brain`: add `setup` to the module docstring's command list, add the disp
         return run_setup(rest)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 36 tests
 
-- [ ] **Step 5: Run the whole suite**
+- [x] **Step 5: Run the whole suite**
 
 Run: `python3 -m unittest discover -s tests`
 Expected: PASS — all 213 original plus the new ones
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add bin/brainlib/setup.py bin/brain tests/test_setup.py
@@ -2156,7 +2156,7 @@ git commit -m "setup: wire brain setup into the CLI with --json, --only and --di
 - Consumes: `brain setup` from Task 11.
 - Produces: no Python symbols.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_setup.py
@@ -2188,16 +2188,16 @@ class TestCiMatrix(unittest.TestCase):
                           "Windows support is CI-verified or it is not verified")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL — `install.ps1` does not exist, and `install.sh` still contains `Repository name`
 
-- [ ] **Step 3: Rewrite `install.sh` as a bootstrap**
+- [x] **Step 3: Rewrite `install.sh` as a bootstrap**
 
 Keep the header comment, the colour helpers and the flag parsing. Replace everything from "Checking prerequisites" onward with: verify `git` and `python3 >= 3.9` only, clone the template to a temp dir, and `exec python3 "$TMP/bin/brain" setup "$@"`. Delete the destination prompt, the `gh` block, the visibility check and the next-steps text — all of that now lives in `brainlib/setup.py`, where it is tested and cross-platform. Target: under 120 lines.
 
-- [ ] **Step 4: Write `install.ps1`**
+- [x] **Step 4: Write `install.ps1`**
 
 ```powershell
 # brain — one-command install for Windows.
@@ -2240,7 +2240,7 @@ try {
 }
 ```
 
-- [ ] **Step 5: Extend the CI matrix**
+- [x] **Step 5: Extend the CI matrix**
 
 In `.github/workflows/gate.yml`, change the `tests` job:
 
@@ -2263,19 +2263,19 @@ In `.github/workflows/gate.yml`, change the `tests` job:
 
 Leave the `gate` job on `ubuntu-latest` — lint and gitleaks are platform-independent and running them three times buys nothing.
 
-- [ ] **Step 6: Run test to verify it passes**
+- [x] **Step 6: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 40 tests
 
-- [ ] **Step 7: Prove the bootstrap end to end**
+- [x] **Step 7: Prove the bootstrap end to end**
 
 ```bash
 sh install.sh --dir /tmp/brain-smoke --no-repo --yes
 ```
 Expected: completes, `/tmp/brain-smoke/bin/brain doctor` exits 0 with no `[RED]`. Then `rm -rf /tmp/brain-smoke`.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add install.sh install.ps1 .github/workflows/gate.yml tests/test_setup.py
@@ -2290,6 +2290,17 @@ git commit -m "install: shrink install.sh to a bootstrap, add install.ps1, test 
 
 Deliberately deferred, with the plan that covers each: `connect --apply` and routing markers → Plan 2. `retire` → Plan 2. README and SETUP.md → Plan 2. `serve` → Plan 3.
 
-**Known gap.** `cmd_doctor` still reads `PLIST_DIR` directly at [bin/brain:4849](bin/brain:4849), so on Linux and Windows it will report schedules as absent rather than asking `osbackend.scheduler().status()`. Task 2 rewires `cmd_schedule` but not `cmd_doctor`. Fix it in Task 2 Step 5 if it is quick; otherwise it is the first item of Plan 2, and doctor must not claim a schedule is missing when the platform simply was not asked.
+**Known gap — CLOSED in Task 2.** `cmd_doctor` was reading `PLIST_DIR` directly, so on Linux and Windows it would report schedules as absent rather than asking `osbackend.scheduler().status()`. It now asks the backend; the only remaining mention of `PLIST_DIR` in `bin/brain` is a comment.
+
+## Completion — 2026-07-29
+
+All twelve tasks landed. `python3 -m unittest discover -s tests` is 336 tests, green apart from one environment-specific failure unrelated to this plan (`test_init_defers_when_claude_cli_absent` builds a PATH with no `claude` on it and asserts its own sandbox; on a machine where `claude` is installed into `/usr/bin` that assertion correctly refuses to run).
+
+Two deviations from what is written above, both deliberate:
+
+- **CI pins 3.9 on ubuntu and windows, 3.11 on macOS.** Task 12 Step 5 pins 3.9 everywhere; `macos-latest` is arm64 and no 3.9 build exists for it, so that runner would fail to start rather than run the suite. The syntax floor is still guarded by the other two.
+- **Task 12 Step 7's smoke ends non-zero, and that is correct.** `sh install.sh --dir … --no-repo --yes` builds a working brain — capture, search, lint and the commit gate all verified inside it — and then `verify` fails, because `--no-repo` means no remote and `cmd_doctor` calls a brain with no off-machine copy `[RED]`. It is the only RED in the run. The step's "doctor exits 0 with no [RED]" cannot hold for a local-only install and never could; the design requirement it conflicts with ("setup's exit code reflects doctor's, so a red install is a failed install") wins.
+
+  Worth deciding in Plan 2: a user who explicitly passed `--no-repo` is being told their install FAILED, when what is true is that it succeeded and they gave up their backup. The exit code is right. The word is not.
 
 **Type consistency.** `Result(status, detail, remedy)` is used identically in every phase. `phase_place` alone returns `(Result, Path)` — noted in its Interfaces block because it breaks the pattern. `link_dir` returns `(method, message)`, distinct from `Result` on purpose: it is an `osbackend` primitive with no notion of setup phases.
