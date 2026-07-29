@@ -24,9 +24,11 @@ Commands:
   brain doctor                     health report (hooks, backup, lint, tools)
   brain stats [--json] [--record]  is the KNOWLEDGE still healthy: findability,
                                    capture rate, staleness, curation, link graph
-  brain reset                      retire this brain and start clean. Interactive,
-                                   TTY-only, never exposed over MCP. Moves the
-                                   repo aside; deletes nothing, ever.
+  brain retire [--dry-run] [--explain]   retire this brain and start clean.
+                                   Interactive, TTY-only, never exposed over
+                                   MCP. Moves the repo aside; deletes nothing,
+                                   ever. --dry-run shows the whole plan and
+                                   changes nothing. (`brain reset` still works.)
 
 `brain init` is no longer part of a first run — `brain setup` covers that. It
 still exists and still re-wires THIS clone into Claude Code, because "re-run
@@ -4716,7 +4718,12 @@ def reset_phrase() -> str:
     remote = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", remote)
     remote = re.sub(r"^[^@/]+@", "", remote)
     remote = re.sub(r"\.git$", "", remote)
-    return f"retire {canonical} notes, history stays at {remote}"
+    # Shortened on 2026-07-29 from "history stays at": the WHAT IS KEPT block
+    # now states where the history lives, in full, two lines above this prompt.
+    # Saying it twice made the one line somebody has to type by hand longer for
+    # no information, and length here is friction without safety — the count is
+    # what makes a pasted phrase refuse.
+    return f"retire {canonical} notes, keep {remote}"
 
 
 def reset_dewire() -> tuple:
@@ -4755,6 +4762,27 @@ def reset_dewire() -> tuple:
     elif link.exists():
         preserved.append(f"{link} exists and is not a symlink — left alone")
 
+    # The routing block, now that `connect --apply` writes it between markers.
+    # A block left behind points every future session at a directory that is no
+    # longer there — which is exactly the state every machine that ever ran the
+    # old paste-it-yourself instructions is still in.
+    from brainlib import configedit
+    for key in CONNECT_CLIENTS:
+        _, routing = client_paths(key)
+        if routing is None or not routing.is_file():
+            continue
+        text = read_text(routing)
+        if configedit.MARKER_START in text:
+            if configedit.remove_markers(routing).changed:
+                done.append(f"routing block removed from {routing}")
+        elif str(ROOT) in text:
+            # Written by hand, before markers existed. Deleting text this
+            # system cannot prove it wrote is the one thing worse than leaving
+            # it behind, so it is named and left.
+            preserved.append(f"{routing} mentions this brain but carries no markers "
+                             "— it was written by hand, so this cannot prove which "
+                             "lines are its own. Remove them yourself.")
+
     if shutil.which("claude"):
         got = subprocess.run(["claude", "mcp", "get", "brain"], cwd=ROOT,
                              capture_output=True, text=True, timeout=60)
@@ -4790,15 +4818,49 @@ def preserved_report(remote_url: str, retired: Path, bundle: Path) -> list:
         f"{bundle} — a second, independent copy of all history.",
         "~/.config/brain/vault-key.txt and the Keychain item 'brain-vault-key'. "
         "The key IS the vault; nothing in this system ever touches either.",
-        "the global routing block (e.g. ~/.claude/CLAUDE.md) and this project's "
-        "trust flag. Both are keyed to the path, so a fresh clone at the same path "
-        "inherits them — that is intended, not a leftover.",
+        "this project's trust flag, which is keyed to the path — so a fresh clone "
+        "at the same path inherits it. That is intended, not a leftover. (The "
+        "routing block itself is NOT preserved: since 2026-07-29 it is written "
+        "between markers and this command takes it back out. A block written by "
+        "hand before that has no markers, and is named and left alone rather than "
+        "guessed at.)",
         "agent transcripts (e.g. ~/.claude/projects/…). Old note text lingers "
         "there. Clearing it is your call, not this tool's.",
     ]
 
 
-def cmd_reset(argv: list) -> int:
+def retire_plan(remote_url: str, retired: Path, bundle: Path) -> tuple:
+    """(what happens, what is kept) — a pure function of its arguments.
+
+    Pure so that `--dry-run` and a real run cannot describe different things:
+    there is one description and both print it. A preview written separately
+    from the act is a preview that can be wrong exactly where it matters.
+
+    Plain language, with the internal name in brackets. Somebody about to
+    retire their brain should not have to know what launchd is to understand
+    what is about to stop.
+    """
+    happens = [
+        f"{ROOT} is MOVED aside to {retired}. Nothing is deleted, by this "
+        "command or any other.",
+        f"a second, independent copy of ALL history is written to {bundle}, "
+        "and verified before anything moves.",
+        "this machine is unwired: the weekly background jobs are stopped "
+        f"({osbackend.scheduler().kind}), the /brain skill link is removed, the "
+        "MCP registration is removed, and the routing block is taken back out "
+        "of your agents' instruction files.",
+    ]
+    kept = [
+        f"your remote. Every note and every commit stays at "
+        f"{remote_url or 'the origin'}, and this command cannot touch it.",
+        f"{retired} — the whole old brain, intact, until you delete it by hand.",
+        "your vault key, your agents' transcripts, and four other things: "
+        "brain retire --explain",
+    ]
+    return happens, kept
+
+
+def cmd_retire(argv: list, alias: bool = False) -> int:
     """Retire this brain and start clean — the only destructive command here.
 
     Deliberately the only interactive one, and deliberately absent from
@@ -4813,23 +4875,52 @@ def cmd_reset(argv: list) -> int:
     """
     import shutil
 
-    if not sys.stdin.isatty():
-        print("brain reset is interactive and refuses to run without a terminal.")
+    if alias:
+        print("brain reset is now `brain retire`. Same command, clearer name — "
+              "the old\none keeps working because it is in shipped docs.\n")
+
+    def block(title: str, lines: list) -> None:
+        print(f"\n{title}")
+        for line in lines:
+            for i, wrapped in enumerate(textwrap.wrap(line, 72)):
+                print(("  - " if i == 0 else "    ") + wrapped)
+
+    if "--explain" in argv:
+        # The six-paragraph preserved list, which used to print unconditionally
+        # at the end of every run and buried the three facts that matter.
+        stamp = "<timestamp>"
+        block("KEPT, IN FULL",
+              preserved_report(git("remote", "get-url", "origin"),
+                               Path(str(ROOT) + f".retired-{stamp}"),
+                               Path.home() / f"brain-backup-{stamp}.bundle"))
+        print("\nNothing was changed. To see the plan for this brain: "
+              "brain retire --dry-run")
+        return 0
+
+    dry_run = "--dry-run" in argv
+    # --dry-run is allowed without a terminal on purpose. It writes nothing, so
+    # the refusal below would only stop people — and agents asked "what would
+    # this do" — from finding out what the command does before running it.
+    if not dry_run and not sys.stdin.isatty():
+        print("brain retire is interactive and refuses to run without a terminal.")
         print("If you are an agent: this command is not yours to run. It is not in "
               "the MCP tool list, and it will not accept a piped confirmation.")
+        print("What it would do, safely: bin/brain retire --dry-run")
         return 1
 
-    print("brain reset — retire this brain and start clean\n")
-    print("This does NOT delete anything:")
-    print(f"  - {ROOT} is MOVED to {ROOT}.retired-<timestamp>")
-    print("  - a verified git bundle of ALL history is written outside the repo")
-    print("  - the remote is never touched, by this command or any other\n")
+    print("brain retire — retire this brain and start clean")
 
     # Read BEFORE anything moves. Every git call runs with cwd=ROOT, so once the
     # repo is aside there is no asking git anything.
     remote_url = git("remote", "get-url", "origin")
+    stamp = time.strftime("%Y-%m-%d-%H%M%S")
+    retired = Path(str(ROOT) + f".retired-{stamp}")
+    bundle = Path.home() / f"brain-backup-{stamp}.bundle"
+    happens, kept = retire_plan(remote_url, retired, bundle)
+    block("WHAT HAPPENS", happens)
+    block("WHAT IS KEPT", kept)
 
-    print("Checking that nothing here exists only here…")
+    print("\nChecking that nothing here exists only here…")
     blockers = reset_blockers()
     if blockers:
         print("\nREFUSING — this brain is not fully backed up:\n")
@@ -4837,11 +4928,17 @@ def cmd_reset(argv: list) -> int:
             for i, line in enumerate(textwrap.wrap(blocker, 72)):
                 print(("  - " if i == 0 else "    ") + line)
         print("\nThere is no --force for this. Fix the above and run it again.")
+        print("Nothing was changed.")
         return 1
     print("  [ok ] every commit on every branch is on the remote")
 
-    stamp = time.strftime("%Y-%m-%d-%H%M%S")
-    bundle = Path.home() / f"brain-backup-{stamp}.bundle"
+    if dry_run:
+        # Stops here, after every safety check has actually run. A dry run that
+        # skipped the checks would be a plan for a brain other than this one.
+        print("\nThat is the whole plan, and nothing was changed. Run it for real "
+              "with:\n  bin/brain retire")
+        return 0
+
     # --all AND HEAD: --all bundles refs/heads, tags and remotes, but a commit
     # reachable only from a detached HEAD sits on no ref and would be left out
     # of a bundle that claims to hold all history. Naming HEAD closes that gap;
@@ -4881,7 +4978,6 @@ def cmd_reset(argv: list) -> int:
     for line in done:
         print(f"  [done] {line}")
 
-    retired = Path(str(ROOT) + f".retired-{stamp}")
     try:
         ROOT.replace(retired)
     except OSError as exc:
@@ -4890,13 +4986,19 @@ def cmd_reset(argv: list) -> int:
         return 1
     print(f"  [done] {ROOT} → {retired}")
 
-    print("\nPRESERVED — deliberately not touched:")
-    for line in preserved + preserved_report(remote_url, retired, bundle):
-        for i, wrapped in enumerate(textwrap.wrap(line, 72)):
-            print(("  - " if i == 0 else "    ") + wrapped)
+    # Only what this run found and deliberately left alone — a foreign skill
+    # link, an MCP entry pointing elsewhere, a hand-written routing block. The
+    # standing six-item list moved behind --explain: printed every time, it
+    # buried the two or three findings that were actually about this machine.
+    if preserved:
+        block("LEFT ALONE — found here and deliberately not touched", preserved)
+    block("KEPT", retire_plan(remote_url, retired, bundle)[1])
 
-    print("\nNext: install fresh from the template exactly as a stranger would —")
-    print("  SETUP.md, Part 1. Nothing above needs undoing first.")
+    print("\nNext: install a fresh brain, exactly as a stranger would.")
+    print("\n  curl -fsSL https://raw.githubusercontent.com/Cazy00/brain/main/"
+          "install.sh | sh")
+    print("\nNothing above needs undoing first. The full list of what was kept: "
+          f"\n  {retired}/bin/brain retire --explain")
     return 0
 
 
@@ -5458,8 +5560,8 @@ def main() -> int:
         return cmd_schedule(rest)
     if cmd == "template":
         return cmd_template(rest)
-    if cmd == "reset":
-        return cmd_reset(rest)
+    if cmd in ("retire", "reset"):
+        return cmd_retire(rest, alias=(cmd == "reset"))
     print(f"unknown command {cmd!r}\n{__doc__}")
     return 2
 

@@ -205,11 +205,11 @@ What changes is the name and the reading experience:
 - The routing block is removed via `configedit.remove_markers` from every routing file that has one, now that Task 5 puts markers there. A block left behind points every future session at a directory that no longer exists. A block without markers (written by hand, before this existed) is REPORTED, not guessed at.
 - Ends by offering to run the install rather than pointing at SETUP.md.
 
-- [ ] **Step 1: Write the failing test** — `--dry-run` changes nothing and its plan matches a real run's; `reset` still works and says the new name; the phrase is shorter but still live-state-derived; a marked routing block is removed and an unmarked one is reported.
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Commit** — `retire: rename reset, add --dry-run, and undo the routing block`
+- [x] **Step 1: Write the failing test** — `--dry-run` changes nothing and its plan matches a real run's; `reset` still works and says the new name; the phrase is shorter but still live-state-derived; a marked routing block is removed and an unmarked one is reported.
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Commit** — `retire: rename reset, add --dry-run, and undo the routing block`
 
 ---
 

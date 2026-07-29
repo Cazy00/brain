@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -86,6 +87,18 @@ def make_sandbox(tmp):
          "commit", "-q", "-m", "sandbox"],
         cwd=repo, check=True, capture_output=True)
     return repo
+
+
+def module_marker_start():
+    sys.path.insert(0, str(ROOT / "bin"))
+    from brainlib import configedit
+    return configedit.MARKER_START
+
+
+def module_marker_end():
+    sys.path.insert(0, str(ROOT / "bin"))
+    from brainlib import configedit
+    return configedit.MARKER_END
 
 
 def json_payload(stdout):
@@ -2842,12 +2855,19 @@ class ResetTests(unittest.TestCase):
 
     def test_the_phrase_is_computed_from_live_state(self):
         """A stale phrase — pasted from a runbook, a chat, or a previous
-        attempt — must stop matching the moment the brain changes."""
+        attempt — must stop matching the moment the brain changes.
+
+        Asserted as properties rather than as one literal sentence: the
+        wording was deliberately shortened on 2026-07-29, and a test pinned to
+        the old string would have failed for a reason that was not a defect.
+        Both halves are what matters. The COUNT is the anti-paste property.
+        The REMOTE says out loud where the history keeps living, so nobody
+        types this believing it destroys their notes.
+        """
         before = self.module.reset_phrase()
-        self.assertIn("retire", before)
-        self.assertIn("history stays at", before,
+        self.assertTrue(before.startswith("retire "), before)
+        self.assertIn("remote", before,
                       "the phrase must name where the history keeps living")
-        self.assertIn("remote", before)
         (self.repo / "knowledge" / "reference" / "one-more.md").write_text(
             "---\nid: one-more\nkind: reference\ntitle: One more\ntopics: [brain]\n"
             "aliases: [one more]\ncreated: 2026-07-24\nstatus: current\nreview_by: null\n"
@@ -2855,7 +2875,7 @@ class ResetTests(unittest.TestCase):
         self.assertNotEqual(self.module.reset_phrase(), before,
                             "the phrase did not change when the note count did")
 
-    def dewire_against(self, link_target, home_name):
+    def dewire_against(self, link_target, home_name, routing_text=None):
         """Run reset_dewire() with HOME and PATH redirected into the sandbox.
 
         PATH is emptied rather than shutil.which patched: reset_dewire imports
@@ -2864,6 +2884,9 @@ class ResetTests(unittest.TestCase):
         must never be able to unload the real launchd jobs."""
         fake_home = Path(self.tmp.name) / home_name
         (fake_home / ".claude" / "skills").mkdir(parents=True)
+        if routing_text is not None:
+            (fake_home / ".claude" / "CLAUDE.md").write_text(routing_text,
+                                                             encoding="utf-8")
         link = fake_home / ".claude" / "skills" / "brain"
         link.symlink_to(link_target)
         real_home = self.module.Path.home
@@ -2889,6 +2912,90 @@ class ResetTests(unittest.TestCase):
         link, (_done, preserved) = self.dewire_against(other, "home")
         self.assertTrue(link.is_symlink(), "a foreign skill symlink was removed")
         self.assertIn("NOT this clone", " ".join(preserved))
+
+    def retire(self, *args):
+        return subprocess.run(
+            [sys.executable, str(self.repo / "bin" / "brain"), *args],
+            cwd=self.repo, input="", capture_output=True, text=True, timeout=180)
+
+    def test_retire_is_the_name_and_reset_still_answers_to_it(self):
+        """The old name is in shipped docs and possibly muscle memory. A
+        redirect costs three lines; a rename that strands people costs a
+        support conversation every time."""
+        listed = self.retire("--help")
+        self.assertIn("brain retire", listed.stdout)
+
+        aliased = self.retire("reset")
+        self.assertIn("brain retire", aliased.stdout,
+                      "`reset` did not say what the command is called now")
+
+    def test_dry_run_changes_nothing_and_does_not_need_a_terminal(self):
+        """The discoverable, safe way to explore the only destructive command
+        here — and the only way to review what it does without owning a spare
+        brain. It writes nothing, so the no-terminal refusal that guards the
+        real run would only stop people finding out what it does."""
+        out = self.retire("retire", "--dry-run")
+
+        self.assertNotIn("refuses to run without a terminal", out.stdout,
+                         "--dry-run was gated behind the TTY check")
+        self.assertIn("WHAT HAPPENS", out.stdout)
+        self.assertTrue((self.repo / "bin" / "brain").is_file(),
+                        "a dry run moved the repo")
+        self.assertTrue((self.repo / "knowledge").is_dir())
+        self.assertEqual(list(Path.home().glob("brain-backup-*.bundle")), [],
+                         "a dry run wrote a bundle into the real home directory")
+        self.assertIn("nothing was changed", out.stdout.lower())
+
+    def test_the_dry_run_prints_the_same_plan_the_real_run_acts_on(self):
+        """One description, printed by both. A preview written separately from
+        the act is a preview that can be wrong exactly where it matters."""
+        out = self.retire("retire", "--dry-run")
+
+        # The stamp is read back out of the run's own output, so retire_plan()
+        # can be called with exactly the arguments that run used. Anything less
+        # exact would be comparing two different brains' plans and passing on
+        # the strength of the words they happen to share.
+        found = re.search(r"\.retired-(\d{4}-\d{2}-\d{2}-\d{6})", out.stdout)
+        self.assertIsNotNone(found, out.stdout)
+        stamp = found.group(1)
+        happens, kept = self.module.retire_plan(
+            str(self.remote), Path(str(self.repo) + f".retired-{stamp}"),
+            Path.home() / f"brain-backup-{stamp}.bundle")
+        self.assertTrue(happens and kept, "the plan is empty")
+
+        # Whitespace-normalised on both sides: the printed form wraps at 72
+        # columns, so a literal substring test would be testing the wrapper.
+        printed = " ".join(out.stdout.split())
+        for line in happens + kept:
+            self.assertIn(" ".join(line.split()), printed,
+                          "the dry run printed a different plan than retire_plan built")
+
+    def test_explain_spells_out_everything_that_is_kept(self):
+        out = self.retire("retire", "--explain")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("vault", out.stdout.lower())
+        self.assertIn("transcripts", out.stdout.lower())
+
+    def test_a_marked_routing_block_is_removed(self):
+        """Now possible because `connect --apply` writes markers. A block left
+        behind points every future session at a directory that is not there."""
+        module = self.module
+        marked = ("# my own rules\n"
+                  f"{module_marker_start()}\nuse the brain at {self.repo}\n"
+                  f"{module_marker_end()}\n")
+        _link, (done, _preserved) = self.dewire_against(
+            self.repo / "setup" / "skills" / "brain", "home3", routing_text=marked)
+        self.assertIn("routing block", " ".join(done))
+
+    def test_an_unmarked_routing_block_is_reported_and_left_alone(self):
+        """Written by hand, before markers existed. Deleting text this system
+        cannot prove it wrote is the one thing worse than leaving it."""
+        by_hand = f"# my own rules\nMy brain lives at {self.repo}. Use it.\n"
+        _link, (_done, preserved) = self.dewire_against(
+            self.repo / "setup" / "skills" / "brain", "home4", routing_text=by_hand)
+        joined = " ".join(preserved)
+        self.assertIn("by hand", joined)
+        self.assertIn("CLAUDE.md", joined)
 
     def test_our_own_skill_symlink_is_unlinked(self):
         link, (done, _preserved) = self.dewire_against(
