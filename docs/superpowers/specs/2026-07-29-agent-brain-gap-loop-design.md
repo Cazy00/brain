@@ -3,6 +3,46 @@
 Design, 2026-07-29. Scope: v1 only. The wider architecture it belongs to is
 recorded in "Settled architecture" below so that v2 does not re-litigate it.
 
+> **STATUS: DEFERRED — 2026-07-29, the same day it was written. Not built.
+> This is a design record, not the plan.**
+>
+> Hermes Agent (github.com/NousResearch/hermes-agent, MIT) turned out to
+> supply almost everything this spec assumed we would have to build: the
+> harness, skills on the agentskills.io standard with autonomous improvement,
+> a messaging gateway across Telegram/Discord/Slack/WhatsApp/Signal, cron
+> triggers, parallel subagents, and any-provider model routing. Brain plugs
+> into it over the existing `bin/brain-mcp` with zero new code, so the
+> decision was to run that and build nothing further for now.
+>
+> Hermes's own memory is not a substitute for this brain and was never
+> considered as one: `MEMORY.md` at 2,200 characters and `USER.md` at 1,375,
+> agent-edited, injected into the system prompt as a frozen snapshot at
+> session start, with no versioning and no history on replace. That is
+> *working* memory, bounded so it always fits in context. Brain remains the
+> long-term corpus. Hermes runs both — its docs are explicit that built-in
+> memory stays active alongside an external provider.
+>
+> **What deferring costs:** the escalation metric. Without the gap ledger
+> there is no measure of whether the system is improving, only the feeling
+> that it is. Tolerable while one agent is watched by hand; it bites once
+> several agents share one human oracle and nobody notices the same question
+> being answered eleven times.
+>
+> **Revive this when** more than one agent shares an oracle, or the
+> escalation rate becomes a number worth reporting, or a customer-facing
+> agent makes the partition real.
+>
+> **What did NOT change:** everything under "Settled architecture" below. No
+> decision there was reversed — they were deferred, and the reasoning behind
+> each still holds.
+>
+> **The reasoning here applies to Hermes today, in the procedural layer.**
+> Hermes skills self-modify during use, unreviewed, by default. That is the
+> hazard `inbox/` quarantine and the pinned consolidator exist to prevent,
+> relocated from facts to procedures. Skills are files, so the mitigation is
+> cheap: keep them in git, read the diffs, and turn on `write_approval`
+> early so proposed writes are visible before they land.
+
 ## The problem
 
 Agents arrive at a task with skills and no context. They know *how* to act and
