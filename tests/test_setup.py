@@ -792,5 +792,68 @@ class TestSetupEndToEnd(unittest.TestCase):
                          "setup touched the user's global agent config")
 
 
+class TestBootstraps(unittest.TestCase):
+    def test_install_sh_is_a_bootstrap_not_a_second_implementation(self):
+        text = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("bin/brain setup", text)
+        # Everything interactive now lives in Python, where it is testable and
+        # where it works on all three platforms.
+        for gone in ("Repository name", "Install to", "gh repo create"):
+            self.assertNotIn(gone, text,
+                             f"{gone!r} belongs in brainlib/setup.py now")
+
+    def test_install_sh_stayed_small(self):
+        lines = (ROOT / "install.sh").read_text(encoding="utf-8").splitlines()
+        self.assertLess(len(lines), 120, "the bootstrap has grown a second brain")
+
+    def test_install_ps1_exists_and_hands_off_the_same_way(self):
+        text = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        self.assertIn("bin\\brain", text.replace("/", "\\"))
+        self.assertIn("setup", text)
+
+    def test_neither_bootstrap_wires_the_machine_from_a_temp_clone(self):
+        # `brain init` re-points the global ~/.claude/skills/brain link at
+        # whatever checkout ran it. A bootstrap runs from a clone it is about
+        # to delete, so calling init there would leave every Claude session on
+        # the machine pointing the /brain skill at a directory that no longer
+        # exists. Wiring is `brain connect`, run later, from the brain itself.
+        #
+        # Comments are stripped first. Both files SAY "brain init" while
+        # explaining why they never run it, and a check that cannot tell prose
+        # from code would push that explanation out of the files — which is
+        # where somebody reading the installer will actually look for it.
+        for name in ("install.sh", "install.ps1"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            code = "\n".join(line for line in text.splitlines()
+                             if not line.lstrip().startswith("#"))
+            self.assertNotIn("brain init", code.replace("\\", "/"),
+                             f"{name} wires the machine from a throwaway clone")
+
+    def test_both_bootstraps_check_the_python_floor(self):
+        # 3.9 is the floor the whole toolbelt is written to. Finding out from a
+        # SyntaxError halfway through setup is a worse first run than being
+        # told before anything is cloned.
+        for name in ("install.sh", "install.ps1"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn("(3,9)", text.replace(" ", ""),
+                          f"{name} does not check the Python version")
+
+
+class TestCiMatrix(unittest.TestCase):
+    def test_all_three_platforms_run_the_tests(self):
+        text = (ROOT / ".github" / "workflows" / "gate.yml").read_text(encoding="utf-8")
+        for runner in ("ubuntu-latest", "macos-latest", "windows-latest"):
+            self.assertIn(runner, text,
+                          "Windows support is CI-verified or it is not verified")
+
+    def test_the_matrix_is_actually_wired_to_the_job(self):
+        # Naming three runners in a `matrix:` block that no job reads is the
+        # failure this catches: the file mentions Windows, and Windows is never
+        # run. Nobody on this project has a Windows machine, so CI is the only
+        # thing standing behind that support claim.
+        text = (ROOT / ".github" / "workflows" / "gate.yml").read_text(encoding="utf-8")
+        self.assertIn("runs-on: ${{ matrix.os }}", text)
+
+
 if __name__ == "__main__":
     unittest.main()

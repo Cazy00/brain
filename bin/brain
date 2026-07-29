@@ -5020,7 +5020,12 @@ def main() -> int:
         K = ROOT / "knowledge"
         INDEX_DB = ROOT / ".cache" / "index.db"
         argv = argv[:i] + argv[i + 2:]
-    else:
+    elif argv[:1] != ["setup"]:
+        # Skipped for setup, and only for setup. Setup runs out of a throwaway
+        # clone of the template and installs the hooks into the DESTINATION,
+        # which phase_create does. Here it would mutate a directory that is
+        # about to be deleted, and announce it — "brain: installed git hooks"
+        # about a temp clone, in the very first output a new user ever sees.
         ensure_hooks()
     if not argv:
         print(__doc__)

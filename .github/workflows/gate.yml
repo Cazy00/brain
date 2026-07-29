@@ -30,9 +30,33 @@ jobs:
   tests:
     # Lint proves the NOTES are well-formed; these prove the TOOLBELT works —
     # bootstrap on a clean clone, read containment, MCP survival.
+    #
+    # Three platforms, because `brain setup` claims to work on all three and
+    # nobody on this project owns a Windows machine. CI is the only thing
+    # standing behind that claim; if it does not run here it is not verified.
+    # The `gate` job above stays on ubuntu alone — lint and gitleaks are
+    # platform-independent and running them three times buys nothing.
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.9 is the floor the toolbelt is written to, and the version worth
+          # pinning: a suite that only ever runs on 3.12 says nothing about
+          # whether the syntax floor still holds. macos-latest is arm64, where
+          # no 3.9 build exists, so that runner takes the oldest one that does
+          # and the floor is guarded by the other two.
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: macos-latest
+            python: "3.11"
+          - os: windows-latest
+            python: "3.9"
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
       - name: runtime tests
-        run: python3 -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -v
