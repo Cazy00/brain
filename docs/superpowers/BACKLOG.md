@@ -9,13 +9,16 @@ deliberate decision, not an oversight, and each one is flagged in the code at
 the point where somebody would trip over it — this is the index, not the only
 record.
 
-**Nothing here is blocking.** The four commands work and 468 tests pass, with no
+**Nothing here is blocking.** The four commands work and 474 tests pass, with no
 known failures on any platform this project can run.
 
 The numbering is stable: items keep their number once closed, because "item 3"
-in a commit message should still mean item 3 in a year. Four of the original
-seven are closed and stay listed with what closed them; item 8 was opened
-2026-07-29 by the work that closed the others.
+in a commit message should still mean item 3 in a year. Six of the nine are
+closed and stay listed with what closed them. Items 8 and 9 were both opened AND
+closed on 2026-07-29 by the work that closed the others — 8 by verifying the new
+documentation, 9 by running a real tunnel in front of the server rather than
+reasoning about one. Two of the three still open need hardware or an account
+this project does not have.
 
 ---
 
@@ -27,6 +30,7 @@ seven are closed and stay listed with what closed them; item 8 was opened
 | [2026-07-29-connect-retire-docs.md](plans/2026-07-29-connect-retire-docs.md) | 4–6: `connect --apply`, `retire`, the docs | closed, 41/41 |
 | [2026-07-29-serve.md](plans/2026-07-29-serve.md) | 7: `brain serve` | closed, 18/18 |
 | [2026-07-29-serve-hardening.md](plans/2026-07-29-serve-hardening.md) | backlog items 1, 2, 5 | closed, 18/18 |
+| — | items 8 and 9, found while verifying the above | closed, no plan |
 
 The four commands the spec set out to build all exist and all end in a working
 state: `brain setup`, `brain connect`, `brain serve`, `brain retire`.
@@ -157,34 +161,45 @@ that cries wolf on the one repo where the wolf is invited.
 Anyone running `doctor` here should read past that line. Anyone running it in
 their **own** brain should not.
 
-## 8. `serve --help` and `setup --help` show the global help — OPEN
+## 8. `serve --help` and `setup --help` show the global help — CLOSED 2026-07-29
 
-**Where:** `bin/brain` `main()` (the `rest[:1] in (["--help"], ["-h"])` guard),
-`bin/brainlib/setup.py` and `bin/brainlib/serve.py` (both `USAGE` constants).
+**Closed by:** `84e591c`.
 
-Found 2026-07-29 while verifying the documentation for `--read-only` by running
-it. `brain serve --help` prints the toolbelt's global `__doc__`, not
-`serve.USAGE` — main() answers `<command> --help` itself for every command, so
-the two per-command usage texts are reachable only behind another flag
-(`brain serve --port 8787 --help`). `setup.py` already says so in a comment, so
-this is a known consequence rather than a surprise.
+Found while verifying the documentation for `--read-only` by running it:
+`brain serve --help` printed the toolbelt's global page, so the flag was written
+up in SETUP.md, README.md and serve's own USAGE while the one place somebody
+looks — asking the command — did not mention it.
 
-The guard is there for a good reason: `init --help` once ignored argv and wired
-the machine — re-pointing a global skill symlink and registering an MCP server —
-for somebody who only asked what the command did. Blunt and safe beat clever and
-sorry.
+`main()` still answers `<command> --help` for everything else, because that
+guard exists for a good reason: `init --help` once ignored argv and wired the
+machine for somebody who only asked what it did. `setup` and `serve` are named
+exceptions, never inferred, because "does this handler look like it checks
+--help first?" is exactly the question the original incident answered wrongly.
+Each has a test asserting its own usage comes back and that nothing was done.
 
-But both `run_setup` and `run_serve` answer `--help` before touching anything,
-and both are tested for it, so the safety the guard buys is already paid for
-twice. The flags stay discoverable meanwhile: `brain --help` documents
-`--read-only`.
+## 9. `brain serve` broke connection reuse — CLOSED 2026-07-29
 
-**Done looks like:** main() defers to the handler for the commands that provably
-answer `--help` first — named explicitly, never inferred, because the rule
-exists precisely because a handler that "obviously" checked `--help` first did
-not — with a test per command asserting its own usage comes back and nothing is
-done. Left alone here because reversing a deliberate, commented decision was not
-in the scope of the plan that found it.
+**Closed by:** `1dadd72`.
+
+Not on the original list. Found on 2026-07-29 by running a live Cloudflare
+tunnel in front of the server to check the new documentation was true.
+
+Every refusal path answered before reading the request body — deliberately,
+since reading a 10 MB body in order to reject it is the denial of service the
+size cap exists to prevent — leaving those bytes in the socket. On a kept-alive
+HTTP/1.1 connection they were parsed as the next request line, so the client's
+next request, with a correct token, came back `400` or `501`. One wrong token
+made the connection useless. Present since the transport was written.
+
+It was invisible to the test suite because every test there opened one
+connection per request and closed it — the transport was only ever exercised in
+the pattern real traffic does not use. A proxy pools connections, which is what
+a tunnel is, which is the deployment the command exists for.
+
+Recorded because the lesson outlives the fix: **the local suite could not have
+found this.** `TestConnectionReuse` now holds the property in both directions,
+and `setup/runbooks/tunnel-cloudflare.md` records what a real tunnel was
+observed to do.
 
 ---
 

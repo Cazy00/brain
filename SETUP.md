@@ -645,6 +645,10 @@ Reaching the server from outside your machine needs something in front of it.
 Which tunnel is your choice and this project takes no position on it. What it
 must do:
 
+(One worked example, tested against this server rather than described from
+documentation: [`setup/runbooks/tunnel-cloudflare.md`](setup/runbooks/tunnel-cloudflare.md).
+It is an example, not a recommendation — the contract below is the requirement.)
+
 1. **Terminate TLS.** The brain speaks plain HTTP; anything crossing a network
    must be wrapped by the thing in front.
 2. **Forward to this port**, path and all — the endpoint is `/mcp`.
