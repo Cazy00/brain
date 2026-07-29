@@ -2475,6 +2475,75 @@ class ConnectApplyTests(unittest.TestCase):
         self.assertIn(self.server, text)
 
 
+class ConnectRoutingApplyTests(ConnectApplyTests):
+    """The routing block is the thing that makes an agent reach for the brain
+    unprompted, and until now it was a paste job with no way back.
+
+    Markers are what change that: the block can be updated in place as this
+    system changes, and `brain retire` can take it out again. Without them,
+    every machine that ever ran this keeps instructions pointing at a directory
+    that is no longer there.
+    """
+
+    def test_the_printed_block_carries_the_markers(self):
+        # Someone who pastes by hand must end up with the same thing --apply
+        # writes, markers included, or retire can undo one and not the other.
+        out = self.connect("--routing")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("<!-- brain:routing:start -->", out.stdout)
+        self.assertIn("<!-- brain:routing:end -->", out.stdout)
+        self.assertIn("brain_search", out.stdout)
+
+    def test_apply_writes_the_block_and_keeps_the_users_own_rules(self):
+        (self.home / ".claude").mkdir()
+        rules = self.home / ".claude" / "CLAUDE.md"
+        rules.write_text("# my rules\nalways use tabs\n", encoding="utf-8")
+
+        out = self.connect("--routing", "--apply")
+
+        self.assertEqual(out.returncode, 0, out.stdout)
+        text = rules.read_text(encoding="utf-8")
+        self.assertIn("always use tabs", text, "the user's own rules were destroyed")
+        self.assertIn("brain_search", text)
+        self.assertIn(str(self.repo.resolve()), text,
+                      "the block was not rendered for this clone")
+
+    def test_a_second_apply_leaves_exactly_one_block(self):
+        (self.home / ".claude").mkdir()
+        self.connect("--routing", "--apply")
+        second = self.connect("--routing", "--apply")
+        text = (self.home / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertEqual(text.count("<!-- brain:routing:start -->"), 1)
+        self.assertIn("unchanged", second.stdout)
+
+    def test_a_client_with_no_routing_file_is_skipped_not_failed(self):
+        # Cursor's routing rule lives in a settings UI. Nothing can write it,
+        # and reporting that as a failure would make an exit code meaningless
+        # on the machines where it is the normal case.
+        (self.home / ".cursor").mkdir()
+        out = self.connect("cursor", "--routing", "--apply")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("Settings", out.stdout, "the UI location was not printed")
+
+    def test_the_copilot_file_is_created_with_its_frontmatter(self):
+        # A .instructions.md with no applyTo matches nothing, so a block
+        # written into a fresh one would sit there being ignored.
+        (self.home / ".copilot").mkdir()
+        out = self.connect("vscode", "--routing", "--apply")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        text = (self.home / ".copilot" / "instructions"
+                / "brain.instructions.md").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---"), text[:40])
+        self.assertIn('applyTo: "**"', text)
+        self.assertIn("<!-- brain:routing:start -->", text)
+
+    def test_routing_apply_never_creates_files_for_an_absent_client(self):
+        out = self.connect("--routing", "--apply")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertFalse((self.home / ".claude").exists())
+        self.assertFalse((self.home / ".codex").exists())
+
+
 class ProtocolBridgeTests(unittest.TestCase):
     """AGENTS.md is the single instruction source; CLAUDE.md imports it.
 

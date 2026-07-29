@@ -158,11 +158,11 @@ The block is written between `<!-- brain:routing:start -->` and `<!-- brain:rout
 - A client with `routing_path: None` prints where the UI setting lives and is counted as skipped, not failed. Cursor and Claude Desktop have no file; nothing can write one for them.
 - Re-running updates the block in place. This matters more than it looks: the block changes as this system changes, and before markers there was no way to update it except by hand.
 
-- [ ] **Step 1: Write the failing test** — including that surrounding content in a pre-existing `~/.claude/CLAUDE.md` is preserved above and below the markers, and that a second apply with a changed block replaces it rather than appending a second copy.
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Commit** — `connect: routing block gets markers and can be applied`
+- [x] **Step 1: Write the failing test** — including that surrounding content in a pre-existing `~/.claude/CLAUDE.md` is preserved above and below the markers, and that a second apply with a changed block replaces it rather than appending a second copy.
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Commit** — `connect: routing block gets markers and can be applied`
 
 ---
 

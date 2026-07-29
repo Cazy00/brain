@@ -1950,6 +1950,55 @@ def print_outcome(key: str, outcome, dry_run: bool) -> None:
             print("  " + line.rstrip("\n"))
 
 
+def apply_routing(keys: list, dry_run: bool = False) -> int:
+    """Write the routing block into each client's global instruction file.
+
+    With no client named this sweeps every client that is actually installed,
+    for the same reason `--all --apply` does: a routing file created for a
+    client nobody has is an instruction nothing will ever read, sitting in a
+    directory this command invented.
+    """
+    from brainlib import configedit
+
+    unknown = [k for k in keys if k not in CONNECT_CLIENTS]
+    if unknown:
+        print(f"unknown client(s): {', '.join(unknown)}")
+        print(f"known: {', '.join(CONNECT_CLIENTS)}")
+        return 2
+    targets = keys or [k for k in CONNECT_CLIENTS if client_installed(k)]
+    if not targets:
+        print("No supported client found on this machine. `brain connect --routing` "
+              "prints the\nblock; name a client explicitly to write it anyway.")
+        return 0
+
+    block = routing_block()
+    refused = 0
+    for key in targets:
+        client = CONNECT_CLIENTS[key]
+        print(f"\n=== {client['name']}  ({key}) "
+              + "=" * max(0, 46 - len(client['name'])))
+        _, routing = client_paths(key)
+        if routing is None:
+            # Not a failure. Cursor and Claude Desktop keep this rule in a
+            # settings UI, and an exit code that went red on the normal case
+            # would stop meaning anything.
+            print(f"  [skipped ] no instruction file — {client['routing']}")
+            continue
+        outcome = configedit.apply_markers(routing, block,
+                                           preamble=client.get("routing_preamble", ""),
+                                           dry_run=dry_run)
+        print(f"  [{outcome.action}] {outcome.detail}")
+        if outcome.backup:
+            print(f"            backup: {outcome.backup}")
+        if outcome.action == "refused":
+            refused += 1
+            print("\n  Paste this yourself instead:\n")
+            for line in outcome.snippet.splitlines():
+                print(f"     {line}")
+    print("\nRestart the client — global instructions are read at session start.")
+    return 1 if refused else 0
+
+
 # Folders no client's own index should be walking. archive/ is superseded and
 # would be read back as current; inbox/ and journal/ are provisional and have
 # not been through consolidation; vault/ is encrypted and its plaintext must
@@ -2011,8 +2060,15 @@ def cmd_connect(argv: list) -> int:
         return 2
 
     if "--routing" in argv:
-        print(routing_block())
-        return 0
+        from brainlib import configedit
+        if not apply_it:
+            # Printed WITH the markers: somebody who pastes by hand must end up
+            # with the same thing --apply writes, or `brain retire` can undo one
+            # and not the other.
+            print(f"{configedit.MARKER_START}\n{routing_block()}\n"
+                  f"{configedit.MARKER_END}")
+            return 0
+        return apply_routing([a for a in argv if not a.startswith("--")], dry_run)
     if "--write-ignores" in argv:
         written = write_ignore_files()
         print("wrote: " + ", ".join(written) if written else
