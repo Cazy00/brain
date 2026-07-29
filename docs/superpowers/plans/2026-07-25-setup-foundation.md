@@ -40,7 +40,7 @@ The data every later task reads to decide what is missing and what to tell the u
   - `package_manager() -> str` — e.g. `"brew"`, `"apt"`, `"dnf"`, `"pacman"`, `"winget"`, or `""`
   - `install_hint(tool: str) -> str` — a literal shell command, or `""` when unknown
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_osbackend.py
@@ -109,12 +109,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'brainlib'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # bin/brainlib/__init__.py
@@ -243,12 +243,12 @@ def install_hint(tool: str) -> str:
     return _MANAGER_COMMANDS[manager].format(pkg=package)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: PASS, 7 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/brainlib/__init__.py bin/brainlib/osbackend.py tests/test_osbackend.py
@@ -274,7 +274,7 @@ Moves `launchctl` out of `bin/brain` and gives Linux and Windows a real implemen
   - `when` is a dict: `{"weekday": 1, "hour": 9, "minute": 0}` (Monday=1), or `{"hour": 9, "minute": 0}` for daily.
   - `.install()` returns a human sentence; it never raises on an unavailable backend, it returns a sentence saying so.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_osbackend.py
@@ -326,12 +326,12 @@ class TestSystemdUnits(unittest.TestCase):
         self.assertIn("Persistent=true", timer)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: FAIL with `AttributeError: module 'brainlib.osbackend' has no attribute 'scheduler_for'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to `bin/brainlib/osbackend.py`:
 
@@ -518,12 +518,12 @@ def scheduler() -> Scheduler:
     return scheduler_for(os_family())
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: PASS, 12 tests
 
-- [ ] **Step 5: Rewire `cmd_schedule` to delegate**
+- [x] **Step 5: Rewire `cmd_schedule` to delegate**
 
 In `bin/brain`, replace the body of `cmd_schedule` ([bin/brain:4153](bin/brain:4153)) so it calls `osbackend.scheduler()` instead of writing plists and calling `launchctl` itself. Keep the command's existing CLI surface (`install [--with-consolidate] | uninstall | status`) and its existing output wording unchanged — this task is a move, not a redesign. Add near the top of `bin/brain`:
 
@@ -532,12 +532,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from brainlib import osbackend
 ```
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `python3 -m unittest discover -s tests`
 Expected: PASS — 213 existing + 12 new. `schedule_serves_this_repo` and the doctor checks that read `PLIST_DIR` must still work on macOS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add bin/brainlib/osbackend.py bin/brain tests/test_osbackend.py
@@ -562,7 +562,7 @@ Where the vault key lives today, and where the `serve` token will live in Plan 3
   - `KeychainKeystore.get_argv(name) -> list`, `CredmanKeystore.set_argv(name, value) -> list` — argv builders, so correctness is checkable off-platform
   - `FileKeystore(directory)` — the Linux fallback, fully testable
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_osbackend.py
@@ -633,12 +633,12 @@ if sys.platform == "win32":
             TestFileKeystore.test_stored_file_is_not_group_or_world_readable)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: FAIL with `AttributeError: module 'brainlib.osbackend' has no attribute 'keystore_for'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to `bin/brainlib/osbackend.py`:
 
@@ -803,12 +803,12 @@ def keystore() -> Keystore:
     return keystore_for(os_family())
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: PASS, 21 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/brainlib/osbackend.py tests/test_osbackend.py
@@ -832,7 +832,7 @@ The `/brain` skill is installed as a symlink today, which needs Developer Mode o
 - Consumes: `os_family()`.
 - Produces: `link_dir(link: Path, target: Path) -> tuple` returning `(method, message)` where `method` is `"symlink"`, `"junction"`, `"copy"` or `"failed"`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_osbackend.py
@@ -870,12 +870,12 @@ class TestLinkDir(unittest.TestCase):
         self.assertTrue((stranger / "someone-elses.md").exists())
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: FAIL with `AttributeError: module 'brainlib.osbackend' has no attribute 'link_dir'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to `bin/brainlib/osbackend.py`:
 
@@ -937,21 +937,21 @@ def link_dir(link, target) -> tuple:
         return "failed", f"could not link or copy {link}: {exc}"
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_osbackend -v`
 Expected: PASS, 25 tests
 
-- [ ] **Step 5: Rewire `cmd_init` step 4 to delegate**
+- [x] **Step 5: Rewire `cmd_init` step 4 to delegate**
 
 Replace the symlink block at [bin/brain:1460-1486](bin/brain:1460) with a call to `osbackend.link_dir(link, skill_dir)`, preserving the existing `[4/5]` output format and the existing failure text. Keep the ownership check that already lives in `reset_dewire` untouched — Plan 2 deals with `retire`.
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `python3 -m unittest discover -s tests`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add bin/brainlib/osbackend.py bin/brain tests/test_osbackend.py
@@ -974,7 +974,7 @@ Two small files without which Windows fails silently rather than loudly.
 - Consumes: nothing.
 - Produces: no Python symbols. `brain.cmd` gives Windows users `brain <command>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_setup.py
@@ -1025,12 +1025,12 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL with `.gitattributes is missing`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```
 # .gitattributes
@@ -1070,17 +1070,17 @@ SANDBOX_IGNORE = shutil.ignore_patterns(
     ".git", ".cache", "graphify-out", "node_modules", ".DS_Store", "__pycache__")
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 4 tests
 
-- [ ] **Step 5: Verify the attributes actually apply**
+- [x] **Step 5: Verify the attributes actually apply**
 
 Run: `git check-attr text eol -- .githooks/pre-commit bin/brain brain.cmd`
 Expected: `eol: lf` for the first two, `eol: crlf` for `brain.cmd`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add .gitattributes brain.cmd tests/test_setup.py tests/test_brain.py
@@ -1103,7 +1103,7 @@ git commit -m "windows: pin line endings and add the brain.cmd shim"
   - `expand(raw: str, home: Path, cwd: Path) -> Path` — `~` expansion and absolute resolution
   - `choose(home, cwd, stream=None, default=None) -> Path` — the interactive loop; returns `default` when `stream` is not a TTY
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_setup.py
@@ -1192,12 +1192,12 @@ class TestChooseWithoutATty(unittest.TestCase):
         self.assertEqual(chosen, Path("/home/x/brain"))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'brainlib.picker'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # bin/brainlib/picker.py
@@ -1349,12 +1349,12 @@ def choose(home, cwd, stream=None, default=None) -> Path:
         print(f"\n  Cannot use that: {reason}")
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 14 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/brainlib/picker.py tests/test_setup.py
@@ -1379,7 +1379,7 @@ The shape every phase returns, and the machine-readable output an agent acts on.
   - `render_json(results: dict) -> str`
   - `overall_status(results: dict) -> str`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_setup.py
@@ -1428,12 +1428,12 @@ class TestJsonContract(unittest.TestCase):
         json.loads(setupmod.render_json(results))
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'brainlib.setup'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # bin/brainlib/setup.py
@@ -1488,12 +1488,12 @@ def render_json(results: dict) -> str:
     }, indent=2)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 19 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/brainlib/setup.py tests/test_setup.py
@@ -1512,7 +1512,7 @@ git commit -m "setup: phase result type and the --json contract"
 - Consumes: `PREREQS`, `install_hint` (Task 1); `Result` (Task 7).
 - Produces: `phase_check(which=None) -> Result` — `which` is an injectable `shutil.which`-alike so tests can simulate a bare machine.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_setup.py
@@ -1544,12 +1544,12 @@ class TestCheckPhase(unittest.TestCase):
         self.assertEqual(result.status, "failed")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL with `AttributeError: module 'brainlib.setup' has no attribute 'phase_check'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to `bin/brainlib/setup.py`:
 
@@ -1599,12 +1599,12 @@ def phase_check(which=None, run=None) -> Result:
     return Result("ok", "every prerequisite is present")
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 23 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/brainlib/setup.py tests/test_setup.py
@@ -1625,7 +1625,7 @@ The failure from 2026-07-25. Determine truth by inspecting git, never by an exit
 - Consumes: `Result` (Task 7).
 - Produces: `phase_backup(dest: Path, repo_name: str, want_remote: bool, run=None, which=None) -> Result`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # append to tests/test_setup.py
@@ -1712,12 +1712,12 @@ class TestBackupPhase(unittest.TestCase):
         self.assertEqual(result.status, "ok")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: FAIL with `AttributeError: module 'brainlib.setup' has no attribute 'phase_backup'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to `bin/brainlib/setup.py`:
 
@@ -1782,12 +1782,12 @@ def phase_backup(dest, repo_name: str, want_remote: bool,
     return Result("ok", f"backed up to {origin}")
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_setup -v`
 Expected: PASS, 27 tests
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add bin/brainlib/setup.py tests/test_setup.py
