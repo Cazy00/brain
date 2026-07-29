@@ -5528,7 +5528,17 @@ def main() -> int:
     # symlink and registering an MCP server — for someone who only asked what it
     # does. Only the leading argument counts, so free-text commands like
     # `capture` can still carry the literal word in their content.
-    if rest[:1] in (["--help"], ["-h"]):
+    #
+    # Two commands answer --help themselves, with usage this file has no room
+    # for — `brain serve --read-only` and setup's phase flags were documented
+    # in text nobody could reach, which is how the flag ends up in SETUP.md and
+    # not in the command that has it. They are NAMED here and never inferred:
+    # this guard exists precisely because a handler that obviously checked
+    # --help first did not, so "does it look like it handles help?" is not a
+    # question worth guessing the answer to. Each name has a test asserting its
+    # own usage comes back and that the command did nothing.
+    self_documenting = ("setup", "serve")
+    if rest[:1] in (["--help"], ["-h"]) and cmd not in self_documenting:
         print(__doc__)
         return 0
     if cmd == "lint":

@@ -769,14 +769,31 @@ class TestServeInTheHelp(unittest.TestCase):
                               cwd=str(ROOT), capture_output=True, text=True, timeout=120)
         self.assertIn("brain serve", done.stdout)
 
-    def test_serve_help_does_not_start_a_server(self):
+    def serve_help(self):
         import subprocess
 
-        done = subprocess.run([sys.executable, str(ROOT / "bin" / "brain"),
+        return subprocess.run([sys.executable, str(ROOT / "bin" / "brain"),
                                "serve", "--help"],
                               cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+
+    def test_serve_help_does_not_start_a_server(self):
+        done = self.serve_help()
         self.assertEqual(done.returncode, 0)
         self.assertNotIn("listening", done.stdout.lower())
+
+    def test_serve_help_shows_serves_own_usage(self):
+        """Not the toolbelt's global help, which is what it used to show.
+
+        Found 2026-07-29 while verifying the documentation for --read-only: the
+        flag was written up in SETUP.md, README.md and serve's own USAGE, and
+        the one place somebody would actually look for it — asking the command
+        — answered with a page that did not mention it. Documentation nobody
+        can reach is documentation that is not there.
+        """
+        done = self.serve_help()
+        self.assertIn("brain serve — reach this brain", done.stdout)
+        self.assertIn("--read-only", done.stdout)
+        self.assertIn("--new-token", done.stdout)
 
 
 if __name__ == "__main__":

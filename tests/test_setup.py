@@ -632,6 +632,18 @@ class TestSetupCli(unittest.TestCase):
         self.assertEqual(done.returncode, 0)
         self.assertNotIn("installing to", done.stdout)
 
+    def test_setup_help_shows_setups_own_usage(self):
+        """And not the toolbelt's global help, which is what it used to show.
+
+        main() answers `<command> --help` itself so that asking what a command
+        does can never do it. setup and serve are named exceptions because both
+        answer --help before touching anything — which is why the test above
+        sits right here, holding the property that earned the exception.
+        """
+        done = run_brain_cmd("setup", "--help")
+        self.assertIn("brain setup — install a brain here", done.stdout)
+        self.assertIn("--only", done.stdout)
+
     def test_json_mode_emits_only_json_on_stdout(self):
         done = run_brain_cmd("setup", "--json", "--yes", "--only", "check")
         json.loads(done.stdout)      # must parse — human text belongs on stderr
