@@ -1932,8 +1932,6 @@ def print_outcome(key: str, outcome, dry_run: bool) -> None:
     """One client's result, plus the diff when nothing was written."""
     import difflib
 
-    client = CONNECT_CLIENTS[key]
-    print(f"\n=== {client['name']}  ({key}) " + "=" * max(0, 46 - len(client['name'])))
     print(f"  [{outcome.action}] {outcome.detail}")
     if outcome.backup:
         print(f"            backup: {outcome.backup}")
@@ -2068,7 +2066,12 @@ def connect_report(as_json: bool = False) -> int:
             status = f"could not read {detail} — check it yourself"
         elif state == "this":
             status = "wired to this brain"
-            status += ", routing block in place" if applied else ", no routing block"
+            if routing is None:
+                # Not a gap. Cursor and Claude Desktop have no instruction file,
+                # so "no routing block" would read as something left undone.
+                status += " (routing rule is a UI setting)"
+            else:
+                status += ", routing block in place" if applied else ", no routing block"
         else:
             status = "not wired"
         print(f"  {key:<16} {client['name']:<26} {status}")
@@ -2225,6 +2228,12 @@ def cmd_connect(argv: list) -> int:
             return 2
         refused = 0
         for key in args:
+            # Header first, then the work. claude-code's branch runs the init
+            # wiring, which prints five lines of its own — under a header
+            # printed afterwards they would look like the previous client's.
+            client = CONNECT_CLIENTS[key]
+            print(f"\n=== {client['name']}  ({key}) "
+                  + "=" * max(0, 46 - len(client['name'])))
             outcome = apply_client(key, dry_run=dry_run)
             print_outcome(key, outcome, dry_run)
             refused += outcome.action == "refused"
