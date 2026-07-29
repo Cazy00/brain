@@ -1,9 +1,20 @@
 # SETUP — the complete guide, in one file
 
-Everything needed to go from nothing to a fully working second brain wired
-into whichever AI agents you use. Follow top to bottom; each part ends with a
-way to verify it worked. The fast path is Parts 1-3 + Part 8 (about 5 minutes);
-everything else is optional power.
+Everything needed to go from nothing to a fully working second brain wired into
+whichever AI agents you use.
+
+It is four commands, and each one ends in a working state — so stopping after
+any of them is a legitimate place to stop, not an abandoned install.
+
+```
+brain setup      you have a brain. Notes work. It is backed up.
+brain connect    your agents can reach it.
+brain serve      it is reachable from other devices.       (not built yet)
+brain retire     all of the above, gracefully undone.
+```
+
+Parts 1 and 2 are the whole install, about five minutes. Everything after them
+is optional power: schedules, the encrypted vault, a second machine.
 
 ---
 
@@ -22,32 +33,45 @@ everything else is optional power.
 **The tool layer is vendor-neutral.** `bin/brain-mcp` is a zero-dependency
 stdio MCP server with no vendor SDK, so any MCP-capable agent consumes it
 unmodified: Claude Code, OpenAI Codex CLI, Gemini CLI, Cursor, VS Code +
-Copilot, Windsurf/Devin, Claude Desktop. Part 2 wires Claude Code in one
-command; Part 2b prints the exact registration for every other client.
-(Developed and smoke-tested end-to-end on Claude Code; the wire protocol the
-others use is covered by the test suite, but do the Part 8 check from your own
-client the first time.)
+Copilot, Windsurf/Devin, Claude Desktop.
 
-Requirements: **macOS** with Python 3.9+ and git, plus at least one MCP-capable
-agent. Optional but recommended: `brew install gh ripgrep gitleaks age` (`gh`
-is the GitHub CLI used in Parts 1 and 8 — run `gh auth login` once after
-installing; every gh step also has a no-gh alternative).
+### Platforms
 
-**Linux:** the core works — markdown, git, the toolbelt and the MCP server are
-all plain Python and portable. Two things are macOS-only and DIY on Linux: the
-schedules (Part 7 uses `launchd`; use `systemd --user` timers or cron) and the
-vault key store (Part 9 uses Keychain; use `pass`, `gnome-keyring`, or a
-file-with-strict-permissions). Everything else is identical.
+macOS, Linux and Windows. The three OS-dependent pieces each have a backend:
 
----
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Schedules | `launchd` | `systemd --user` | `schtasks` |
+| Vault key storage | Keychain | file, mode 0600 | Credential Manager |
+| The `/brain` skill link | symlink | symlink | directory junction |
 
-## Part 1 — Get the code
+**Windows is verified by CI only.** The full test suite runs on all three
+platforms on every push, but nobody on this project owns a Windows machine, so
+anything CI cannot reach there — how the path picker feels in a real terminal,
+Credential Manager prompts — is unverified rather than known to work.
 
-### First, the thing to understand about git and GitHub
+### Prerequisites
 
-Your brain is **a git repository**. That is not an implementation detail you can
-ignore — it is the whole reason your notes are permanent, versioned, and yours.
-Two consequences you need to accept before you start:
+Nothing is ever installed for you, on any platform. `brain setup` prints the
+exact command for your OS and package manager, and what you lose by skipping it.
+
+| | | Without it |
+|---|---|---|
+| `git` | **required** | Nothing works — the brain *is* a git repository |
+| `python3` ≥ 3.9 | **required** | The toolbelt and the MCP server are Python |
+| `gh` | optional | No automatic private backup; you create the GitHub repo yourself |
+| `gitleaks` | optional | The secret gate falls back to the built-in scanner alone |
+| `age` | optional | No encrypted vault for sensitive notes |
+| `rg` | optional | Search still works; the plain-grep tier is slower |
+
+If you use `gh`, run `gh auth login` once before Part 1 — that is what lets
+setup create your private repo for you. Every `gh` step has a no-`gh`
+alternative.
+
+### Before you start: your brain is a git repository
+
+That is not an implementation detail you can ignore — it is the whole reason
+your notes are permanent, versioned, and yours. Two consequences to accept:
 
 - **Every commit is pushed automatically.** A git hook pushes to your remote in
   the background after each commit. That is the backup, and it is what makes a
@@ -57,28 +81,76 @@ Two consequences you need to accept before you start:
   down, world-readable, in a history that outlives deleting it.
 
 GitHub is the default because it is where most people already are, but nothing
-here requires it — any git remote works (GitLab, a self-hosted server, even a
-drive you control). You can also run with **no remote at all**: everything works
-except the backup, and `bin/brain doctor` will tell you, every time, that your
-knowledge exists on exactly one machine.
+here requires it — any git remote works. You can also run with **no remote at
+all**: everything works except the backup. That is supported, and it is
+deliberately not treated as finished — `doctor` reports it red every time, and
+so does `brain setup --no-repo`, which tells you plainly that the red line is
+the one you asked for.
 
-`bin/brain doctor` actively checks this. If your remote is publicly readable it
-fails loudly with the command to fix it — see Part 8.
+---
+
+## Part 1 — `brain setup`
 
 ### Option A (recommended): one command
+
+**macOS and Linux**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Cazy00/brain/main/install.sh | sh
 ```
 
-It checks your prerequisites, installs into `~/brain` (ask for somewhere else
-with `--dir`), gives the clone a **fresh git history that is yours**, offers to
-create your **private** GitHub repo, wires this machine, and finishes by running
-`doctor`. It refuses to install over a directory that already has anything in
-it, and it never touches a file you did not name.
+**Windows** (PowerShell)
 
-Not comfortable piping a script into a shell? Read it first — it is one file:
-<https://github.com/Cazy00/brain/blob/main/install.sh>. Or use Option B.
+```powershell
+irm https://raw.githubusercontent.com/Cazy00/brain/main/install.ps1 | iex
+```
+
+Both scripts are bootstraps and nothing more: they check git and Python, fetch
+the template into a temp directory, and hand off to `brain setup`. Everything
+interactive lives there, in Python, so all three platforms behave identically.
+
+Flags go after `-s --` when piping:
+
+```sh
+curl -fsSL … | sh -s -- --dir ~/knowledge --repo my-brain --yes
+```
+
+| Flag | |
+|---|---|
+| `--dir <path>` | Where the brain lives; skips the picker |
+| `--repo <name>` | Name for the private GitHub repo (default: `my-brain`) |
+| `--no-repo` | No remote at all — LOCAL ONLY, no backup |
+| `--yes`, `-y` | Never ask; take every default |
+| `--json` | Machine-readable result on stdout, human text on stderr |
+| `--only <phase>` | Re-run one phase: `check`, `place`, `create`, `backup`, `verify` |
+
+### What setup actually does
+
+Five phases, each idempotent and each re-runnable on its own with `--only`:
+
+1. **check** — prerequisites. Missing required tools stop the run with the exact
+   install command. Missing optional ones report the *consequence*, not the name.
+   Nothing is ever installed.
+2. **place** — where the brain lives. A shortlist (`~/brain`, `~/Documents/brain`,
+   any cloud folder you actually have) plus a typed path with tab completion.
+   Skipped when you pass `--dir`. With no terminal — piped into `sh`, or run by
+   an agent — it takes the recommended default rather than blocking.
+3. **create** — copies the template and gives it a **fresh git history that is
+   yours**. The template's history is the product's, not yours. It refuses a
+   destination that already has anything in it, and the refusal names what is in
+   the way.
+4. **backup** — your private GitHub repo, via `gh` if you have it. Success is
+   determined by **inspecting git state afterwards**, never by an exit code:
+   `gh repo create --push` adds the remote *before* it pushes, so a push failure
+   leaves a remote sitting right there and a non-zero exit that says nothing
+   about whether one exists. If a remote exists with no upstream, it pushes with
+   `-u` so the run cannot leave `doctor` red.
+5. **verify** — `doctor`. Setup's exit code **is** doctor's, so an install this
+   calls done is one the health check agrees with.
+
+Setup does **not** wire your agents. That is Part 2, deliberately: wiring
+re-points a global link at whatever checkout ran it, and a first install runs
+from a throwaway clone.
 
 ### Option B: GitHub template button
 
@@ -88,7 +160,7 @@ repository**, name it (e.g. `my-brain`), and — important — set visibility to
 
 ```sh
 git clone https://github.com/<you>/my-brain.git ~/brain
-cd ~/brain
+cd ~/brain && bin/brain setup --only verify --dir .
 ```
 
 ### Option C: plain clone, remote later
@@ -123,92 +195,80 @@ gh repo edit <you>/my-brain --visibility private --accept-visibility-change-cons
 
 ---
 
-## Part 2 — One command wires the machine
+## Part 2 — `brain connect`
+
+Two things have to be true for an agent to use your brain: it must be able to
+*reach* it (the MCP server), and it must know to *reach for* it (the routing
+rule). `connect` does both.
+
+Start by asking what this machine looks like:
 
 ```sh
-bin/brain init
+bin/brain connect
 ```
 
-This does five things (each idempotent — safe to re-run):
+One line per client, and three answers that matter:
 
-1. Installs the git hooks (`core.hooksPath = .githooks`) — actually, *every*
-   `bin/brain` command self-installs these, so hooks can never silently be missing.
-2. Writes `.mcp.json` with this clone's absolute path — Claude Code sessions
-   *inside* the repo get the brain tools.
-3. Renders `setup/skills/brain/SKILL.md` for this clone's path.
-4. Symlinks the `/brain` skill into `~/.claude/skills/`.
-5. Registers the MCP server at **user scope** (`claude mcp add --scope user
-   brain <repo>/bin/brain-mcp`) — Claude Code sessions in *any* directory get
-   the brain tools. If the `claude` CLI isn't installed, it prints the exact
-   command to run later.
+| | |
+|---|---|
+| `not installed` | The client is not on this machine. Nothing to do. |
+| `not wired` | Installed, no brain registered. |
+| `wired to this brain` | Done — and it says whether the routing block is in place. |
+| **`WIRED TO A DIFFERENT brain`** | An agent is talking to a path that is not this one. Every tool call still succeeds, against someone else's notes or against nothing. This is the failure that used to be invisible. |
 
-The two files init generates (`.mcp.json` and `setup/skills/brain/SKILL.md`)
-contain this machine's absolute paths and are gitignored — every machine
-regenerates its own via `bin/brain init`; don't commit them.
-
-**Manual equivalents** (only if you want to do it by hand or `init` failed —
-all five steps, in order):
+Then wire it:
 
 ```sh
-git config core.hooksPath .githooks
-printf '{\n  "mcpServers": {\n    "brain": {"command": "%s/bin/brain-mcp", "args": []}\n  }\n}\n' "$(pwd)" > .mcp.json
-sed "s|{{REPO}}|$(pwd)|g" setup/skills/brain/SKILL.md.template > setup/skills/brain/SKILL.md
-ln -sfn "$(pwd)/setup/skills/brain" ~/.claude/skills/brain
-claude mcp add --scope user brain "$(pwd)/bin/brain-mcp"
+bin/brain connect --all --apply           # register the server with every client found here
+bin/brain connect --routing --apply       # add the rule that makes agents reach for it
 ```
 
-Verify:
+Restart your agents afterwards — MCP servers and global instructions are read at
+session start.
+
+### What `--apply` will and will not do
+
+It edits config files this system did not create, so it has rules:
+
+- **Merge, never overwrite.** Your other MCP servers and unrelated settings
+  survive untouched. (The official Claude Desktop instruction is to "replace the
+  contents" of its config file, which destroys them.)
+- **Back up first**, to `<file>.brain-backup-<timestamp>`, named in the output.
+- **Refuse anything it cannot recognise** — a config with comments in it, a
+  shape it does not know — and print the snippet for you to paste instead.
+  Refusing is always available and always safe.
+- **Do nothing when already correct.** Re-running is the repair when wiring
+  drifts, so it costs nothing.
+- **`--all` only writes to clients that are actually installed.** Creating
+  `~/.codex/config.toml` on a machine with no Codex is litter. Naming a client
+  explicitly is different — that is you saying you want it.
+
+See exactly what would change, first:
 
 ```sh
-claude mcp list          # → brain: .../bin/brain-mcp - ✔ Connected
-bin/brain doctor         # → [ok ] git hooks installed
+bin/brain connect cursor --apply --dry-run
 ```
 
----
+### Doing it by hand
 
-## Part 2b — Any other agent (optional)
-
-Skip if you only use Claude Code. Otherwise, one command prints the exact
-registration for any supported client, plus where that client reads a global
-routing rule and what silently breaks:
+`--apply` is opt-in. Everything it does, you can do yourself — that is what this
+command did before `--apply` existed, and it still works:
 
 ```sh
-bin/brain connect              # list the clients it knows
-bin/brain connect codex        # exact snippet + gotchas for one of them
+bin/brain connect              # what is here, and what it is wired to
+bin/brain connect codex        # the exact snippet + the gotchas, for one client
 bin/brain connect --all        # every client at once
+bin/brain connect --routing    # the routing block itself
 ```
 
-Supported: `codex` (OpenAI Codex CLI), `gemini` (Gemini CLI), `cursor`,
-`vscode` (+ Copilot), `windsurf` (Windsurf/Devin), `claude-desktop`, and
-`claude-code` (which Part 2 already did). The server is identical for all of
-them — stdio, command `<repo>/bin/brain-mcp`, args `[]`. Only the config
-spelling differs, and it differs in ways that fail *silently* (three different
-top-level keys), which is why `connect` prints the exact one per client instead
-of leaving you to guess.
+Supported: `claude-code`, `codex` (OpenAI Codex CLI), `gemini` (Gemini CLI),
+`cursor`, `vscode` (+ Copilot), `windsurf` (Windsurf/Devin), `claude-desktop`.
+The server is identical for all of them — stdio, command `<repo>/bin/brain-mcp`,
+args `[]`. Only the config spelling differs, and it differs in ways that fail
+*silently*: three different top-level keys, two file formats, and one client
+with no global instruction file at all.
 
-The connect output tells you the per-client restart step and, for clients that
-have one, the ignore file. Write those ignore files with:
-
-```sh
-bin/brain connect --write-ignores   # .cursorignore / .geminiignore / .devinignore
-```
-
-They keep a client's *own* index out of `archive/`, `inbox/`, `journal/` and
-`vault/`. They are a backstop, not a guarantee — see the note in Part 3.
-
----
-
-## Part 3 — Tell your agent the brain exists (global routing)
-
-This is what makes an agent *reach for* the brain unprompted. Without it the
-tools exist but nothing routes questions to them. Print the exact block,
-already filled in with your repo path:
-
-```sh
-bin/brain connect --routing
-```
-
-Then paste it into wherever your agent reads global instructions:
+Where each client reads its global routing rule:
 
 | Agent | Global instruction file |
 |---|---|
@@ -220,73 +280,92 @@ Then paste it into wherever your agent reads global instructions:
 | Cursor | No file — Settings → Customize → Rules → User Rules (paste it there) |
 | Claude Desktop | No file — it reads none; rely on the server's tool descriptions |
 
-(`bin/brain connect <client>` names the exact path for that client too.)
+The last two are why `--routing --apply` reports "skipped" for some clients: no
+file exists to write.
 
-**Both halves of the block matter**: the first paragraph makes the agent
-RETRIEVE, the second makes it OFFER TO CAPTURE. Ship only the first and you get
-a brain that answers but never grows — every session's reasoning is lost at the
-moment it was worth keeping.
+### Why the routing block matters
 
-One line in that block is load-bearing and worth understanding: *retrieve
-through the brain's tools, never through the agent's own file index.* Several
-agents ship a semantic codebase search that does not honour this repo's ignore
-rules — it will return `archive/` (superseded — wrong) and `inbox/`
-(unconsolidated) as if current, and it strips the trust signals (`[provisional
-— unconsolidated]`, the ARCHIVED banner) that are the only thing marking a
-stale note as stale. The ignore files from Part 2b narrow that blast radius;
-the rule in the routing block is what actually holds.
+Without it the tools exist but nothing routes questions to them. **Both halves
+of the block are load-bearing**: the first paragraph makes the agent RETRIEVE,
+the second makes it OFFER TO CAPTURE. Ship only the first and you get a brain
+that answers but never grows — every session's reasoning lost at the moment it
+was worth keeping.
 
-**Restart your agent now** — MCP servers and (for Claude Code) skills load at
-session start.
+The block is written between markers:
 
----
-
-## Part 4 — Claude Desktop chat (optional)
-
-Normal desktop chat can use the brain too. Edit
-`~/Library/Application Support/Claude/claude_desktop_config.json` and **merge**
-this in (don't delete existing keys; create the file if absent):
-
-```json
-{
-  "mcpServers": {
-    "brain": {
-      "command": "/Users/<you>/brain/bin/brain-mcp",
-      "args": []
-    }
-  }
-}
+```
+<!-- brain:routing:start -->  …  <!-- brain:routing:end -->
 ```
 
-The path must be absolute. Restart the Claude Desktop app. Chat now has
-`brain_search` / `brain_read` / `brain_recent` / `brain_capture` — and capture
-still commits + pushes, because the server does the git work itself.
+which is what lets `connect --routing --apply` update it in place as this system
+changes, and lets `brain retire` take it back out again. If you paste it by
+hand, keep the markers.
 
-## Part 5 — Cowork (optional)
+One line inside it is worth understanding: *retrieve through the brain's tools,
+never through the agent's own file index.* Several agents ship a semantic
+codebase search that does not honour this repo's ignore rules — it will return
+`archive/` (superseded — wrong) and `inbox/` (unconsolidated) as if current, and
+it strips the trust signals (`[provisional — unconsolidated]`, the ARCHIVED
+banner) that are the only thing marking a stale note as stale. Ignore files
+narrow that blast radius:
 
-In Cowork, connect `~/brain` as a folder. Local Cowork sessions can then
-read/write your notes directly (guided by the repo's `AGENTS.md`). Notes:
-local sessions only — remote/cloud sessions can't reach local folders or
-local MCP servers. Don't worry about Cowork breaking things: the commit gate
-validates whatever any agent writes, and the nightly doctor flags anything
-left uncommitted.
+```sh
+bin/brain connect --write-ignores   # .cursorignore / .geminiignore / .devinignore
+```
 
-## Part 6 — claude.ai web and mobile
+They are a backstop, not a guarantee. The rule in the routing block is what
+actually holds.
 
-Not supported — they can't run local processes. (Closable later by hosting
-`brain-mcp` behind HTTP as a custom connector; deliberately not part of v1.)
+### Claude Code specifics
+
+`brain connect claude-code --apply` runs the repo's own wiring: git hooks,
+`.mcp.json` for sessions started *inside* the repo, the rendered `/brain` skill,
+a link into `~/.claude/skills/`, and `claude mcp add --scope user` so sessions in
+*any* directory get the brain tools. The same routine is available directly as
+`bin/brain init`, which is the documented repair when a machine's wiring drifts.
+
+`.mcp.json` and `setup/skills/brain/SKILL.md` hold this machine's absolute paths
+and are gitignored. Every machine regenerates its own; do not commit them.
+
+**Never run `bin/brain init` from a scratch or template copy** — it re-points the
+global `~/.claude/skills/brain` link at whatever checkout it ran in, hijacking
+the `/brain` skill for every session on the machine. Repair by re-running it from
+the real brain.
+
+Verify:
+
+```sh
+claude mcp list          # → brain: .../bin/brain-mcp - ✔ Connected
+bin/brain connect        # → claude-code … wired to this brain, routing block in place
+```
+
+### Cowork
+
+Connect `~/brain` as a folder. Local Cowork sessions can then read/write your
+notes directly (guided by the repo's `AGENTS.md`). Local sessions only —
+remote/cloud sessions cannot reach local folders or local MCP servers. The
+commit gate validates whatever any agent writes, and the nightly doctor flags
+anything left uncommitted.
+
+### claude.ai web and mobile
+
+Not supported yet — they cannot run local processes. `brain serve` is the
+planned answer (host `brain-mcp` behind HTTP as a custom connector) and is not
+built. It carries its own security review because a tunnel that publishes an
+unauthenticated origin would expose a **write** tool.
 
 ---
 
-## Part 7 — Schedules (recommended)
+## Part 3 — Schedules (recommended)
 
 ```sh
 bin/brain schedule install --with-consolidate   # nightly doctor + weekly tidy
 bin/brain schedule install                      # doctor only, no consolidation
 ```
 
-The nightly doctor writes `.cache/doctor-report.txt` and shows a macOS
-notification only when something is red.
+The scheduler is per-platform (`launchd` / `systemd --user` / `schtasks`); the
+command is the same everywhere. The nightly doctor writes
+`.cache/doctor-report.txt` and notifies only when something is red.
 
 Install the consolidation job too — it is not decoration. The capture policy in
 `AGENTS.md` deliberately captures generously into `inbox/`, and consolidation
@@ -360,7 +439,9 @@ The nightly local `doctor` is the primary alarm regardless; this is the
 belt-and-braces that still fires when the laptop is off. (GitHub also pauses
 scheduled workflows after ~60 days of no repo activity.)
 
-## Part 8 — First run: prove the whole loop
+---
+
+## Part 4 — First run: prove the whole loop
 
 ```sh
 bin/brain capture "The brain is alive as of $(date +%F)" --commit
@@ -399,9 +480,13 @@ test suite cannot do for you.
 
 ---
 
-## Part 9 — Vault for sensitive notes (optional)
+## Part 5 — Vault for sensitive notes (optional)
 
-For notes too sensitive for plaintext on GitHub (health, money, IDs):
+For notes too sensitive for plaintext on GitHub (health, money, IDs). The key
+storage differs per platform — Keychain on macOS, Credential Manager on Windows,
+a file at mode 0600 on Linux — and `bin/brain` uses whichever is present.
+
+macOS:
 
 ```sh
 brew install age
@@ -413,30 +498,39 @@ age-keygen -y ~/.config/brain/vault-key.txt > setup/vault-recipient.txt
 git add setup/vault-recipient.txt && git commit -m "vault: add public recipient"
 ```
 
+Linux: the same, minus the `security` line — the key file at
+`~/.config/brain/vault-key.txt` with mode 0600 *is* the store. Install `age` with
+your package manager.
+
 Also copy the private key into your password manager — **the key IS the
 vault**; lose both copies and encrypted notes are gone forever. Encrypting
 and reading: see `setup/runbooks/vault.md`. Lint enforces the boundary: no
 plaintext in `vault/`, no `sensitivity: private` outside it, everywhere.
 
-## Part 10 — Second machine
+## Part 6 — Second machine
 
 ```sh
 git clone https://github.com/<you>/my-brain.git ~/brain
-cd ~/brain && bin/brain init && bin/brain schedule install --with-consolidate
-# vault access, if used — write to a temp file FIRST, then move it into place.
-# `... -w > key.txt` truncates key.txt to zero bytes before security runs, so
-# if the keychain item is missing (the default on a new machine) the redirect
-# destroys the very key you were restoring.
+cd ~/brain
+bin/brain connect --all --apply
+bin/brain connect --routing --apply
+bin/brain schedule install --with-consolidate
+```
+
+No `setup` — the brain already exists; this machine only needs wiring. Vault
+access, if used (macOS) — write to a temp file FIRST, then move it into place.
+`... -w > key.txt` truncates `key.txt` to zero bytes before `security` runs, so
+if the keychain item is missing (the default on a new machine) the redirect
+destroys the very key you were restoring:
+
+```sh
 mkdir -p ~/.config/brain
 security find-generic-password -a "$USER" -s brain-vault-key -w > /tmp/vault-key.$$ \
   && mv /tmp/vault-key.$$ ~/.config/brain/vault-key.txt \
   || { rm -f /tmp/vault-key.$$; echo "no vault key in this machine's Keychain"; }
 ```
 
-Add the Part 3 routing block to that machine's agent (`bin/brain connect
---routing`), and Part 2b for any non-Claude client. Done.
-
-## Part 11 — Keeping the toolbelt up to date
+## Part 7 — Keeping the toolbelt up to date
 
 There is no automatic upgrade path, on purpose: your brain's `origin` is *your*
 private repo, not the template it came from, so a fix to `bin/brain` in the
@@ -467,17 +561,19 @@ and starter vocabulary over your real notes. Cherry-pick paths, as above.
 
 | Symptom | Fix |
 |---|---|
-| Brain tools don't appear in a session | Sessions load MCP at start — open a new session. Check `claude mcp list`; re-run `bin/brain init`. |
-| Desktop chat doesn't show the tools | Config path/JSON typo, or app not restarted. Path must be absolute. |
+| Brain tools don't appear in a session | Sessions load MCP at start — open a new session. `bin/brain connect` says what this machine is wired to; `--apply` re-wires it. |
+| An agent answers from the wrong notes | `bin/brain connect` — look for `WIRED TO A DIFFERENT brain`. A second clone or a moved brain leaves the old path registered. |
+| `--apply` refused | It printed why, and the snippet to paste instead. A config with comments in it is the usual cause: JSON with comments parses for the client and not for us, and rewriting it would delete them. |
+| Desktop chat doesn't show the tools | Config path/JSON typo, or app not restarted (Cmd-Q, not just closing the window). The command must be an absolute path. |
 | `commit blocked` with lint errors | That's the system working. Read the errors — each says exactly what to fix. `bin/brain lint` re-checks. |
 | `WARNING: the content gate is DOWN` | Lint itself crashed (not your content). Run `python3 bin/brain lint` to see why; commits still work meanwhile. |
 | Push rejected: `workflow scope` | Push once from a terminal (`git push`), or `gh auth refresh -s workflow`. |
 | Doctor: `no upstream tracking` | `git push -u origin main` once. |
 | Doctor: `not pushed — backup is behind; run: git push` | You're offline or the remote rejects; `git push` when back online. |
-| `claude: command not found` | Install Claude Code, then `claude mcp add --scope user brain ~/brain/bin/brain-mcp`. |
+| `claude: command not found` | Install Claude Code, then `bin/brain connect claude-code --apply`. |
 | Consolidation does nothing on schedule | The `claude` CLI must be logged in for headless runs; run `bin/brain consolidate` manually once to check. |
 
-## Uninstall / undo
+## Part 8 — `brain retire`
 
 To unwire a single machine while keeping the brain:
 
@@ -485,23 +581,33 @@ To unwire a single machine while keeping the brain:
 bin/brain schedule uninstall
 claude mcp remove --scope user brain           # if you wired Claude Code
 rm ~/.claude/skills/brain                       # removes the symlink only
-# remove the routing block from your agent's global instruction file, and any
-# per-client MCP registration you added in Part 2b. Your notes remain: they're
-# just files in git.
+# and remove the routing block between its markers from each instruction file.
+# Your notes remain: they're just files in git.
 ```
 
 To retire a brain entirely and start clean — the protected fresh start:
 
 ```sh
-bin/brain reset
+bin/brain retire --dry-run    # every safety check, the whole plan, changes nothing
+bin/brain retire              # the real thing
 ```
 
-`reset` is interactive and refuses without a terminal, so no agent can trigger
-it. It will not run until every commit on every branch is confirmed pushed
-(it fetches first), writes and verifies a `git bundle` of all history outside
-the repo, and makes you type a phrase computed from your live note count and
-remote. It then de-wires this machine and **moves** `~/brain` aside to
-`~/brain.retired-<timestamp>` — it deletes nothing, and it never touches the
-remote. When it finishes it prints exactly what it preserved (the remote, the
-bundle, the vault key, the routing block). Reinstall fresh with Part 1; delete
-the retired copy by hand once the new brain passes `doctor`.
+(`bin/brain reset` still works and says where it moved to.)
+
+`--dry-run` is the safe way to explore it, and it runs the checks for real
+rather than describing them. The command itself is interactive and refuses
+without a terminal, so no agent can trigger it. It will not run until every
+commit on every branch is confirmed pushed (it fetches first), writes and
+verifies a `git bundle` of all history outside the repo, and makes you type a
+phrase computed from your live note count and remote — so a phrase copied from
+a chat log will not match.
+
+It then de-wires this machine — schedules, the skill link, the MCP registration,
+and the routing block from every instruction file that has one between markers —
+and **moves** `~/brain` aside to `~/brain.retired-<timestamp>`. It deletes
+nothing, and it never touches the remote. A routing block written by hand,
+without markers, is named and left alone rather than guessed at.
+
+`bin/brain retire --explain` lists everything it preserves, in full. Reinstall
+fresh with Part 1; delete the retired copy by hand once the new brain passes
+`doctor`.

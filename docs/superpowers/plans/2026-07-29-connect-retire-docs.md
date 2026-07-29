@@ -241,9 +241,9 @@ Restructured to the four-command shape: `setup` / `connect` / `retire`, with `se
 
 Anything the previous plan changed and this file still describes the old way of is a lie a new user will follow: `bin/brain init` as a first-run step, the interactive `install.sh`, the manual paste of the routing block.
 
-- [ ] **Step 1: Rewrite**
-- [ ] **Step 2: Verify every command** — every command block in the file, run or explicitly marked as unverifiable here (macOS/Windows paths)
-- [ ] **Step 3: Commit** — `SETUP: restructure around setup, connect and retire`
+- [x] **Step 1: Rewrite**
+- [x] **Step 2: Verify every command** — every command block in the file, run or explicitly marked as unverifiable here (macOS/Windows paths)
+- [x] **Step 3: Commit** — `SETUP: restructure around setup, connect and retire`
 
 ---
 
