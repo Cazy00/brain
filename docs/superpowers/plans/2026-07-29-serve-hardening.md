@@ -141,17 +141,17 @@ Shape: five free attempts, then `min(1 * 2**(n-6), 300)` seconds — 1s, 2s, 4s 
 capped at five minutes. At the cap that is roughly twelve attempts an hour
 against a 256-bit secret.
 
-- [ ] **Step 1: Write the failing tests.** Unit, with an injected clock: free
+- [x] **Step 1: Write the failing tests.** Unit, with an injected clock: free
       attempts pass; the next one blocks; the backoff grows and is capped; time
       passing clears it; success clears it; a second key is untouched; the table
       stays bounded. Integration: a run of bad tokens ends in `429` carrying
       `Retry-After`; a good token interleaved resets the count; a fresh server
       answers the same good token `200`, proving it was the limiter and not the
       server.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `serve: make guessing the token cost something`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `serve: make guessing the token cost something`
 
 ---
 

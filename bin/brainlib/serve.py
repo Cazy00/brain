@@ -20,20 +20,24 @@ security contract is short, absolute, and each clause has a test:
 5. The token lives in the OS keystore. Never the repo (lint refuses credentials
    in tracked files and that rule is not being weakened for this), never a
    config file, never a URL.
+6. Failed authentication backs off, per address, and there is no flag to turn
+   it off. It is checked BEFORE the token is compared, so a blocked caller's
+   guess is never looked at. See Limiter for what that costs and who pays it.
 
 No TLS here, deliberately. The tunnel terminates TLS; this serves plaintext to
 loopback, which is correct, or to whatever the operator explicitly asked for,
 which is their call and is printed back to them.
 
-NOT BUILT, and tracked in docs/superpowers/BACKLOG.md rather than left as
-folklore — each of these is a decision somebody may need to revisit:
+`--read-only` serves the four read tools and refuses brain_capture, in the
+dispatcher rather than here — a transport that filters the advertised list and
+then runs whatever arrives has implemented a suggestion. It shrinks what can be
+DONE to the brain, not what can be read out of it, and for a second brain the
+reading is most of the exposure. Read-only is a property of the process, so
+serving both at once means two of them on two ports.
 
-- **No read-only mode.** brain_capture is reachable over this transport and it
-  writes. Splitting the tool list by a --read-only flag is the obvious shape;
-  the spec called it future work and it stayed that way.
-- **No rate limiting.** Fine on loopback, which is the default. The moment
-  anyone runs this on a public bind for real it stops being fine, and there is
-  nothing here that would slow a credential-stuffing loop down.
+NOT BUILT, and tracked in docs/superpowers/BACKLOG.md rather than left as
+folklore — a decision somebody may need to revisit:
+
 - **No OAuth.** Bearer only, which is what Claude Code and anything else that
   can set a header takes. claude.ai on the web, Desktop and mobile cannot use
   it: checked 2026-07-29, their per-user custom connector flow accepts OAuth
@@ -48,8 +52,11 @@ they are a MAY and this server is stateless.
 """
 import hmac
 import json
+import math
 import secrets
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -69,6 +76,117 @@ MAX_BODY_BYTES = 10_000_000
 # deliberate edit rather than something that happens by accident.
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18",
                                "2025-11-25")
+
+
+# Failed-authentication backoff. Five attempts are free — a stale token in a
+# client, a paste that dropped a character, a colleague trying the wrong one —
+# and every failure after that costs 1s, 2s, 4s … up to five minutes. Against
+# 32 random bytes the arithmetic was never the problem; this is what turns
+# "guessing it is not practical" from an argument into a control.
+AUTH_FREE_ATTEMPTS = 5
+AUTH_BACKOFF_BASE_SECONDS = 1.0
+AUTH_BACKOFF_CAP_SECONDS = 300.0
+# Forget an address that has been quiet for an hour, and never track more than
+# this many at once. Both are about the limiter's own footprint, not the attack.
+AUTH_IDLE_SECONDS = 3600.0
+AUTH_MAX_KEYS = 4096
+
+
+class Limiter:
+    """Per-address backoff on failed authentication.
+
+    Keyed on the TCP peer address, and `X-Forwarded-For` is deliberately NOT
+    consulted: a header the client sets is a header an attacker rotates, so
+    trusting it would swap a real control for one that is stepped around by
+    editing a request. The cost of that choice is stated rather than hidden —
+    behind a tunnel every client arrives as the tunnel, so a guessing run
+    through it slows down everything else through it too. That is the direction
+    this should fail in.
+
+    Only failed authentication is counted. An Origin refusal is not, and that
+    is not an oversight: those requests come from the operator's own browser,
+    driven by whatever page asked for them, so counting them would let any web
+    page lock the operator out of their own brain with a `fetch` in a loop.
+
+    The backoff escalates on failed AUTHENTICATION, not on refused requests: a
+    caller who keeps hammering while blocked is turned away without their count
+    moving, so the wait they were told about is the wait they get. Escalating on
+    blocked requests too would be a stronger control against one attacker and a
+    permanent lockout for everyone sharing a tunnel with them — Retry-After
+    should mean what it says.
+
+    The clock is a parameter so the tests can assert on a five-minute backoff
+    without waiting five minutes for it.
+    """
+
+    def __init__(self, free: int = AUTH_FREE_ATTEMPTS,
+                 base: float = AUTH_BACKOFF_BASE_SECONDS,
+                 cap: float = AUTH_BACKOFF_CAP_SECONDS,
+                 idle: float = AUTH_IDLE_SECONDS,
+                 max_keys: int = AUTH_MAX_KEYS,
+                 clock=time.monotonic):
+        self._free = free
+        self._base = base
+        self._cap = cap
+        self._idle = idle
+        self._max_keys = max_keys
+        self._clock = clock
+        # ThreadingHTTPServer means concurrent handlers share this table.
+        self._lock = threading.Lock()
+        self._state = {}          # address -> [failures, blocked_until, last_seen]
+
+    def retry_after(self, key) -> int:
+        """Whole seconds this address must wait, or 0. Whole, because that is
+        what a Retry-After header carries."""
+        with self._lock:
+            entry = self._state.get(key)
+            if entry is None:
+                return 0
+            remaining = entry[1] - self._clock()
+            return int(math.ceil(remaining)) if remaining > 0 else 0
+
+    def failed(self, key) -> None:
+        now = self._clock()
+        with self._lock:
+            self._prune(now)
+            entry = self._state.get(key) or [0, 0.0, now]
+            entry[0] += 1
+            entry[2] = now
+            over = entry[0] - self._free
+            if over > 0:
+                entry[1] = now + min(self._base * (2 ** (over - 1)), self._cap)
+            self._state[key] = entry
+
+    def succeeded(self, key) -> None:
+        """Forget this address. A count that survived a correct token would
+        have a client which reconnects all day blocked by this morning's typo."""
+        with self._lock:
+            self._state.pop(key, None)
+
+    def tracked(self) -> int:
+        with self._lock:
+            return len(self._state)
+
+    def _prune(self, now: float) -> None:
+        """Bound the table. The caller holds the lock.
+
+        A dict keyed by remote address that only ever grows is a memory
+        exhaustion primitive reachable by anyone who can send one unauthorised
+        request — a limiter that becomes the denial of service it was added to
+        prevent is worse than no limiter at all.
+
+        Evicting the least recently seen when full does mean somebody able to
+        arrive from many addresses can push a real entry out. That costs them
+        the backoff they had already earned and costs the operator nothing,
+        which is the right way round.
+        """
+        for key in [k for k, entry in self._state.items()
+                    if now - entry[2] > self._idle]:
+            del self._state[key]
+        if len(self._state) >= self._max_keys:
+            ordered = sorted(self._state.items(), key=lambda kv: kv[1][2])
+            for key, _entry in ordered[:len(self._state) - self._max_keys + 1]:
+                del self._state[key]
 
 
 def mint_token() -> str:
@@ -135,9 +253,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _allowed(self) -> bool:
-        """Origin, then token. Everything else happens after both."""
+        """Backoff, then Origin, then token. Everything else follows all three.
+
+        The order is the design. A blocked address is refused before its guess
+        is looked at, which is the entire slow-down — a guess that is never
+        compared cannot be a guess that succeeds. The price is that a CORRECT
+        token from a blocked address waits too, which is deliberate and is the
+        same trade every SSH server on the internet makes.
+        """
+        peer = self.client_address[0]
+        wait = self.server.limiter.retry_after(peer)
+        if wait:
+            self._refuse(429, "too many failed authentication attempts from "
+                              f"this address; retry in {wait}s",
+                         {"Retry-After": str(wait)})
+            return False
+
         origin = self.headers.get("Origin")
         if origin and origin not in self.server.allow_origin:
+            # Not counted against the limiter, on purpose — see Limiter.
             self._refuse(403, "this server does not accept browser origins")
             return False
 
@@ -148,9 +282,11 @@ class _Handler(BaseHTTPRequestHandler):
         # must not short-circuit.
         if scheme.lower() != "bearer" or not hmac.compare_digest(
                 value.strip(), self.server.token):
+            self.server.limiter.failed(peer)
             self._refuse(401, "a bearer token is required",
                          {"WWW-Authenticate": 'Bearer realm="brain"'})
             return False
+        self.server.limiter.succeeded(peer)
 
         version = self.headers.get("MCP-Protocol-Version")
         if version and version not in SUPPORTED_PROTOCOL_VERSIONS:
@@ -237,7 +373,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
                 allow_origin=(), quiet: bool = False,
-                allow_tools=None) -> ThreadingHTTPServer:
+                allow_tools=None, limiter=None) -> ThreadingHTTPServer:
     """A configured, unstarted server. Refuses to exist without a token.
 
     Raising here rather than at the call site is deliberate: this is the
@@ -255,6 +391,10 @@ def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
     server.allow_origin = tuple(allow_origin)
     server.quiet = quiet
     server.allow_tools = None if allow_tools is None else frozenset(allow_tools)
+    # Always one, never optional: there is no flag to turn it off, because the
+    # only argument for turning it off is that guessing was never going to work
+    # anyway — which is an argument, and this is a control.
+    server.limiter = limiter or Limiter()
     return server
 
 

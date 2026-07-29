@@ -41,11 +41,15 @@ NOTIFY = {"jsonrpc": "2.0", "method": "notifications/initialized"}
 class ServeCase(unittest.TestCase):
     ALLOW_ORIGIN = ()
     ALLOW_TOOLS = None          # None means every tool, which is the default
+    FREE_ATTEMPTS = None        # None means the server's own limiter settings
 
     def setUp(self):
+        limiter = None if self.FREE_ATTEMPTS is None else \
+            serve.Limiter(free=self.FREE_ATTEMPTS)
         self.server = serve.make_server(BEARER, "127.0.0.1", 0,
                                         allow_origin=self.ALLOW_ORIGIN,
-                                        allow_tools=self.ALLOW_TOOLS)
+                                        allow_tools=self.ALLOW_TOOLS,
+                                        limiter=limiter)
         self.port = self.server.server_address[1]
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
@@ -329,6 +333,169 @@ class TestTheReadOnlySetIsDerivedFailingClosed(unittest.TestCase):
     def test_the_write_tool_is_not_in_the_read_only_set(self):
         self.assertNotIn("brain_capture", mcp.READ_ONLY_TOOLS)
         self.assertEqual(len(mcp.READ_ONLY_TOOLS), len(mcp.TOOLS) - 1)
+
+
+class TestTheLimiter(unittest.TestCase):
+    """The backoff itself, with the clock as a parameter.
+
+    Nothing here sleeps. A suite that waits five minutes to observe a five
+    minute block is a suite somebody deletes within a month, and its absence
+    then reads as "this was considered and found unnecessary".
+    """
+
+    def setUp(self):
+        self.now = 1000.0
+
+    def limiter(self, free=3, base=1.0, cap=300.0, **kw):
+        return serve.Limiter(free=free, base=base, cap=cap,
+                             clock=lambda: self.now, **kw)
+
+    def test_the_first_failures_are_free(self):
+        """A typo, a stale token in a client, a paste that dropped a character
+        — none of those should cost anything."""
+        limiter = self.limiter(free=3)
+        for _ in range(3):
+            limiter.failed("10.0.0.1")
+            self.assertEqual(limiter.retry_after("10.0.0.1"), 0)
+
+    def test_the_next_failure_starts_the_backoff(self):
+        limiter = self.limiter(free=3)
+        for _ in range(4):
+            limiter.failed("10.0.0.1")
+        self.assertEqual(limiter.retry_after("10.0.0.1"), 1)
+
+    def test_the_backoff_doubles_and_is_capped(self):
+        limiter = self.limiter(free=0, base=1.0, cap=8.0)
+        for expected in (1, 2, 4, 8, 8, 8):
+            limiter.failed("10.0.0.1")
+            self.assertEqual(limiter.retry_after("10.0.0.1"), expected)
+
+    def test_time_passing_clears_the_block(self):
+        limiter = self.limiter(free=0, base=4.0)
+        limiter.failed("10.0.0.1")
+        self.assertEqual(limiter.retry_after("10.0.0.1"), 4)
+        self.now += 4.0
+        self.assertEqual(limiter.retry_after("10.0.0.1"), 0)
+
+    def test_a_correct_token_clears_the_count(self):
+        """Otherwise a client that reconnects all day accumulates its way to a
+        block on the strength of one typo this morning."""
+        limiter = self.limiter(free=2)
+        for _ in range(2):
+            limiter.failed("10.0.0.1")
+        limiter.succeeded("10.0.0.1")
+        # Four failures in total now. Without the reset that is two past the
+        # allowance and a block; with it, the count starts again at zero.
+        for _ in range(2):
+            limiter.failed("10.0.0.1")
+        self.assertEqual(limiter.retry_after("10.0.0.1"), 0,
+                         "the count survived a successful authentication")
+
+    def test_one_address_does_not_block_another(self):
+        limiter = self.limiter(free=0)
+        limiter.failed("10.0.0.1")
+        self.assertTrue(limiter.retry_after("10.0.0.1"))
+        self.assertEqual(limiter.retry_after("10.0.0.2"), 0)
+
+    def test_the_table_does_not_grow_without_bound(self):
+        """A dict keyed by remote address that only ever grows is a memory
+        exhaustion primitive, reachable by anyone who can send an unauthorised
+        request. A limiter that becomes the denial of service it was added to
+        prevent is worse than no limiter."""
+        limiter = self.limiter(free=0, max_keys=64)
+        for n in range(1000):
+            limiter.failed("10.0.%d.%d" % (n // 256, n % 256))
+        self.assertLessEqual(limiter.tracked(), 64)
+
+    def test_entries_that_have_gone_quiet_are_forgotten(self):
+        limiter = self.limiter(free=0, idle=60.0)
+        limiter.failed("10.0.0.1")
+        self.now += 61.0
+        limiter.failed("10.0.0.2")
+        self.assertEqual(limiter.tracked(), 1)
+
+
+class TestFailedAuthIsRateLimited(ServeCase):
+    """The limiter through the socket, which is the only place it matters."""
+    FREE_ATTEMPTS = 2
+
+    def fail_until_blocked(self):
+        for _ in range(self.FREE_ATTEMPTS + 1):
+            status, _headers, _body = self.request(PING, bearer="wrong")
+            self.assertEqual(status, 401, "a wrong token stopped being a 401")
+
+    def test_a_run_of_bad_tokens_ends_in_429(self):
+        self.fail_until_blocked()
+        status, headers, _body = self.request(PING, bearer="wrong")
+        self.assertEqual(status, 429)
+        self.assertIn("Retry-After", headers,
+                      "a 429 without Retry-After tells a client nothing about when "
+                      "to come back, so it comes back immediately")
+        self.assertGreater(int(headers["Retry-After"]), 0)
+
+    def test_the_block_holds_against_the_correct_token_too(self):
+        """Deliberate, and the honest cost of the control.
+
+        The block is checked BEFORE the token is compared — that is the whole
+        slow-down, because a guess that is never looked at cannot be a guess
+        that succeeds. The price is that the operator's own next request waits,
+        which is the same trade every SSH server on the internet makes.
+        """
+        self.fail_until_blocked()
+        status, _headers, _body = self.request(PING, bearer=BEARER)
+        self.assertEqual(status, 429)
+
+    def test_a_good_token_resets_the_count(self):
+        for _ in range(self.FREE_ATTEMPTS):
+            self.request(PING, bearer="wrong")
+        self.assertEqual(self.request(PING)[0], 200)
+        for _ in range(self.FREE_ATTEMPTS):
+            self.assertEqual(self.request(PING, bearer="wrong")[0], 401)
+        self.assertEqual(self.request(PING)[0], 200,
+                         "a successful authentication did not clear the count")
+
+    def test_an_origin_refusal_is_not_counted(self):
+        """Counting them would hand any web page a lockout.
+
+        A page on evil.com can make the operator's own browser send requests to
+        127.0.0.1 — refused on Origin, and from the operator's own address. If
+        those counted, a `fetch` in a loop would lock the operator out of their
+        own brain: the limiter would become the attack it exists to blunt.
+        """
+        for _ in range(self.FREE_ATTEMPTS + 5):
+            status, _headers, _body = self.request(
+                PING, extra={"Origin": "https://evil.example"})
+            self.assertEqual(status, 403)
+        self.assertEqual(self.request(PING)[0], 200,
+                         "browser origins locked the operator out")
+
+
+class TestTheLimiterIsNotTheServer(ServeCase):
+    """A control that cannot be told apart from a broken server is not a
+    control anybody can debug. A fresh server answers the same good token."""
+    FREE_ATTEMPTS = 1
+
+    def test_a_fresh_server_answers_the_token_the_blocked_one_refused(self):
+        for _ in range(self.FREE_ATTEMPTS + 1):
+            self.request(PING, bearer="wrong")
+        self.assertEqual(self.request(PING, bearer=BEARER)[0], 429)
+
+        other = serve.make_server(BEARER, "127.0.0.1", 0)
+        self.addCleanup(other.server_close)
+        thread = threading.Thread(target=other.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(other.shutdown)
+
+        conn = http.client.HTTPConnection("127.0.0.1", other.server_address[1],
+                                          timeout=15)
+        try:
+            conn.request("POST", serve.ENDPOINT, body=json.dumps(PING).encode("utf-8"),
+                         headers={"Authorization": f"Bearer {BEARER}",
+                                  "Content-Type": "application/json"})
+            self.assertEqual(conn.getresponse().status, 200)
+        finally:
+            conn.close()
 
 
 class TestTokenStorage(unittest.TestCase):
