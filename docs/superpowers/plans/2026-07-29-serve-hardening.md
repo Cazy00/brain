@@ -178,14 +178,14 @@ not a place Windows keeps anything — so the workaround is too, and the fallbac
 is today's construction with a comment saying why. Windows CI must stay exactly
 as green (or as red) as it is now; this task is not the place to change it.
 
-- [ ] **Step 1: Determine empirically what `init` needs on PATH** — run it with
+- [x] **Step 1: Determine empirically what `init` needs on PATH** — run it with
       a minimal one and add what actually breaks, rather than guessing from the
       source
-- [ ] **Step 2: Implement**
-- [ ] **Step 3: Run the full suite and confirm it is green on this machine** —
+- [x] **Step 2: Implement**
+- [x] **Step 3: Run the full suite and confirm it is green on this machine** —
       445 passing, zero failures, which it has not been at any point in this
       plan's predecessors
-- [ ] **Step 4: Commit** — `tests: a no-claude PATH that is actually claude-free`
+- [x] **Step 4: Commit** — `tests: a no-claude PATH that is actually claude-free`
 
 ---
 

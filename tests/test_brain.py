@@ -582,25 +582,56 @@ class InitTests(unittest.TestCase):
     def claude_calls(self):
         return self.calls.read_text(encoding="utf-8") if self.calls.exists() else ""
 
+    # What cmd_init actually reaches for through PATH, established by running
+    # it against progressively smaller ones rather than by reading the source
+    # and hoping: `git` for the hooks step, and `cat` because the stubbed
+    # claude above is a shell script that heredocs its replies. Everything else
+    # init runs it finds by absolute path (sys.executable) or does without.
+    INIT_PATH_TOOLS = ("git", "cat")
+
+    def tool_bin(self):
+        """A bin directory holding INIT_PATH_TOOLS — and no `claude`.
+
+        Built rather than borrowed, which is the entire point: see env_with.
+        """
+        bindir = Path(self.tmp.name) / "toolbin"
+        if bindir.is_dir():
+            return str(bindir)
+        bindir.mkdir()
+        for name in self.INIT_PATH_TOOLS:
+            real = shutil.which(name)
+            if real:
+                os.symlink(real, bindir / name)
+        return str(bindir)
+
     def env_with(self, claude=True):
         """A PATH with, or without, a `claude` on it.
 
-        KNOWN LIMITATION, recorded 2026-07-29 so nobody re-derives it: the
-        no-claude PATH still contains /usr/bin, so on a machine where Claude
-        Code is installed THERE (some Linux packages do) the sandbox is not
-        actually claude-free and the assertion below fails. That is the
-        assertion working — it refuses to run a test whose premise is false —
-        but it means the suite is red on those machines for a reason unrelated
-        to the change under test.
+        The PATH is a directory of symlinks to just the tools init needs, not
+        the system directories, and the two branches differ by exactly one
+        thing: whether the stub is on it.
 
-        Not silenced, because a silent version of this test would pass while
-        proving nothing. Fixing it properly means a PATH built from a temp
-        directory of symlinks to just the tools init needs, which is fiddly to
-        keep working on Windows. Tracked in docs/superpowers/BACKLOG.md.
+        That construction is the fix for a real failure, not tidiness. The old
+        PATH contained /usr/bin, which is where some Linux packages install
+        `claude` — so on those machines the no-claude sandbox contained one, the
+        assertion below refused, and the suite was red for a reason unrelated to
+        anything under test. The assertion was right and stayed; what changed is
+        that the premise is now constructed instead of assumed. Silencing it
+        would have left a test that passes while proving nothing.
+
+        Windows keeps the previous construction unchanged. A symlink there needs
+        Developer Mode or admin, `git` is a shim that does not survive being
+        copied away from the libraries beside it, and /usr/bin — the whole
+        reason for any of this — does not exist. The bug is POSIX-only, so the
+        fix is, and this is not the place to change what CI does on Windows.
         """
-        git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
-        path = f"{self.stub_bin}:{git_dir}:/usr/bin:/bin" if claude \
-            else f"{git_dir}:/usr/bin:/bin"
+        if os.name == "nt":
+            git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+            path = f"{self.stub_bin}:{git_dir}:/usr/bin:/bin" if claude \
+                else f"{git_dir}:/usr/bin:/bin"
+        else:
+            path = os.pathsep.join([str(self.stub_bin), self.tool_bin()]) if claude \
+                else self.tool_bin()
         if not claude:
             self.assertIsNone(shutil.which("claude", path=path),
                               "test setup: claude still reachable on PATH")
