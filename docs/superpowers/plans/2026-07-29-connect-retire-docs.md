@@ -226,9 +226,9 @@ Order, per the owner: **how it works → install → the interesting parts.** It
 
 The current README opens with the problem and reaches Install at line 135, after the git primer. The primer moves to SETUP.md; the install section moves up and shrinks to the four commands that now exist.
 
-- [ ] **Step 1: Rewrite**
-- [ ] **Step 2: Check every command in it actually runs** — including on this machine, not just by eye
-- [ ] **Step 3: Commit** — `README: how it works, then install, then the interesting parts`
+- [x] **Step 1: Rewrite**
+- [x] **Step 2: Check every command in it actually runs** — including on this machine, not just by eye
+- [x] **Step 3: Commit** — `README: how it works, then install, then the interesting parts`
 
 ---
 

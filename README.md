@@ -5,13 +5,8 @@
 repo you own, wired so any MCP-capable agent can search it, read it, and add to
 it — and built to stay *accurate* as it gets large, not just to get large.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/Cazy00/brain/main/install.sh | sh
-```
-
 Works with Claude Code, OpenAI Codex CLI, Gemini CLI, Cursor, VS Code + Copilot,
-Windsurf, and Claude Desktop. macOS today; the core is portable Python and runs
-on Linux with two DIY pieces ([SETUP.md](SETUP.md)).
+Windsurf, and Claude Desktop. macOS, Linux and Windows.
 
 ---
 
@@ -31,17 +26,6 @@ superseded eighteen months ago.
 
 So most of this system is not storage. It is machinery for keeping knowledge
 true as it grows.
-
-## How it stays true
-
-| Mechanism | What it prevents |
-|---|---|
-| **Supersede protocol** | Outdated notes get `status: superseded` and physically **move out of the search scope**. Being wrong requires effort, not vigilance. |
-| **A commit gate that blocks** | Schema violations, secrets, dangling `[[links]]`, duplicate ids and half-finished supersedes are refused at `git commit`, and again in CI. |
-| **Generous capture, strict promotion** | Quick thoughts land in `inbox/`, outside default search. A weekly pass promotes the few that earn it and deletes the rest. |
-| **A validated link graph** | A `[[wikilink]]` to a note that does not exist fails the build. Links rot loudly instead of quietly. |
-| **Trust signals on every read** | `[provisional — unconsolidated]`, an ARCHIVED banner, a passed `review_by` — retrieval tells you how much to trust what it just handed you. |
-| **`brain stats`** | Measures the things that fail *silently*: findability, capture rate, staleness, curation, orphans. |
 
 ## The loop
 
@@ -90,27 +74,85 @@ every index is derived and can be deleted at any time. And **the tool layer is
 vendor-neutral**: `bin/brain-mcp` is a stdio MCP server with no vendor SDK, so
 switching models or agents loses nothing.
 
-## Git and GitHub — read this before you start
+## Install
 
-Your brain **is a git repository**, and that is the point: permanent, versioned,
-yours. Two consequences you have to accept:
+Two commands. The first gives you a working, backed-up brain; the second lets
+your agents reach it. Each ends in a working state, so stopping after either
+one is a legitimate place to stop.
 
-- **Every commit auto-pushes.** A hook pushes to your remote in the background.
-  That is the backup, and it makes a lost laptop a non-event.
-- **So the remote holds everything you ever record — it must be private.**
+**macOS and Linux**
 
-A brain in a public repo is every private thought you wrote down, world-readable,
-in a history that outlives deleting it. So `bin/brain doctor` checks on every run
-and fails loudly if your remote is publicly readable:
-
-```
-[RED] YOUR BRAIN IS PUBLIC — anyone on the internet can read every note in it.
-       Fix it now:  gh repo edit <you>/my-brain --visibility private …
+```sh
+curl -fsSL https://raw.githubusercontent.com/Cazy00/brain/main/install.sh | sh
 ```
 
-GitHub is the default because it is where most people are; any git remote works.
-Running with **no remote** is supported too — everything works except the backup,
-and doctor will remind you, every time, that your knowledge exists on one machine.
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/Cazy00/brain/main/install.ps1 | iex
+```
+
+Both do the same thing: check git and Python, fetch the template, and hand off
+to `brain setup`, which asks where the brain should live, gives it a git history
+that is **yours**, creates your **private** GitHub repo, and proves the result
+with `doctor`. Setup's exit code is doctor's, so an install it calls done is one
+the health check agrees with. Prefer to read it first? It is
+[one file](install.sh), and under 120 lines.
+
+Then, from the new brain:
+
+```sh
+brain connect                     # what this machine is wired to
+brain connect --all --apply       # register the server with every client found
+brain connect --routing --apply   # the rule that makes agents reach for it
+```
+
+### Prerequisites
+
+Nothing is ever installed for you. Setup prints the exact command and what you
+lose by skipping it.
+
+| | | Without it |
+|---|---|---|
+| `git` | **required** | Nothing works — the brain *is* a git repository |
+| `python3` ≥ 3.9 | **required** | The toolbelt and the MCP server are Python |
+| `gh` | optional | No automatic private backup; you create the GitHub repo yourself |
+| `gitleaks` | optional | The secret gate falls back to the built-in scanner alone |
+| `age` | optional | No encrypted vault for sensitive notes |
+| `rg` | optional | Search still works; the plain-grep tier is slower |
+
+### Handing this to an agent
+
+The whole install is scriptable, and setup speaks JSON for exactly this reason:
+
+> Install the brain from https://github.com/Cazy00/brain — run its install
+> script, then `bin/brain setup --json --yes`, then `bin/brain connect --all
+> --apply` and `bin/brain connect --routing --apply`. Report the JSON.
+
+**Claude Code users** can also install the plugin:
+
+```
+/plugin marketplace add Cazy00/brain
+/plugin install brain@cazy00
+```
+
+The plugin is wiring only — it registers the MCP server and ships the `/brain`
+skill, pointing at whatever brain repo you already have. Your notes never live
+in the plugin directory.
+
+Full guide, including schedules, the encrypted vault and a second machine:
+**[SETUP.md](SETUP.md)**. The rules notes are held to: **[AGENTS.md](AGENTS.md)**.
+
+## How it stays true
+
+| Mechanism | What it prevents |
+|---|---|
+| **Supersede protocol** | Outdated notes get `status: superseded` and physically **move out of the search scope**. Being wrong requires effort, not vigilance. |
+| **A commit gate that blocks** | Schema violations, secrets, dangling `[[links]]`, duplicate ids and half-finished supersedes are refused at `git commit`, and again in CI. |
+| **Generous capture, strict promotion** | Quick thoughts land in `inbox/`, outside default search. A weekly pass promotes the few that earn it and deletes the rest. |
+| **A validated link graph** | A `[[wikilink]]` to a note that does not exist fails the build. Links rot loudly instead of quietly. |
+| **Trust signals on every read** | `[provisional — unconsolidated]`, an ARCHIVED banner, a passed `review_by` — retrieval tells you how much to trust what it just handed you. |
+| **`brain stats`** | Measures the things that fail *silently*: findability, capture rate, staleness, curation, orphans. |
 
 ## Knowing it still works
 
@@ -132,30 +174,33 @@ must come back. It is the weakest query that has to work — if that misses,
 nothing you type will do better. `--record` appends a tracked history line, so
 the trend survives a re-clone.
 
-## Install
+`brain connect` answers the other half of the question: not whether the brain is
+healthy, but whether your agents are pointed at **this** one. A second clone, or
+a brain that moved, leaves an agent talking to a path that is not this one, and
+every tool call still succeeds — against nothing.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/Cazy00/brain/main/install.sh | sh
+## Your brain is a git repository
+
+That is the point: permanent, versioned, yours. Two consequences you have to
+accept:
+
+- **Every commit auto-pushes.** A hook pushes to your remote in the background.
+  That is the backup, and it makes a lost laptop a non-event.
+- **So the remote holds everything you ever record — it must be private.**
+
+A brain in a public repo is every private thought you wrote down, world-readable,
+in a history that outlives deleting it. So `bin/brain doctor` checks on every run
+and fails loudly if your remote is publicly readable:
+
+```
+[RED] YOUR BRAIN IS PUBLIC — anyone on the internet can read every note in it.
+       Fix it now:  gh repo edit <you>/my-brain --visibility private …
 ```
 
-Checks prerequisites, installs into `~/brain`, gives the clone a fresh git
-history that is **yours**, offers to create your **private** repo, wires this
-machine, and proves it with `doctor`. It refuses to install over a non-empty
-directory. Prefer to read it first? It is [one file](install.sh).
-
-**Claude Code users** can also install the plugin:
-
-```
-/plugin marketplace add Cazy00/brain
-/plugin install brain@cazy00
-```
-
-The plugin is wiring only — it registers the MCP server and ships the `/brain`
-skill, pointing at whatever brain repo you already have. Your notes never live
-in the plugin directory.
-
-Full guide, including other agents, schedules and the encrypted vault:
-**[SETUP.md](SETUP.md)**. The rules notes are held to: **[AGENTS.md](AGENTS.md)**.
+GitHub is the default because it is where most people are; any git remote works.
+Running with **no remote** is supported — everything works except the backup —
+but it is not a state this system will call finished: `doctor` reports it red
+every time, and so does `brain setup --no-repo`, on purpose.
 
 ## What it deliberately does not do
 
@@ -182,7 +227,11 @@ trusting.
 - **The privacy rule is instruction-enforced.** "Ask before recording anything
   about a person's private life" is followed by the model, not enforced by code,
   and commits auto-push. Weaker harnesses will eventually get this wrong.
-- **Not all of it is tested.** 209 runtime tests cover the toolbelt
+- **Windows is verified by CI only.** The test suite runs on all three
+  platforms; nobody on this project owns a Windows machine, so anything CI
+  cannot reach there — how the path picker feels in a real terminal, Credential
+  Manager prompts — is unverified rather than known to work.
+- **Not all of it is tested.** 407 runtime tests cover the toolbelt
   (`python3 -m unittest discover -s tests`). `schedule` and the vault flow are
   exercised by hand.
 
@@ -190,7 +239,7 @@ trusting.
 
 | | |
 |---|---|
-| [SETUP.md](SETUP.md) | Install, wire every agent, schedules, vault, troubleshooting |
+| [SETUP.md](SETUP.md) | The complete guide: install, wiring, schedules, vault, second machine, troubleshooting |
 | [AGENTS.md](AGENTS.md) | The protocol: note contract, capture policy, search tiers, supersede |
 | [docs/assets/BRIEFS.md](docs/assets/BRIEFS.md) | Visual asset specifications |
 | `bin/brain --help` | Every command |
