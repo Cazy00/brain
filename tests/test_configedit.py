@@ -127,6 +127,30 @@ class TestJsonMerge(ConfigEditCase):
             configedit.apply_json(path, "mcpServers", "brain", ENTRY).action,
             "refused")
 
+    def test_a_dry_run_shows_exactly_what_apply_would_write(self):
+        """The one property that makes --dry-run worth trusting.
+
+        A preview built by a second code path is a preview that can disagree
+        with the write — and it would disagree exactly where the write is
+        unusual, which is the case somebody ran --dry-run to check.
+        """
+        path = self.base / "mcp.json"
+        path.write_text('{"mcpServers": {"other": {"command": "/x", "args": []}}}',
+                        encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+
+        planned = configedit.apply_json(path, "mcpServers", "brain", ENTRY,
+                                        dry_run=True)
+        self.assertEqual(path.read_text(encoding="utf-8"), before,
+                         "a dry run wrote to the file")
+        self.assertEqual(self.backups(), [], "a dry run made a backup")
+        self.assertIn("would", planned.detail)
+
+        real = configedit.apply_json(path, "mcpServers", "brain", ENTRY)
+        self.assertEqual(planned.action, real.action)
+        self.assertEqual(planned.preview, path.read_text(encoding="utf-8"),
+                         "the dry run showed something other than what was written")
+
     @unittest.skipIf(os.name == "nt", "POSIX file modes only")
     def test_the_files_permissions_survive_the_rewrite(self):
         # Written through a temp file and os.replace, so a half-written config

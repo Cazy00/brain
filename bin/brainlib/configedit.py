@@ -49,7 +49,8 @@ class Outcome:
     nothing to paste has turned a working manual path into a dead end.
     """
 
-    def __init__(self, action: str, detail: str, backup: str = "", snippet: str = ""):
+    def __init__(self, action: str, detail: str, backup: str = "", snippet: str = "",
+                 preview: str = ""):
         if action not in _ACTIONS:
             raise ValueError(f"action must be one of {_ACTIONS}, got {action!r}")
         if action == "refused" and not (snippet or "").strip():
@@ -58,6 +59,11 @@ class Outcome:
         self.detail = detail
         self.backup = backup
         self.snippet = snippet
+        # The whole file as it would be after the edit. Set on every write and
+        # on every dry run, so --dry-run diffs the real proposed content rather
+        # than a second, hand-built approximation of it that could disagree
+        # with what --apply actually does.
+        self.preview = preview
 
     @property
     def changed(self) -> bool:
@@ -108,7 +114,27 @@ def _write(path: Path, text: str) -> None:
         raise
 
 
-def apply_json(path, container: str, name: str, entry: dict) -> Outcome:
+def _commit(path: Path, new_text: str, dry_run: bool, action: str, verb: str) -> Outcome:
+    """The single place a write happens, so backup-then-write cannot be skipped.
+
+    Every caller routes through here, which is what keeps `--dry-run` honest:
+    it reports the same proposed text the real run would write, rather than a
+    second rendering of it that could quietly drift out of step.
+
+    `verb` is the stem — "add the brain server to X" — so that one string
+    serves both "would add ..." and "added ...". Two hand-written tenses per
+    call site is two chances for them to describe different things.
+    """
+    if dry_run:
+        return Outcome(action, "would " + verb, preview=new_text)
+    backup = _backup(path) if path.exists() else ""
+    _write(path, new_text)
+    stem, _, rest = verb.partition(" ")
+    past = stem + ("d " if stem.endswith("e") else "ed ") + rest
+    return Outcome(action, past, backup=backup, preview=new_text)
+
+
+def apply_json(path, container: str, name: str, entry: dict, dry_run: bool = False) -> Outcome:
     """Merge one server entry into a JSON config under `container`.
 
     `container` differs per client and the difference is silent: VS Code reads
@@ -119,8 +145,8 @@ def apply_json(path, container: str, name: str, entry: dict) -> Outcome:
     snippet = json.dumps({container: {name: entry}}, indent=2)
 
     if not path.exists():
-        _write(path, snippet + "\n")
-        return Outcome("created", f"created {path} with the brain server")
+        return _commit(path, snippet + "\n", dry_run, "created",
+                       f"create {path} with the brain server")
 
     text = _read(path)
     try:
@@ -151,13 +177,12 @@ def apply_json(path, container: str, name: str, entry: dict) -> Outcome:
     servers = dict(servers)
     servers[name] = entry
     parsed[container] = servers
-    backup = _backup(path)
     # Re-serialised at indent 2 rather than patched in place: without a parser
     # that preserves formatting there is no way to do better, and the backup is
     # what makes reformatting recoverable.
-    _write(path, json.dumps(parsed, indent=2) + "\n")
-    verb = "repointed" if had else "added"
-    return Outcome("updated", f"{verb} the brain server in {path}", backup=backup)
+    return _commit(path, json.dumps(parsed, indent=2) + "\n", dry_run, "updated",
+                   ("repoint the brain server in " if had
+                    else "add the brain server to ") + str(path))
 
 
 def _toml_value(value) -> str:
@@ -172,7 +197,7 @@ def _toml_value(value) -> str:
     raise ValueError(f"no TOML spelling for {type(value).__name__}")
 
 
-def apply_toml(path, table: str, entry: dict) -> Outcome:
+def apply_toml(path, table: str, entry: dict, dry_run: bool = False) -> Outcome:
     """Insert or replace a `[table]` in a TOML file, by text.
 
     There is no TOML parser in the standard library below Python 3.11 and this
@@ -186,8 +211,8 @@ def apply_toml(path, table: str, entry: dict) -> Outcome:
     snippet = f"[{table}]\n{body}"
 
     if not path.exists():
-        _write(path, snippet + "\n")
-        return Outcome("created", f"created {path} with [{table}]")
+        return _commit(path, snippet + "\n", dry_run, "created",
+                       f"create {path} with [{table}]")
 
     text = _read(path)
     if '"""' in text or "'''" in text:
@@ -206,10 +231,9 @@ def apply_toml(path, table: str, entry: dict) -> Outcome:
             break
 
     if start is None:
-        backup = _backup(path)
         joined = text if text.endswith("\n") or not text else text + "\n"
-        _write(path, joined + ("\n" if joined.strip() else "") + snippet + "\n")
-        return Outcome("updated", f"added [{table}] to {path}", backup=backup)
+        return _commit(path, joined + ("\n" if joined.strip() else "") + snippet + "\n",
+                       dry_run, "updated", f"add [{table}] to {path}")
 
     end = len(lines)
     for i in range(start + 1, len(lines)):
@@ -220,13 +244,12 @@ def apply_toml(path, table: str, entry: dict) -> Outcome:
     if current == snippet.strip():
         return Outcome("unchanged", f"{path} already points at this brain")
 
-    backup = _backup(path)
     rebuilt = lines[:start] + snippet.splitlines() + [""] + lines[end:]
-    _write(path, "\n".join(rebuilt).rstrip("\n") + "\n")
-    return Outcome("updated", f"repointed [{table}] in {path}", backup=backup)
+    return _commit(path, "\n".join(rebuilt).rstrip("\n") + "\n", dry_run, "updated",
+                   f"repoint [{table}] in {path}")
 
 
-def apply_markers(path, block: str, preamble: str = "") -> Outcome:
+def apply_markers(path, block: str, preamble: str = "", dry_run: bool = False) -> Outcome:
     """Write `block` between the routing markers, creating the file if needed.
 
     The markers are the whole point. Without them, updating the block means a
@@ -238,8 +261,8 @@ def apply_markers(path, block: str, preamble: str = "") -> Outcome:
     marked = f"{MARKER_START}\n{block.strip()}\n{MARKER_END}\n"
 
     if not path.exists():
-        _write(path, (preamble.rstrip("\n") + "\n\n" if preamble else "") + marked)
-        return Outcome("created", f"created {path} with the routing block")
+        return _commit(path, (preamble.rstrip("\n") + "\n\n" if preamble else "") + marked,
+                       dry_run, "created", f"create {path} with the routing block")
 
     text = _read(path)
     has_start, has_end = MARKER_START in text, MARKER_END in text
@@ -256,17 +279,15 @@ def apply_markers(path, block: str, preamble: str = "") -> Outcome:
         rebuilt = head + marked.rstrip("\n") + tail
         if rebuilt == text:
             return Outcome("unchanged", f"{path} already has the current block")
-        backup = _backup(path)
-        _write(path, rebuilt)
-        return Outcome("updated", f"updated the routing block in {path}", backup=backup)
+        return _commit(path, rebuilt, dry_run, "updated",
+                       f"update the routing block in {path}")
 
-    backup = _backup(path)
     joined = text if text.endswith("\n") or not text else text + "\n"
-    _write(path, joined + ("\n" if joined.strip() else "") + marked)
-    return Outcome("updated", f"added the routing block to {path}", backup=backup)
+    return _commit(path, joined + ("\n" if joined.strip() else "") + marked,
+                   dry_run, "updated", f"add the routing block to {path}")
 
 
-def remove_markers(path) -> Outcome:
+def remove_markers(path, dry_run: bool = False) -> Outcome:
     """Take the block and its markers out, leaving everything else alone.
 
     A file with no markers is reported as unchanged rather than searched: a
@@ -285,6 +306,5 @@ def remove_markers(path) -> Outcome:
     head, _, rest = text.partition(MARKER_START)
     _, _, tail = rest.partition(MARKER_END)
     rebuilt = head.rstrip("\n") + ("\n" if head.strip() else "") + tail.lstrip("\n")
-    backup = _backup(path)
-    _write(path, rebuilt)
-    return Outcome("updated", f"removed the routing block from {path}", backup=backup)
+    return _commit(path, rebuilt, dry_run, "updated",
+                   f"remove the routing block from {path}")

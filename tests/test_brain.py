@@ -2287,6 +2287,30 @@ class ConnectTests(unittest.TestCase):
         self.assertIsNotNone(resolved)
         self.assertTrue(resolved.is_absolute())
 
+    def test_what_apply_writes_is_what_the_snippet_says_to_paste(self):
+        """Two renderings of one registration, and nothing held them together.
+
+        A person who pastes the snippet and a person who runs `--apply` must
+        end up with the same file. If they can differ, one of those two paths
+        is instructions this project prints and never exercises — and the
+        printed one is the fallback everything else here falls back TO.
+        """
+        module = load_brain_module()
+        module.ROOT = self.repo
+        server = str(self.repo / "bin" / "brain-mcp")
+        for fmt, template in module.CONNECT_FORMATS.items():
+            with self.subTest(fmt=fmt):
+                kind, container, entry = module.server_entry(fmt)
+                pasted = template.format(server=server)
+                if kind == "json":
+                    self.assertEqual(json.loads(pasted), {container: {"brain": entry}})
+                else:
+                    written = "\n".join(
+                        [f"[{container}]"]
+                        + [f"{k} = {json.dumps(v) if isinstance(v, str) else '[]'}"
+                           for k, v in entry.items()])
+                    self.assertEqual(written.strip(), pasted.strip())
+
     def test_an_unknown_client_is_refused_rather_than_guessed_at(self):
         out = run_brain("connect", "emacs", repo=self.repo)
         self.assertEqual(out.returncode, 2)
@@ -2337,6 +2361,118 @@ class ConnectTests(unittest.TestCase):
         second = self.connect("--write-ignores")
         self.assertIn("already up to date", second)
         self.assertEqual(before, (self.repo / ".cursorignore").read_text(encoding="utf-8"))
+
+
+class ConnectApplyTests(unittest.TestCase):
+    """`--apply` edits config files this system did not create.
+
+    Every test here runs with HOME redirected into a temp directory. A test
+    that touched the real ~/.cursor would be indistinguishable from the bug
+    this command has to not have.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        self.server = str(self.repo.resolve() / "bin" / "brain-mcp")
+
+    def connect(self, *args):
+        env = {**os.environ, "HOME": str(self.home), "USERPROFILE": str(self.home),
+               "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+               "XDG_CONFIG_HOME": str(self.home / ".config")}
+        return subprocess.run(
+            [sys.executable, str(self.repo / "bin" / "brain"), "connect", *args],
+            cwd=self.repo, capture_output=True, text=True, timeout=180, env=env)
+
+    def cursor_config(self, text):
+        (self.home / ".cursor").mkdir(parents=True, exist_ok=True)
+        path = self.home / ".cursor" / "mcp.json"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_apply_merges_and_names_the_backup(self):
+        path = self.cursor_config(json.dumps({
+            "mcpServers": {"other": {"command": "/usr/local/bin/other", "args": []}}}))
+
+        out = self.connect("cursor", "--apply")
+
+        self.assertEqual(out.returncode, 0, out.stdout)
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(parsed["mcpServers"]["brain"]["command"], self.server)
+        self.assertEqual(parsed["mcpServers"]["other"]["command"],
+                         "/usr/local/bin/other", "an unrelated server was destroyed")
+        self.assertIn(".brain-backup-", out.stdout,
+                      "the backup was made but never named, so nobody can find it")
+        self.assertTrue(list((self.home / ".cursor").glob("*.brain-backup-*")))
+
+    def test_re_applying_reports_unchanged_and_writes_nothing(self):
+        self.cursor_config('{"mcpServers": {}}')
+        self.connect("cursor", "--apply")
+        before = (self.home / ".cursor" / "mcp.json").read_text(encoding="utf-8")
+        backups = len(list((self.home / ".cursor").glob("*.brain-backup-*")))
+
+        out = self.connect("cursor", "--apply")
+
+        self.assertIn("unchanged", out.stdout)
+        self.assertEqual((self.home / ".cursor" / "mcp.json").read_text(encoding="utf-8"),
+                         before)
+        self.assertEqual(len(list((self.home / ".cursor").glob("*.brain-backup-*"))),
+                         backups, "an unchanged run made another backup")
+
+    def test_dry_run_shows_the_diff_and_writes_nothing(self):
+        path = self.cursor_config('{"mcpServers": {}}')
+        before = path.read_text(encoding="utf-8")
+
+        out = self.connect("cursor", "--apply", "--dry-run")
+
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertIn("brain-mcp", out.stdout, "the diff does not show the change")
+        self.assertIn("+", out.stdout, "no diff was printed")
+
+    def test_dry_run_without_apply_is_a_usage_error(self):
+        # Without --apply, connect already only prints. A --dry-run that
+        # silently did the same thing would read as confirmation that --apply
+        # had been asked for and previewed.
+        out = self.connect("cursor", "--dry-run")
+        self.assertEqual(out.returncode, 2)
+
+    def test_a_refusal_exits_nonzero_and_still_hands_over_the_snippet(self):
+        path = self.cursor_config('{\n  // mine\n  "mcpServers": {}\n}\n')
+        original = path.read_text(encoding="utf-8")
+
+        out = self.connect("cursor", "--apply")
+
+        self.assertEqual(out.returncode, 1,
+                         "a refusal that exits 0 reads as a successful write")
+        self.assertIn("refused", out.stdout)
+        self.assertIn(self.server, out.stdout, "no snippet to paste instead")
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_all_apply_never_creates_config_for_a_client_that_is_absent(self):
+        # Litter, and worse than litter: the next run would detect the client
+        # as present because the directory it just made is there.
+        self.cursor_config('{"mcpServers": {}}')
+
+        out = self.connect("--all", "--apply")
+
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertTrue((self.home / ".cursor" / "mcp.json").exists())
+        self.assertFalse((self.home / ".codex").exists(),
+                         "a config was created for a client that is not installed")
+        self.assertFalse((self.home / ".codeium").exists())
+
+    def test_naming_a_client_explicitly_is_consent_to_create_it(self):
+        # The complement of the rule above. --all is a sweep and must not
+        # invent clients; naming one is a person saying they want it.
+        out = self.connect("codex", "--apply")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        text = (self.home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn("[mcp_servers.brain]", text)
+        self.assertIn(self.server, text)
 
 
 class ProtocolBridgeTests(unittest.TestCase):

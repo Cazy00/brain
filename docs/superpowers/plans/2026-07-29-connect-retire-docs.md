@@ -136,11 +136,11 @@ Behaviour:
 - `brain connect --all --apply` — every client that is actually installed. Never one that is not: creating `~/.codex/config.toml` on a machine with no Codex is litter, and it makes the next `connect` report the client as present.
 - Exit code is non-zero if any client refused, so a scripted run cannot mistake a refusal for a write.
 
-- [ ] **Step 1: Write the failing test** — a fake HOME with pre-seeded config files; assert unrelated entries survive, backups are named, re-apply is unchanged, `--dry-run` writes nothing, and an uninstalled client is skipped rather than created.
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Commit** — `connect: --apply writes the registration, --dry-run shows it first`
+- [x] **Step 1: Write the failing test** — a fake HOME with pre-seeded config files; assert unrelated entries survive, backups are named, re-apply is unchanged, `--dry-run` writes nothing, and an uninstalled client is skipped rather than created.
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Commit** — `connect: --apply writes the registration, --dry-run shows it first`
 
 ---
 

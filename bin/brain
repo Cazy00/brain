@@ -1781,6 +1781,19 @@ CONNECT_FORMATS = {
 }
 
 
+# What `--apply` writes, per format: the container key and any fields beyond
+# command/args. Kept beside CONNECT_FORMATS rather than parsed back out of it —
+# those strings exist for a human to paste, and a machine reading its own output
+# is one refactor away from writing something nobody was ever shown. The two
+# are held in step by a test that renders both and compares them.
+CONNECT_TARGETS = {
+    "toml": ("toml", "mcp_servers.brain", {}),
+    "json-mcpServers": ("json", "mcpServers", {}),
+    "json-mcpServers-typed": ("json", "mcpServers", {"type": "stdio"}),
+    "json-servers": ("json", "servers", {"type": "stdio"}),
+}
+
+
 def expand_client_path(spec):
     """Resolve a CONNECT_CLIENTS path spec to a real path on THIS machine.
 
@@ -1850,6 +1863,93 @@ def print_client(key: str) -> None:
                 print(f"       {line}")
 
 
+def client_paths(key: str) -> tuple:
+    """(config path, routing path) for this machine. Either may be None."""
+    client = CONNECT_CLIENTS[key]
+    return (expand_client_path(client.get("path")),
+            expand_client_path(client.get("routing_path")))
+
+
+def client_installed(key: str) -> bool:
+    """Is this client on this machine at all?
+
+    The test is whether the DIRECTORY its config lives in exists, not the
+    config file. A client that has never had an MCP server registered has no
+    mcp.json and is still installed — the directory is what it creates on first
+    run, and the file is what we are here to write.
+    """
+    for path in client_paths(key):
+        if path is not None and path.parent.is_dir():
+            return True
+    return False
+
+
+def server_entry(fmt: str) -> tuple:
+    """(kind, container, entry) — the brain server in one client's spelling."""
+    kind, container, extra = CONNECT_TARGETS[fmt]
+    entry = dict(extra)
+    entry["command"] = str(ROOT / "bin" / "brain-mcp")
+    entry["args"] = []
+    return kind, container, entry
+
+
+def apply_client(key: str, dry_run: bool = False):
+    """Register the brain server with one client. Returns a configedit.Outcome."""
+    from brainlib import configedit
+
+    client = CONNECT_CLIENTS[key]
+    if key == "claude-code":
+        # Claude Code's two files are this repo's own, and `init` already
+        # writes them — including the parts no config merge could do, like
+        # rendering the skill and registering at user scope. Duplicating that
+        # here would give the same job two implementations that drift.
+        if dry_run:
+            return configedit.Outcome(
+                "updated", "would run the `brain init` wiring: git hooks, .mcp.json, "
+                "the /brain skill, and `claude mcp add --scope user`")
+        return configedit.Outcome(
+            "updated" if cmd_init([]) == 0 else "refused",
+            "wired this clone into Claude Code",
+            snippet="python3 bin/brain init")
+
+    target, _ = client_paths(key)
+    if target is None:
+        return configedit.Outcome(
+            "refused",
+            f"{client['name']} has no config file this can write on "
+            f"{osbackend.os_family()} — see the notes in `brain connect {key}`",
+            snippet=f"# nothing to write on this OS\n# {client['config']}")
+
+    kind, container, entry = server_entry(client["format"])
+    if kind == "toml":
+        return configedit.apply_toml(target, container, entry, dry_run=dry_run)
+    return configedit.apply_json(target, container, "brain", entry, dry_run=dry_run)
+
+
+def print_outcome(key: str, outcome, dry_run: bool) -> None:
+    """One client's result, plus the diff when nothing was written."""
+    import difflib
+
+    client = CONNECT_CLIENTS[key]
+    print(f"\n=== {client['name']}  ({key}) " + "=" * max(0, 46 - len(client['name'])))
+    print(f"  [{outcome.action}] {outcome.detail}")
+    if outcome.backup:
+        print(f"            backup: {outcome.backup}")
+    if outcome.action == "refused":
+        print("\n  Paste this yourself instead — which is what this command did for "
+              "every\n  client before --apply existed, and it still works:\n")
+        for line in outcome.snippet.splitlines():
+            print(f"     {line}")
+    if dry_run and outcome.preview:
+        target, _ = client_paths(key)
+        before = read_text(target).splitlines(keepends=True) if target and target.exists() else []
+        diff = difflib.unified_diff(before, outcome.preview.splitlines(keepends=True),
+                                    fromfile=str(target), tofile=str(target) + " (proposed)")
+        print()
+        for line in diff:
+            print("  " + line.rstrip("\n"))
+
+
 # Folders no client's own index should be walking. archive/ is superseded and
 # would be read back as current; inbox/ and journal/ are provisional and have
 # not been through consolidation; vault/ is encrypted and its plaintext must
@@ -1900,6 +2000,16 @@ def cmd_connect(argv: list) -> int:
     spelling, which is where the real failures are: a wrong top-level key
     produces a server that never appears and never explains why.
     """
+    apply_it = "--apply" in argv
+    dry_run = "--dry-run" in argv
+    if dry_run and not apply_it:
+        # Without --apply this command already only prints, so a --dry-run that
+        # quietly did the same thing would read back as confirmation that a
+        # write had been asked for and previewed.
+        print("--dry-run only means something with --apply — without it, connect "
+              "already only prints.")
+        return 2
+
     if "--routing" in argv:
         print(routing_block())
         return 0
@@ -1912,7 +2022,33 @@ def cmd_connect(argv: list) -> int:
         return 0
     args = [a for a in argv if not a.startswith("--")]
     if "--all" in argv:
-        args = list(CONNECT_CLIENTS)
+        # A sweep writes only to clients that are actually here. Creating
+        # ~/.codex/config.toml on a machine with no Codex is litter, and worse
+        # than litter: the next run detects the client as present because of
+        # the directory this one made. Naming a client explicitly is different
+        # — that is a person saying they want it.
+        args = [k for k in CONNECT_CLIENTS if not apply_it or client_installed(k)]
+        if apply_it and not args:
+            print("No supported client found on this machine. `brain connect` lists "
+                  "what is\nsupported; name one explicitly to wire it anyway.")
+            return 0
+    if apply_it and args:
+        unknown = [a for a in args if a not in CONNECT_CLIENTS]
+        if unknown:
+            print(f"unknown client(s): {', '.join(unknown)}")
+            print(f"known: {', '.join(CONNECT_CLIENTS)}")
+            return 2
+        refused = 0
+        for key in args:
+            outcome = apply_client(key, dry_run=dry_run)
+            print_outcome(key, outcome, dry_run)
+            refused += outcome.action == "refused"
+        print("\nFull manual instructions for any client: brain connect <client>")
+        print("Then verify from that client: ask it to search your brain for a term "
+              "you know\nis in a note. Tools appearing in a list is not the same as "
+              "the server working.")
+        # Non-zero on a refusal so a scripted run cannot read it as a write.
+        return 1 if refused else 0
     if not args:
         print("usage: brain connect <client> [...] | --all | --routing | --write-ignores\n")
         print("Every client below runs the SAME stdio server, unmodified:")
