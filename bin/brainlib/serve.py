@@ -25,6 +25,21 @@ No TLS here, deliberately. The tunnel terminates TLS; this serves plaintext to
 loopback, which is correct, or to whatever the operator explicitly asked for,
 which is their call and is printed back to them.
 
+NOT BUILT, and tracked in docs/superpowers/BACKLOG.md rather than left as
+folklore — each of these is a decision somebody may need to revisit:
+
+- **No read-only mode.** brain_capture is reachable over this transport and it
+  writes. Splitting the tool list by a --read-only flag is the obvious shape;
+  the spec called it future work and it stayed that way.
+- **No rate limiting.** Fine on loopback, which is the default. The moment
+  anyone runs this on a public bind for real it stops being fine, and there is
+  nothing here that would slow a credential-stuffing loop down.
+- **No OAuth.** Bearer only, which is what Claude Code and anything else that
+  can set a header takes. claude.ai on the web, Desktop and mobile cannot use
+  it: checked 2026-07-29, their per-user custom connector flow accepts OAuth
+  client credentials, and the fixed-header path is beta and org-admin-only.
+  Closing that gap means OAuth 2.1 with dynamic client registration.
+
 Transport: Streamable HTTP per the 2025-06-18 MCP specification, minus the
 optional parts. One endpoint, POST only, a single JSON object per request. GET
 answers 405, which the spec explicitly permits for a server that offers no SSE

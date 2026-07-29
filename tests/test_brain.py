@@ -583,6 +583,21 @@ class InitTests(unittest.TestCase):
         return self.calls.read_text(encoding="utf-8") if self.calls.exists() else ""
 
     def env_with(self, claude=True):
+        """A PATH with, or without, a `claude` on it.
+
+        KNOWN LIMITATION, recorded 2026-07-29 so nobody re-derives it: the
+        no-claude PATH still contains /usr/bin, so on a machine where Claude
+        Code is installed THERE (some Linux packages do) the sandbox is not
+        actually claude-free and the assertion below fails. That is the
+        assertion working — it refuses to run a test whose premise is false —
+        but it means the suite is red on those machines for a reason unrelated
+        to the change under test.
+
+        Not silenced, because a silent version of this test would pass while
+        proving nothing. Fixing it properly means a PATH built from a temp
+        directory of symlinks to just the tools init needs, which is fiddly to
+        keep working on Windows. Tracked in docs/superpowers/BACKLOG.md.
+        """
         git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
         path = f"{self.stub_bin}:{git_dir}:/usr/bin:/bin" if claude \
             else f"{git_dir}:/usr/bin:/bin"

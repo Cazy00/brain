@@ -326,6 +326,16 @@ class SystemdScheduler(Scheduler):
 
 
 class SchtasksScheduler(Scheduler):
+    """UNVERIFIED ON A REAL MACHINE, as of 2026-07-29.
+
+    Nobody on this project owns Windows. CI runs the whole suite on
+    windows-latest, so the argv this builds is checked — but a scheduled task
+    that CI never installs, fires, or reads back is not the same as one known
+    to work. Anything here that only shows up when a task actually runs at 3am
+    is untested. Tracked in docs/superpowers/BACKLOG.md; the same caveat
+    applies to CredmanKeystore below.
+    """
+
     kind = "schtasks"
 
     def available(self) -> bool:
