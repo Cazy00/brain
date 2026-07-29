@@ -40,10 +40,12 @@ NOTIFY = {"jsonrpc": "2.0", "method": "notifications/initialized"}
 
 class ServeCase(unittest.TestCase):
     ALLOW_ORIGIN = ()
+    ALLOW_TOOLS = None          # None means every tool, which is the default
 
     def setUp(self):
         self.server = serve.make_server(BEARER, "127.0.0.1", 0,
-                                        allow_origin=self.ALLOW_ORIGIN)
+                                        allow_origin=self.ALLOW_ORIGIN,
+                                        allow_tools=self.ALLOW_TOOLS)
         self.port = self.server.server_address[1]
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
@@ -240,6 +242,95 @@ class TestItIsTheSameBrain(ServeCase):
         self.assertIn("brain_capture", names)
 
 
+class TestReadOnlyServing(ServeCase):
+    """`--read-only`, which has to hold against a client that ignores it.
+
+    The tool list is a courtesy: a client is free to call any name it likes,
+    and the thing this mode defends against is precisely a client that does.
+    So the two halves — what is advertised and what is executed — are asserted
+    separately, and the second one is the one that matters.
+    """
+    ALLOW_TOOLS = mcp.READ_ONLY_TOOLS
+
+    def tools(self):
+        _status, _headers, body = self.request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        return {t["name"] for t in json.loads(body)["result"]["tools"]}
+
+    def test_the_write_tool_is_not_listed(self):
+        listed = self.tools()
+        self.assertNotIn("brain_capture", listed)
+        self.assertEqual(listed, set(mcp.READ_ONLY_TOOLS))
+
+    def test_the_read_tools_are_all_still_listed(self):
+        # Read-only must mean "one tool fewer", not "a different brain". A mode
+        # that quietly dropped brain_links as well would be discovered by
+        # somebody far from their laptop, which is the one place this runs.
+        self.assertEqual(self.tools(),
+                         {"brain_search", "brain_read", "brain_links", "brain_recent"})
+
+    def test_calling_the_write_tool_by_name_is_refused(self):
+        """The whole mode, in one assertion.
+
+        Filtering the advertised list and then running whatever arrives is not
+        a read-only server, it is a suggestion. This calls the tool that was
+        never listed, exactly as a client that ignored the list would.
+        """
+        _status, _headers, body = self.request(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "brain_capture",
+                        "arguments": {"text": "this must never reach the inbox"}}})
+        result = json.loads(body)["result"]
+        self.assertTrue(result["isError"],
+                        "brain_capture ran on a read-only server")
+        self.assertIn("brain_capture", result["content"][0]["text"])
+
+    def test_a_read_tool_still_works(self):
+        """Proves the filter refuses rather than breaks. A read-only mode where
+        nothing works passes every test above and is useless."""
+        _status, _headers, body = self.request(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "brain_recent", "arguments": {"days": 1}}})
+        result = json.loads(body)["result"]
+        self.assertFalse(result.get("isError"), result["content"][0]["text"])
+
+
+class TestTheReadOnlySetIsDerivedFailingClosed(unittest.TestCase):
+    """How the four names are arrived at, which is more important than the four
+    names — this is the part that has to keep being right after somebody adds a
+    sixth tool in 2028."""
+
+    def test_every_tool_says_whether_it_is_read_only(self):
+        """The real guard. A tool added without the annotation fails here,
+        rather than being silently left out of read-only serving (or, if the
+        derivation were ever inverted, silently exposed by it)."""
+        for tool in mcp.TOOLS:
+            with self.subTest(tool=tool["name"]):
+                annotations = tool.get("annotations")
+                self.assertIsInstance(
+                    annotations, dict,
+                    f"{tool['name']} declares no annotations; "
+                    "readOnlyHint is what --read-only filters on")
+                self.assertIsInstance(
+                    annotations.get("readOnlyHint"), bool,
+                    f"{tool['name']} must say readOnlyHint true or false")
+
+    def test_an_unannotated_tool_is_excluded_not_included(self):
+        # Fail closed. The failure mode of the other direction is a write tool
+        # served over a socket somebody believed was read-only.
+        self.assertEqual(mcp.read_only_names([{"name": "brain_future"}]), ())
+        self.assertEqual(mcp.read_only_names([{"name": "brain_future",
+                                               "annotations": {}}]), ())
+        self.assertEqual(
+            mcp.read_only_names([{"name": "brain_future",
+                                  "annotations": {"readOnlyHint": "yes"}}]), (),
+            "a truthy non-boolean was treated as a promise of read-only")
+
+    def test_the_write_tool_is_not_in_the_read_only_set(self):
+        self.assertNotIn("brain_capture", mcp.READ_ONLY_TOOLS)
+        self.assertEqual(len(mcp.READ_ONLY_TOOLS), len(mcp.TOOLS) - 1)
+
+
 class TestTokenStorage(unittest.TestCase):
     """The token goes to the OS keystore and nowhere else — never the repo,
     where lint refuses credentials, and never a config file."""
@@ -381,6 +472,44 @@ class TestTheCli(unittest.TestCase):
         self.run_serve("--port", "0")
         self.addCleanup(self.started[0].server_close)
         self.assertNotIn("EXPOSED", self.err.getvalue())
+
+    def serve_and_get_server(self, *argv):
+        self.run_serve("--new-token")
+        self.out, self.err = io.StringIO(), io.StringIO()
+        code = self.run_serve(*argv)
+        self.assertEqual(code, 0)
+        self.addCleanup(self.started[0].server_close)
+        return self.started[0]
+
+    def test_read_only_narrows_what_the_server_will_run(self):
+        # A set, not a sequence: this is a membership test on every call, and
+        # ordering it would be an invitation to depend on the order.
+        server = self.serve_and_get_server("--read-only", "--port", "0")
+        self.assertEqual(set(server.allow_tools), set(mcp.READ_ONLY_TOOLS))
+
+    def test_without_the_flag_every_tool_is_served(self):
+        # The default has to stay the default. `serve` with no flags is what
+        # the docs, the banner and every existing registration assume.
+        server = self.serve_and_get_server("--port", "0")
+        self.assertIsNone(server.allow_tools)
+
+    def test_the_banner_says_which_mode_it_is_in(self):
+        """Both ways round, because the interesting one is the default.
+
+        Somebody who ran it read-only last week and forgets the flag this week
+        is exposing a write tool, and the only thing standing between them and
+        not noticing is what the terminal said at startup.
+        """
+        self.serve_and_get_server("--read-only", "--port", "0")
+        read_only = self.err.getvalue().lower()
+        self.assertIn("read-only", read_only)
+        self.assertNotIn("write", read_only.replace("read-only", ""))
+
+        self.started, self.out, self.err = [], io.StringIO(), io.StringIO()
+        self.serve_and_get_server("--port", "0")
+        writable = self.err.getvalue().lower()
+        self.assertIn("brain_capture", writable)
+        self.assertIn("write", writable)
 
 
 class TestServeInTheHelp(unittest.TestCase):

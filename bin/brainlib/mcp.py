@@ -10,6 +10,12 @@ one validator, one dispatcher, and the transports are thin.
 It shells out to bin/brain for the actual work, which is what makes retrieval
 behaviour identical on the CLI, over stdio, and over HTTP — the ranking and the
 trust signals are deterministic code, not model judgement.
+
+One table, but not always all of it: `handle` and `call_tool` take an `allow`
+set, which is how `brain serve --read-only` exposes four tools instead of five
+without a second table to drift out of sync with this one. `allow=None` — every
+tool — stays the default, because that is what stdio is: a subprocess a client
+spawned on the machine the user is already sitting at.
 """
 import json
 import subprocess
@@ -41,6 +47,7 @@ TOOLS = [
             },
             "required": ["query"],
         },
+        "annotations": {"readOnlyHint": True},
     },
     {
         "name": "brain_read",
@@ -58,6 +65,7 @@ TOOLS = [
             },
             "required": ["id_or_path"],
         },
+        "annotations": {"readOnlyHint": True},
     },
     {
         "name": "brain_links",
@@ -76,6 +84,7 @@ TOOLS = [
             },
             "required": ["id_or_path"],
         },
+        "annotations": {"readOnlyHint": True},
     },
     {
         "name": "brain_recent",
@@ -84,6 +93,7 @@ TOOLS = [
             "type": "object",
             "properties": {"days": {"type": "integer", "description": "Look-back window in days."}},
         },
+        "annotations": {"readOnlyHint": True},
     },
     {
         "name": "brain_capture",
@@ -109,12 +119,38 @@ TOOLS = [
             },
             "required": ["text"],
         },
+        # The one tool that is not read-only, and the reason --read-only exists.
+        # destructiveHint is false because a capture only ever appends: it adds
+        # a note to inbox/, it cannot edit or delete an existing one.
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
 ]
 
 
 TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 MAX_ARG_CHARS = 100_000  # a note or query longer than this is a bug or an abuse
+
+
+def read_only_names(tools=None) -> tuple:
+    """The tools safe to serve when the caller must not be able to write.
+
+    Derived from the table rather than written out beside it, so there is one
+    place a tool is declared. It fails CLOSED, and that direction is the whole
+    point: a tool added later with no annotation, or with a truthy-but-not-True
+    one, is left OUT of read-only serving. Getting that wrong the other way
+    means a write tool on a socket somebody believed was read-only, which is a
+    silent failure; being left out is a loud one, and tests/test_serve.py also
+    refuses a tool that declares nothing at all.
+
+    readOnlyHint is the MCP specification's own annotation, so this is not a
+    private convention — it is information clients already receive.
+    """
+    return tuple(tool["name"] for tool in (TOOLS if tools is None else tools)
+                 if isinstance(tool.get("annotations"), dict)
+                 and tool["annotations"].get("readOnlyHint") is True)
+
+
+READ_ONLY_TOOLS = read_only_names()
 
 
 def run_cli(args):
@@ -180,11 +216,27 @@ def validate_args(name, args):
     return clean, None
 
 
-def call_tool(name, args):
+def call_tool(name, args, allow=None):
     # isinstance first: a non-string name (dict/list) is unhashable and would
     # raise on the membership test instead of reporting an unknown tool.
     if not isinstance(name, str) or name not in TOOLS_BY_NAME:
         return {"content": [{"type": "text", "text": f"unknown tool {name!r}"}], "isError": True}
+    if allow is not None and name not in allow:
+        # The enforcement point, and it is deliberately HERE rather than in the
+        # transport: a restriction that lives beside the dispatcher cannot be
+        # skipped by a caller who never read tools/list, and a client is exactly
+        # what this mode is defending against.
+        #
+        # It says which tool and why, instead of claiming the tool does not
+        # exist. Whether this server is read-only is printed in its own startup
+        # banner and is a property of how it was launched, not a secret — and a
+        # model told the truth stops retrying, where one told "unknown tool"
+        # reasonably tries three spellings of the name first.
+        return {"content": [{"type": "text", "text":
+                             f"{name} is not served by this brain: it is running read-only, "
+                             "which serves the four read tools and refuses the write one. "
+                             "Retrieval is unaffected."}],
+                "isError": True}
     args, problem = validate_args(name, args)
     if problem:
         return {"content": [{"type": "text", "text": f"invalid arguments for {name}: {problem}"}],
@@ -219,13 +271,17 @@ def call_tool(name, args):
     return {"content": [{"type": "text", "text": text}], "isError": run.returncode != 0}
 
 
-def handle(msg):
+def handle(msg, allow=None):
     """One JSON-RPC message in, one reply out — or None for a notification.
 
     Returns rather than writes, which is the whole reason a second transport is
     possible. The old version printed to stdout, so it could only ever serve
     stdio; HTTP needs the answer as a value, and needs to be able to tell a
     request (answer it) from a notification (202, no body).
+
+    `allow` is the set of tool names this caller may reach, or None for all of
+    them. It filters tools/list and gates tools/call — both, because either one
+    alone is a mode a client can step around.
     """
     method = msg.get("method", "")
     msg_id = msg.get("id")
@@ -239,10 +295,12 @@ def handle(msg):
             "serverInfo": {"name": "brain", "version": "1.0.0"},
         })
     if method == "tools/list":
-        return _reply(msg_id, {"tools": TOOLS})
+        served = TOOLS if allow is None else [t for t in TOOLS if t["name"] in allow]
+        return _reply(msg_id, {"tools": served})
     if method == "tools/call":
         args = params.get("arguments")
-        return _reply(msg_id, call_tool(params.get("name", ""), args if args is not None else {}))
+        return _reply(msg_id, call_tool(params.get("name", ""),
+                                        args if args is not None else {}, allow=allow))
     if method == "ping":
         return _reply(msg_id, {})
     if msg_id is not None:

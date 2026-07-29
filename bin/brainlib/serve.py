@@ -194,7 +194,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            out = mcp.handle(msg)
+            out = mcp.handle(msg, allow=self.server.allow_tools)
         except Exception as exc:
             # Same containment as stdio: one malformed request must never take
             # down a server other sessions are sharing.
@@ -236,13 +236,16 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
-                allow_origin=(), quiet: bool = False) -> ThreadingHTTPServer:
+                allow_origin=(), quiet: bool = False,
+                allow_tools=None) -> ThreadingHTTPServer:
     """A configured, unstarted server. Refuses to exist without a token.
 
     Raising here rather than at the call site is deliberate: this is the
     function every caller — the CLI, the tests, anything later — has to go
     through, so the one rule that must never be bypassed lives at the choke
     point rather than in each caller's good intentions.
+
+    `allow_tools` is None for every tool, or the names this server will serve.
     """
     if not (token or "").strip():
         raise ValueError("brain serve requires a token; mint one with "
@@ -251,38 +254,57 @@ def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
     server.token = token
     server.allow_origin = tuple(allow_origin)
     server.quiet = quiet
+    server.allow_tools = None if allow_tools is None else frozenset(allow_tools)
     return server
 
 
 USAGE = """brain serve — reach this brain from another device.
 
-  brain serve [--bind <addr>] [--port <n>] [--allow-origin <origin>]
+  brain serve [--read-only] [--bind <addr>] [--port <n>] [--allow-origin <origin>]
   brain serve --new-token
 
   --new-token           mint a value, store it in the OS keystore, print it ONCE
+  --read-only           serve the four read tools; refuse brain_capture
   --bind <addr>         default 127.0.0.1. Anything else is exposed; it says so
   --port <n>            default {port}
   --allow-origin <o>    permit one browser Origin. Repeatable. Empty by default,
                         because no legitimate client of this server is a browser
 
 Serves the same tools as the stdio server, over HTTP, behind a bearer token.
-That includes brain_capture, which WRITES to your brain and auto-pushes it —
-whoever holds the token can add notes. There is no read-only mode yet.
+By default that includes brain_capture, which WRITES to your brain and
+auto-pushes it — whoever holds the token can add notes.
+
+--read-only takes that tool away, server-side: it is not listed, and it is
+refused if a client calls it regardless. It does not make the brain safe to
+expose — every note is still readable by whoever holds the token. Read-only is
+a property of the process, so serving both at once means two of them, on two
+ports, with the writable one on loopback.
 
 No TLS here. Put a tunnel in front that terminates TLS, forwards to this port,
 preserves the Authorization header, and adds no Origin header.
 """.format(port=DEFAULT_PORT)
 
 
-def startup_notes(host: str, port: int) -> tuple:
+def startup_notes(host: str, port: int, read_only: bool = False) -> tuple:
     """(what to tell the operator, what to warn them about).
 
     Split from the serving so both halves can be read — and tested — without
     opening a socket.
+
+    The mode is stated on every start, including the default one. Somebody who
+    ran this read-only last week and forgets the flag this week is exposing a
+    write tool, and this line is the only thing between them and not noticing.
     """
     url = f"http://{host}:{port}{ENDPOINT}"
+    mode = ["  READ-ONLY — serving the four read tools. brain_capture is not",
+            "  served, and is refused if a client calls it anyway."] if read_only else \
+           ["  Serving all five tools, which includes brain_capture: whoever holds",
+            "  the token can write notes into this brain, and they are committed",
+            "  and pushed automatically. `--read-only` serves the other four."]
     notes = [
         f"brain serve — listening on {url}",
+        "",
+    ] + mode + [
         "",
         "  Register it with a client that can set a header:",
         f'    claude mcp add --transport http brain {url} \\',
@@ -299,7 +321,17 @@ def startup_notes(host: str, port: int) -> tuple:
         "  header, and add no Origin header.",
     ]
     warnings = []
-    if not _is_loopback(host):
+    if not _is_loopback(host) and read_only:
+        # Still the whole brain, and that is the part worth saying out loud.
+        # --read-only shrinks what can be DONE to it, not what can be read out
+        # of it, and for a second brain the reading is most of the exposure.
+        warnings = [
+            "",
+            f"  EXPOSED — bound to {host}, not loopback. Anything that can reach",
+            f"  {host}:{port} and holds the token can read EVERY note in this brain.",
+            "  Read-only limits what it can change, not what it can see.",
+        ]
+    elif not _is_loopback(host):
         warnings = [
             "",
             f"  EXPOSED — bound to {host}, not loopback. Anything that can reach",
@@ -354,14 +386,16 @@ def run_serve(argv: list, store=None, run=None) -> int:
         print("--port needs a number", file=sys.stderr)
         return 2
     allow_origin = _flags(argv, "--allow-origin")
+    read_only = "--read-only" in argv
 
     try:
-        server = make_server(existing, host, port, allow_origin=allow_origin)
+        server = make_server(existing, host, port, allow_origin=allow_origin,
+                             allow_tools=mcp.READ_ONLY_TOOLS if read_only else None)
     except OSError as exc:
         print(f"could not listen on {host}:{port} — {exc}", file=sys.stderr)
         return 1
 
-    notes, warnings = startup_notes(host, server.server_address[1])
+    notes, warnings = startup_notes(host, server.server_address[1], read_only=read_only)
     for line in notes:
         print(line, file=sys.stderr)
     for line in warnings:

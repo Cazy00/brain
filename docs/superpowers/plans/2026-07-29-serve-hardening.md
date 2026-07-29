@@ -90,15 +90,15 @@ socket somebody believed was read-only.
 - `serve.make_server(..., allow_tools=None)`, `serve.startup_notes(host, port,
   read_only=False)`.
 
-- [ ] **Step 1: Write the failing tests.** `tools/list` returns four tools and
+- [x] **Step 1: Write the failing tests.** `tools/list` returns four tools and
       not `brain_capture`; `tools/call` on `brain_capture` by name is refused
       even though it was never listed; a read tool still works in the same
       server; every tool declares `readOnlyHint`; the derivation is fail-closed;
       stdio and a default `serve` still expose all five.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `serve: --read-only, enforced where the client cannot reach it`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `serve: --read-only, enforced where the client cannot reach it`
 
 ---
 
