@@ -2544,6 +2544,74 @@ class ConnectRoutingApplyTests(ConnectApplyTests):
         self.assertFalse((self.home / ".codex").exists())
 
 
+class ConnectReportTests(ConnectApplyTests):
+    """Bare `brain connect` was a catalogue of what this system supports. It
+    becomes a report of what THIS machine is actually wired to, because the
+    catalogue answers a question nobody has and the report answers the one
+    everybody does."""
+
+    def test_it_reports_what_is_here_not_what_exists(self):
+        (self.home / ".cursor").mkdir()
+        out = self.connect()
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("Cursor", out.stdout)
+        self.assertIn("not wired", out.stdout)
+
+    def test_a_client_wired_to_a_different_brain_is_called_out(self):
+        """The case that silently breaks things today.
+
+        A second clone, or a brain that moved, leaves an agent talking to a
+        path that is not this one. Every tool call still succeeds — against
+        somebody else's notes, or against nothing — and no health check
+        anywhere has ever mentioned it.
+        """
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text(json.dumps({
+            "mcpServers": {"brain": {"command": "/somewhere/else/bin/brain-mcp",
+                                     "args": []}}}), encoding="utf-8")
+
+        out = self.connect()
+
+        self.assertIn("DIFFERENT brain", out.stdout)
+        self.assertIn("/somewhere/else/bin/brain-mcp", out.stdout,
+                      "the report must name the path it is wired to instead")
+
+    def test_json_is_the_contract_an_agent_reads_before_applying(self):
+        (self.home / ".cursor").mkdir()
+        self.connect("cursor", "--apply")
+
+        out = self.connect("--json")
+
+        payload = json_payload(out.stdout)
+        self.assertEqual(payload["server"], self.server)
+        cursor = payload["clients"]["cursor"]
+        self.assertTrue(cursor["installed"])
+        self.assertEqual(cursor["wired"], "this")
+        self.assertIsNone(cursor["routing_path"], "cursor has no instruction file")
+        codex = payload["clients"]["codex"]
+        self.assertFalse(codex["installed"])
+        self.assertEqual(codex["wired"], "no")
+
+    def test_json_reports_whether_the_routing_block_is_in_place(self):
+        (self.home / ".claude").mkdir()
+        before = json_payload(self.connect("--json").stdout)
+        self.assertFalse(before["clients"]["claude-code"]["routing_applied"])
+
+        self.connect("--routing", "--apply")
+
+        after = json_payload(self.connect("--json").stdout)
+        self.assertTrue(after["clients"]["claude-code"]["routing_applied"])
+
+    def test_an_unreadable_config_is_unknown_rather_than_not_wired(self):
+        # JSONC parses for the client and not for us. Reporting it as "not
+        # wired" would send somebody to fix wiring that is already correct.
+        (self.home / ".cursor").mkdir()
+        (self.home / ".cursor" / "mcp.json").write_text(
+            '{\n  // mine\n  "mcpServers": {}\n}\n', encoding="utf-8")
+        payload = json_payload(self.connect("--json").stdout)
+        self.assertEqual(payload["clients"]["cursor"]["wired"], "unknown")
+
+
 class ProtocolBridgeTests(unittest.TestCase):
     """AGENTS.md is the single instruction source; CLAUDE.md imports it.
 

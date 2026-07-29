@@ -1950,6 +1950,133 @@ def print_outcome(key: str, outcome, dry_run: bool) -> None:
             print("  " + line.rstrip("\n"))
 
 
+def client_wiring(key: str) -> tuple:
+    """(state, detail) — what this client is pointed at right now.
+
+    States: 'this' (this brain), 'other' (a DIFFERENT brain — the case that
+    silently breaks things), 'no' (nothing registered), 'unknown' (a config
+    that exists and cannot be read).
+
+    'unknown' is not folded into 'no' on purpose. JSONC parses for the client
+    and not for us, and reporting a working registration as absent would send
+    somebody to fix wiring that is already correct.
+    """
+    server = str(ROOT / "bin" / "brain-mcp")
+    if key == "claude-code":
+        # No config file of its own to read — `init` writes .mcp.json inside
+        # whichever clone it ran from, so the machine-wide question is which
+        # clone the global skill link points into.
+        link = Path.home() / ".claude" / "skills" / "brain"
+        if not link.exists() and not link.is_symlink():
+            return "no", ""
+        try:
+            target = link.resolve()
+        except OSError:
+            return "unknown", str(link)
+        here = ROOT.resolve()
+        if target == here or here in target.parents:
+            return "this", ""
+        return "other", str(target)
+
+    target, _ = client_paths(key)
+    if target is None or not target.is_file():
+        return "no", ""
+    client = CONNECT_CLIENTS[key]
+    _, container, _ = CONNECT_TARGETS[client["format"]]
+    text = read_text(target)
+    if client["format"] == "toml":
+        # Same text-only reasoning as configedit: no parser below 3.11.
+        in_table, command = False, ""
+        for line in text.splitlines():
+            if line.strip() == f"[{container}]":
+                in_table = True
+                continue
+            if in_table and line.lstrip().startswith("["):
+                break
+            if in_table and line.strip().startswith("command"):
+                _, _, value = line.partition("=")
+                command = value.strip().strip('"').strip("'")
+        if not command:
+            return "no", ""
+        return ("this", "") if command == server else ("other", command)
+
+    import json as _json
+    try:
+        parsed = _json.loads(text) if text.strip() else {}
+    except ValueError:
+        return "unknown", str(target)
+    entry = (parsed.get(container) or {}).get("brain") if isinstance(parsed, dict) else None
+    if not isinstance(entry, dict):
+        return "no", ""
+    command = entry.get("command", "")
+    return ("this", "") if command == server else ("other", command)
+
+
+def routing_applied(key: str) -> bool:
+    """Is this brain's routing block in that client's instruction file?
+
+    Both halves are required. A marked block naming a DIFFERENT brain is not
+    this brain's routing rule, and calling it applied would hide exactly the
+    same failure client_wiring exists to surface.
+    """
+    from brainlib import configedit
+
+    _, routing = client_paths(key)
+    if routing is None or not routing.is_file():
+        return False
+    text = read_text(routing)
+    return configedit.MARKER_START in text and str(ROOT) in text
+
+
+def connect_report(as_json: bool = False) -> int:
+    """What THIS machine is wired to, rather than a catalogue of what exists."""
+    server = str(ROOT / "bin" / "brain-mcp")
+    rows = []
+    for key, client in CONNECT_CLIENTS.items():
+        config, routing = client_paths(key)
+        state, detail = client_wiring(key)
+        rows.append((key, client, client_installed(key), state, detail,
+                     config, routing, routing_applied(key)))
+
+    if as_json:
+        import json as _json
+        print(_json.dumps({
+            "server": server,
+            "clients": {key: {
+                "name": client["name"],
+                "installed": installed,
+                "wired": state,
+                "wired_to": detail,
+                "path": str(config) if config else None,
+                "routing_path": str(routing) if routing else None,
+                "routing_applied": applied,
+            } for key, client, installed, state, detail, config, routing, applied in rows},
+        }, indent=2))
+        return 0
+
+    print("Every client below runs the SAME stdio server, unmodified:")
+    print(f"  {server}\n")
+    print("On this machine:\n")
+    for key, client, installed, state, detail, _config, routing, applied in rows:
+        if not installed:
+            status = "not installed"
+        elif state == "other":
+            status = f"WIRED TO A DIFFERENT brain — {detail}"
+        elif state == "unknown":
+            status = f"could not read {detail} — check it yourself"
+        elif state == "this":
+            status = "wired to this brain"
+            status += ", routing block in place" if applied else ", no routing block"
+        else:
+            status = "not wired"
+        print(f"  {key:<16} {client['name']:<26} {status}")
+    print("\n  brain connect <client>            what to paste, and what silently breaks")
+    print("  brain connect --all --apply       write it for every client found here")
+    print("  brain connect --routing --apply   add the block that makes agents reach "
+          "for it")
+    return 0
+
+
 def apply_routing(keys: list, dry_run: bool = False) -> int:
     """Write the routing block into each client's global instruction file.
 
@@ -2106,14 +2233,7 @@ def cmd_connect(argv: list) -> int:
         # Non-zero on a refusal so a scripted run cannot read it as a write.
         return 1 if refused else 0
     if not args:
-        print("usage: brain connect <client> [...] | --all | --routing | --write-ignores\n")
-        print("Every client below runs the SAME stdio server, unmodified:")
-        print(f"  {ROOT / 'bin' / 'brain-mcp'}\n")
-        for key, client in CONNECT_CLIENTS.items():
-            print(f"  {key:<16} {client['name']}")
-        print("\n`brain connect <client>` prints the exact registration, where that "
-              "client\nreads its global routing rule, and what silently breaks.")
-        return 0
+        return connect_report(as_json="--json" in argv)
     unknown = [a for a in args if a not in CONNECT_CLIENTS]
     if unknown:
         print(f"unknown client(s): {', '.join(unknown)}")

@@ -178,11 +178,11 @@ The third is the case that silently breaks things today: a second clone, or a br
 
 `--json` emits the same information as data: per client, `installed`, `wired` (`"no"` | `"this"` | `"other"`), `path`, `routing_path`, `routing_applied`. This is the contract an agent reads before deciding whether to run `--apply`, so it is tested like an API.
 
-- [ ] **Step 1: Write the failing test**
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Commit** — `connect: report what this machine is actually wired to`
+- [x] **Step 1: Write the failing test**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Commit** — `connect: report what this machine is actually wired to`
 
 ---
 
