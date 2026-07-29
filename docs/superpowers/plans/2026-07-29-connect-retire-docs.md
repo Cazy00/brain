@@ -109,11 +109,11 @@ Rules, all four tested directly:
 
 Also required, and easy to forget: writes are atomic (write a sibling temp file, then `os.replace`), because a half-written config is worse than an unwritten one, and the backup exists precisely so this is recoverable.
 
-- [ ] **Step 1: Write the failing test** — one test per rule per format, plus the atomicity and permissions cases.
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Commit** — `configedit: merge, back up, refuse, idempotent`
+- [x] **Step 1: Write the failing test** — one test per rule per format, plus the atomicity and permissions cases.
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Commit** — `configedit: merge, back up, refuse, idempotent`
 
 ---
 
