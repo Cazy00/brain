@@ -206,6 +206,46 @@ class SandboxContainmentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
 
 
+class McpToolLayerTests(unittest.TestCase):
+    """One tool table, two transports.
+
+    Split out of bin/brain-mcp on 2026-07-29 when `brain serve` arrived. Two
+    transports each carrying their own copy would drift, and a tool present
+    over stdio and missing over HTTP is a bug nobody finds until somebody far
+    from their laptop needs it.
+    """
+
+    def test_the_stdio_entry_point_is_thin(self):
+        text = MCP.read_text(encoding="utf-8")
+        self.assertNotIn("TOOLS = [", text,
+                         "the tool table is back in the stdio entry point — that is "
+                         "the drift this split exists to prevent")
+        self.assertIn("serve_stdio", text)
+
+    def test_handle_answers_a_request_and_says_nothing_to_a_notification(self):
+        """The distinction HTTP needs and stdio never did. A notification gets
+        202 with no body over HTTP, so `handle` has to report the difference
+        rather than just declining to print."""
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcp
+
+        answered = mcp.handle({"jsonrpc": "2.0", "id": 7, "method": "ping"})
+        self.assertEqual(answered, {"jsonrpc": "2.0", "id": 7, "result": {}})
+        self.assertIsNone(
+            mcp.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+
+    def test_every_tool_is_reachable_by_name(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcp
+
+        listed = mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {t["name"] for t in listed["result"]["tools"]}
+        self.assertEqual(names, set(mcp.TOOLS_BY_NAME))
+        self.assertIn("brain_capture", names,
+                      "the write tool must stay visible — every transport that "
+                      "exposes it has to say so")
+
+
 class McpServerTests(unittest.TestCase):
     """One bad request must not kill a server that other sessions are sharing."""
 
