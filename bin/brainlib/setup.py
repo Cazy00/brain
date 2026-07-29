@@ -8,9 +8,11 @@ exercises it daily — and most people will hand this whole thing to an agent.
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from . import osbackend
+from . import picker
 
 PHASES = ("check", "place", "create", "backup", "verify")
 
@@ -185,3 +187,97 @@ def phase_backup(dest, repo_name: str, want_remote: bool,
                 remedy=f"cd {dest} && git push -u origin {branch}")
 
     return Result("ok", f"backed up to {origin}")
+
+
+def phase_place(home, cwd, requested=None, stream=None) -> tuple:
+    """Decide where the brain goes. Returns (Result, path).
+
+    The only phase that returns a pair, because the destination it settles on
+    is what every phase after it operates on and there is nowhere else for that
+    answer to come from.
+    """
+    home, cwd = Path(home), Path(cwd)
+    if requested:
+        chosen = picker.expand(str(requested), home, cwd)
+        reason = picker.reject_reason(chosen)
+        if reason:
+            return Result("failed", reason,
+                          remedy="choose a different path with --dir <path>"), chosen
+        return Result("ok", f"installing to {chosen}"), chosen
+    chosen = picker.choose(home, cwd, stream=stream)
+    return Result("ok", f"installing to {chosen}"), chosen
+
+
+def phase_create(source, dest) -> Result:
+    """Copy the template and give it a git history that belongs to its owner.
+
+    The template's history is the PRODUCT's history, not yours. Starting fresh
+    is also what GitHub's 'Use this template' button does, and nothing is lost:
+    toolbelt updates come across by adding the template as a second remote and
+    checking out paths, which needs no shared ancestry.
+    """
+    source, dest = Path(source), Path(dest)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in source.iterdir():
+            # Distribution scaffolding, not knowledge. install.sh in particular
+            # must not survive the copy: it carries the TEMPLATE repo's name,
+            # so running it from inside a brain would reinstall the product
+            # over the notes.
+            if item.name in {".git", ".cache", "__pycache__", "install.sh",
+                             "install.ps1", ".claude-plugin", "plugins"}:
+                continue
+            target = dest / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+    except OSError as exc:
+        return Result("failed", f"could not copy the template: {exc}",
+                      remedy=f"check that {dest} is writable, then run setup again")
+
+    made = subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(dest),
+                          capture_output=True, text=True)
+    if made.returncode != 0:
+        # git < 2.28 has no -b. Fall back rather than demanding an upgrade.
+        subprocess.run(["git", "init", "-q"], cwd=str(dest), capture_output=True)
+        subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                       cwd=str(dest), capture_output=True)
+
+    subprocess.run(["git", "config", "core.hooksPath", ".githooks"],
+                   cwd=str(dest), capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=str(dest), capture_output=True)
+    # The gate has nothing to check on an empty history and its own tooling is
+    # not wired yet, so this one commit bypasses it deliberately.
+    first = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "commit",
+                            "-q", "-m", "brain: start"],
+                           cwd=str(dest), capture_output=True, text=True)
+    if first.returncode != 0:
+        return Result("failed",
+                      "could not make the first commit — git needs a name and email",
+                      remedy='git config --global user.name "You" && '
+                             'git config --global user.email "you@example.com"')
+    return Result("ok", f"created {dest} with a fresh history on main")
+
+
+def phase_verify(dest, run=None) -> Result:
+    """Run doctor and let its verdict be setup's verdict.
+
+    A fresh install that finishes in a state its own health check calls red is
+    the exact failure this whole plan exists to remove, so doctor's result is
+    not advisory here.
+
+    Both the exit code and the output are read, and the worse of the two wins.
+    An exit code is a summary somebody has to remember to keep true; the RED
+    lines are the finding itself. Trusting only the summary is the same shape
+    of mistake phase_backup exists to undo.
+    """
+    dest = Path(dest)
+    run = run or (lambda argv: subprocess.run(argv, cwd=str(dest),
+                                              capture_output=True, text=True))
+    done = run([sys.executable, str(dest / "bin" / "brain"), "doctor"])
+    output = (getattr(done, "stdout", "") or "") + (getattr(done, "stderr", "") or "")
+    if getattr(done, "returncode", 1) != 0 or "[RED]" in output:
+        return Result("failed", "doctor reported a problem:\n" + output.strip(),
+                      remedy=f"cd {dest} && bin/brain doctor")
+    return Result("ok", "doctor is green")

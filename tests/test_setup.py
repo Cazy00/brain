@@ -5,6 +5,7 @@ never touch the developer's real brain, real HOME, or real keychain.
 """
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -442,6 +443,170 @@ class TestBackupPhase(unittest.TestCase):
                                        run=lambda *a, **k: None,
                                        which=lambda t: None)
         self.assertEqual(result.status, "ok")
+
+
+class TestPlacePhase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_an_explicit_path_skips_the_prompt(self):
+        result, path = setupmod.phase_place(self.home, self.home,
+                                            requested=str(self.home / "chosen"))
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(path, self.home / "chosen")
+
+    def test_an_unusable_explicit_path_fails_with_the_reason(self):
+        busy = self.home / "busy"
+        busy.mkdir()
+        (busy / "a.txt").write_text("x", encoding="utf-8")
+        result, path = setupmod.phase_place(self.home, self.home,
+                                            requested=str(busy))
+        self.assertEqual(result.status, "failed")
+        self.assertIn("1", result.detail)
+
+    def test_without_a_tty_the_recommended_default_is_taken(self):
+        # Piped into `sh`, or run by an agent, there is no terminal to ask. The
+        # phase must still produce a destination rather than blocking — the
+        # same guarantee picker.choose() makes, asserted at the phase boundary
+        # because that is where run_setup() consumes it.
+        result, path = setupmod.phase_place(self.home, self.home,
+                                            stream=io.StringIO(""))
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(path, self.home / "brain")
+
+
+class TestCreatePhase(unittest.TestCase):
+    """phase_create runs `git commit` itself, so the identity it commits under
+    has to come from somewhere.
+
+    Left to the machine's own config, these tests pass on a developer's laptop
+    and fail on every CI runner, which configures no user.name — and on a
+    laptop with commit.gpgsign on they fail there too, waiting for a passphrase
+    nobody is at the keyboard to type. An empty global config plus an identity
+    in the environment fixes both, and keeps the promise at the top of this
+    file: nothing here reads or writes the developer's real state.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.source = self.base / "template"
+        (self.source / "knowledge").mkdir(parents=True)
+        (self.source / "knowledge" / "index.md").write_text("# i", encoding="utf-8")
+        (self.source / ".githooks").mkdir()
+        (self.source / ".githooks" / "pre-commit").write_text("#!/bin/sh\n",
+                                                              encoding="utf-8")
+        empty_config = self.base / "gitconfig"
+        empty_config.write_text("", encoding="utf-8")
+        patched = mock.patch.dict(os.environ, {
+            "GIT_CONFIG_GLOBAL": str(empty_config),
+            "GIT_CONFIG_SYSTEM": str(empty_config),
+            "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com",
+        })
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_creates_a_repo_with_one_commit_on_main(self):
+        dest = self.base / "brain"
+        result = setupmod.phase_create(self.source, dest)
+        self.assertEqual(result.status, "ok", result.detail)
+        self.assertEqual(_git(dest, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+                         "main")
+        self.assertEqual(_git(dest, "rev-list", "--count", "HEAD").stdout.strip(), "1")
+
+    def test_hooks_are_pointed_at_the_repos_own_directory(self):
+        dest = self.base / "brain"
+        setupmod.phase_create(self.source, dest)
+        self.assertEqual(
+            _git(dest, "config", "core.hooksPath").stdout.strip(), ".githooks")
+
+    def test_the_template_history_does_not_come_along(self):
+        # A brain's history is ITS OWN. Inheriting the product's history is
+        # what `gh repo create --template` avoids too.
+        dest = self.base / "brain"
+        setupmod.phase_create(self.source, dest)
+        subject = _git(dest, "log", "-1", "--format=%s").stdout.strip()
+        self.assertEqual(subject, "brain: start")
+
+    def test_the_bootstraps_are_not_copied_into_the_brain(self):
+        # install.sh installs a brain; it is not part of one. It also carries
+        # the template repo's own name, so a copy left behind would reinstall
+        # the PRODUCT over someone's notes if it were ever run from there.
+        (self.source / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.source / ".claude-plugin").mkdir()
+        dest = self.base / "brain"
+        setupmod.phase_create(self.source, dest)
+        self.assertFalse((dest / "install.sh").exists())
+        self.assertFalse((dest / ".claude-plugin").exists())
+
+    def test_a_git_with_no_identity_fails_with_the_command_that_fixes_it(self):
+        # The one failure mode a first run actually hits: git installed, never
+        # configured. It must name both settings, because `git commit` names
+        # neither in a way an agent can act on.
+        dest = self.base / "brain"
+        with mock.patch.dict(os.environ, {"GIT_AUTHOR_NAME": "",
+                                          "GIT_AUTHOR_EMAIL": "",
+                                          "GIT_COMMITTER_NAME": "",
+                                          "GIT_COMMITTER_EMAIL": ""}):
+            result = setupmod.phase_create(self.source, dest)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("user.name", result.remedy)
+        self.assertIn("user.email", result.remedy)
+
+
+def _done(code, out="", err=""):
+    """What subprocess.run() hands phase_verify back, without running anything."""
+    return subprocess.CompletedProcess([], code, out, err)
+
+
+class TestVerifyPhase(unittest.TestCase):
+    """doctor's verdict IS setup's verdict, so this phase may not soften it.
+
+    `run` is injected rather than executing the real doctor: doctor reads the
+    git remote, the inbox and the note birthdays of whatever repo it is pointed
+    at, and a unit test that depends on all of those is a test of doctor, not
+    of this phase.
+    """
+
+    def test_a_green_doctor_passes(self):
+        result = setupmod.phase_verify(Path("/nowhere"),
+                                       run=lambda argv: _done(0, "  [ok ] all good"))
+        self.assertEqual(result.status, "ok")
+
+    def test_a_nonzero_exit_fails_and_carries_doctors_own_words(self):
+        result = setupmod.phase_verify(
+            Path("/nowhere"),
+            run=lambda argv: _done(1, "  [RED] no git remote — not backed up"))
+        self.assertEqual(result.status, "failed")
+        self.assertIn("no git remote", result.detail)
+        self.assertIn("doctor", result.remedy)
+
+    def test_a_red_line_fails_even_when_the_exit_code_says_otherwise(self):
+        # The 2026-07-25 regression in its general form: an exit code is a
+        # summary somebody has to remember to keep true, and doctor's RED lines
+        # are the thing actually being asserted about. Read both, trust the
+        # worse one.
+        result = setupmod.phase_verify(
+            Path("/nowhere"),
+            run=lambda argv: _done(0, "  [RED] YOUR BRAIN IS PUBLIC"))
+        self.assertEqual(result.status, "failed")
+
+    def test_doctors_stderr_is_read_too(self):
+        # A traceback from a broken doctor lands on stderr and leaves stdout
+        # empty. Reading only stdout would call that install healthy.
+        result = setupmod.phase_verify(
+            Path("/nowhere"),
+            run=lambda argv: _done(1, "", "Traceback (most recent call last):"))
+        self.assertEqual(result.status, "failed")
+        self.assertIn("Traceback", result.detail)
 
 
 if __name__ == "__main__":
