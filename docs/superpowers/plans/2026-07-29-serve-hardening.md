@@ -208,10 +208,10 @@ commit that did them, item 6 becomes a recorded decision, and 3, 4 and 7 stay
 exactly as they are. An item that is done and still listed as open is the same
 folklore problem the file was opened to solve.
 
-- [ ] **Step 1: Write the docs**
-- [ ] **Step 2: Verify every command in them runs** — on this machine, on
+- [x] **Step 1: Write the docs**
+- [x] **Step 2: Verify every command in them runs** — on this machine, on
       loopback, not by eye
-- [ ] **Step 3: Commit** — `serve: document the read-only mode and the limiter`
+- [x] **Step 3: Commit** — `serve: document the read-only mode and the limiter`
 
 ---
 

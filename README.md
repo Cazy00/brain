@@ -228,13 +228,16 @@ trusting.
   unconsolidated notes as current, stripped of their trust signals. Retrieval
   goes through the brain's own tools.
 - **Remote access is bearer-token only, and opt-in.** `brain serve` puts the
-  same tools on HTTP behind a token you mint, refuses to start without one, and
-  binds loopback unless told otherwise. It works with Claude Code and anything
-  else that can set a request header; it does **not** work with claude.ai on the
-  web, Desktop or mobile, whose per-user custom connector flow takes OAuth
-  credentials and not a token (checked 2026-07-29). Closing that means OAuth
-  2.1, which is not built. There is no read-only mode: `brain_capture` writes,
-  and it is reachable over that transport.
+  same tools on HTTP behind a token you mint, refuses to start without one,
+  binds loopback unless told otherwise, and backs off after repeated failed
+  authentication. It works with Claude Code and anything else that can set a
+  request header; it does **not** work with claude.ai on the web, Desktop or
+  mobile, whose per-user custom connector flow takes OAuth credentials and not
+  a token (checked 2026-07-29). Closing that means OAuth 2.1, which is not
+  built. `--read-only` serves the four read tools and refuses `brain_capture`,
+  which limits what a holder of the token can *change* — every note is still
+  readable, and read-only is a property of the process rather than of the
+  token, so there is no such thing as a read-only token here.
 - **The privacy rule is instruction-enforced.** "Ask before recording anything
   about a person's private life" is followed by the model, not enforced by code,
   and commits auto-push. Weaker harnesses will eventually get this wrong.

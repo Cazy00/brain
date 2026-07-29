@@ -567,6 +567,7 @@ entirely; nothing else in the system depends on it.
 ```sh
 bin/brain serve --new-token     # mint a token, store it, print it ONCE
 bin/brain serve                 # listen on 127.0.0.1:8787
+bin/brain serve --read-only     # the four read tools; no brain_capture
 ```
 
 It serves the **same tools** as the local stdio server, over HTTP, behind a
@@ -575,10 +576,10 @@ differently from the local one would be worse than no remote brain.
 
 ### Read this before you expose it
 
-- **`brain_capture` is reachable over this transport, and it writes.** Whoever
-  holds the token can add notes to your brain, which are committed and pushed
-  automatically. That is the whole tool surface, not a subset. There is no
-  read-only mode yet.
+- **By default `brain_capture` is reachable over this transport, and it
+  writes.** Whoever holds the token can add notes to your brain, which are
+  committed and pushed automatically. `--read-only` takes that tool away; see
+  below for what it does and does not buy you.
 - **It refuses to start without a token.** A refusal, not a warning. It will
   not mint one silently: a credential nobody saw is a credential nobody knows
   to protect.
@@ -591,7 +592,34 @@ differently from the local one would be worse than no remote brain.
   rejected, because no legitimate client of this server is a browser and a web
   page can otherwise make your browser talk to `127.0.0.1`.
 - **There is no TLS here, on purpose.** See the tunnel contract below.
-- **There is no rate limiting.** Worth knowing before a public bind.
+- **Failed authentication backs off.** Five wrong tokens from an address are
+  free; after that each attempt costs 1s, 2s, 4s, up to five minutes, and the
+  reply is a `429` with `Retry-After`. There is no flag to switch it off.
+
+### `--read-only`, and what it does not do
+
+```sh
+bin/brain serve --read-only
+```
+
+Serves `brain_search`, `brain_read`, `brain_links` and `brain_recent`, and
+refuses `brain_capture` — not just by leaving it out of the tool list, but by
+refusing it if a client calls it anyway. A server that hides a tool and then
+runs whatever arrives has implemented a suggestion.
+
+**It does not make your brain safe to expose.** Every note is still readable by
+whoever holds the token, and for a second brain the reading is most of what
+there was to protect. Read-only limits what someone can *change*, not what they
+can *see*.
+
+Read-only is a property of the process, not of the token, so there is no way to
+hand out a read-only token and a writable one for the same server. If you want
+both, run two: the read-only one wherever you are reaching it from, the writable
+one on loopback.
+
+Startup says which mode you are in every time, including the default. That line
+exists for the week you run it read-only, the week after when you forget the
+flag, and the fact that nothing else would tell you.
 
 ### Connecting a client
 
@@ -629,6 +657,13 @@ publishes an unauthenticated origin to a public hostname is one mis-scoped
 route, one bypass policy, or one other path to the origin away from exposing
 the whole brain. The check inside the server travels with the server; a policy
 in front of it does not.
+
+One consequence worth knowing before it surprises you: behind a tunnel every
+request arrives from the tunnel's address, so the backoff above sees all your
+clients as one. A run of wrong tokens through the tunnel therefore slows down
+everything else coming through it. That is deliberate — the alternative is
+trusting an `X-Forwarded-For` header, and a header the client sets is a header
+an attacker changes, which would leave the control there in name only.
 
 ## Part 9 — `brain retire`
 

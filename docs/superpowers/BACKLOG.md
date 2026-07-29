@@ -1,15 +1,21 @@
 # Backlog — what is known, deferred, and not done
 
 Opened 2026-07-29, at the end of the session that closed all seven stages of
-[the setup UX spec](specs/2026-07-25-setup-ux-redesign-design.md).
+[the setup UX spec](specs/2026-07-25-setup-ux-redesign-design.md). Last worked
+2026-07-29.
 
 This file exists because the alternative is folklore. Every item below was a
 deliberate decision, not an oversight, and each one is flagged in the code at
 the point where somebody would trip over it — this is the index, not the only
 record.
 
-**Nothing here is blocking.** The four commands work, 445 tests pass (with one
-known environment failure, item 5), and the system is usable as it stands.
+**Nothing here is blocking.** The four commands work and 468 tests pass, with no
+known failures on any platform this project can run.
+
+The numbering is stable: items keep their number once closed, because "item 3"
+in a commit message should still mean item 3 in a year. Four of the original
+seven are closed and stay listed with what closed them; item 8 was opened
+2026-07-29 by the work that closed the others.
 
 ---
 
@@ -20,44 +26,46 @@ known environment failure, item 5), and the system is usable as it stands.
 | [2026-07-25-setup-foundation.md](plans/2026-07-25-setup-foundation.md) | 1–3: backends, `brain setup`, the bootstraps | closed, 69/69 |
 | [2026-07-29-connect-retire-docs.md](plans/2026-07-29-connect-retire-docs.md) | 4–6: `connect --apply`, `retire`, the docs | closed, 41/41 |
 | [2026-07-29-serve.md](plans/2026-07-29-serve.md) | 7: `brain serve` | closed, 18/18 |
+| [2026-07-29-serve-hardening.md](plans/2026-07-29-serve-hardening.md) | backlog items 1, 2, 5 | closed, 18/18 |
 
 The four commands the spec set out to build all exist and all end in a working
 state: `brain setup`, `brain connect`, `brain serve`, `brain retire`.
 
 ---
 
-## 1. `brain serve` has no read-only mode
+## 1. `brain serve` has no read-only mode — CLOSED 2026-07-29
 
-**Where:** `bin/brainlib/serve.py` (module docstring), `SETUP.md` Part 8.
+**Closed by:** `70ffa1d`, `brain serve --read-only`.
 
-`brain_capture` is reachable over the HTTP transport and it **writes** — notes
-land in the brain, get committed, and get pushed. Whoever holds the token can
-do that. The docs say so plainly rather than implying a subset, which is the
-honest interim position, but it is an interim position.
+Serves `brain_search`, `brain_read`, `brain_links` and `brain_recent`; refuses
+`brain_capture`. The filtering happens in the dispatcher, so a client that
+never read `tools/list` and calls the tool by name is refused too — that half
+is the actual control, and it has its own test.
 
-The spec called this future work and it stayed future work. The obvious shape
-is a `--read-only` flag that serves a filtered tool list; the thing to be
-careful about is that filtering must happen server-side, not by trusting a
-client to not call the tool.
+Which tools qualify is derived from the tool table's `readOnlyHint`
+annotations, failing closed: a tool added later with no annotation is left OUT
+of read-only serving, and a test refuses any tool that declares nothing.
 
-**Done looks like:** `brain serve --read-only` exposes four tools instead of
-five, with a test that asserts `brain_capture` is absent from `tools/list` AND
-that calling it by name is refused.
+What it does **not** do, stated here because the flag invites the opposite
+reading: every note is still readable by whoever holds the token. Read-only is
+also a property of the process rather than of the token, so serving both modes
+at once means two processes on two ports.
 
-## 2. `brain serve` has no rate limiting
+## 2. `brain serve` has no rate limiting — CLOSED 2026-07-29
 
-**Where:** `bin/brainlib/serve.py` (module docstring).
+**Closed by:** `49c5295`, a per-address backoff on failed authentication.
 
-Fine on loopback, which is the default and where almost everyone will leave it.
-Not fine the moment anyone runs it on a public bind for real: there is nothing
-in the server that would slow down a loop guessing tokens. The token is 32
-random bytes, so guessing it is not a practical attack — but "not practical"
-is an argument, and a limiter is a control.
+Five failures from an address are free; each one after that costs 1s, 2s, 4s,
+capped at five minutes, answered `429` with `Retry-After`. Always on, no flag
+to disable it.
 
-**Done looks like:** a per-IP failure counter with a backoff, and a test that a
-run of bad tokens starts getting refused without a valid one being affected.
+Three decisions in it have costs, all documented at the point they are made:
+the key is the TCP peer and `X-Forwarded-For` is not trusted (so a tunnel's
+clients share one bucket); `Origin` refusals are not counted (or any web page
+could lock the operator out with a `fetch` loop); and the table is bounded (an
+unbounded one is a memory exhaustion primitive reachable without a token).
 
-## 3. claude.ai web, Desktop and mobile cannot use `brain serve`
+## 3. claude.ai web, Desktop and mobile cannot use `brain serve` — OPEN
 
 **Where:** `bin/brainlib/serve.py` (module docstring), `SETUP.md` Part 8,
 `README.md` ("what it deliberately does not do").
@@ -77,7 +85,7 @@ authorization server, not a flag — and it is the reason the spec split `serve`
 into its own stage in the first place. Re-check the beta status before starting:
 if `static_headers` leaves beta for individuals, this becomes unnecessary.
 
-## 4. Windows is verified by CI only
+## 4. Windows is verified by CI only — OPEN
 
 **Where:** `bin/brainlib/osbackend.py` (`SchtasksScheduler`, `CredmanKeystore`),
 `SETUP.md` Part 0, `README.md`.
@@ -91,25 +99,35 @@ whether a scheduled task actually fires, whether Credential Manager prompts.
 whether the `CredentialManager` PowerShell module is present on a stock box —
 which was to be confirmed on the Windows runner and has not been.
 
+`InitTests.env_with` also keeps its pre-2026-07-29 PATH construction on Windows
+only (see item 5), so what that class proves there is weaker than what it proves
+on POSIX. Worth folding into the same session as the rest of this.
+
 **Done looks like:** somebody with a Windows machine runs `brain setup`,
 `brain connect --all --apply`, `brain schedule install`, and a vault round
 trip, and writes down what actually happened.
 
-## 5. One test fails on a machine with `claude` in `/usr/bin`
+## 5. One test fails on a machine with `claude` in `/usr/bin` — CLOSED 2026-07-29
 
-**Where:** `tests/test_brain.py`, `InitTests.env_with` (docstring).
+**Closed by:** `6267293`, a PATH built from symlinks instead of borrowed from
+the system.
 
 `test_init_defers_when_claude_cli_absent` builds a PATH with no `claude` on it
-and asserts its own sandbox is clean. That PATH still contains `/usr/bin`, so
-on a machine where Claude Code is installed there the premise is false and the
-assertion refuses. **This is the assertion working.** It predates all three
-plans and must not be "fixed" by weakening it.
+and asserts its own sandbox is clean. That PATH used to contain `/usr/bin`,
+where some Linux packages install `claude`, so on those machines the premise
+was false and the assertion refused — the assertion working, and the suite red
+for a reason unrelated to anything under test.
 
-**Done looks like:** the no-claude PATH is a temp directory of symlinks to just
-the tools `init` needs, rather than `/usr/bin`. Fiddly to keep working on
-Windows, which is why it was not done under time pressure.
+The assertion did not move. The PATH is now a temp directory of symlinks to
+just the tools `init` needs, so the premise is constructed rather than assumed.
+Verified by putting a `claude` back into the farm and watching the test refuse,
+because a fix that quietly made the assertion unreachable would look identical
+from the summary line.
 
-## 6. A commit message on `main` is garbled
+Still the old construction on Windows, for the reasons in the docstring —
+folded into item 4.
+
+## 6. A commit message on `main` is garbled — CLOSED 2026-07-29, as a decision
 
 **Where:** commit `05d1f8f`, "setup: wire brain setup into the CLI".
 
@@ -118,14 +136,15 @@ sentence "…setup installs the brain and  — run from the brain itself — wir
 it". The code is unaffected: an amended commit with the correct message exists
 in the reflog and is byte-identical in content.
 
-Fixing it needs a history rewrite of one already-pushed commit
-(`git push --force-with-lease`), which was declined by the permission layer in
-the session that made it.
+**Decided 2026-07-29: leave it.** Fixing it means rewriting published history
+(`git push --force-with-lease`) of the repo that is the public template, which
+diverges every existing clone to buy one tidy sentence in a log. The content is
+right and the cost of the fix exceeds the cost of the defect.
 
-**Done looks like:** either the force-push, or a decision to leave it — the
-content is fine and the cost is one confusing sentence in the log.
+This is recorded rather than deleted so it stops reading as outstanding work
+and nobody reopens it.
 
-## 7. `doctor` reports this repo as public, correctly
+## 7. `doctor` reports this repo as public, correctly — NOT A DEFECT
 
 **Where:** not a defect. Recorded so nobody "fixes" it.
 
@@ -137,6 +156,35 @@ that cries wolf on the one repo where the wolf is invited.
 
 Anyone running `doctor` here should read past that line. Anyone running it in
 their **own** brain should not.
+
+## 8. `serve --help` and `setup --help` show the global help — OPEN
+
+**Where:** `bin/brain` `main()` (the `rest[:1] in (["--help"], ["-h"])` guard),
+`bin/brainlib/setup.py` and `bin/brainlib/serve.py` (both `USAGE` constants).
+
+Found 2026-07-29 while verifying the documentation for `--read-only` by running
+it. `brain serve --help` prints the toolbelt's global `__doc__`, not
+`serve.USAGE` — main() answers `<command> --help` itself for every command, so
+the two per-command usage texts are reachable only behind another flag
+(`brain serve --port 8787 --help`). `setup.py` already says so in a comment, so
+this is a known consequence rather than a surprise.
+
+The guard is there for a good reason: `init --help` once ignored argv and wired
+the machine — re-pointing a global skill symlink and registering an MCP server —
+for somebody who only asked what the command did. Blunt and safe beat clever and
+sorry.
+
+But both `run_setup` and `run_serve` answer `--help` before touching anything,
+and both are tested for it, so the safety the guard buys is already paid for
+twice. The flags stay discoverable meanwhile: `brain --help` documents
+`--read-only`.
+
+**Done looks like:** main() defers to the handler for the commands that provably
+answer `--help` first — named explicitly, never inferred, because the rule
+exists precisely because a handler that "obviously" checked `--help` first did
+not — with a test per command asserting its own usage comes back and nothing is
+done. Left alone here because reversing a deliberate, commented decision was not
+in the scope of the plan that found it.
 
 ---
 
