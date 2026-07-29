@@ -10,7 +10,9 @@ Two rules hold in every test here: bind 127.0.0.1 on port 0, never a real
 interface; and the token is a literal fixture, never read from or written to
 the machine's real keystore.
 """
+import contextlib
 import http.client
+import io
 import json
 import sys
 import tempfile
@@ -272,6 +274,131 @@ class TestTokenStorage(unittest.TestCase):
         serve.store_token(serve.mint_token(), store=self.store)
         path = Path(self.tmp.name) / serve.TOKEN_NAME
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+
+class TestTheCli(unittest.TestCase):
+    """`run_serve` without ever listening.
+
+    `run` is injected the same way phase_backup's is: the tests that actually
+    bind a socket are above, and what is left to check here is the wiring —
+    that the value the server is handed is the stored one, and that the two
+    paths which must never reach a socket at all do not.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = osbackend.FileKeystore(directory=Path(self.tmp.name))
+        self.started = []
+        self.out = io.StringIO()
+        self.err = io.StringIO()
+
+    def run_serve(self, *argv):
+        with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(self.err):
+            return serve.run_serve(list(argv), store=self.store,
+                                   run=self.started.append)
+
+    def test_it_refuses_to_start_without_one_and_names_the_fix(self):
+        """A refusal, not a warning, and not a silent mint.
+
+        Minting one here would be worse than refusing: a credential that
+        appears without anybody seeing it is a credential nobody knows to
+        protect, and it would authorise a write tool.
+        """
+        code = self.run_serve()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.started, [], "it opened a socket anyway")
+        self.assertIn("--new-token", self.err.getvalue())
+
+    def test_new_token_prints_it_once_and_stores_it(self):
+        code = self.run_serve("--new-token")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.started, [], "--new-token started a server")
+        stored = serve.read_token(store=self.store)
+        self.assertTrue(stored)
+        self.assertIn(stored, self.out.getvalue(),
+                      "the value was stored but never shown — it is unrecoverable now")
+        self.assertIn("only time", self.out.getvalue().lower(),
+                      "nothing told the reader this is the only time they see it")
+
+    def test_new_token_says_it_breaks_every_client_already_wired(self):
+        # Rotation is the correct behaviour. Rotation nobody was told about is
+        # a morning spent debugging four clients that all stopped at once.
+        self.run_serve("--new-token")
+        self.assertIn("stop working", self.err.getvalue() + self.out.getvalue())
+
+    def test_a_stored_value_is_what_the_server_gets(self):
+        self.run_serve("--new-token")
+        stored = serve.read_token(store=self.store)
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+        code = self.run_serve("--port", "0")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.started), 1)
+        server = self.started[0]
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.token, stored)
+        self.assertEqual(server.server_address[0], "127.0.0.1",
+                         "the default bind is not loopback")
+
+    def test_the_banner_never_prints_the_value_itself(self):
+        """It prints the registration command with a placeholder.
+
+        Printing the real one on every start writes it into scrollback, any
+        terminal log, and any screen recording — repeatedly, long after the one
+        moment the operator was paying attention to it.
+        """
+        self.run_serve("--new-token")
+        stored = serve.read_token(store=self.store)
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+        self.run_serve("--port", "0")
+
+        printed = self.out.getvalue() + self.err.getvalue()
+        self.assertNotIn(stored, printed)
+        self.assertIn("BRAIN_TOKEN", printed)
+        self.assertIn("claude mcp add", printed,
+                      "the one client this is known to work with is not named")
+
+    def test_a_public_bind_says_what_it_is_exposing(self):
+        self.run_serve("--new-token")
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+        code = self.run_serve("--bind", "0.0.0.0", "--port", "0")
+
+        self.assertEqual(code, 0)
+        self.addCleanup(self.started[0].server_close)
+        warned = self.err.getvalue()
+        self.assertIn("0.0.0.0", warned)
+        # It must name the consequence, not just the address. What is on the
+        # other end of this socket can write to the brain.
+        self.assertIn("write", warned.lower())
+
+    def test_loopback_is_not_warned_about(self):
+        self.run_serve("--new-token")
+        self.out, self.err = io.StringIO(), io.StringIO()
+        self.run_serve("--port", "0")
+        self.addCleanup(self.started[0].server_close)
+        self.assertNotIn("EXPOSED", self.err.getvalue())
+
+
+class TestServeInTheHelp(unittest.TestCase):
+    def test_serve_is_listed(self):
+        import subprocess
+
+        done = subprocess.run([sys.executable, str(ROOT / "bin" / "brain"), "--help"],
+                              cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+        self.assertIn("brain serve", done.stdout)
+
+    def test_serve_help_does_not_start_a_server(self):
+        import subprocess
+
+        done = subprocess.run([sys.executable, str(ROOT / "bin" / "brain"),
+                               "serve", "--help"],
+                              cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0)
+        self.assertNotIn("listening", done.stdout.lower())
 
 
 if __name__ == "__main__":

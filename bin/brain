@@ -21,6 +21,11 @@ Commands:
   brain schedule install|uninstall|status [--with-consolidate]
   brain template <dest> [--force]  emit a publishable copy: all tooling, none
                                    of your notes (the public template is DERIVED)
+  brain serve [--bind <addr>] [--port <n>] | --new-token
+                                   the same tools over HTTP, for reaching this
+                                   brain from another device. Loopback by
+                                   default; refuses to start without a token;
+                                   brain_capture WRITES over it
   brain doctor                     health report (hooks, backup, lint, tools)
   brain stats [--json] [--record]  is the KNOWLEDGE still healthy: findability,
                                    capture rate, staleness, curation, link graph
@@ -5537,6 +5542,11 @@ def main() -> int:
         return cmd_init(rest)
     if cmd == "connect":
         return cmd_connect(rest)
+    if cmd == "serve":
+        # Local import for the same reason setup's is: this pulls in the HTTP
+        # server machinery, and most sessions never serve anything.
+        from brainlib.serve import run_serve
+        return run_serve(rest)
     if cmd == "new":
         return cmd_new(rest)
     if cmd == "capture":

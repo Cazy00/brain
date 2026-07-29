@@ -43,6 +43,7 @@ from . import osbackend
 
 ENDPOINT = "/mcp"
 TOKEN_NAME = "brain-serve-token"
+DEFAULT_PORT = 8787
 
 # The same ceiling the stdio loop uses: a single request larger than this is
 # not real traffic.
@@ -236,3 +237,140 @@ def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
     server.allow_origin = tuple(allow_origin)
     server.quiet = quiet
     return server
+
+
+USAGE = """brain serve — reach this brain from another device.
+
+  brain serve [--bind <addr>] [--port <n>] [--allow-origin <origin>]
+  brain serve --new-token
+
+  --new-token           mint a value, store it in the OS keystore, print it ONCE
+  --bind <addr>         default 127.0.0.1. Anything else is exposed; it says so
+  --port <n>            default {port}
+  --allow-origin <o>    permit one browser Origin. Repeatable. Empty by default,
+                        because no legitimate client of this server is a browser
+
+Serves the same tools as the stdio server, over HTTP, behind a bearer token.
+That includes brain_capture, which WRITES to your brain and auto-pushes it —
+whoever holds the token can add notes. There is no read-only mode yet.
+
+No TLS here. Put a tunnel in front that terminates TLS, forwards to this port,
+preserves the Authorization header, and adds no Origin header.
+""".format(port=DEFAULT_PORT)
+
+
+def startup_notes(host: str, port: int) -> tuple:
+    """(what to tell the operator, what to warn them about).
+
+    Split from the serving so both halves can be read — and tested — without
+    opening a socket.
+    """
+    url = f"http://{host}:{port}{ENDPOINT}"
+    notes = [
+        f"brain serve — listening on {url}",
+        "",
+        "  Register it with a client that can set a header:",
+        f'    claude mcp add --transport http brain {url} \\',
+        '      --header "Authorization: Bearer $BRAIN_TOKEN"',
+        "",
+        # The value itself is deliberately absent. Printing it on every start
+        # writes it into scrollback, any terminal log and any screen recording
+        # — repeatedly, long after the one moment anybody was watching for it.
+        "  $BRAIN_TOKEN is the value `brain serve --new-token` printed. It is not",
+        "  repeated here on purpose; mint a new one if it is lost.",
+        "",
+        "  Behind a tunnel, swap the host for your hostname. The tunnel must",
+        "  terminate TLS, forward to this port, preserve the Authorization",
+        "  header, and add no Origin header.",
+    ]
+    warnings = []
+    if not _is_loopback(host):
+        warnings = [
+            "",
+            f"  EXPOSED — bound to {host}, not loopback. Anything that can reach",
+            f"  {host}:{port} and holds the token can read every note in this brain",
+            "  and WRITE new ones, which are committed and pushed automatically.",
+            "  That is the whole tool surface, not a subset.",
+        ]
+    return notes, warnings
+
+
+def run_serve(argv: list, store=None, run=None) -> int:
+    """The `brain serve` command.
+
+    `run` is injected so the wiring can be tested without a socket, the same
+    way phase_backup takes its runner. The tests that genuinely bind one go
+    through make_server directly.
+    """
+    if "--help" in argv or "-h" in argv:
+        print(USAGE)
+        return 0
+
+    store = store or osbackend.keystore()
+    run = run or (lambda server: server.serve_forever())
+
+    if "--new-token" in argv:
+        minted = mint_token()
+        if not store_token(minted, store=store):
+            print(f"could not store the value in {store.describe()}", file=sys.stderr)
+            return 1
+        print("This is the ONLY time this is shown. Copy it now:\n")
+        print(f"  {minted}\n")
+        print(f"Stored in {store.describe()}.", file=sys.stderr)
+        print("Any client already wired to a previous value will stop working "
+              "until you\nre-register it with this one.", file=sys.stderr)
+        return 0
+
+    existing = read_token(store=store)
+    if not existing:
+        # A refusal, not a warning, and emphatically not a silent mint: a
+        # credential that appears without anybody seeing it is a credential
+        # nobody knows to protect — and this one authorises a write tool.
+        print("brain serve refuses to start without a token.\n\n"
+              "  brain serve --new-token\n\n"
+              "mints one, stores it in this machine's keystore, and prints it once.",
+              file=sys.stderr)
+        return 1
+
+    host = _flag(argv, "--bind") or "127.0.0.1"
+    try:
+        port = int(_flag(argv, "--port") or DEFAULT_PORT)
+    except ValueError:
+        print("--port needs a number", file=sys.stderr)
+        return 2
+    allow_origin = _flags(argv, "--allow-origin")
+
+    try:
+        server = make_server(existing, host, port, allow_origin=allow_origin)
+    except OSError as exc:
+        print(f"could not listen on {host}:{port} — {exc}", file=sys.stderr)
+        return 1
+
+    notes, warnings = startup_notes(host, server.server_address[1])
+    for line in notes:
+        print(line, file=sys.stderr)
+    for line in warnings:
+        print(line, file=sys.stderr)
+    print("", file=sys.stderr)
+    try:
+        run(server)
+    except KeyboardInterrupt:
+        print("\nstopped", file=sys.stderr)
+    finally:
+        server.server_close()
+    return 0
+
+
+def _flag(argv: list, name: str) -> str:
+    if name not in argv:
+        return ""
+    index = argv.index(name)
+    return argv[index + 1] if index + 1 < len(argv) else ""
+
+
+def _flags(argv: list, name: str) -> tuple:
+    found = []
+    for i, arg in enumerate(argv):
+        if arg == name and i + 1 < len(argv):
+            found.append(argv[i + 1])
+    return tuple(found)
