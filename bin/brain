@@ -1613,9 +1613,11 @@ CONNECT_CLIENTS = {
         "name": "Claude Code",
         "config": "handled by `bin/brain init` — nothing to paste",
         "format": None,
+        "path": None,
         "cli": None,
         "agents_md": "no — reads CLAUDE.md, which imports AGENTS.md (@AGENTS.md)",
         "routing": "~/.claude/CLAUDE.md",
+        "routing_path": "~/.claude/CLAUDE.md",
         "ignore": None,
         "restart": "start a new session — MCP servers and skills load at session start",
         "notes": ["`bin/brain init` writes .mcp.json, renders the /brain skill and "
@@ -1628,9 +1630,11 @@ CONNECT_CLIENTS = {
         "name": "OpenAI Codex CLI",
         "config": "~/.codex/config.toml",
         "format": "toml",
+        "path": "~/.codex/config.toml",
         "cli": 'codex mcp add brain -- "{server}"',
         "agents_md": "yes, natively (Codex is where AGENTS.md came from)",
         "routing": "~/.codex/AGENTS.md",
+        "routing_path": "~/.codex/AGENTS.md",
         "ignore": None,
         "restart": "start a new session",
         "notes": ["The table is `[mcp_servers.brain]` — snake_case, TOML, NOT the "
@@ -1647,9 +1651,11 @@ CONNECT_CLIENTS = {
         "name": "Gemini CLI",
         "config": "~/.gemini/settings.json",
         "format": "json-mcpServers",
+        "path": "~/.gemini/settings.json",
         "cli": 'gemini mcp add --scope user brain "{server}"',
         "agents_md": 'opt-in — set context.fileName to ["AGENTS.md", "GEMINI.md"]',
         "routing": "~/.gemini/GEMINI.md",
+        "routing_path": "~/.gemini/GEMINI.md",
         "ignore": ".geminiignore",
         "restart": "restart, or `/mcp reload` in the REPL",
         "notes": ["`--scope user` is NOT the default. Without it the server is written "
@@ -1670,9 +1676,11 @@ CONNECT_CLIENTS = {
         "name": "Cursor",
         "config": "~/.cursor/mcp.json  (global)  or  <repo>/.cursor/mcp.json  (project)",
         "format": "json-mcpServers-typed",
+        "path": "~/.cursor/mcp.json",
         "cli": None,
         "agents_md": "yes, from the project root (it reads a root CLAUDE.md too)",
         "routing": "NO FILE — Settings → Customize → Rules → User Rules (UI only)",
+        "routing_path": None,
         "ignore": ".cursorignore",
         "restart": "undocumented — assume a restart is needed",
         "notes": ["Cursor's own docs contradict themselves on whether `type` is "
@@ -1689,10 +1697,19 @@ CONNECT_CLIENTS = {
         "config": "<repo>/.vscode/mcp.json  (workspace)  —  user scope: "
                   "run “MCP: Open User Configuration”",
         "format": "json-servers",
+        # The user-scope file that palette command opens, located the same way
+        # settings.json is. Per-OS because VS Code's user profile directory is.
+        "path": {"macos": "~/Library/Application Support/Code/User/mcp.json",
+                 "linux": "~/.config/Code/User/mcp.json",
+                 "windows": "%APPDATA%/Code/User/mcp.json"},
         "cli": 'code --add-mcp \'{{"name":"brain","type":"stdio","command":"{server}","args":[]}}\'',
         "agents_md": "yes, on by default (chat.useAgentsMdFile), workspace-scoped",
         "routing": "~/.copilot/instructions/brain.instructions.md, with frontmatter "
                    "applyTo: \"**\"  (it also reads ~/.claude/CLAUDE.md by default)",
+        "routing_path": "~/.copilot/instructions/brain.instructions.md",
+        # A .instructions.md file with no applyTo matches nothing, so a routing
+        # block written into a fresh one would sit there being ignored.
+        "routing_preamble": '---\napplyTo: "**"\n---\n',
         "ignore": None,
         "restart": "use the mcp.json code-lens Start/Restart, or “MCP: List Servers”",
         "notes": ["The top-level key is `servers`, NOT `mcpServers`. A Claude Desktop "
@@ -1707,9 +1724,11 @@ CONNECT_CLIENTS = {
         "name": "Windsurf / Devin Desktop",
         "config": "~/.codeium/windsurf/mcp_config.json",
         "format": "json-mcpServers",
+        "path": "~/.codeium/windsurf/mcp_config.json",
         "cli": None,
         "agents_md": "yes, workspace-scoped",
         "routing": "~/.codeium/windsurf/memories/global_rules.md  (6,000 char limit)",
+        "routing_path": "~/.codeium/windsurf/memories/global_rules.md",
         "ignore": ".devinignore",
         "restart": "refresh from the Cascade MCP panel",
         "notes": ["Mid-rebrand: docs.windsurf.com now redirects to docs.devin.ai, but "
@@ -1724,10 +1743,18 @@ CONNECT_CLIENTS = {
         "name": "Claude Desktop",
         "config": "~/Library/Application Support/Claude/claude_desktop_config.json",
         "format": "json-mcpServers",
+        # No Linux entry, and that is the answer rather than a gap: Claude
+        # Desktop does not ship there. A made-up path would make detection
+        # report a client that cannot be present.
+        "path": {"macos": "~/Library/Application Support/Claude/"
+                          "claude_desktop_config.json",
+                 "linux": None,
+                 "windows": "%APPDATA%/Claude/claude_desktop_config.json"},
         "cli": None,
         "agents_md": "no — Desktop reads no instruction file at all",
         "routing": "NO FILE — account Settings → Profile preferences, or rely on the "
                    "tool descriptions the server itself sends",
+        "routing_path": None,
         "ignore": None,
         "restart": "quit with Cmd-Q and relaunch — closing the window is not enough",
         "notes": ["MERGE into the existing file. It may already hold preferences and "
@@ -1752,6 +1779,35 @@ CONNECT_FORMATS = {
                      '      "type": "stdio",\n      "command": "{server}",\n'
                      '      "args": []\n    }}\n  }}\n}}'),
 }
+
+
+def expand_client_path(spec):
+    """Resolve a CONNECT_CLIENTS path spec to a real path on THIS machine.
+
+    Returns None when there is nothing to resolve — either the client owns no
+    writable file (Claude Code, whose two files `init` writes), or it does not
+    exist on this OS at all (Claude Desktop on Linux). None is an answer here,
+    not a failure: detection must not report a client that cannot be present,
+    and `--apply` must not create a file nothing will ever read.
+
+    Every spec is anchored to a home directory rather than being absolute, so
+    that the tests can redirect HOME and so that `--apply` run from inside the
+    brain cannot write another tool's config into the brain.
+    """
+    import os
+
+    if isinstance(spec, dict):
+        spec = spec.get(osbackend.os_family())
+    if not spec:
+        return None
+    if spec.startswith("~/"):
+        return Path.home() / spec[2:]
+    if spec.startswith("%APPDATA%/"):
+        # Only set on Windows. Nothing else can honour this spelling, and
+        # guessing an equivalent would put a file where nothing looks for it.
+        base = os.environ.get("APPDATA")
+        return Path(base) / spec[len("%APPDATA%/"):] if base else None
+    return Path(spec)
 
 
 def routing_block() -> str:

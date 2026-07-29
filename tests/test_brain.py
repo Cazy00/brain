@@ -23,6 +23,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 BRAIN = ROOT / "bin" / "brain"
@@ -2230,6 +2231,61 @@ class ConnectTests(unittest.TestCase):
             self.assertTrue(module.CONNECT_CLIENTS[key]["format"].startswith("json-mcpServers"),
                             f"{key} must use the mcpServers key")
         self.assertEqual(module.CONNECT_CLIENTS["codex"]["format"], "toml")
+
+    def test_every_writable_client_says_where_its_config_lives(self):
+        """`--apply` cannot write to a sentence.
+
+        The prose `config` field carries what a single path cannot — project
+        vs global scope, "run this palette command", the Windows spelling — so
+        it stays, and `path` is the machine-readable half beside it. A client
+        with a config FORMAT is a client something can be written for, so it
+        must have one.
+        """
+        module = load_brain_module()
+        for key, client in module.CONNECT_CLIENTS.items():
+            with self.subTest(client=key):
+                if client["format"]:
+                    self.assertIsNotNone(client.get("path"),
+                                         f"{key} has a config format but no path")
+
+    def test_every_client_with_a_routing_file_says_where_it_is(self):
+        """Cursor and Claude Desktop have no global instruction file at all —
+        their routing rule lives in a UI. Everyone else has a file, and
+        `--routing --apply` needs to know which."""
+        module = load_brain_module()
+        for key, client in module.CONNECT_CLIENTS.items():
+            with self.subTest(client=key):
+                ui_only = client["routing"].startswith("NO FILE")
+                self.assertEqual(ui_only, client.get("routing_path") is None,
+                                 f"{key}: routing prose and routing_path disagree")
+
+    def test_no_client_path_is_relative(self):
+        """A relative path would resolve against the current directory, so
+        `--apply` run from inside the brain would write another tool's config
+        into the brain — tracked, committed and pushed."""
+        module = load_brain_module()
+        for key, client in module.CONNECT_CLIENTS.items():
+            for field in ("path", "routing_path"):
+                spec = client.get(field)
+                specs = list(spec.values()) if isinstance(spec, dict) else [spec]
+                for one in specs:
+                    if one:
+                        with self.subTest(client=key, field=field):
+                            self.assertTrue(one.startswith(("~", "%")),
+                                            f"{key}.{field} is not anchored to a home")
+
+    def test_claude_desktop_has_no_path_on_linux(self):
+        """It does not ship there. Inventing a Linux path would make detection
+        report a client that cannot be present, and `--apply` create a file
+        nothing will ever read."""
+        module = load_brain_module()
+        spec = module.CONNECT_CLIENTS["claude-desktop"]["path"]
+        with mock.patch.object(module.osbackend, "os_family", return_value="linux"):
+            self.assertIsNone(module.expand_client_path(spec))
+        with mock.patch.object(module.osbackend, "os_family", return_value="macos"):
+            resolved = module.expand_client_path(spec)
+        self.assertIsNotNone(resolved)
+        self.assertTrue(resolved.is_absolute())
 
     def test_an_unknown_client_is_refused_rather_than_guessed_at(self):
         out = run_brain("connect", "emacs", repo=self.repo)

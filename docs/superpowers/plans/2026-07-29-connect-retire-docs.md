@@ -1,6 +1,6 @@
 # Connect, Retire and the Docs — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** Finish the setup UX redesign. `brain connect` stops printing snippets for a human to paste and starts writing them, safely, into files this system did not create. `brain reset` becomes `brain retire` and stops reading like a warning label. README and SETUP.md are rewritten to document what was built rather than what was planned.
 
@@ -71,17 +71,17 @@ The enabling change. Nothing can be written until each client says where it live
 
 The existing prose fields stay exactly as they are. They carry the caveats — project vs global scope, the Windows path, "UI only" — that a single path cannot, and `print_client` is still what a human reads.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Assert that every client with a `format` also has a `path`; that every client whose `routing` prose does not begin `NO FILE` has a `routing_path`; and that no `path` is a bare relative name (a config written to the current directory instead of the user's home is the failure mode).
 
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement**
 
 Add the three fields. `claude-desktop`'s path is OS-dependent (`~/Library/Application Support/Claude/` on macOS, `%APPDATA%/Claude/` on Windows, and it does not ship on Linux) — resolve it through a helper that asks `osbackend.os_family()`, and return `None` on Linux rather than inventing a path no file will ever be at.
 
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Commit** — `connect: give every client a machine-readable config path`
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Commit** — `connect: give every client a machine-readable config path`
 
 ---
 
