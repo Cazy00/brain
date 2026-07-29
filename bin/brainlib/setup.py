@@ -5,6 +5,7 @@ One implementation serves a human at a terminal and an agent running headless.
 Two implementations would mean the agent path rots silently, because nobody
 exercises it daily — and most people will hand this whole thing to an agent.
 """
+import io
 import json
 import shutil
 import subprocess
@@ -281,3 +282,130 @@ def phase_verify(dest, run=None) -> Result:
         return Result("failed", "doctor reported a problem:\n" + output.strip(),
                       remedy=f"cd {dest} && bin/brain doctor")
     return Result("ok", "doctor is green")
+
+
+USAGE = """brain setup — install a brain here and prove it works.
+
+  brain setup [--dir <path>] [--repo <name>] [--no-repo]
+              [--yes] [--json] [--only <phase>]
+
+  --dir <path>    where the brain lives; skips the picker
+  --repo <name>   name for the private GitHub repo  (default: my-brain)
+  --no-repo       do not create a remote at all — LOCAL ONLY, no backup
+  --yes, -y       never ask; take every default
+  --json          machine-readable result on stdout, human text on stderr
+  --only <phase>  re-run one phase: {phases}
+                  create/backup/verify also need --dir
+
+Phases run in that order and each one is safe to re-run. The exit code is
+doctor's, so an install this reports as done is one doctor calls healthy.
+""".format(phases=" | ".join(PHASES))
+
+
+def _flag_value(argv: list, flag: str):
+    """The argument after `flag`: None when absent, "" when it has no value.
+
+    A bare trailing `--only` is a typo, and argv[i + 1] would answer it with an
+    IndexError traceback where a one-line "needs a value" belongs.
+    """
+    if flag not in argv:
+        return None
+    index = argv.index(flag)
+    return argv[index + 1] if index + 1 < len(argv) else ""
+
+
+def run_setup(argv: list, home=None, cwd=None, source=None) -> int:
+    """The whole first run. Interactive with a terminal, silent without one.
+
+    Human text goes to stderr and machine output to stdout, so `--json` can be
+    parsed by an agent without stripping anything first.
+    """
+    home = Path(home) if home else Path.home()
+    cwd = Path(cwd) if cwd else Path.cwd()
+    # What this brain is copied FROM: the checkout bin/brain is running out of,
+    # which is install.sh's temp clone when it hands off, and this repo when a
+    # developer runs it by hand.
+    source = Path(source) if source else Path(__file__).resolve().parent.parent.parent
+
+    if "--help" in argv or "-h" in argv:
+        # Reached only when help arrives behind another flag; `brain setup
+        # --help` is caught by main()'s own guard first. Either way the rule is
+        # the one `init --help` broke in 2026-07-25: asking what a command does
+        # must never do it.
+        print(USAGE)
+        return 0
+
+    as_json = "--json" in argv
+    # --yes and --json both mean do not ask. An agent parsing stdout has no way
+    # to answer a prompt, so a --json run that stopped at one would block
+    # against a terminal nobody is watching.
+    ask = not (as_json or "--yes" in argv or "-y" in argv)
+
+    for flag in ("--only", "--dir", "--repo"):
+        if _flag_value(argv, flag) == "":
+            print(f"{flag} needs a value", file=sys.stderr)
+            return 2
+
+    only = _flag_value(argv, "--only")
+    requested = _flag_value(argv, "--dir")
+    repo_name = _flag_value(argv, "--repo") or "my-brain"
+    want_remote = "--no-repo" not in argv
+
+    if only and only not in PHASES:
+        print(f"unknown phase {only!r} — one of: {', '.join(PHASES)}", file=sys.stderr)
+        return 2
+    # Every phase after `place` needs a destination. Running one of them alone
+    # is a legitimate repair, so ask where the brain is rather than crashing on
+    # a None that came from a phase that was never run.
+    if only in ("create", "backup", "verify") and not requested:
+        print(f"--only {only} needs --dir <path>", file=sys.stderr)
+        return 2
+
+    def say(text=""):
+        if not as_json:
+            print(text, file=sys.stderr)
+
+    results, dest = {}, None
+    if requested:
+        dest = picker.expand(str(requested), home, cwd)
+
+    wanted = (only,) if only else PHASES
+    for name in PHASES:
+        if name not in wanted:
+            continue
+        if name == "check":
+            results[name] = phase_check()
+        elif name == "place":
+            # A stream that is not a terminal is exactly what picker.choose()
+            # already reads as "take the default", so --yes costs one argument
+            # rather than a second, less-exercised non-interactive branch that
+            # would have to be kept in step with the interactive one.
+            results[name], dest = phase_place(
+                home, cwd, requested=requested,
+                stream=None if ask else io.StringIO(""))
+        elif name == "create":
+            results[name] = phase_create(source, dest)
+        elif name == "backup":
+            results[name] = phase_backup(dest, repo_name, want_remote)
+        elif name == "verify":
+            results[name] = phase_verify(dest)
+
+        result = results[name]
+        say(f"  [{result.status:<7}] {name}: {result.detail}")
+        if result.status == "failed":
+            say(f"            fix: {result.remedy}")
+            break
+
+    if as_json:
+        print(render_json(results))
+    elif dest and not only and overall_status(results) == "ok":
+        # "and it is backed up" is safe to say unconditionally here only
+        # because verify ran and passed: doctor calls a remote-less brain RED,
+        # so this line is unreachable unless there really is a remote.
+        say(f"\n  Your brain is at {dest}. It works and it is backed up.")
+        say("\n  Next: let your agents reach it —  brain connect")
+        say("\n  Only using this on this computer? That is everything.")
+        say("  Reaching it from other devices is a separate, optional step: "
+            "brain serve --help")
+
+    return 0 if overall_status(results) == "ok" else 1

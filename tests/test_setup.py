@@ -609,5 +609,188 @@ class TestVerifyPhase(unittest.TestCase):
         self.assertIn("Traceback", result.detail)
 
 
+BRAIN = ROOT / "bin" / "brain"
+
+
+def run_brain_cmd(*args, cwd=None, env=None):
+    environ = dict(os.environ)
+    environ.update(env or {})
+    return subprocess.run([sys.executable, str(BRAIN), *args],
+                          cwd=str(cwd or ROOT), capture_output=True,
+                          text=True, timeout=180, env=environ)
+
+
+class TestSetupCli(unittest.TestCase):
+    def test_setup_appears_in_help(self):
+        done = run_brain_cmd("--help")
+        self.assertIn("setup", done.stdout)
+
+    def test_setup_help_does_not_perform_setup(self):
+        # `init --help` once wired the machine for someone who only asked what
+        # it does. That must never recur for setup.
+        done = run_brain_cmd("setup", "--help")
+        self.assertEqual(done.returncode, 0)
+        self.assertNotIn("installing to", done.stdout)
+
+    def test_json_mode_emits_only_json_on_stdout(self):
+        done = run_brain_cmd("setup", "--json", "--yes", "--only", "check")
+        json.loads(done.stdout)      # must parse — human text belongs on stderr
+
+    def test_check_only_never_writes_anything(self):
+        before = sorted(p.name for p in ROOT.iterdir())
+        run_brain_cmd("setup", "--yes", "--only", "check")
+        self.assertEqual(before, sorted(p.name for p in ROOT.iterdir()))
+
+    def test_an_unknown_phase_names_the_ones_that_exist(self):
+        # A typo must not silently run nothing and report success — that reads,
+        # to an agent, as a completed install.
+        done = run_brain_cmd("setup", "--only", "instal", "--yes")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("place", done.stderr)
+
+    def test_a_later_phase_on_its_own_demands_a_destination(self):
+        # Re-running one phase is a legitimate repair, but create/backup/verify
+        # all need to know WHICH brain. Asking beats crashing on the None that
+        # the place phase would have filled in.
+        done = run_brain_cmd("setup", "--only", "verify", "--yes")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("--dir", done.stderr)
+
+    def test_the_help_points_a_first_run_at_setup(self):
+        # AGENTS.md and CLAUDE.md both document "re-run init" as the repair
+        # when a machine's wiring drifts, so init keeps working (test_brain.py
+        # covers that it still wires). What must change is where somebody
+        # installing for the FIRST time is sent.
+        done = run_brain_cmd("init", "--help")
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("brain setup", done.stdout)
+
+
+class TestSetupIsNeverInteractiveWhenTold(unittest.TestCase):
+    """--yes and --json both mean "do not ask".
+
+    Both branches are driven at a fake terminal, because without one the test
+    runner's stdin is never a TTY and the picker takes the default regardless —
+    which would make this pass whether or not --yes does anything at all.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_yes_leaves_the_terminal_unread(self):
+        terminal = _FakeTTY("1\n")
+        with mock.patch.object(sys, "stdin", terminal):
+            code = setupmod.run_setup(["--only", "place", "--yes"],
+                                      home=self.home, cwd=self.home)
+        self.assertEqual(code, 0)
+        self.assertEqual(terminal.read(), "1\n",
+                         "--yes prompted anyway and ate the answer")
+
+    def test_json_leaves_the_terminal_unread(self):
+        # An agent parsing stdout has no way to answer a prompt, so --json must
+        # imply --yes rather than deadlocking against a terminal it cannot see.
+        terminal = _FakeTTY("1\n")
+        with mock.patch.object(sys, "stdin", terminal):
+            setupmod.run_setup(["--only", "place", "--json"],
+                               home=self.home, cwd=self.home)
+        self.assertEqual(terminal.read(), "1\n", "--json prompted")
+
+    def test_without_either_flag_a_terminal_is_asked(self):
+        # The control: the same call WITHOUT --yes must consume the answer.
+        # Otherwise the two tests above prove nothing.
+        terminal = _FakeTTY("1\n")
+        with mock.patch.object(sys, "stdin", terminal):
+            setupmod.run_setup(["--only", "place"], home=self.home, cwd=self.home)
+        self.assertEqual(terminal.read(), "",
+                         "the picker never asked at a real terminal")
+
+
+class TestSetupEndToEnd(unittest.TestCase):
+    """Every phase in one run, against a real copy of this repo.
+
+    The only test that proves the phases compose: that the tree `create`
+    produces is one `doctor` can actually run inside, and that setup's exit
+    code is doctor's rather than its own opinion.
+
+    `--no-repo` is not optional here. Without it phase_backup would run `gh
+    repo create` against whatever GitHub account the developer is logged into,
+    from a test suite.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.home = self.base / "home"
+        self.home.mkdir()
+        empty_config = self.base / "gitconfig"
+        empty_config.write_text("", encoding="utf-8")
+        patched = mock.patch.dict(os.environ, {
+            "HOME": str(self.home), "USERPROFILE": str(self.home),
+            "GIT_CONFIG_GLOBAL": str(empty_config),
+            "GIT_CONFIG_SYSTEM": str(empty_config),
+            "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com",
+        })
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_local_only_install_builds_a_brain_and_calls_it_not_backed_up(self):
+        """The install works; doctor still calls it red, and so does setup.
+
+        `--no-repo` is a legitimate choice and the backup phase records it as a
+        skip, not a failure — but a brain with no off-machine copy is exactly
+        what doctor is built to call [RED], and this repo's own manual says a
+        backup gap is "worth seeing, not an untidiness to hide". So the run
+        ends non-zero with the reason attached.
+
+        Worth revisiting in Plan 2: a user who explicitly asked for local-only
+        is being told their install failed, when what is true is that it
+        succeeded and they gave something up. The exit code is right; the word
+        "failed" against a choice they made deliberately is the part that
+        reads badly.
+        """
+        dest = self.base / "brain"
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            code = setupmod.run_setup(["--dir", str(dest), "--no-repo", "--yes",
+                                       "--json"],
+                                      home=self.home, cwd=self.base, source=ROOT)
+        payload = json.loads(out.getvalue())
+        phases = payload["phases"]
+
+        self.assertEqual(phases["check"]["status"], "ok", phases["check"]["detail"])
+        self.assertEqual(phases["create"]["status"], "ok", phases["create"]["detail"])
+        self.assertEqual(phases["backup"]["status"], "skipped")
+        self.assertEqual(phases["verify"]["status"], "failed")
+        self.assertIn("no git remote", phases["verify"]["detail"])
+        self.assertEqual(code, 1, "a doctor-red install must not exit 0")
+
+        # ...and what it built is a real brain, not a half-copied directory.
+        self.assertTrue((dest / "bin" / "brain").is_file())
+        self.assertTrue((dest / "knowledge" / "index.md").is_file())
+        self.assertEqual(_git(dest, "config", "core.hooksPath").stdout.strip(),
+                         ".githooks")
+
+    def test_setup_wires_nothing_into_the_users_home(self):
+        # The hazard this whole command inherits: `brain init` re-points the
+        # global ~/.claude/skills/brain symlink at whatever checkout ran it, so
+        # an install from a temp clone would hijack the /brain skill for every
+        # session on the machine. setup does not wire — `brain connect` does,
+        # deliberately, as a separate step you run from the brain itself.
+        dest = self.base / "brain"
+        with mock.patch.object(sys, "stdout", io.StringIO()):
+            setupmod.run_setup(["--dir", str(dest), "--no-repo", "--yes", "--json"],
+                               home=self.home, cwd=self.base, source=ROOT)
+        self.assertFalse((self.home / ".claude").exists(),
+                         "setup touched the user's global agent config")
+
+
 if __name__ == "__main__":
     unittest.main()

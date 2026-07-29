@@ -34,7 +34,7 @@ setup/            templates, runbooks (this system's own docs)
                   consolidate-prompt.md writes notes; audit-prompt.md is the
                   independent, digest-blind, write-less check on that work
                   consolidator.conf names the ONE agent allowed to run them
-bin/brain         toolbelt: init | connect | new | capture | search | read |
+bin/brain         toolbelt: setup | connect | new | capture | search | read |
                   links | recent | supersede | index | sessions | consolidate |
                   schedule | template | plugin | lint | doctor | stats | reset
                   (`bin/brain --help` is authoritative; doctor reports whether

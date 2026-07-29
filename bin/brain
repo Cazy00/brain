@@ -2,8 +2,9 @@
 """brain — toolbelt for the second-brain repo. Python stdlib only, no dependencies.
 
 Commands:
-  brain init                       wire a fresh clone into Claude Code (run once)
-  brain connect [<client>|--all]   wire it into any other MCP-capable agent
+  brain setup [--dir <path>] [--repo <name>] [--no-repo] [--yes] [--json]
+                                   install a brain and prove it works (run once)
+  brain connect [<client>|--all]   wire it into any MCP-capable agent
   brain new <kind> "<title>" [--topics a,b] [--sensitivity normal|personal]
   brain capture "<text>" [--commit]  quick note into knowledge/inbox/
   brain lint [--staged]            validate every note; exit 1 on errors
@@ -26,6 +27,11 @@ Commands:
   brain reset                      retire this brain and start clean. Interactive,
                                    TTY-only, never exposed over MCP. Moves the
                                    repo aside; deletes nothing, ever.
+
+`brain init` is no longer part of a first run — `brain setup` covers that. It
+still exists and still re-wires THIS clone into Claude Code, because "re-run
+init" is the documented repair in AGENTS.md and CLAUDE.md when a machine's
+wiring drifts.
 
 Lint exit codes: 0 = clean, 1 = content errors (block commit), 3 = environment
 failure (the pre-commit hook fails OPEN on 3 so a broken toolchain never blocks
@@ -1402,12 +1408,22 @@ def cmd_init(argv: list) -> int:
     Part 2. Every step is idempotent: re-running init is always safe, and is
     the documented fix when a machine's wiring drifts.
 
+    No longer part of a first run: `brain setup` owns that, and it deliberately
+    does NOT call this. Wiring re-points the global ~/.claude/skills/brain link
+    at whatever checkout ran it, and a first run happens from a throwaway clone
+    — so setup installs the brain and `brain connect`, run from the brain
+    itself, wires it. This survives as the repair, which is why it still says
+    what it is doing rather than redirecting and refusing.
+
     The two files written here (.mcp.json, SKILL.md) hold THIS clone's absolute
     paths, which is exactly why they are gitignored and regenerated per machine
     rather than committed.
     """
     import json as _json
     import shutil
+
+    print("brain init — re-wiring THIS clone into Claude Code. Installing a new "
+          "brain is `brain setup`.\n")
 
     mcp_server = ROOT / "bin" / "brain-mcp"
     skill_dir = ROOT / "setup" / "skills" / "brain"
@@ -5027,6 +5043,12 @@ def main() -> int:
         except Exception as exc:  # environment failure must not look like content failure
             print(f"brain lint: environment failure: {exc!r}")
             return 3
+    if cmd == "setup":
+        # Imported here, not at module scope: setup pulls in the picker and
+        # everything the phases need, and it is the one command in this file
+        # that most sessions never run.
+        from brainlib.setup import run_setup
+        return run_setup(rest)
     if cmd == "init":
         return cmd_init(rest)
     if cmd == "connect":
