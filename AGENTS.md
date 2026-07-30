@@ -36,7 +36,8 @@ setup/            templates, runbooks (this system's own docs)
                   consolidator.conf names the ONE agent allowed to run them
 bin/brain         toolbelt: setup | connect | new | capture | search | read |
                   links | recent | supersede | index | sessions | consolidate |
-                  schedule | template | plugin | lint | doctor | stats | reset
+                  schedule | template | publish | plugin | lint | doctor |
+                  stats | reset
                   (`bin/brain --help` is authoritative; doctor reports whether
                   the machinery works, stats whether the KNOWLEDGE still does)
 bin/brain-mcp     the same tools over MCP, for any agent that speaks stdio
@@ -63,7 +64,21 @@ status:   current   (canonical folders hold current notes ONLY)
 
 Optional: `valid_from`, `review_by` (date to re-verify perishable facts),
 `supersedes`, `superseded_by`, `sensitivity` (required in people/ and life/:
-normal | personal; `private` content goes to vault/, never plaintext).
+normal | personal; `private` content goes to vault/, never plaintext),
+`visibility` (public | private — see below), `source` (which endpoint accepted
+a capture; on inbox notes).
+
+**`visibility` decides what may leave this brain**, and it has THREE states.
+`public` means a human approved this note for readers outside — customers,
+through whatever agent you point at the compiled copy. `private` means a human
+looked and said no. **Absent means nobody has looked**, which is the default
+for every note `brain new` creates and every note that already exists, and is
+the state `brain publish review` lists. Absent and `private` are both excluded
+from a published brain; the difference is only that you stop being asked about
+the ones you refused. Never set it by hand — `bin/brain publish approve <id>`
+and `deny <id>` apply the rules lint would apply anyway (nothing under people/
+or life/, nothing classified, nothing that is not current). It is never
+inherited: superseding a published note leaves the successor unreviewed.
 
 One fact/decision per note. Bodies use absolute dates only ("2026-07-22",
 never "today" or "last week"). Link related notes with [[note-id]] wikilinks.

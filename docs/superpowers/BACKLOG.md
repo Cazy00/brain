@@ -31,14 +31,35 @@ this project does not have.
 | [2026-07-29-serve.md](plans/2026-07-29-serve.md) | 7: `brain serve` | closed, 18/18 |
 | [2026-07-29-serve-hardening.md](plans/2026-07-29-serve-hardening.md) | backlog items 1, 2, 5 | closed, 18/18 |
 | — | items 8 and 9, found while verifying the above | closed, no plan |
-| [2026-07-30-business-partition.md](plans/2026-07-30-business-partition.md) | M/P partition, the drop box, `publish` | **open, not started** |
+| [2026-07-30-business-partition.md](plans/2026-07-30-business-partition.md) | M/P partition, the drop box, `publish` | closed, 6/6 |
 
 The four commands the spec set out to build all exist and all end in a working
-state: `brain setup`, `brain connect`, `brain serve`, `brain retire`.
+state: `brain setup`, `brain connect`, `brain serve`, `brain retire`. A fifth,
+`brain publish`, compiles the customer-facing copy.
 
-The business partition is the first work here that is not about the toolbelt.
-It makes a brain safe to put in front of customers, and it is written to be
-handed to an agent that has not been part of the conversation behind it.
+The business partition was the first work here that is not about the toolbelt:
+it makes a brain safe to put in front of customers. Built 2026-07-30, 584 tests
+green. Three things it found that no test would have, because they only appear
+when both endpoints are actually running (see the runbook's "Three things that
+will catch you out"):
+
+- Two endpoints run by the same user on one host **share one bearer token** —
+  `brain serve` reads a single keystore entry — so P's read token also opens
+  M's drop box. Different hosts, or at minimum different OS users.
+- A drop box on a host with no git identity wrote every note and failed every
+  commit, and reported each one to the bot as a failure — inviting it to retry
+  the same claim until the daily cap. A capture that reached disk is now
+  acknowledged, with the identical response either way.
+- `ensure_hooks` announced "installed git hooks" in a directory that is not a
+  git repo, and git's "fatal: not in a git directory" went with it — into the
+  MCP responses a customer-facing bot reads out. A compiled brain is exactly
+  such a directory until somebody runs `git init`.
+
+Two deliberate departures from the plan, both recorded in the commits: the tree
+is built in a temp directory and swapped in only once clean (building in place
+would take the LIVE artifact down on a refused audit), and the review queue
+counts notes that can never be published in a footer instead of listing them
+forever.
 
 ---
 

@@ -10,6 +10,8 @@ any of them is a legitimate place to stop, not an abandoned install.
 brain setup      you have a brain. Notes work. It is backed up.
 brain connect    your agents can reach it.
 brain serve      it is reachable from other devices.       (opt-in, Part 8)
+brain publish    a second brain, holding only what customers
+                 may see, for an agent you do not trust.    (opt-in, Part 9)
 brain retire     all of the above, gracefully undone.
 ```
 
@@ -669,7 +671,55 @@ everything else coming through it. That is deliberate — the alternative is
 trusting an `X-Forwarded-For` header, and a header the client sets is a header
 an attacker changes, which would leave the control there in name only.
 
-## Part 9 — `brain retire`
+## Part 9 — Two brains, for a customer-facing agent (optional)
+
+Skip this unless you are putting an agent in front of your brain that other
+people talk to. It is the one deployment where "whoever holds the token can
+read every note" is not an acceptable answer.
+
+The shape: your brain **M** stays private and gains a **drop box** — an
+endpoint that accepts notes and cannot read one. A second brain **P** is
+COMPILED out of M, containing only the notes you approved one at a time, and is
+served read-only. The bot reads P and files what it learns into M's drop box.
+It holds no path and no credential that reaches M, so its model can be cheap,
+weak and jailbroken without that being the thing standing between a customer
+and your notes.
+
+```sh
+brain publish review                   # what nobody has decided about yet
+brain publish approve opening-hours    # one note at a time, by a person
+brain publish ~/P                      # compile it; read the report
+cd ~/P && bin/brain serve --read-only --port 8801    # P answers questions
+brain serve --drop-box --source support-bot --port 8802   # M accepts notes
+```
+
+Three properties, each of which is a refusal rather than a convention:
+
+- **P is compiled, not filtered.** It is rebuilt from zero every time and
+  contains only `visibility: public` notes. There is no query-time exclusion
+  anywhere, because a boundary that is a code path is one bug from a leak.
+  Frontmatter ships by allowlist, links to notes that stayed behind are
+  stripped to plain text (a dangling `[[2026-03-01-acquisition-talks]]` names a
+  private note to anyone the bot talks to), and the build audits its own output
+  and deletes the tree rather than ship one that failed.
+- **The drop box tells the caller nothing.** It acknowledges a write and stops
+  — no dedup hint, no error text from inside M. A response that varies with
+  your notes is a way to read them one question at a time.
+- **Approval is a CLI act by a person.** No MCP tool sets `visibility`, reads
+  it, or lists what is pending, and none ever will: a tool that listed the
+  queue would enumerate your private notes to whoever holds a token.
+
+`--drop-box` and `--read-only` are refused together. That combination is not a
+mode, it is two deployments — two processes, two ports, two tokens, and if they
+face different things, two hosts.
+
+**The complete deployment, with an isolation checklist you can actually run:**
+[`setup/runbooks/business-partition.md`](setup/runbooks/business-partition.md).
+Read the "Three things that will catch you out" section before you start — one
+of them is that two endpoints run by the same user on the same host share a
+single token, which quietly undoes the whole separation.
+
+## Part 10 — `brain retire`
 
 To unwire a single machine while keeping the brain:
 

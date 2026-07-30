@@ -245,7 +245,17 @@ trusting.
   platforms; nobody on this project owns a Windows machine, so anything CI
   cannot reach there — how the path picker feels in a real terminal, Credential
   Manager prompts — is unverified rather than known to work.
-- **Not all of it is tested.** 407 runtime tests cover the toolbelt
+- **A published brain protects the notes you left out of it, and nothing
+  else.** `brain publish` compiles a second brain (P) holding only notes a
+  human approved, so an agent you do not trust can be pointed at P and there is
+  no prompt that gets it the rest — they are not there to get. What it does not
+  do: stop a cheap model saying something wrong about what IS in P, or make
+  anything in P confidential. Curate P as a public web page, because
+  functionally it is one. The isolation is process and credential separation,
+  which is why it survives a weak model —
+  [`setup/runbooks/business-partition.md`](setup/runbooks/business-partition.md)
+  has the checklist that proves it on your own hosts.
+- **Not all of it is tested.** 585 runtime tests cover the toolbelt
   (`python3 -m unittest discover -s tests`). `schedule` and the vault flow are
   exercised by hand.
 
@@ -255,6 +265,7 @@ trusting.
 |---|---|
 | [SETUP.md](SETUP.md) | The complete guide: install, wiring, schedules, vault, second machine, troubleshooting |
 | [AGENTS.md](AGENTS.md) | The protocol: note contract, capture policy, search tiers, supersede |
+| [setup/runbooks/business-partition.md](setup/runbooks/business-partition.md) | Two brains: the one you keep, and the one a customer-facing agent may read |
 | [docs/assets/BRIEFS.md](docs/assets/BRIEFS.md) | Visual asset specifications |
 | `bin/brain --help` | Every command |
 

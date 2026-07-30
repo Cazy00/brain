@@ -43,6 +43,17 @@ tested. Connect it, call `brain_search` and `brain_capture`, and write down what
 happened. Everything below assumes that works. If it does not, fix that first —
 it changes the shape of Tasks 2 and 6.
 
+> **NOT DONE, 2026-07-30 — Hermes Agent is not on this machine**, so this was
+> built without it. What was verified instead: both endpoints answering real
+> JSON-RPC over real HTTP — `initialize`, `tools/list`, `tools/call` for every
+> tool, on both a drop box and a read-only P — which is the whole of what an
+> MCP client does over the Streamable HTTP transport. If Hermes turns out to
+> speak stdio instead, `bin/brain-mcp` serves the same table through the same
+> dispatcher, but the drop box's flags live in `brain serve`: a stdio
+> deployment would need `--drop-box`/`--source` plumbed into that entry point
+> too. That is the one thing this could not check, and it is the shape of Task
+> 2 the prerequisite was warning about.
+
 ---
 
 ## Global Constraints
@@ -185,14 +196,14 @@ of one, regardless of how confident it reads. State it in the prompt in those
 terms — the prompt is the only place this rule can live, because the
 consolidator is the only thing that acts on it.
 
-- [ ] **Step 1: Write the failing tests.** `--source` writes the field; omitted
+- [x] **Step 1: Write the failing tests.** `--source` writes the field; omitted
       gives `local`; an invalid slug is refused and nothing is written; a
       caller-supplied `source` in MCP arguments is overridden by the server's;
       lint accepts the field and rejects a malformed value.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `capture: record who wrote it, stamped by the endpoint`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `capture: record who wrote it, stamped by the endpoint`
 
 ---
 
@@ -243,16 +254,16 @@ counter would reset every crash, which is a bypass an unstable bot finds by
 accident. Over the cap, `brain_capture` returns a tool error and the refusal is
 logged. Existing `scan_secrets` refusal is unchanged and runs first.
 
-- [ ] **Step 1: Write the failing tests.** `tools/list` returns only
+- [x] **Step 1: Write the failing tests.** `tools/list` returns only
       `brain_capture`; `tools/call` on `brain_search` by name is refused; the
       derivation is fail-closed; `--drop-box` without `--source` refuses to
       start; `--drop-box --read-only` refuses; a successful capture returns no
       information about M; the daily cap refuses at the boundary and survives a
       simulated restart; the cap is per-source.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `serve: --drop-box, a write-only endpoint that tells the caller nothing`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `serve: --drop-box, a write-only endpoint that tells the caller nothing`
 
 ---
 
@@ -284,14 +295,14 @@ without the field, so a changed fact is private until a human looks at it
 again. Add the assertion to the existing supersede tests rather than a new
 file: the chain test already exists and this is a property of the chain.
 
-- [ ] **Step 1: Write the failing tests.** Lint accepts `public`/`private` and
+- [x] **Step 1: Write the failing tests.** Lint accepts `public`/`private` and
       rejects anything else; absent is valid everywhere; each of the three
       cross-checks errors; `brain new` sets no visibility; `brain supersede`
       leaves the successor without one even when the predecessor was public.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `notes: visibility, absent by default and never inherited`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `notes: visibility, absent by default and never inherited`
 
 ---
 
@@ -346,7 +357,7 @@ the part most implementations get wrong.
 audit without writing; `--force` is **not** offered — there is no legitimate
 reason to publish a tree that failed its audit.
 
-- [ ] **Step 1: Write the failing tests.** A public note ships and a private one
+- [x] **Step 1: Write the failing tests.** A public note ships and a private one
       does not; absent visibility does not ship; disallowed frontmatter fields
       are absent from the output; a wikilink to an unpublished note is stripped
       to plain text and counted; `topics.yaml` contains only used topics; a
@@ -354,10 +365,10 @@ reason to publish a tree that failed its audit.
       `sensitivity` fails; the output passes its own lint; a revoked note
       disappears on rebuild; the diff reports removals; `--dry-run` writes
       nothing.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `publish: compile P from M, and refuse to ship a tree that failed its audit`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `publish: compile P from M, and refuse to ship a tree that failed its audit`
 
 ---
 
@@ -388,14 +399,14 @@ task.
 rather than writing a field that makes the next `publish` fail. The check
 already exists from Task 3 — call it here rather than duplicating it.
 
-- [ ] **Step 1: Write the failing tests.** `review` lists absent-visibility
+- [x] **Step 1: Write the failing tests.** `review` lists absent-visibility
       notes and omits `private` and `public` ones; `approve` and `deny` set the
       field and nothing else; an unknown id exits non-zero; `approve` refuses a
       note that violates a Task 3 cross-check and names the rule.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `publish: the review queue, and why it is not an MCP tool`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `publish: the review queue, and why it is not an MCP tool`
 
 ---
 
@@ -432,19 +443,77 @@ It must contain:
   the bot into reciting it. Curate P as if it were a public web page, because
   functionally it is one.
 
-- [ ] **Step 1: Write the runbook and the doc changes**
-- [ ] **Step 2: Run every command in the isolation checklist and correct the
+- [x] **Step 1: Write the runbook and the doc changes**
+- [x] **Step 2: Run every command in the isolation checklist and correct the
       document to match what actually happened** — not what it should have
       done. The tunnel runbook was written this way and it is why item 9 was
       found.
-- [ ] **Step 3: `bin/brain lint`, then the whole suite**
-- [ ] **Step 4: Commit** — `docs: the two-brain deployment, checked against a running one`
+- [x] **Step 3: `bin/brain lint`, then the whole suite**
+- [x] **Step 4: Commit** — `docs: the two-brain deployment, checked against a running one`
 
 ---
 
-## Self-review
+## Self-review — answered 2026-07-30
 
-Before declaring this done, answer each in writing:
+Every answer below is from a run, not from reading the code. The rig was two
+real `brain serve` processes on 127.0.0.1:8801 (P, read-only) and
+127.0.0.1:8802 (M, drop box), reached over HTTP with their own tokens.
+
+1. **Can the bot's process reach M?** No path found, and one caveat that is
+   documented rather than fixed. The bot holds two URLs and two bearer tokens
+   and nothing else — no shell, no filesystem, no git, because the MCP table is
+   five tools and the two endpoints serve four and one of them. P's server is
+   started from inside P, and `ROOT` is derived from the script's own location
+   (`bin/brain:60`), so there is no flag that could redirect it at M. P's tree
+   names M nowhere: the compiler audits for M's absolute path and refuses, and
+   `grep -rn` over the built tree found nothing. **The caveat:** two endpoints
+   run by the same OS user on one host share one keystore entry, so P's read
+   token would also open M's drop box. Confirmed by minting twice under one
+   HOME. It is the first item in the runbook's "Three things that will catch
+   you out", and check 6 of the isolation checklist tests for it (401 expected;
+   the rig returned 401 with separate HOMEs).
+2. **Does any drop-box response differ depending on M's contents?** No. Success
+   is `captured <id>`, where the id is built from the caller's own text and the
+   date. Failure is fixed text. The one remaining difference was removed during
+   the build: a capture that reached disk but failed to commit used to come
+   back as an error, so the caller could tell M's git was unhappy — it now
+   returns the identical success reply, and the operator gets the reason on the
+   server's terminal. A credential refusal does differ, and is derived from the
+   caller's own text rather than from M. Timing was not measured, and that is
+   stated rather than claimed.
+3. **Publish a brain containing one private note whose id is embarrassing.**
+   Done: M held `margin-model` (`visibility: private`), P was compiled, and
+   `grep -rn margin P/` returned nothing — not in a note, not in a wikilink,
+   not in `topics.yaml` (filtered to the one topic that shipped), not in the
+   regenerated `index.md`, not in a backlink. The published tree is one note
+   plus the folder skeleton.
+4. **Revoke a note's approval and rebuild.** The note disappears and the run
+   says so: `REMOVED 1 note(s) — this brain will stop answering anything they
+   covered`. Tested in `TestTheReport`.
+5. **Supersede a published note.** The fact leaves P, the successor is not
+   published (it is a new note nobody has reviewed), and the report shows the
+   removal. Tested end to end through the real `brain supersede`.
+6. **Did any new MCP tool appear?** No. The table is still the same five names,
+   and a test asserts it — plus that no tool's schema mentions `visibility` or
+   `publish`. Only `brain_capture`'s behaviour changed.
+7. **Full suite.** 474 before, **585** after, all green. Traceable: Task 1 +11,
+   Task 2 +44, Task 3 +12, the notes.py extraction +0, Task 4 +31, Task 5 +12,
+   Task 6 +1.
+8. **Would this survive a weak model?** Every control here is process or
+   credential separation: tool filtering happens in the dispatcher rather than
+   the advertised list, provenance is stamped by the endpoint rather than
+   claimed by the caller, the daily cap is counted off the filesystem rather
+   than held in memory, P is compiled rather than filtered at query time, and
+   approval is a CLI act with no tool behind it. None of them depends on the
+   bot choosing correctly. Two things still rest on judgement and neither is
+   the bot's: what a human approves into P, and consolidation's decision about
+   what becomes permanent — which is why that one runner stays pinned to an
+   expensive model while everything else gets cheap. What is NOT protected: a
+   weak model saying something wrong about what IS in P. That is a product
+   problem, it is stated in the README and the runbook, and no amount of
+   partitioning fixes it.
+
+### The questions the plan asked, for reference
 
 1. **Can the bot's process reach M?** Not "is it configured not to" — is there
    any path, credential, mount or tool through which it could. Walk it from the

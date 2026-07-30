@@ -532,6 +532,22 @@ class TestTheDropBoxTellsTheCallerNothing(unittest.TestCase):
         self.assertNotIn("/home/someone/brain", text)
         self.assertNotIn("knowledge/inbox", text)
 
+    def test_a_note_that_reached_disk_is_acknowledged_however_git_went(self):
+        """`brain capture` exits 1 when the note is written but the commit
+        fails, and says the note is NOT lost. Reporting that as a failure sends
+        the bot back with the same claim until the daily cap stops it — an
+        inbox full of duplicates, which is worse than one uncommitted note.
+
+        The answer is byte-identical to the clean case, so this costs the
+        caller no information about the state of the brain.
+        """
+        _seen, result, text = self.run_capture(
+            source="support-bot", returncode=1,
+            stdout="/home/someone/brain/knowledge/inbox/2026-07-30-120000-hours.md\n"
+                   "SAVED BUT NOT COMMITTED: Please tell me who you are")
+        self.assertFalse(result.get("isError"), text)
+        self.assertEqual(text, "captured 2026-07-30-120000-hours")
+
     def test_a_failure_does_not_hand_back_the_reason(self):
         """A failed commit forwards git's and lint's stderr, and lint's output
         is text about OTHER notes. The caller learns that it failed."""

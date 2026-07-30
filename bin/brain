@@ -230,6 +230,14 @@ def is_local_remote(url: str) -> bool:
 
 
 def ensure_hooks() -> None:
+    # A brain that is not a git checkout has no hooks to install, and saying so
+    # is worse than saying nothing: `git config` prints "fatal: not in a git
+    # directory" to the terminal and this function then claims it installed
+    # them. Found 2026-07-30 in a COMPILED brain (`brain publish` writes a
+    # directory nobody has run `git init` in yet) — where both lines were
+    # arriving inside the MCP responses a customer-facing bot reads out.
+    if not (ROOT / ".git").exists():
+        return
     try:
         if git("config", "core.hooksPath") != ".githooks":
             subprocess.run(

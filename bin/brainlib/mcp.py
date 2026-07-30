@@ -257,17 +257,29 @@ def drop_box_reply(run):
     text and tells them nothing they did not send. Failure is that it failed.
     The reason goes to the operator's terminal, which is the one place it is
     both useful and safe.
+
+    Success is "the note reached disk", NOT "the CLI exited 0". `brain capture`
+    exits 1 when the note is written but the commit fails — an unconfigured git
+    identity, a consolidation branch — and the note is explicitly not lost.
+    Reporting that as a failure invites the bot to retry the same claim until
+    the daily cap stops it, which is a worse outcome than an uncommitted note
+    and fills the inbox with duplicates of it. The answer is identical either
+    way, so the caller still learns nothing about this brain's state; the
+    operator sees the real reason on the terminal, which is where it can be
+    acted on. Found 2026-07-30 by running a real drop box on a host with no
+    git identity configured.
     """
+    written = [line.strip() for line in (run.stdout or "").splitlines()
+               if line.strip().endswith(".md")]
     if run.returncode != 0:
         detail = (run.stdout or "").strip() + (("\n" + run.stderr.strip())
                                                if (run.stderr or "").strip() else "")
         # Terse to the caller, not silent to the owner: a drop box whose
         # failures are invisible is one that stops working quietly.
-        sys.stderr.write("  drop box REFUSED a capture: " + (detail or "no detail") + "\n")
+        sys.stderr.write("  drop box: capture problem: " + (detail or "no detail") + "\n")
         sys.stderr.flush()
-        return _error("this brain did not accept that capture")
-    written = [line.strip() for line in (run.stdout or "").splitlines()
-               if line.strip().endswith(".md")]
+        if not written:
+            return _error("this brain did not accept that capture")
     note_id = Path(written[-1]).stem if written else ""
     return {"content": [{"type": "text",
                          "text": f"captured {note_id}".strip()}], "isError": False}
