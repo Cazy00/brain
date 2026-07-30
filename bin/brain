@@ -25,6 +25,10 @@ Commands:
   brain schedule install|uninstall|status [--with-consolidate]
   brain template <dest> [--force]  emit a publishable copy: all tooling, none
                                    of your notes (the public template is DERIVED)
+  brain publish <dest> [--dry-run] compile a customer-facing brain: only notes
+                                   a human marked visibility: public, rebuilt
+                                   from zero, audited, toolbelt included so it
+                                   serves itself (`publish --help`)
   brain serve [--read-only | --drop-box --source <slug>] [--bind <addr>]
               [--port <n>] | --new-token
                                    the same tools over HTTP, for reaching this
@@ -5477,7 +5481,7 @@ def main() -> int:
     # --help first did not, so "does it look like it handles help?" is not a
     # question worth guessing the answer to. Each name has a test asserting its
     # own usage comes back and that the command did nothing.
-    self_documenting = ("setup", "serve")
+    self_documenting = ("setup", "serve", "publish")
     if rest[:1] in (["--help"], ["-h"]) and cmd not in self_documenting:
         print(__doc__)
         return 0
@@ -5534,6 +5538,11 @@ def main() -> int:
         return cmd_schedule(rest)
     if cmd == "template":
         return cmd_template(rest)
+    if cmd == "publish":
+        # Local import, like setup and serve: most sessions never compile a
+        # customer-facing brain, and this pulls in the whole compiler.
+        from brainlib.publish import run_publish
+        return run_publish(rest, ROOT)
     if cmd in ("retire", "reset"):
         return cmd_retire(rest, alias=(cmd == "reset"))
     print(f"unknown command {cmd!r}\n{__doc__}")
