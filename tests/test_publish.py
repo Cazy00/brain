@@ -485,5 +485,129 @@ class TestTheDestination(PublishCase):
                          "the rebuild lost P's history")
 
 
+class TestTheReviewQueue(PublishCase):
+    """The human gate, and the reason it is a CLI command and not a tool.
+
+    Approval is an act by a person. A tool that lists what is pending is a tool
+    that enumerates a brain's private notes to whoever holds a token, and
+    putting the human gate on the wire defeats the human gate.
+    """
+
+    def brain(self, *args):
+        return subprocess.run(
+            [sys.executable, str(self.repo / "bin" / "brain"), *args],
+            cwd=self.repo, capture_output=True, text=True, timeout=300)
+
+    def test_it_lists_notes_nobody_has_reviewed(self):
+        self.note("reference", "reference", "never-reviewed")
+        out = self.brain("publish", "review")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("never-reviewed", out.stdout)
+
+    def test_it_omits_notes_already_decided(self):
+        """`private` means a human looked and said no. Asking again every week
+        is how a review queue becomes a queue nobody finishes."""
+        self.note("reference", "reference", "already-refused", visibility="private")
+        self.note("reference", "reference", "already-approved", visibility="public")
+        self.note("reference", "reference", "never-reviewed")
+        out = self.brain("publish", "review")
+        self.assertIn("never-reviewed", out.stdout)
+        self.assertNotIn("already-refused", out.stdout)
+        self.assertNotIn("already-approved", out.stdout)
+
+    def test_it_shows_enough_to_decide_without_opening_the_file(self):
+        self.note("reference", "reference", "weekend-cover",
+                  body="Saturdays are covered by whoever opened on Friday.")
+        out = self.brain("publish", "review")
+        self.assertIn("weekend-cover", out.stdout)
+        self.assertIn("Saturdays are covered", out.stdout)
+
+    def test_it_is_newest_first(self):
+        self.note("reference", "reference", "older-note", created="2026-01-01")
+        self.note("reference", "reference", "newer-note", created="2026-07-01")
+        out = self.brain("publish", "review")
+        self.assertLess(out.stdout.index("newer-note"), out.stdout.index("older-note"),
+                        "the oldest unreviewed note was listed first")
+
+    def test_approve_sets_the_field_and_touches_nothing_else(self):
+        path = self.note("reference", "reference", "opening-hours")
+        before = path.read_text(encoding="utf-8")
+        out = self.brain("publish", "approve", "opening-hours")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        after = path.read_text(encoding="utf-8")
+        self.assertIn("visibility: public", after)
+        self.assertEqual([l for l in before.splitlines() if l.strip()],
+                         [l for l in after.splitlines()
+                          if l.strip() and l != "visibility: public"],
+                         "approve rewrote something other than the one field")
+
+    def test_deny_records_the_refusal_rather_than_leaving_it_absent(self):
+        self.note("reference", "reference", "margin-model")
+        self.assertEqual(self.brain("publish", "deny", "margin-model").returncode, 0)
+        text = (self.repo / "knowledge/reference/margin-model.md").read_text(
+            encoding="utf-8")
+        self.assertIn("visibility: private", text)
+        self.assertNotIn("margin-model", self.brain("publish", "review").stdout,
+                         "a refused note came back to the queue")
+
+    def test_notes_that_could_never_be_published_are_counted_not_listed(self):
+        """On a brain with a hundred people in it, people/ and life/ would be
+        most of the queue, permanently, and no keystroke clears them. Counted
+        rather than dropped: a queue that quietly hides notes is its own lie."""
+        self.note("people", "person", "a-colleague", sensitivity="normal")
+        self.note("reference", "reference", "opening-hours")
+        out = self.brain("publish", "review")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("opening-hours", out.stdout)
+        self.assertNotIn("a-colleague", out.stdout)
+        self.assertIn("never be", out.stdout)
+        self.assertIn("people/", out.stdout)
+
+    def test_an_unknown_id_is_an_error(self):
+        out = self.brain("publish", "approve", "no-such-note")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no-such-note", out.stdout)
+
+    def test_approve_refuses_a_note_that_could_never_be_published(self):
+        """The check is the one lint applies, called here rather than copied.
+        Writing the field and letting the next publish fail would put the
+        refusal in a place nobody is looking."""
+        self.note("people", "person", "a-colleague", sensitivity="normal")
+        out = self.brain("publish", "approve", "a-colleague")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("people/", out.stdout, "the refusal does not name the rule")
+        self.assertNotIn("visibility",
+                         (self.repo / "knowledge/people/a-colleague.md").read_text(
+                             encoding="utf-8"),
+                         "a note that cannot be published was marked public anyway")
+
+    def test_approve_refuses_a_personal_note(self):
+        self.note("reference", "reference", "an-arrangement", sensitivity="personal")
+        out = self.brain("publish", "approve", "an-arrangement")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("sensitivity", out.stdout)
+
+    def test_approve_then_publish_ships_it(self):
+        """The whole cycle, because each half passing on its own proves
+        nothing about the join."""
+        self.note("reference", "reference", "opening-hours")
+        self.assertEqual(self.brain("publish", "approve", "opening-hours").returncode, 0)
+        self.assertEqual(self.publish().returncode, 0)
+        self.assertIn("opening-hours", self.published_ids())
+
+    def test_the_tool_surface_did_not_grow(self):
+        """No MCP tool was added here, and none ever will be. Approval over the
+        wire is approval by whoever holds a token."""
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcp
+
+        self.assertEqual({t["name"] for t in mcp.TOOLS},
+                         {"brain_search", "brain_read", "brain_links", "brain_recent",
+                          "brain_capture"})
+        for tool in mcp.TOOLS:
+            self.assertNotIn("visibility", json.dumps(tool).lower())
+            self.assertNotIn("publish", json.dumps(tool).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

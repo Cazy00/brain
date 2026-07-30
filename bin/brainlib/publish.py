@@ -61,9 +61,22 @@ UNPUBLISHED_MARK = "(unpublished note)"
 USAGE = """brain publish — compile a customer-facing brain from this one.
 
   brain publish <destination> [--dry-run]
+  brain publish review
+  brain publish approve <id>
+  brain publish deny <id>
 
   --dry-run     build, audit and report, then throw the tree away. Writes
                 nothing to the destination
+
+`review` lists the notes nobody has decided about yet — newest first, with
+enough of each to decide without opening it. `approve` and `deny` set the one
+field, in place, and nothing else. Notes already denied stay out of the queue:
+being re-asked forever about refusals is how a review queue stops being read.
+
+None of these is an MCP tool, and none ever will be. Approval is an act by a
+person at a keyboard; a tool that listed what is pending would enumerate this
+brain's PRIVATE notes to whoever holds a token, and putting the human gate on
+the wire defeats the human gate.
 
 Selects the notes a human marked `visibility: public`, drops every other
 frontmatter field, strips links to notes that stayed behind, and writes a
@@ -85,6 +98,14 @@ def run_publish(argv: list, root: Path) -> int:
     if "--help" in argv or "-h" in argv:
         print(USAGE)
         return 0
+    if argv[:1] == ["review"]:
+        return review(Path(root).resolve())
+    if argv[:1] in (["approve"], ["deny"]):
+        if len(argv) < 2:
+            print(f"usage: brain publish {argv[0]} <id>")
+            return 2
+        return decide(Path(root).resolve(), argv[1],
+                      "public" if argv[0] == "approve" else "private")
     unknown = [a for a in argv if a.startswith("-") and a != "--dry-run"]
     if unknown:
         print(f"unknown flag {unknown[0]!r}\n\n{USAGE}")
@@ -254,6 +275,108 @@ def select(k: Path):
         published.append({"folder": folder, "rel": path.relative_to(k),
                           "id": str(fm["id"]), "fm": fm, "text": text})
     return published, refused
+
+
+# --------------------------------------------------------------- the human gate
+
+
+def first_line(text: str, fm: dict) -> str:
+    """A line of the note worth reading in a list. Headings are the template's
+    words, not the author's, so they are skipped."""
+    for line in text.splitlines()[fm.get("_end_line", 0):]:
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("#", ">", "<!--", "-")):
+            return stripped[:78]
+    return ""
+
+
+def pending(root: Path):
+    """(decidable, never-publishable): notes with ABSENT visibility.
+
+    `private` notes are decided and stay out. That distinction is the entire
+    reason absent and private are different states: a queue that keeps
+    re-asking about refusals is a queue nobody finishes, and a review queue
+    nobody finishes is a review queue nobody reads.
+
+    The same argument takes out the notes that COULD never be approved —
+    everything under people/ and life/, and anything classified. On a brain
+    with a hundred people in it those would be most of the queue, permanently,
+    and there is no keystroke that clears them. They are counted rather than
+    dropped: a queue that quietly hides notes is its own kind of lie.
+    """
+    decidable, blocked = [], []
+    for folder, path, fm, text, err in candidates(root / "knowledge"):
+        if err or fm.get("visibility") is not None:
+            continue
+        note = {"folder": folder, "path": path, "fm": fm,
+                "id": str(fm.get("id") or path.stem),
+                "created": str(fm.get("created") or ""),
+                "line": first_line(text, fm)}
+        (blocked if notes.publish_blockers(folder, fm) else decidable).append(note)
+    order = lambda n: (n["created"], n["id"])          # noqa: E731 — one use
+    return sorted(decidable, key=order, reverse=True), blocked
+
+
+def review(root: Path) -> int:
+    waiting, blocked = pending(root)
+    if not waiting:
+        print("Nothing waiting: every note that could be published has been "
+              "approved or denied.")
+        if blocked:
+            print(f"({len(blocked)} note(s) can never be published — see below.)")
+    else:
+        print(f"{len(waiting)} note(s) nobody has decided about yet, newest first.\n")
+    for note in waiting:
+        print(f"  {note['created']}  {note['id']}")
+        print(f"      {note['fm'].get('title', '')}")
+        if note["line"]:
+            print(f"      {note['line']}")
+        print("")
+    if blocked:
+        folders = sorted({note["folder"] for note in blocked})
+        print(f"  {len(blocked)} unreviewed note(s) are not listed because they can "
+              "never be\n  published (" + ", ".join(f"{f}/" for f in folders) +
+              ", or a sensitivity that is not `normal`).\n  Nothing you type here "
+              "changes that, which is why they are not in the queue.\n")
+    if waiting:
+        print("  brain publish approve <id>     may be seen by customers")
+        print("  brain publish deny <id>        never; and stop asking")
+    return 0
+
+
+def decide(root: Path, note_id: str, value: str) -> int:
+    """Set `visibility` on one note, in place. Non-interactive on purpose.
+
+    An interactive loop is welcome on top of this and is not this: a command
+    that can only be driven by a human at a prompt is a command no test ever
+    exercises, and this one decides what customers see.
+    """
+    for folder, path, fm, _text, err in candidates(root / "knowledge"):
+        if err or str(fm.get("id") or "") != note_id:
+            continue
+        current = fm.get("visibility")
+        if current == value:
+            print(f"{note_id} is already {value} — nothing to do")
+            return 0
+        if value == "public":
+            blockers = notes.publish_blockers(folder, fm)
+            if blockers:
+                # Refused here rather than written and left for the next
+                # publish to reject: that puts the refusal in a place nobody is
+                # looking, hours later, in a command about something else.
+                print(f"REFUSED — {note_id} cannot be published:")
+                for reason in blockers:
+                    print(f"  - {reason}")
+                return 1
+        notes.fm_update(path, {"visibility": value})
+        was = "unreviewed" if current is None else current
+        print(f"{note_id}: {was} -> {value}  ({path.relative_to(root)})")
+        if value == "public":
+            print("It reaches customers at the next `brain publish`, not now.")
+        return 0
+    print(f"no current note in a canonical folder has the id {note_id!r} — "
+          "`brain publish review` lists what is waiting")
+    return 1
 
 
 # -------------------------------------------------------------------- writing

@@ -219,6 +219,36 @@ def extract_links(body: str) -> list:
     return out
 
 
+def fm_update(path: Path, updates: dict, banner: str = None) -> None:
+    """Set flat frontmatter fields in place (add if missing); optionally insert a
+    banner line right after the frontmatter block.
+
+    A value of None REMOVES the field. Removing is not the same as writing an
+    empty value: `visibility:` with nothing after it reads as a field somebody
+    set, and the difference between "never reviewed" and "reviewed" is the
+    whole of what that field records.
+    """
+    lines = read_text(path).splitlines()
+    end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    opener, block, tail = lines[:1], lines[1:end], lines[end:]
+    kept, done = [], set()
+    for line in block:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):", line)
+        if m and m.group(1) in updates:
+            done.add(m.group(1))
+            if updates[m.group(1)] is None:
+                continue
+            line = f"{m.group(1)}: {updates[m.group(1)]}"
+        kept.append(line)
+    for key, value in updates.items():
+        if key not in done and value is not None:
+            kept.append(f"{key}: {value}")
+    if banner:
+        # After the closing --- (tail[0]), with a blank line between.
+        tail = tail[:1] + ["", banner] + tail[1:]
+    path.write_text("\n".join(opener + kept + tail) + "\n", encoding="utf-8")
+
+
 def publish_blockers(folder: str, fm: dict) -> list:
     """Every reason this note must NOT be marked `visibility: public`.
 
