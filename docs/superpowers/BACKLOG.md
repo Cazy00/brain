@@ -38,10 +38,19 @@ state: `brain setup`, `brain connect`, `brain serve`, `brain retire`. A fifth,
 `brain publish`, compiles the customer-facing copy.
 
 The business partition was the first work here that is not about the toolbelt:
-it makes a brain safe to put in front of customers. Built 2026-07-30, 584 tests
-green. Three things it found that no test would have, because they only appear
-when both endpoints are actually running (see the runbook's "Three things that
-will catch you out"):
+it makes a brain safe to put in front of customers. Built 2026-07-30, 585 tests
+green.
+
+Its prerequisite is **met**: Hermes Agent's own MCP client was pointed at both
+live endpoints and registered exactly the partition — four read tools against
+P, `brain_capture` against M's drop box, nothing else — and a capture it made
+landed in M stamped `source: support-bot` despite the call claiming `local`. No
+new code was needed, and no API key: the MCP client layer does not involve the
+model. One trap came out of it — Hermes parks every HTTP MCP server under
+`mcp` 2.0.0 and needs its own pinned `mcp==1.26.0`.
+
+Four things it found that no test would have, because they only appear when
+both endpoints are actually running (see the runbook):
 
 - Two endpoints run by the same user on one host **share one bearer token** —
   `brain serve` reads a single keystore entry — so P's read token also opens
@@ -54,6 +63,9 @@ will catch you out"):
   git repo, and git's "fatal: not in a git directory" went with it — into the
   MCP responses a customer-facing bot reads out. A compiled brain is exactly
   such a directory until somebody runs `git init`.
+- The agent side has a version cliff: `mcp` 2.0.0 removes the import Hermes
+  uses for HTTP transport, so every brain endpoint parks silently and the bot
+  comes up with no tools and nothing in its answers to say why.
 
 Two deliberate departures from the plan, both recorded in the commits: the tree
 is built in a temp directory and swapped in only once clean (building in place

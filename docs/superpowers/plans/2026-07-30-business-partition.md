@@ -43,16 +43,35 @@ tested. Connect it, call `brain_search` and `brain_capture`, and write down what
 happened. Everything below assumes that works. If it does not, fix that first —
 it changes the shape of Tasks 2 and 6.
 
-> **NOT DONE, 2026-07-30 — Hermes Agent is not on this machine**, so this was
-> built without it. What was verified instead: both endpoints answering real
-> JSON-RPC over real HTTP — `initialize`, `tools/list`, `tools/call` for every
-> tool, on both a drop box and a read-only P — which is the whole of what an
-> MCP client does over the Streamable HTTP transport. If Hermes turns out to
-> speak stdio instead, `bin/brain-mcp` serves the same table through the same
-> dispatcher, but the drop box's flags live in `brain serve`: a stdio
-> deployment would need `--drop-box`/`--source` plumbed into that entry point
-> too. That is the one thing this could not check, and it is the shape of Task
-> 2 the prerequisite was warning about.
+> **DONE 2026-07-30, and it works with zero new code.** Not a simulation:
+> `tools/mcp_tool.py` was imported out of a real `hermes-agent` checkout and
+> handed the same config dict it would read from `~/.hermes/config.yaml`,
+> pointed at two live `brain serve` processes. No model and no API key are
+> involved — Hermes's MCP client layer is independent of whatever LLM the agent
+> is driving, which is why this could be checked without one.
+>
+> Hermes registered exactly the partition:
+>
+> ```
+> mcp__brain_p__brain_search      mcp__brain_p__brain_links
+> mcp__brain_p__brain_read        mcp__brain_p__brain_recent
+> mcp__brain_dropbox__brain_capture
+> ```
+>
+> Four read tools against P, one write tool against M, and no way for the model
+> to even name the others — Hermes builds its registry from each server's own
+> `tools/list`, so the server-side refusal is the second barrier rather than
+> the only one. Called through Hermes, `brain_search` returned the published
+> note, and `brain_capture` returned `captured <id>` and nothing else. The note
+> landed in M's inbox stamped `source: support-bot` **although the call passed
+> `"source": "local"`** — the endpoint's stamp beat the caller's claim in a
+> real client, not just in a unit test.
+>
+> One deployment trap, found here: Hermes reaches HTTP MCP servers through
+> `mcp.client.streamable_http.streamablehttp_client`, which does not exist
+> under `mcp` **2.0.0** — the import fails, Hermes logs it and **parks every
+> HTTP server**, and the agent comes up with no brain tools at all. Its own
+> `pyproject.toml` pins `mcp==1.26.0`, which works. Recorded in the runbook.
 
 ---
 

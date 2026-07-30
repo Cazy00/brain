@@ -14,8 +14,8 @@ the isolation depends on it behaving. It holds one URL for P and one for M's
 drop box, and no path, credential or tool that reaches anything else.
 
 Written 2026-07-30 by standing both endpoints up and running every command
-below. Where a check needs two hosts it says so, and says what was verified on
-one.
+below, including a real agent's MCP client against both. Where a check needs
+two hosts it says so, and says what was verified on one.
 
 ## The publish cycle
 
@@ -76,6 +76,51 @@ with a flag would work and is one typo away from serving M.
 Neither command opens a public port on its own. Put a tunnel in front of P's
 (see `tunnel-cloudflare.md`) or bind it where the bot's host can reach it, and
 leave M's drop box on loopback or behind a private network.
+
+## Wiring it into the bot
+
+Any MCP-capable agent works; this is the one that was actually tested, on
+2026-07-30, against both live endpoints. Hermes Agent
+(`github.com/NousResearch/hermes-agent`) reads `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  brain_p:                                    # what the bot may READ
+    url: "http://P-HOST:8801/mcp"
+    headers:
+      Authorization: "Bearer <P's token>"
+    connect_timeout: 20
+    timeout: 60
+  brain_dropbox:                              # what the bot may WRITE
+    url: "http://M-HOST:8802/mcp"
+    headers:
+      Authorization: "Bearer <the drop box's token>"
+    connect_timeout: 20
+    timeout: 60
+```
+
+That registers five tools and no more:
+
+```
+mcp__brain_p__brain_search      mcp__brain_p__brain_links
+mcp__brain_p__brain_read        mcp__brain_p__brain_recent
+mcp__brain_dropbox__brain_capture
+```
+
+The agent builds its tool registry from each server's own `tools/list`, so the
+model cannot even name the tools its endpoint does not serve. That is a second
+barrier, not the first — the server refuses them anyway.
+
+**Pin `mcp==1.26.0`.** Hermes reaches HTTP MCP servers through
+`mcp.client.streamable_http.streamablehttp_client`, which does not exist under
+`mcp` 2.0.0. The import fails, Hermes logs one line and **parks every HTTP
+server**, and your agent comes up with no brain at all — with nothing in its
+answers to suggest why. Its own `pyproject.toml` pins `1.26.0`; check the
+version before you debug anything else.
+
+`brain serve` needs no `skip_preflight`. Hermes probes with HEAD, gets a 501,
+falls back to GET, gets the 405 that says this endpoint offers no SSE stream,
+and passes the probe — non-2xx responses are not judged. Verified, not assumed.
 
 ## Three things that will catch you out
 
@@ -175,7 +220,8 @@ status: draft
 A customer asked whether we open on Saturdays.
 ```
 
-The caller claimed to be `local`. The endpoint stamped what it knows.
+The caller claimed to be `local`. The endpoint stamped what it knows. That held
+through a real agent too, not only through `curl`.
 
 **4. P serves the four read tools and refuses the write one.**
 
