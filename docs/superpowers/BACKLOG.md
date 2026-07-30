@@ -31,9 +31,14 @@ this project does not have.
 | [2026-07-29-serve.md](plans/2026-07-29-serve.md) | 7: `brain serve` | closed, 18/18 |
 | [2026-07-29-serve-hardening.md](plans/2026-07-29-serve-hardening.md) | backlog items 1, 2, 5 | closed, 18/18 |
 | — | items 8 and 9, found while verifying the above | closed, no plan |
+| [2026-07-30-business-partition.md](plans/2026-07-30-business-partition.md) | M/P partition, the drop box, `publish` | **open, not started** |
 
 The four commands the spec set out to build all exist and all end in a working
 state: `brain setup`, `brain connect`, `brain serve`, `brain retire`.
+
+The business partition is the first work here that is not about the toolbelt.
+It makes a brain safe to put in front of customers, and it is written to be
+handed to an agent that has not been part of the conversation behind it.
 
 ---
 
@@ -248,3 +253,11 @@ observed to do.
 - **The gap loop** — [specs/2026-07-29-agent-brain-gap-loop-design.md](specs/2026-07-29-agent-brain-gap-loop-design.md),
   deferred in commit `ece23ea` because Hermes Agent supplies the harness it
   assumed would need building. That note records its own revival trigger.
+
+  **Still deferred as of 2026-07-30, but only half of it.** That spec holds two
+  things: the gap loop (deferred, unchanged) and the **M/P partition** under
+  "Settled architecture" (no longer deferred — its own revival trigger, *"a
+  customer-facing agent makes the partition real"*, has been met, and
+  [plans/2026-07-30-business-partition.md](plans/2026-07-30-business-partition.md)
+  implements it). Anyone reading that spec's DEFERRED banner should know it
+  applies to the loop, not to the architecture underneath it.
