@@ -419,6 +419,235 @@ class TestTheReadOnlySetIsDerivedFailingClosed(unittest.TestCase):
         self.assertEqual(len(mcp.READ_ONLY_TOOLS), len(mcp.TOOLS) - 1)
 
 
+class TestDropBoxServing(ServeCase):
+    """`--drop-box`, the mirror of `--read-only`, and the same rule holds.
+
+    A client that never read tools/list and calls brain_search by name has to
+    be refused, because the client is the thing being defended against and
+    therefore cannot be the thing enforcing the restriction. Both halves get
+    their own assertion, and the second one is the one that matters.
+
+    No capture is made over this socket on purpose: run_cli shells out to THIS
+    repo's bin/brain, so a successful capture here would write a note into the
+    tester's own brain. What a capture hands back is asserted below, against
+    the dispatcher, with the CLI mocked.
+    """
+    ALLOW_TOOLS = mcp.WRITE_ONLY_TOOLS
+
+    def tools(self):
+        _status, _headers, body = self.request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        return {t["name"] for t in json.loads(body)["result"]["tools"]}
+
+    def test_only_the_write_tool_is_listed(self):
+        self.assertEqual(self.tools(), {"brain_capture"})
+
+    def test_calling_a_read_tool_by_name_is_refused(self):
+        _status, _headers, body = self.request(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "brain_search", "arguments": {"query": "prices"}}})
+        result = json.loads(body)["result"]
+        self.assertTrue(result["isError"], "brain_search ran on a drop box")
+        self.assertIn("brain_search", result["content"][0]["text"])
+
+    def test_every_read_tool_is_refused_not_just_search(self):
+        """A drop box that leaked one read tool is a drop box that leaks the
+        brain — brain_read and brain_links each return note bodies too."""
+        for tool, args in (("brain_read", {"id_or_path": "knowledge/index.md"}),
+                           ("brain_links", {"id_or_path": "knowledge/index.md"}),
+                           ("brain_recent", {"days": 7})):
+            with self.subTest(tool=tool):
+                _status, _headers, body = self.request(
+                    {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                     "params": {"name": tool, "arguments": args}})
+                self.assertTrue(json.loads(body)["result"]["isError"],
+                                f"{tool} ran on a drop box")
+
+
+class TestTheWriteOnlySetIsDerivedFailingClosed(unittest.TestCase):
+    """Derived from the same annotation as the read-only set, and failing in
+    the same direction. A tool added in 2028 with no annotation belongs to
+    NEITHER restricted mode — so it is never exposed by one of them by
+    accident, in either direction."""
+
+    def test_the_write_only_set_is_the_write_tool(self):
+        self.assertEqual(set(mcp.WRITE_ONLY_TOOLS), {"brain_capture"})
+
+    def test_an_unannotated_tool_joins_neither_set(self):
+        for annotations in ({}, {"annotations": {}},
+                            {"annotations": {"readOnlyHint": "no"}},
+                            {"annotations": {"readOnlyHint": 0}}):
+            table = [dict({"name": "brain_future"}, **annotations)]
+            with self.subTest(annotations=annotations):
+                self.assertEqual(mcp.read_only_names(table), ())
+                self.assertEqual(mcp.write_only_names(table), (),
+                                 "a tool nobody annotated was served by a drop box")
+
+    def test_the_two_sets_never_overlap(self):
+        self.assertEqual(set(mcp.READ_ONLY_TOOLS) & set(mcp.WRITE_ONLY_TOOLS), set())
+        self.assertEqual(set(mcp.READ_ONLY_TOOLS) | set(mcp.WRITE_ONLY_TOOLS),
+                         set(mcp.TOOLS_BY_NAME),
+                         "a tool belongs to neither mode — it declares no readOnlyHint")
+
+
+class TestTheDropBoxTellsTheCallerNothing(unittest.TestCase):
+    """Clause 3 of the security contract: it acknowledges a write and stops.
+
+    A duplicate hint, a "similar note exists", a count, or a forwarded error
+    turns the drop box into a read oracle — the bot captures guesses and reads
+    the brain one question at a time by watching which ones come back known.
+    """
+
+    def run_capture(self, arguments=None, returncode=0, stdout=None, stderr="", **kw):
+        seen = []
+
+        def fake_run_cli(args):
+            seen.append(list(args))
+            out = "/home/someone/brain/knowledge/inbox/2026-07-30-120000-hours.md\n" \
+                if stdout is None else stdout
+            return subprocess.CompletedProcess(args, returncode, stdout=out, stderr=stderr)
+
+        with mock.patch.object(mcp, "run_cli", fake_run_cli):
+            result = mcp.call_tool("brain_capture",
+                                   arguments or {"text": "hours are 9 to 5"}, **kw)
+        return seen, result, result["content"][0]["text"]
+
+    def test_a_capture_never_reads_the_brain(self):
+        """The structural guard behind the whole clause. Nothing on this path
+        may look M up — not to dedup, not to enrich, not to be helpful."""
+        seen, _result, _text = self.run_capture(source="support-bot")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], "capture",
+                         f"a drop-box capture ran another brain command: {seen}")
+
+    def test_the_answer_is_an_acknowledgement_and_an_id(self):
+        _seen, result, text = self.run_capture(source="support-bot")
+        self.assertFalse(result.get("isError"), text)
+        self.assertIn("2026-07-30-120000-hours", text)
+
+    def test_the_answer_never_carries_the_path_of_the_brain(self):
+        """The CLI prints an absolute path. Where this brain lives on disk is
+        the first thing anybody attacking it would like to know."""
+        _seen, _result, text = self.run_capture(source="support-bot")
+        self.assertNotIn("/home/someone/brain", text)
+        self.assertNotIn("knowledge/inbox", text)
+
+    def test_a_failure_does_not_hand_back_the_reason(self):
+        """A failed commit forwards git's and lint's stderr, and lint's output
+        is text about OTHER notes. The caller learns that it failed."""
+        _seen, result, text = self.run_capture(
+            source="support-bot", returncode=1,
+            stdout="SAVED BUT NOT COMMITTED: knowledge/people/dana.md missing sensitivity",
+            stderr="On branch consolidate/2026-07-30")
+        self.assertTrue(result["isError"])
+        self.assertNotIn("dana", text.lower())
+        self.assertNotIn("consolidate", text.lower())
+        self.assertNotIn("knowledge/", text)
+
+    def test_the_operator_still_sees_the_reason(self):
+        """Terse to the caller, not silent to the owner: a drop box whose
+        failures are invisible is one that stops working quietly."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_capture(source="support-bot", returncode=1,
+                             stdout="SAVED BUT NOT COMMITTED: git said no")
+        self.assertIn("git said no", err.getvalue())
+
+    def test_an_endpoint_that_stamps_nothing_is_unchanged(self):
+        """stdio is a subprocess on the operator's own machine. It gets the
+        CLI's output verbatim, exactly as it always has."""
+        _seen, result, text = self.run_capture()
+        self.assertFalse(result.get("isError"))
+        self.assertIn("/home/someone/brain/knowledge/inbox", text)
+
+
+class TestTheDailyCap(unittest.TestCase):
+    """A cap counted from the filesystem, so a restart is not a reset.
+
+    An in-memory counter is a bypass an unstable bot finds by accident: crash,
+    reconnect, full budget. Inbox filenames already begin with YYYY-MM-DD and
+    every capture carries `source:`, so the count is derivable from what is
+    already on disk and needs no state file of its own.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.inbox = Path(self.tmp.name)
+
+    def write(self, day, index, source):
+        (self.inbox / f"{day}-1200{index:02d}-note.md").write_text(
+            f"---\ncreated: {day}\nsource: {source}\nstatus: draft\n---\n\nbody\n",
+            encoding="utf-8")
+
+    def cap(self, limit=3, source="support-bot", day="2026-07-30"):
+        return serve.DailyCap(limit, source, inbox=self.inbox, today=lambda: day)
+
+    def test_under_the_cap_says_nothing(self):
+        self.write("2026-07-30", 1, "support-bot")
+        self.assertEqual(self.cap()(), "")
+
+    def test_at_the_cap_refuses(self):
+        for i in range(3):
+            self.write("2026-07-30", i, "support-bot")
+        self.assertTrue(self.cap()(), "the boundary was not enforced")
+
+    def test_the_count_survives_a_restart(self):
+        for i in range(3):
+            self.write("2026-07-30", i, "support-bot")
+        # A second, freshly constructed cap — a process that just came back up
+        # — sees the same three notes, because it counts the disk.
+        self.assertTrue(self.cap()())
+
+    def test_the_cap_is_per_source(self):
+        """Two drop boxes on one brain must not spend each other's budget."""
+        for i in range(3):
+            self.write("2026-07-30", i, "other-bot")
+        self.assertEqual(self.cap()(), "")
+
+    def test_yesterdays_captures_do_not_count(self):
+        for i in range(5):
+            self.write("2026-07-29", i, "support-bot")
+        self.assertEqual(self.cap()(), "")
+
+    def test_an_unstamped_note_is_not_counted_against_a_source(self):
+        """A note with no source did not come from this endpoint."""
+        (self.inbox / "2026-07-30-120009-hand-written.md").write_text(
+            "---\ncreated: 2026-07-30\nstatus: draft\n---\n\nbody\n", encoding="utf-8")
+        self.assertEqual(self.cap(limit=1)(), "")
+
+    def test_a_missing_inbox_is_not_a_crash(self):
+        """Nothing has been captured yet. The first write must not 500."""
+        cap = serve.DailyCap(3, "support-bot", inbox=self.inbox / "nope",
+                             today=lambda: "2026-07-30")
+        self.assertEqual(cap(), "")
+
+    def test_the_refusal_reaches_the_caller_as_a_tool_error(self):
+        for i in range(3):
+            self.write("2026-07-30", i, "support-bot")
+        called = []
+
+        def fake_run_cli(args):
+            called.append(args)
+            return subprocess.CompletedProcess(args, 0, stdout="x.md", stderr="")
+
+        with mock.patch.object(mcp, "run_cli", fake_run_cli):
+            result = mcp.call_tool("brain_capture", {"text": "one more"},
+                                   source="support-bot", cap=self.cap())
+        self.assertTrue(result["isError"])
+        self.assertEqual(called, [], "the capture ran despite being over the cap")
+
+    def test_the_refusal_says_nothing_about_the_brain(self):
+        for i in range(3):
+            self.write("2026-07-30", i, "support-bot")
+        with mock.patch.object(mcp, "run_cli", lambda args: None):
+            result = mcp.call_tool("brain_capture", {"text": "one more"},
+                                   source="support-bot", cap=self.cap())
+        text = result["content"][0]["text"].lower()
+        for leak in ("knowledge/", "inbox", "note", "brain_search"):
+            self.assertNotIn(leak, text)
+
+
 class TestProvenanceIsStampedNotClaimed(unittest.TestCase):
     """Where a capture came from is decided by the endpoint that accepted it.
 
@@ -818,6 +1047,110 @@ class TestTheCli(unittest.TestCase):
         self.assertIn("write", writable)
 
 
+class TestTheDropBoxCli(TestTheCli):
+    """The flags, and the four ways of asking for a drop box that are wrong.
+
+    Inherits the harness above: same injected store, same injected runner, so
+    none of these opens a socket either.
+    """
+
+    def test_it_narrows_what_the_server_will_run(self):
+        server = self.serve_and_get_server("--drop-box", "--source", "support-bot",
+                                           "--port", "0")
+        self.assertEqual(set(server.allow_tools), set(mcp.WRITE_ONLY_TOOLS))
+
+    def test_the_source_reaches_the_server(self):
+        server = self.serve_and_get_server("--drop-box", "--source", "support-bot",
+                                           "--port", "0")
+        self.assertEqual(server.source, "support-bot")
+
+    def test_a_cap_is_always_configured(self):
+        """There is no flag to turn it off, for the same reason the limiter has
+        none: 'they probably will not send that many' is an argument, and this
+        is a control."""
+        server = self.serve_and_get_server("--drop-box", "--source", "support-bot",
+                                           "--port", "0")
+        self.assertEqual(server.cap.limit, serve.DEFAULT_DAILY_CAP)
+        self.assertEqual(server.cap.source, "support-bot")
+
+    def test_a_cap_can_be_lowered(self):
+        server = self.serve_and_get_server("--drop-box", "--source", "support-bot",
+                                           "--daily-cap", "5", "--port", "0")
+        self.assertEqual(server.cap.limit, 5)
+
+    def refuses(self, *argv):
+        self.run_serve("--new-token")
+        self.out, self.err = io.StringIO(), io.StringIO()
+        code = self.run_serve(*argv)
+        self.assertNotEqual(code, 0, "it started anyway")
+        self.assertEqual(self.started, [], "it opened a socket anyway")
+        return self.err.getvalue() + self.out.getvalue()
+
+    def test_a_drop_box_without_a_source_refuses_to_start(self):
+        """An unattributed drop box is worse than none: it produces exactly the
+        inbox notes the consolidator cannot weigh, while looking like it
+        works."""
+        said = self.refuses("--drop-box", "--port", "0")
+        self.assertIn("--source", said)
+
+    def test_a_source_without_a_drop_box_refuses_to_start(self):
+        """The pairing is what makes 'this endpoint stamps a foreign source'
+        mean 'this endpoint answers tersely'. Half of it is a surprise."""
+        said = self.refuses("--source", "support-bot", "--port", "0")
+        self.assertIn("--drop-box", said)
+
+    def test_a_malformed_source_refuses_to_start(self):
+        said = self.refuses("--drop-box", "--source", "Support Bot!", "--port", "0")
+        self.assertIn("--source", said)
+
+    def test_a_drop_box_that_is_also_read_only_refuses_to_start(self):
+        """The operator will reach for the combination, and it is not a mode:
+        it is two deployments, and therefore two processes on two ports."""
+        said = self.refuses("--drop-box", "--source", "support-bot", "--read-only",
+                            "--port", "0")
+        self.assertIn("two", said.lower())
+        self.assertIn("--read-only", said)
+
+    def test_a_cap_of_zero_refuses_to_start(self):
+        said = self.refuses("--drop-box", "--source", "support-bot",
+                            "--daily-cap", "0", "--port", "0")
+        self.assertIn("--daily-cap", said)
+
+    def test_the_banner_says_what_this_endpoint_is(self):
+        self.serve_and_get_server("--drop-box", "--source", "support-bot", "--port", "0")
+        said = self.err.getvalue()
+        self.assertIn("support-bot", said, "the banner does not name the source")
+        self.assertIn(str(serve.DEFAULT_DAILY_CAP), said, "the cap is not stated")
+        self.assertIn("brain_capture", said)
+        self.assertNotIn("brain_search", said, "a drop box banner advertised a read tool")
+
+    def test_the_banner_says_the_notes_are_proposals(self):
+        """The operator has to know what arrives here is not knowledge yet, or
+        the drop box reads as a way for a bot to teach the brain things."""
+        self.serve_and_get_server("--drop-box", "--source", "support-bot", "--port", "0")
+        self.assertIn("inbox", self.err.getvalue().lower())
+
+    def test_an_exposed_drop_box_says_what_it_exposes(self):
+        """Different from the read-only warning, and it has to be: what is at
+        risk here is what gets WRITTEN, not what can be read."""
+        self.run_serve("--new-token")
+        self.out, self.err = io.StringIO(), io.StringIO()
+        code = self.run_serve("--drop-box", "--source", "support-bot",
+                              "--bind", "0.0.0.0", "--port", "0")
+        self.assertEqual(code, 0)
+        self.addCleanup(self.started[0].server_close)
+        warned = self.err.getvalue()
+        self.assertIn("EXPOSED", warned)
+        self.assertNotIn("read EVERY note", warned)
+
+    def test_the_slug_rule_is_the_toolbelts_rule(self):
+        """Two enforcement points — serve refuses a bad slug at startup, the
+        CLI refuses one at write time — and this is what keeps them one rule.
+        They are allowed to be two copies; they are not allowed to differ."""
+        brain = (ROOT / "bin" / "brain").read_text(encoding="utf-8")
+        self.assertIn(serve.SOURCE_RE.pattern, brain)
+
+
 class TestServeInTheHelp(unittest.TestCase):
     def test_serve_is_listed(self):
         import subprocess
@@ -850,6 +1183,7 @@ class TestServeInTheHelp(unittest.TestCase):
         done = self.serve_help()
         self.assertIn("brain serve — reach this brain", done.stdout)
         self.assertIn("--read-only", done.stdout)
+        self.assertIn("--drop-box", done.stdout)
         self.assertIn("--new-token", done.stdout)
 
 

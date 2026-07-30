@@ -12,10 +12,16 @@ behaviour identical on the CLI, over stdio, and over HTTP — the ranking and th
 trust signals are deterministic code, not model judgement.
 
 One table, but not always all of it: `handle` and `call_tool` take an `allow`
-set, which is how `brain serve --read-only` exposes four tools instead of five
-without a second table to drift out of sync with this one. `allow=None` — every
-tool — stays the default, because that is what stdio is: a subprocess a client
-spawned on the machine the user is already sitting at.
+set, which is how `brain serve --read-only` exposes four tools instead of five,
+and `--drop-box` exactly one, without a second table to drift out of sync with
+this one. `allow=None` — every tool — stays the default, because that is what
+stdio is: a subprocess a client spawned on the machine the user is already
+sitting at.
+
+Two more properties of the ENDPOINT travel the same way, never through the
+message: `source` (what provenance a write is stamped with) and `cap` (how
+much this endpoint may write today). A caller must not be able to set either,
+so neither is a tool argument.
 """
 import json
 import subprocess
@@ -131,26 +137,41 @@ TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 MAX_ARG_CHARS = 100_000  # a note or query longer than this is a bug or an abuse
 
 
-def read_only_names(tools=None) -> tuple:
-    """The tools safe to serve when the caller must not be able to write.
+def _named_by_hint(hint: bool, tools=None) -> tuple:
+    """Tool names whose readOnlyHint is EXACTLY this boolean.
 
     Derived from the table rather than written out beside it, so there is one
-    place a tool is declared. It fails CLOSED, and that direction is the whole
-    point: a tool added later with no annotation, or with a truthy-but-not-True
-    one, is left OUT of read-only serving. Getting that wrong the other way
-    means a write tool on a socket somebody believed was read-only, which is a
-    silent failure; being left out is a loud one, and tests/test_serve.py also
-    refuses a tool that declares nothing at all.
+    place a tool is declared. Identity against True/False, not truthiness, is
+    what makes both restricted modes fail CLOSED: a tool added later with no
+    annotation, or with a truthy-but-not-boolean one, lands in NEITHER set and
+    is therefore served by neither mode. Getting that wrong in the other
+    direction means a write tool on a socket somebody believed was read-only,
+    or a read tool on a drop box — silent failures both; being left out is a
+    loud one, and tests/test_serve.py also refuses a tool that declares
+    nothing at all.
 
     readOnlyHint is the MCP specification's own annotation, so this is not a
     private convention — it is information clients already receive.
     """
     return tuple(tool["name"] for tool in (TOOLS if tools is None else tools)
                  if isinstance(tool.get("annotations"), dict)
-                 and tool["annotations"].get("readOnlyHint") is True)
+                 and tool["annotations"].get("readOnlyHint") is hint)
+
+
+def read_only_names(tools=None) -> tuple:
+    """The tools safe to serve when the caller must not be able to write."""
+    return _named_by_hint(True, tools)
+
+
+def write_only_names(tools=None) -> tuple:
+    """The mirror: the tools safe to serve when the caller must not be able to
+    READ. A drop box is not a small brain — it is a slot, and the thing on the
+    other side of it is not trusted with a single note."""
+    return _named_by_hint(False, tools)
 
 
 READ_ONLY_TOOLS = read_only_names()
+WRITE_ONLY_TOOLS = write_only_names()
 
 
 def run_cli(args):
@@ -216,7 +237,43 @@ def validate_args(name, args):
     return clean, None
 
 
-def call_tool(name, args, allow=None, source=None):
+def _error(text):
+    return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
+def drop_box_reply(run):
+    """What an endpoint that stamps a foreign source hands back: an
+    acknowledgement, and nothing else.
+
+    An endpoint that has to stamp provenance is by definition one the operator
+    is not sitting at, so the CLI's own output must not be forwarded. It
+    carries the note's ABSOLUTE PATH — where this brain lives on disk — and on
+    a failed commit it carries git's and lint's stderr, which is text about
+    OTHER notes. Each of those is a read channel out of a brain the caller is
+    not supposed to be able to read at all, and clause 3 of the security
+    contract is that this endpoint acknowledges a write and stops.
+
+    So: success is the new note's id, which is derived from the caller's own
+    text and tells them nothing they did not send. Failure is that it failed.
+    The reason goes to the operator's terminal, which is the one place it is
+    both useful and safe.
+    """
+    if run.returncode != 0:
+        detail = (run.stdout or "").strip() + (("\n" + run.stderr.strip())
+                                               if (run.stderr or "").strip() else "")
+        # Terse to the caller, not silent to the owner: a drop box whose
+        # failures are invisible is one that stops working quietly.
+        sys.stderr.write("  drop box REFUSED a capture: " + (detail or "no detail") + "\n")
+        sys.stderr.flush()
+        return _error("this brain did not accept that capture")
+    written = [line.strip() for line in (run.stdout or "").splitlines()
+               if line.strip().endswith(".md")]
+    note_id = Path(written[-1]).stem if written else ""
+    return {"content": [{"type": "text",
+                         "text": f"captured {note_id}".strip()}], "isError": False}
+
+
+def call_tool(name, args, allow=None, source=None, cap=None):
     # isinstance first: a non-string name (dict/list) is unhashable and would
     # raise on the membership test instead of reporting an unknown tool.
     if not isinstance(name, str) or name not in TOOLS_BY_NAME:
@@ -227,15 +284,17 @@ def call_tool(name, args, allow=None, source=None):
         # skipped by a caller who never read tools/list, and a client is exactly
         # what this mode is defending against.
         #
-        # It says which tool and why, instead of claiming the tool does not
-        # exist. Whether this server is read-only is printed in its own startup
-        # banner and is a property of how it was launched, not a secret — and a
-        # model told the truth stops retrying, where one told "unknown tool"
-        # reasonably tries three spellings of the name first.
+        # It says which tool and what IS served, instead of claiming the tool
+        # does not exist. That is no more than tools/list already returns, and
+        # a model told the truth stops retrying, where one told "unknown tool"
+        # reasonably tries three spellings of the name first. Phrased from the
+        # allow-set rather than from a mode name so it stays true for whatever
+        # the third restricted mode turns out to be.
         return {"content": [{"type": "text", "text":
-                             f"{name} is not served by this brain: it is running read-only, "
-                             "which serves the four read tools and refuses the write one. "
-                             "Retrieval is unaffected."}],
+                             f"{name} is not served by this brain. This endpoint serves "
+                             f"{', '.join(sorted(allow))} and nothing else — that is a "
+                             "property of how it was started, not a permission to retry "
+                             "into."}],
                 "isError": True}
     args, problem = validate_args(name, args)
     if problem:
@@ -273,18 +332,33 @@ def call_tool(name, args, allow=None, source=None):
             # which calls it `local`. Two spellings of the default would be
             # two things to keep in step.
             cli += ["--source", source]
+        if cap is not None:
+            # Checked BEFORE the CLI runs: nothing reaches disk either way, and
+            # a refusal that still forked a subprocess would be a cheap way to
+            # keep the machine busy. What this endpoint has already written
+            # today is a fact about the ENDPOINT — anything counted out of the
+            # inbox's contents would not be, and would not be said out loud.
+            refusal = cap()
+            if refusal:
+                return _error(refusal)
     try:
         run = run_cli(cli)
     except Exception as exc:
+        if name == "brain_capture" and source:
+            sys.stderr.write(f"  drop box could not run the capture: {exc!r}\n")
+            return _error("this brain did not accept that capture")
         return {"content": [{"type": "text", "text": f"brain tool failed: {exc!r}. "
                              f"Fallback: search the files directly with rg in {ROOT} "
                              "(archive/ and vault/ are excluded by .rgignore)."}],
                 "isError": True}
+    # A stamped source means an untrusted caller — see drop_box_reply.
+    if name == "brain_capture" and source:
+        return drop_box_reply(run)
     text = (run.stdout + ("\n" + run.stderr if run.stderr.strip() else "")).strip() or "(no output)"
     return {"content": [{"type": "text", "text": text}], "isError": run.returncode != 0}
 
 
-def handle(msg, allow=None, source=None):
+def handle(msg, allow=None, source=None, cap=None):
     """One JSON-RPC message in, one reply out — or None for a notification.
 
     Returns rather than writes, which is the whole reason a second transport is
@@ -297,7 +371,9 @@ def handle(msg, allow=None, source=None):
     alone is a mode a client can step around.
 
     `source` is what this endpoint stamps on anything it writes, or None to
-    leave the CLI's own default. It travels the same way `allow` does — from
+    leave the CLI's own default. `cap` is a callable returning a refusal
+    string when this endpoint has written enough for today, or "" when it may
+    write; None means uncapped. Both travel the same way `allow` does — from
     how the server was started, past the message entirely — for the same
     reason: a property of the deployment must not be settable by the caller.
     """
@@ -319,7 +395,7 @@ def handle(msg, allow=None, source=None):
         args = params.get("arguments")
         return _reply(msg_id, call_tool(params.get("name", ""),
                                         args if args is not None else {}, allow=allow,
-                                        source=source))
+                                        source=source, cap=cap))
     if method == "ping":
         return _reply(msg_id, {})
     if msg_id is not None:

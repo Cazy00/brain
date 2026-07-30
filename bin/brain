@@ -25,12 +25,16 @@ Commands:
   brain schedule install|uninstall|status [--with-consolidate]
   brain template <dest> [--force]  emit a publishable copy: all tooling, none
                                    of your notes (the public template is DERIVED)
-  brain serve [--read-only] [--bind <addr>] [--port <n>] | --new-token
+  brain serve [--read-only | --drop-box --source <slug>] [--bind <addr>]
+              [--port <n>] | --new-token
                                    the same tools over HTTP, for reaching this
                                    brain from another device. Loopback by
                                    default; refuses to start without a token;
                                    brain_capture WRITES over it unless
-                                   --read-only, which refuses that one tool
+                                   --read-only, which refuses that one tool.
+                                   --drop-box is the mirror — that one tool and
+                                   nothing else, for an agent allowed to
+                                   contribute but not to read (`serve --help`)
   brain doctor                     health report (hooks, backup, lint, tools)
   brain stats [--json] [--record]  is the KNOWLEDGE still healthy: findability,
                                    capture rate, staleness, curation, link graph
