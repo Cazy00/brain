@@ -37,6 +37,35 @@ state: `brain setup`, `brain connect`, `brain serve`, `brain retire`.
 
 ---
 
+## Waiting on the owner, not on work
+
+Recorded 2026-07-30. Everything still open needs a **person to answer something**
+before any code is worth writing — none of it is blocked on effort, and picking
+any of it up without asking first would be building on a guess.
+
+Whoever works on this repo next should raise these rather than wait to be asked.
+The owner said on 2026-07-30 that they will confirm or deny each one when it
+comes up, so the questions matter more than the estimates.
+
+| Ask | Why it decides the work | Item |
+|---|---|---|
+| **Do you want the brain inside the claude.ai app** (phone, web, Desktop) — as opposed to Claude Code, which already works? | "No" keeps item 3 closed forever, at zero cost. "Yes" means an authorization server, and even then the `static_headers` re-check below comes first. | 3 |
+| **Do you have a Windows machine to hand yet?** | It is the only thing that can close item 4. Nothing on macOS or Linux moves it, and CI already covers everything CI can reach. | 4 |
+
+Two things NOT to ask, because they are settled:
+
+- **Do not re-raise item 7 as a defect.** `doctor` calling this repo public is
+  correct and is supposed to stay.
+- **Do not offer to install a brain on the development machine.** Asked and
+  answered 2026-07-30: `brain setup` was run there as a demonstration, verified,
+  and removed at the owner's request. This checkout is the public template.
+
+Before starting item 3 on a "yes", re-check `static_headers` first — it was
+still OAuth-only for individuals on 2026-07-29, and if that changes the item
+becomes a settings change instead of a codebase.
+
+---
+
 ## 1. `brain serve` has no read-only mode — CLOSED 2026-07-29
 
 **Closed by:** `70ffa1d`, `brain serve --read-only`.
