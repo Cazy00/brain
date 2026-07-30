@@ -1141,6 +1141,32 @@ class SupersedeTests(unittest.TestCase):
         self.assertFalse((self.repo / f"knowledge/reference/{seed}.md").exists())
         self.assertTrue((self.repo / f"knowledge/archive/reference/{seed}.md").exists())
 
+    def test_approval_is_not_carried_forward(self):
+        """A changed fact is private until a human looks at it again.
+
+        The successor is a new note nobody has reviewed, and the predecessor
+        stops claiming a customer may see it — otherwise a price rise leaves
+        the old price approved, in the archive, one bug away from shipping.
+        """
+        seed = self.seed()
+        self.write_ref(seed, "Seed note", "The original claim.", visibility="public")
+        result = run_brain("supersede", seed, "Seed note v2", repo=self.repo)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.finish_supersede(seed, "seed-note-v2")
+
+        successor = (self.repo / "knowledge/reference/seed-note-v2.md").read_text(
+            encoding="utf-8")
+        self.assertNotIn("visibility", successor,
+                         "the successor inherited an approval nobody gave it")
+        archived = (self.repo / f"knowledge/archive/reference/{seed}.md").read_text(
+            encoding="utf-8")
+        self.assertNotIn("visibility: public", archived,
+                         "an archived note still claims it may be published")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0,
+                         "superseding a published note left the tree un-lintable:\n"
+                         + lint.stdout)
+
     def test_unreplaced_banner_placeholder_blocks_the_commit(self):
         """The archived note must record WHY it was replaced. Left unfilled, it
         says only THAT it was — and the reason is unrecoverable once the session
@@ -3242,6 +3268,120 @@ class SearchCurrencyTests(unittest.TestCase):
         self.assertTrue(inbox_rows, "the capture did not show in recent")
         for row in inbox_rows:
             self.assertIn("provisional", row, "an inbox row was listed as settled: " + row)
+
+
+class VisibilityTests(unittest.TestCase):
+    """`visibility:` — the field a human sets to say a note may leave here.
+
+    THREE states, not two. Absent means never reviewed and belongs in the
+    review queue; `private` means reviewed and refused, and stays quiet. Both
+    are excluded from a published brain, so the fail-closed property is the
+    same either way — but without the distinction the operator is re-asked
+    forever about notes they already rejected, and a review queue nobody
+    finishes is a review queue nobody reads.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.repo = make_sandbox(self.tmp.name)
+
+    def tearDown(self):
+        cleanup_temp(self.tmp)
+
+    def write(self, folder, kind, name, **fm):
+        extra = "".join(f"{k}: {v}\n" for k, v in fm.items())
+        path = self.repo / "knowledge" / folder / f"{name}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\nid: {name}\nkind: {kind}\ntitle: {name.replace('-', ' ')}\n"
+            f"topics: [brain]\naliases: [{name}]\ncreated: 2026-07-01\n"
+            f"status: current\n{extra}---\n\nA durable fact about the business.\n",
+            encoding="utf-8")
+        return path
+
+    def lint(self):
+        return run_brain("lint", repo=self.repo)
+
+    def test_public_is_accepted(self):
+        self.write("reference", "reference", "opening-hours", visibility="public")
+        self.assertEqual(self.lint().returncode, 0, self.lint().stdout)
+
+    def test_private_is_accepted(self):
+        self.write("reference", "reference", "margin-model", visibility="private")
+        self.assertEqual(self.lint().returncode, 0, self.lint().stdout)
+
+    def test_absent_is_accepted_and_is_the_default_state(self):
+        """Every note that exists today has no visibility, and every note
+        `brain new` writes will have none either. Absent has to be legal, or
+        the field would make the whole brain un-lintable the day it arrived."""
+        self.write("reference", "reference", "never-reviewed")
+        self.assertEqual(self.lint().returncode, 0, self.lint().stdout)
+
+    def test_an_unknown_value_is_rejected(self):
+        self.write("reference", "reference", "half-published", visibility="unlisted")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("visibility", out.stdout)
+
+    def test_a_list_is_rejected(self):
+        self.write("reference", "reference", "two-minds", visibility="[public, private]")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("visibility", out.stdout)
+
+    def test_public_with_personal_sensitivity_is_an_error(self):
+        """The two fields disagreeing is a mistake with a bad failure mode,
+        and lint is the only thing that sees both."""
+        self.write("reference", "reference", "a-personal-arrangement",
+                   sensitivity="personal", visibility="public")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("visibility", out.stdout)
+        self.assertIn("personal", out.stdout)
+
+    def test_public_in_people_is_an_error(self):
+        self.write("people", "person", "a-colleague",
+                   sensitivity="normal", visibility="public")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("people/", out.stdout)
+
+    def test_public_in_life_is_an_error(self):
+        self.write("life", "note", "how-i-handle-mornings",
+                   sensitivity="normal", visibility="public")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("life/", out.stdout)
+
+    def test_public_on_a_note_that_is_not_current_is_an_error(self):
+        path = self.write("reference", "reference", "half-retired", visibility="public")
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "status: current", "status: draft"), encoding="utf-8")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("visibility", out.stdout)
+
+    def test_new_notes_carry_no_visibility(self):
+        """Approval is a decision somebody makes, one note at a time. A default
+        of `public` would publish a business's brain by accident; a default of
+        `private` would claim a human reviewed it and said no."""
+        out = run_brain("new", "reference", "How the indexer works",
+                        "--topics", "brain", repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        written = Path(out.stdout.strip().splitlines()[0])
+        self.assertNotIn("visibility", written.read_text(encoding="utf-8"))
+
+    def test_an_inbox_note_claiming_visibility_is_warned_about(self):
+        """Nothing publishes out of inbox/, so the field there does nothing.
+        A warning, not an error: provisional material must never block a
+        commit, and the point is only that it was noticed."""
+        (self.repo / "knowledge" / "inbox" / "2026-07-30-120000-probe.md").write_text(
+            "---\ncreated: 2026-07-30\nsource: local\nstatus: draft\n"
+            "visibility: public\n---\n\nSomething a customer could see.\n",
+            encoding="utf-8")
+        out = self.lint()
+        self.assertEqual(out.returncode, 0, "a stray field blocked a capture\n" + out.stdout)
+        self.assertIn("visibility", out.stdout)
 
 
 class CaptureProvenanceTests(unittest.TestCase):

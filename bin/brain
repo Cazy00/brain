@@ -88,6 +88,18 @@ FOLDER_KIND = {
 STATUSES = {"current", "superseded", "draft"}
 SENSITIVITIES = {"normal", "personal", "private"}
 SENSITIVITY_REQUIRED = {"people", "life"}
+# May a note leave this brain? Three states, and the third one is ABSENT:
+# never reviewed. `private` means a human looked and said no, which is why it
+# is worth spelling — both are excluded from a published brain, but only the
+# absent ones belong in the review queue, and a queue that keeps re-asking
+# about refusals is a queue nobody finishes.
+VISIBILITIES = {"public", "private"}
+# Folders whose notes are never publishable, whatever their frontmatter says.
+# Spelled separately from SENSITIVITY_REQUIRED even though the two match
+# today: one asks "must this be classified", the other "may this be seen by a
+# customer", and merging them would silently answer the second question with
+# the first the day either list changes.
+NEVER_PUBLIC = {"people", "life"}
 # Which endpoint accepted a capture. Stamped by the endpoint, never claimed by
 # the caller — an agent that can lie about its content can lie about its label
 # — and validated as an id, so there is one slug rule in this file rather than
@@ -489,6 +501,56 @@ def check_links(path, text, fm, ctx: LintCtx, hard: bool = True) -> None:
                                     " with no recorded successor")))
 
 
+def publish_blockers(folder: str, fm: dict) -> list:
+    """Every reason this note must NOT be marked `visibility: public`.
+
+    One function, two callers — lint refuses a note that already carries the
+    field wrongly, and `brain publish approve` refuses to write it in the
+    first place — because two copies of the rule that decides what a customer
+    can see is one copy too many, and they would not stay the same rule.
+
+    Returns human-readable reasons, plural on purpose: an operator fixing one
+    problem should be told about the second one now, not after the next run.
+    """
+    reasons = []
+    sensitivity = (fm or {}).get("sensitivity")
+    if sensitivity and sensitivity != "normal":
+        reasons.append(f"its sensitivity is {sensitivity!r} — the two fields disagree, "
+                       "and a note classified as not-normal is not customer-facing "
+                       "material whatever the other field says")
+    if folder in NEVER_PUBLIC:
+        reasons.append(f"notes in {folder}/ are about a named person's life; nothing "
+                       "there is publishable, and the person whose details they are "
+                       "never got a say")
+    if (fm or {}).get("status") != "current":
+        reasons.append("only a current note can be published — an archived or draft "
+                       "one is history or work in progress, and serving it to a "
+                       "customer would serve a fact this brain has already replaced")
+    return reasons
+
+
+def check_visibility(path, folder, in_archive, fm, ctx: LintCtx) -> None:
+    """The enum, and the three combinations that must never exist.
+
+    Archived notes are exempt from the cross-checks, not from the enum:
+    `brain supersede` strips the field on the way into archive/, so a `public`
+    still sitting there predates that and is history, and history is not
+    rewritten to satisfy a rule. Nothing publishes out of archive/ anyway —
+    the compiler selects current canonical notes, never a folder.
+    """
+    visibility = (fm or {}).get("visibility")
+    if visibility is None:
+        return
+    if visibility not in VISIBILITIES:
+        ctx.errors.append((path, f"visibility must be one of {sorted(VISIBILITIES)}, "
+                           f"got {visibility!r} — absent is the third state and means "
+                           "nobody has reviewed this note yet"))
+        return
+    if visibility == "public" and not in_archive:
+        for reason in publish_blockers(folder, fm):
+            ctx.errors.append((path, f"visibility: public, but {reason}"))
+
+
 def check_source(path, fm, ctx: LintCtx) -> None:
     """Validate `source:` wherever it appears — inbox included.
 
@@ -518,7 +580,7 @@ def check_source(path, fm, ctx: LintCtx) -> None:
 def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     errors, warnings, topics, metas = ctx.errors, ctx.warnings, ctx.topics, ctx.metas
     for f in ("id", "kind", "title", "created", "status", "sensitivity",
-              "supersedes", "superseded_by", "valid_from", "review_by"):
+              "visibility", "supersedes", "superseded_by", "valid_from", "review_by"):
         if isinstance(fm.get(f), list):
             errors.append((path, f"{f} must be a single value, not a list"))
             fm[f] = None
@@ -619,6 +681,7 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
                                "knowledge. Write the successor's content first."))
 
     check_source(path, fm, ctx)
+    check_visibility(path, folder, in_archive, fm, ctx)
 
     sensitivity = fm.get("sensitivity")
     if folder in SENSITIVITY_REQUIRED and not sensitivity:
@@ -720,6 +783,15 @@ def check_knowledge_file(rel: Path, blob: Blob, ctx: LintCtx, fm_cached=None) ->
                            "— encrypt into vault/ (see setup/runbooks/vault.md)"))
         # Where captures actually land, so where `source:` actually appears.
         check_source(path, fm, ctx)
+        if fm and fm.get("visibility"):
+            # A warning, not an error: provisional material must never block a
+            # commit. The point is only that the field does NOTHING here —
+            # publishing selects current canonical notes, so somebody who
+            # marked an inbox note public is waiting for something that will
+            # not happen until consolidation promotes it.
+            warnings.append((path, f"visibility in {top}/ has no effect — only current "
+                             "notes in canonical folders can be published; set it on "
+                             "the note consolidation promotes this into"))
         # Provisional material: a bad link is worth reporting but must never
         # block a capture from committing.
         check_links(path, note_text, fm, ctx, hard=False)
@@ -3330,23 +3402,32 @@ def cmd_recent(argv: list) -> int:
 
 def fm_update(path: Path, updates: dict, banner: str = None) -> None:
     """Set flat frontmatter fields in place (add if missing); optionally insert a
-    banner line right after the frontmatter block."""
+    banner line right after the frontmatter block.
+
+    A value of None REMOVES the field. Removing is not the same as writing an
+    empty value: `visibility:` with nothing after it reads as a field somebody
+    set, and the difference between "never reviewed" and "reviewed" is the
+    whole of what that field records.
+    """
     lines = read_text(path).splitlines()
     end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
-    done = set()
-    for i in range(1, end):
-        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):", lines[i])
+    opener, block, tail = lines[:1], lines[1:end], lines[end:]
+    kept, done = [], set()
+    for line in block:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):", line)
         if m and m.group(1) in updates:
-            lines[i] = f"{m.group(1)}: {updates[m.group(1)]}"
             done.add(m.group(1))
+            if updates[m.group(1)] is None:
+                continue
+            line = f"{m.group(1)}: {updates[m.group(1)]}"
+        kept.append(line)
     for key, value in updates.items():
-        if key not in done:
-            lines.insert(end, f"{key}: {value}")
-            end += 1
+        if key not in done and value is not None:
+            kept.append(f"{key}: {value}")
     if banner:
-        lines.insert(end + 1, "")
-        lines.insert(end + 2, banner)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # After the closing --- (tail[0]), with a blank line between.
+        tail = tail[:1] + ["", banner] + tail[1:]
+    path.write_text("\n".join(opener + kept + tail) + "\n", encoding="utf-8")
 
 
 def cmd_supersede(argv: list) -> int:
@@ -3411,7 +3492,13 @@ def cmd_supersede(argv: list) -> int:
     fm_update(new_path, {"supersedes": old_id})
 
     old_path = K / old_rel
-    fm_update(old_path, {"status": "superseded", "superseded_by": new_id},
+    # Approval does not survive the fact changing. The successor is rendered
+    # from a blank template, so it carries no visibility and stays unpublished
+    # until a human looks again; the predecessor stops claiming a customer may
+    # see it, because otherwise a price rise leaves the old price marked
+    # public, sitting in the archive, one bug away from being served.
+    fm_update(old_path, {"status": "superseded", "superseded_by": new_id,
+                         "visibility": None},
               banner=f"> SUPERSEDED {today} by [[{new_id}]] — <one-line reason>")
     dest.parent.mkdir(parents=True, exist_ok=True)
     # git mv stages a rename, so it is an index mutation like any commit and
