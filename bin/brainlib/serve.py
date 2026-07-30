@@ -72,18 +72,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import mcp
+from . import notes
 from . import osbackend
 
 ENDPOINT = "/mcp"
 TOKEN_NAME = "brain-serve-token"
 DEFAULT_PORT = 8787
 
-# What a `--source` slug may look like. A second copy of bin/brain's ID_RE, on
-# purpose: this file cannot import that script, and the alternative — letting a
-# bad slug through and finding out at the first capture — puts the error in the
-# bot's response instead of the operator's terminal. tests/test_serve.py reads
-# both files and refuses to let the two rules differ.
-SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,79}$")
+# What a `--source` slug may look like: the id rule, imported rather than
+# copied. Two enforcement points — this one refuses a bad slug at startup, the
+# CLI refuses one at write time — and refusing early is what puts the error in
+# the operator's terminal instead of the bot's response.
+SOURCE_RE = notes.ID_RE
 # How many captures one source may leave in the inbox in a day. There is no
 # flag to turn this off, for the same reason the limiter has none: "it probably
 # will not send that many" is an argument, and this is a control.

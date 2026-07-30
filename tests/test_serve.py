@@ -1145,10 +1145,12 @@ class TestTheDropBoxCli(TestTheCli):
 
     def test_the_slug_rule_is_the_toolbelts_rule(self):
         """Two enforcement points — serve refuses a bad slug at startup, the
-        CLI refuses one at write time — and this is what keeps them one rule.
-        They are allowed to be two copies; they are not allowed to differ."""
-        brain = (ROOT / "bin" / "brain").read_text(encoding="utf-8")
-        self.assertIn(serve.SOURCE_RE.pattern, brain)
+        CLI refuses one at write time — and one rule between them. Asserted as
+        identity, not equality: a copy that happens to match today is a copy
+        that stops matching the day somebody widens one of them."""
+        from brainlib import notes
+
+        self.assertIs(serve.SOURCE_RE, notes.ID_RE)
 
 
 class TestServeInTheHelp(unittest.TestCase):
