@@ -216,7 +216,7 @@ def validate_args(name, args):
     return clean, None
 
 
-def call_tool(name, args, allow=None):
+def call_tool(name, args, allow=None, source=None):
     # isinstance first: a non-string name (dict/list) is unhashable and would
     # raise on the membership test instead of reporting an unknown tool.
     if not isinstance(name, str) or name not in TOOLS_BY_NAME:
@@ -260,6 +260,19 @@ def call_tool(name, args, allow=None):
         cli = ["capture", args["text"]]
         if args.get("commit", True):
             cli.append("--commit")
+        if source:
+            # Provenance is stamped by the ENDPOINT, never claimed by the
+            # caller. `source` comes from how this server was started; a
+            # `source` in the request arguments never reaches this line,
+            # because validate_args rebuilds the argument dict from the
+            # declared schema and the schema does not offer the field. An
+            # agent that can lie about its content can lie about its label, so
+            # the label has to come from somewhere the agent cannot reach.
+            #
+            # None — stdio — passes nothing and leaves the default to the CLI,
+            # which calls it `local`. Two spellings of the default would be
+            # two things to keep in step.
+            cli += ["--source", source]
     try:
         run = run_cli(cli)
     except Exception as exc:
@@ -271,7 +284,7 @@ def call_tool(name, args, allow=None):
     return {"content": [{"type": "text", "text": text}], "isError": run.returncode != 0}
 
 
-def handle(msg, allow=None):
+def handle(msg, allow=None, source=None):
     """One JSON-RPC message in, one reply out — or None for a notification.
 
     Returns rather than writes, which is the whole reason a second transport is
@@ -282,6 +295,11 @@ def handle(msg, allow=None):
     `allow` is the set of tool names this caller may reach, or None for all of
     them. It filters tools/list and gates tools/call — both, because either one
     alone is a mode a client can step around.
+
+    `source` is what this endpoint stamps on anything it writes, or None to
+    leave the CLI's own default. It travels the same way `allow` does — from
+    how the server was started, past the message entirely — for the same
+    reason: a property of the deployment must not be settable by the caller.
     """
     method = msg.get("method", "")
     msg_id = msg.get("id")
@@ -300,7 +318,8 @@ def handle(msg, allow=None):
     if method == "tools/call":
         args = params.get("arguments")
         return _reply(msg_id, call_tool(params.get("name", ""),
-                                        args if args is not None else {}, allow=allow))
+                                        args if args is not None else {}, allow=allow,
+                                        source=source))
     if method == "ping":
         return _reply(msg_id, {})
     if msg_id is not None:

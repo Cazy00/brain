@@ -6,7 +6,11 @@ Commands:
                                    install a brain and prove it works (run once)
   brain connect [<client>|--all]   wire it into any MCP-capable agent
   brain new <kind> "<title>" [--topics a,b] [--sensitivity normal|personal]
-  brain capture "<text>" [--commit]  quick note into knowledge/inbox/
+  brain capture "<text>" [--commit] [--source <slug>]
+                                   quick note into knowledge/inbox/. --source
+                                   records WHICH endpoint accepted it (default
+                                   `local`, this machine); consolidation treats
+                                   anything else as an untrusted proposal
   brain lint [--staged]            validate every note; exit 1 on errors
   brain search "<query>" [--scope all] [--limit N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
@@ -80,6 +84,11 @@ FOLDER_KIND = {
 STATUSES = {"current", "superseded", "draft"}
 SENSITIVITIES = {"normal", "personal", "private"}
 SENSITIVITY_REQUIRED = {"people", "life"}
+# Which endpoint accepted a capture. Stamped by the endpoint, never claimed by
+# the caller — an agent that can lie about its content can lie about its label
+# — and validated as an id, so there is one slug rule in this file rather than
+# two that drift. `local` is a capture made on this machine by its owner.
+DEFAULT_SOURCE = "local"
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,79}$")
@@ -476,6 +485,32 @@ def check_links(path, text, fm, ctx: LintCtx, hard: bool = True) -> None:
                                     " with no recorded successor")))
 
 
+def check_source(path, fm, ctx: LintCtx) -> None:
+    """Validate `source:` wherever it appears — inbox included.
+
+    An ERROR, not a warning, and in provisional material too, which is the one
+    place the relaxed inbox rules bend. The field is what the consolidation
+    prompt weighs a proposal by: a value that cannot be compared to `local` is
+    a value somebody has to interpret, and lint is the last thing that sees it
+    before an agent does. It follows the same precedent as `sensitivity:
+    private` in inbox/, which also blocks a commit for a security reason.
+
+    `brain capture` refuses a malformed slug before writing, so anything this
+    catches arrived by hand-edit or from a bug — both worth stopping.
+    """
+    source = (fm or {}).get("source")
+    if source is None:
+        return
+    if isinstance(source, list):
+        ctx.errors.append((path, "source must be a single value, not a list — one "
+                           "capture came from one endpoint"))
+        return
+    if not ID_RE.match(str(source)):
+        ctx.errors.append((path, f"source {source!r} invalid — lowercase letters, "
+                           "digits, hyphens, 3-80 chars (it is stamped by the endpoint "
+                           "that accepted the capture; `local` means this machine)"))
+
+
 def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     errors, warnings, topics, metas = ctx.errors, ctx.warnings, ctx.topics, ctx.metas
     for f in ("id", "kind", "title", "created", "status", "sensitivity",
@@ -579,6 +614,8 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
                                "left the default search scope, so committing this loses that "
                                "knowledge. Write the successor's content first."))
 
+    check_source(path, fm, ctx)
+
     sensitivity = fm.get("sensitivity")
     if folder in SENSITIVITY_REQUIRED and not sensitivity:
         errors.append((path, f"notes in {folder}/ require a sensitivity field "
@@ -677,6 +714,8 @@ def check_knowledge_file(rel: Path, blob: Blob, ctx: LintCtx, fm_cached=None) ->
         if fm and fm.get("sensitivity") == "private":
             errors.append((path, "sensitivity: private must never exist as plaintext "
                            "— encrypt into vault/ (see setup/runbooks/vault.md)"))
+        # Where captures actually land, so where `source:` actually appears.
+        check_source(path, fm, ctx)
         # Provisional material: a bad link is worth reporting but must never
         # block a capture from committing.
         check_links(path, note_text, fm, ctx, hard=False)
@@ -2349,9 +2388,32 @@ def cmd_new(argv: list) -> int:
 
 def cmd_capture(argv: list) -> int:
     do_commit = "--commit" in argv
-    text = " ".join(a for a in argv if a != "--commit").strip()
+    # --source and its value are lifted OUT of argv before the text is
+    # assembled: capture's text is positional and swallows the rest of the
+    # line, so a flag parsed by filtering alone leaves its value sitting in
+    # the middle of the note.
+    source = DEFAULT_SOURCE
+    words, skip = [], False
+    for i, arg in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if arg == "--commit":
+            continue
+        if arg == "--source" and i + 1 < len(argv):
+            source, skip = argv[i + 1], True
+            continue
+        words.append(arg)
+    text = " ".join(words).strip()
     if not text:
-        print("usage: brain capture \"<text>\" [--commit]")
+        print("usage: brain capture \"<text>\" [--commit] [--source <slug>]")
+        return 2
+    if not ID_RE.match(source):
+        # Refused here rather than written and linted later: this value is how
+        # consolidation decides whether a note is knowledge or a proposal, and
+        # a malformed one is a value nothing downstream can compare.
+        print(f"--source {source!r} is not a valid slug — lowercase letters, digits "
+              "and hyphens, 3-80 chars. Nothing was written.")
         return 2
     today = date.today().isoformat()
     stamp = time.strftime("%H%M%S")
@@ -2361,7 +2423,12 @@ def cmd_capture(argv: list) -> int:
     while path.exists():
         path = K / "inbox" / f"{today}-{stamp}-{slug}-{n}.md"
         n += 1
-    body = f"---\ncreated: {today}\nstatus: draft\n---\n\n{text}\n"
+    # `source` is written on EVERY capture, including the owner's own. Absent
+    # would mean "no idea" — a note from before this field existed, or one
+    # written by something that never said — and the consolidator would have to
+    # guess. It guesses in the trusting direction, which is the failure this
+    # field exists to prevent.
+    body = f"---\ncreated: {today}\nsource: {source}\nstatus: draft\n---\n\n{text}\n"
     # Scan BEFORE the write, not after. Without this the only moment an inbox
     # note ever meets scan_secrets is --commit -> pre-commit -> lint --staged,
     # so a capture without --commit (the CLI default) reached disk unexamined

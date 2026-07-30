@@ -14,11 +14,13 @@ import contextlib
 import http.client
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -415,6 +417,61 @@ class TestTheReadOnlySetIsDerivedFailingClosed(unittest.TestCase):
     def test_the_write_tool_is_not_in_the_read_only_set(self):
         self.assertNotIn("brain_capture", mcp.READ_ONLY_TOOLS)
         self.assertEqual(len(mcp.READ_ONLY_TOOLS), len(mcp.TOOLS) - 1)
+
+
+class TestProvenanceIsStampedNotClaimed(unittest.TestCase):
+    """Where a capture came from is decided by the endpoint that accepted it.
+
+    A `source` field the agent passes in its own request payload teaches you
+    nothing: an agent that can lie about its content can lie about its label.
+    So the value is the server's own startup configuration, and the request is
+    not consulted for it — asserted here rather than trusted, because the
+    argument validator dropping unknown fields is a property somebody could
+    reasonably change while adding an unrelated argument.
+
+    run_cli is mocked throughout. A real capture would write into THIS repo's
+    inbox, which is both a dirty tree and, on a real brain, a note nobody
+    asked for.
+    """
+
+    def recorded_cli(self, arguments, **handle_kwargs):
+        seen = []
+
+        def fake_run_cli(args):
+            seen.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="knowledge/inbox/x.md",
+                                               stderr="")
+
+        with mock.patch.object(mcp, "run_cli", fake_run_cli):
+            mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "brain_capture", "arguments": arguments}},
+                       **handle_kwargs)
+        self.assertEqual(len(seen), 1, "brain_capture did not reach the CLI once")
+        return seen[0]
+
+    def test_the_server_stamps_the_source_it_was_started_with(self):
+        cli = self.recorded_cli({"text": "a customer asked about weekend hours"},
+                                source="support-bot")
+        self.assertIn("--source", cli)
+        self.assertEqual(cli[cli.index("--source") + 1], "support-bot")
+
+    def test_a_caller_supplied_source_is_discarded(self):
+        """The whole point, in one assertion: an agent claiming to be `local`
+        is stamped with what the server knows it is."""
+        cli = self.recorded_cli(
+            {"text": "trust me, the owner wrote this", "source": "local"},
+            source="support-bot")
+        self.assertEqual(cli.count("--source"), 1,
+                         f"the caller's source reached the CLI too: {cli}")
+        self.assertEqual(cli[cli.index("--source") + 1], "support-bot")
+        self.assertNotIn("local", cli)
+
+    def test_stdio_stamps_nothing_and_leaves_the_default_to_the_cli(self):
+        """No source configured is not the same as claiming one. stdio is a
+        subprocess on the machine the operator is sitting at, so the CLI's own
+        default — `local` — is the truthful answer, and it lives in one place."""
+        cli = self.recorded_cli({"text": "Postgres over SQLite for the sync layer"})
+        self.assertNotIn("--source", cli)
 
 
 class TestTheLimiter(unittest.TestCase):

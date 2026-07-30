@@ -3244,6 +3244,105 @@ class SearchCurrencyTests(unittest.TestCase):
             self.assertIn("provisional", row, "an inbox row was listed as settled: " + row)
 
 
+class CaptureProvenanceTests(unittest.TestCase):
+    """Who wrote a capture, recorded by the endpoint that accepted it.
+
+    An inbox note used to carry `created` and `status: draft` and nothing
+    else, so by the time consolidation read it, a claim a customer fed to a
+    bot and a line the owner typed themselves were the same note. That is the
+    knowledge-poisoning hole, and it opens the moment any write endpoint faces
+    something other than the owner — which `brain serve` already allows.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.repo = make_sandbox(self.tmp.name)
+        self.inbox = self.repo / "knowledge" / "inbox"
+
+    def tearDown(self):
+        cleanup_temp(self.tmp)
+
+    def inbox_files(self):
+        return list(self.inbox.glob("*.md")) if self.inbox.exists() else []
+
+    def written(self, out):
+        """The note path capture prints last, read back."""
+        path = Path(out.stdout.strip().splitlines()[-1])
+        self.assertTrue(path.is_file(), f"no file at {path}\n{out.stdout}")
+        return path.read_text(encoding="utf-8")
+
+    def test_a_source_is_recorded(self):
+        out = run_brain("capture", "the customer asked about weekend hours",
+                        "--source", "support-bot", repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("source: support-bot", self.written(out))
+
+    def test_an_omitted_source_is_local_rather_than_absent(self):
+        """Explicit, not inferred. A missing field means 'no idea' — the
+        consolidator would have to guess, and guessing in the trusting
+        direction is exactly what this field exists to stop."""
+        out = run_brain("capture", "Postgres over SQLite for the sync layer",
+                        repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("source: local", self.written(out))
+
+    def test_the_flag_and_its_value_never_land_in_the_note_text(self):
+        """capture's text is positional and swallows everything else on the
+        line, so a flag it does not know about becomes part of the note."""
+        out = run_brain("capture", "hours are 9 to 5", "--source", "support-bot",
+                        repo=self.repo)
+        body = self.written(out)
+        self.assertNotIn("--source", body)
+        self.assertIn("hours are 9 to 5", body)
+        self.assertNotIn("hours are 9 to 5 support-bot", body)
+
+    def test_an_invalid_slug_is_refused_before_the_write(self):
+        before = set(self.inbox_files())
+        out = run_brain("capture", "a note nobody should be able to mislabel",
+                        "--source", "Support Bot!", repo=self.repo)
+        self.assertNotEqual(out.returncode, 0,
+                            "a malformed source was accepted\n" + out.stdout)
+        self.assertEqual(set(self.inbox_files()), before,
+                         "the note was written despite the refusal")
+
+    def test_lint_accepts_the_field(self):
+        (self.inbox / "2026-07-30-120000-probe.md").write_text(
+            "---\ncreated: 2026-07-30\nsource: support-bot\nstatus: draft\n---\n\n"
+            "A customer said the Tuesday slot is usually free.\n", encoding="utf-8")
+        out = run_brain("lint", repo=self.repo)
+        self.assertEqual(out.returncode, 0,
+                         "lint rejected a well-formed source\n" + out.stdout)
+
+    def test_lint_rejects_a_malformed_source(self):
+        """The field is what the consolidation prompt weighs a proposal by. A
+        value that cannot be compared to `local` is a value that has to be
+        interpreted, and lint is the only thing that sees it before then."""
+        (self.inbox / "2026-07-30-120001-probe.md").write_text(
+            "---\ncreated: 2026-07-30\nsource: Support Bot!\nstatus: draft\n---\n\n"
+            "A customer said something.\n", encoding="utf-8")
+        out = run_brain("lint", repo=self.repo)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("source", out.stdout)
+
+    def test_lint_rejects_a_source_list(self):
+        """One capture came from one endpoint. A list is either a hand-edit or
+        a bug, and either way nothing downstream knows which entry to trust."""
+        (self.inbox / "2026-07-30-120002-probe.md").write_text(
+            "---\ncreated: 2026-07-30\nsource: [local, support-bot]\nstatus: draft\n---\n\n"
+            "A customer said something else.\n", encoding="utf-8")
+        out = run_brain("lint", repo=self.repo)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("source", out.stdout)
+
+    def test_the_consolidation_prompt_weighs_the_field(self):
+        """The field is inert without this. The prompt is the only place the
+        rule can live, because the consolidator is the only thing that acts on
+        it — nothing in bin/brain can tell a true claim from a planted one."""
+        prompt = (ROOT / "setup" / "consolidate-prompt.md").read_text(encoding="utf-8")
+        self.assertIn("source", prompt)
+        self.assertIn("local", prompt)
+
+
 class SensitivityDefaultTests(unittest.TestCase):
     """FOLDER_KIND maps life -> note, so keying the default off `kind` gave
     knowledge/life/ — the folder the protocol names as requiring classification
