@@ -3462,7 +3462,13 @@ CONSOLIDATOR_CONF = "setup/consolidator.conf"
 # someone edited it and getting a silent Claude default instead of what they
 # wrote is how a security boundary disappears without anyone noticing.
 CONSOLIDATOR_DEFAULTS = {
-    "model": "claude-opus-4-8",
+    # Kept in step with setup/consolidator.conf BY A TEST, not by discipline:
+    # this is the second copy of the pin, and on 2026-07-31 moving the conf
+    # alone left it behind — a clone with no conf file would have silently run
+    # a different model from every other clone. That is precisely the drift
+    # test_the_shipped_config_reproduces_todays_behaviour_exactly exists for,
+    # and it caught this within a minute of the edit.
+    "model": "claude-opus-5",
     "propose": "claude --model {model} --permission-mode acceptEdits -p",
     "audit": "claude --model {model} -p",
     "audit_cannot_write": ("The Claude CLI grants no write tools in its default "

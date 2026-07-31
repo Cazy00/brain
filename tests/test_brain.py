@@ -3788,9 +3788,9 @@ class ConsolidatorConfigTests(unittest.TestCase):
         changes. If this drifts, an unattended weekly job changed silently."""
         runner = self.module.load_consolidator()
         self.assertEqual(runner["propose"],
-                         ["claude", "--model", "claude-opus-4-8",
+                         ["claude", "--model", "claude-opus-5",
                           "--permission-mode", "acceptEdits", "-p"])
-        self.assertEqual(runner["audit"], ["claude", "--model", "claude-opus-4-8", "-p"])
+        self.assertEqual(runner["audit"], ["claude", "--model", "claude-opus-5", "-p"])
         self.assertEqual(runner["propose_timeout"], 1800)
         self.assertEqual(runner["audit_timeout"], 900)
         self.assertIn("consolidator.conf", runner["source"])
@@ -3821,14 +3821,14 @@ class ConsolidatorConfigTests(unittest.TestCase):
         into BOTH invocations, so propose != audit still holds, but the auditor
         silently gains --permission-mode acceptEdits. Refuse the multi-token
         model outright."""
-        self.write_conf(model="claude-opus-4-8 --permission-mode acceptEdits")
+        self.write_conf(model="claude-opus-5 --permission-mode acceptEdits")
         self.assertIn("single token", self.refusal())
 
     def test_a_multi_token_model_is_refused_however_it_is_spelled(self):
         """The conf format is `model = <token>`; a space makes it two tokens,
         which is the injection vector. Refuse it whether the second token is a
         flag or just noise — the single-token rule is the whole guarantee."""
-        for bad in ("claude-opus-4-8 --permission-mode acceptEdits",
+        for bad in ("claude-opus-5 --permission-mode acceptEdits",
                     "claude opus", "claude; rm -rf /"):
             with self.subTest(model=bad):
                 self.write_conf(model=bad)
