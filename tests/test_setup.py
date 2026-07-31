@@ -847,6 +847,26 @@ class TestSetupEndToEnd(unittest.TestCase):
 
 
 class TestBootstraps(unittest.TestCase):
+    """The bootstraps are TEMPLATE-ONLY artifacts.
+
+    `brain setup` builds a brain out of the template and deliberately does not
+    copy `install.sh` or `install.ps1` into it — a brain is not a thing other
+    people install from. So these tests have nothing to assert against inside
+    a brain, and they SKIP there rather than fail.
+
+    That distinction matters because SETUP.md Part 7 tells every user to run
+    this suite after pulling toolbelt updates, to prove the update still holds.
+    Failing on a file a brain is correct not to have would hand them a red
+    result for doing exactly the right thing — and a red suite people learn to
+    ignore is worse than no suite.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not (ROOT / "install.sh").exists():
+            raise unittest.SkipTest(
+                "template-only: a brain does not ship the bootstrap installers")
+
     def test_install_sh_is_a_bootstrap_not_a_second_implementation(self):
         text = (ROOT / "install.sh").read_text(encoding="utf-8")
         self.assertIn("bin/brain setup", text)

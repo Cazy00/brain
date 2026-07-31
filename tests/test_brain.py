@@ -3904,6 +3904,15 @@ class PluginTests(unittest.TestCase):
     points at the toolbelt inside the USER'S brain — so the server and the notes
     it serves can never be different versions of each other."""
 
+    @classmethod
+    def setUpClass(cls):
+        # Template-only, for the same reason as TestBootstraps: `brain setup`
+        # does not copy plugins/ into a brain, because a brain is not something
+        # other people install a plugin from.
+        if not (ROOT / "plugins").is_dir():
+            raise unittest.SkipTest(
+                "template-only: a brain does not ship the Claude Code plugin")
+
     def test_the_plugin_skill_has_not_drifted_from_the_template(self):
         """Two copies of the same instructions drift, and the one you are not
         looking at is the one that is wrong. Regenerating is one command; this
