@@ -1409,3 +1409,159 @@ class TestServeInTheHelp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheServiceFlags(unittest.TestCase):
+    """`brain serve --install-service` — the answer to "who keeps it running".
+
+    Nothing here installs a real unit. The backend is replaced with a recorder,
+    because a leaked `brain-serve` unit restarts itself forever and would
+    outlive the test session that created it.
+    """
+
+    class Recorder(osbackend.Service):
+        kind = "systemd"
+
+        def __init__(self):
+            self.installed = None
+            self.ok = True
+
+        def available(self):
+            return True
+
+        def install(self, argv, cwd=None, env=None):
+            self.installed = {"argv": list(argv), "cwd": cwd, "env": env}
+            return "installed and started (/tmp/fake.service)" if self.ok \
+                else "could not write it"
+
+        def uninstall(self):
+            return "removed"
+
+        def status(self):
+            return "running"
+
+        def serves(self, marker):
+            return True
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = osbackend.FileKeystore(Path(self.tmp.name))
+        self.store.set(serve.TOKEN_NAME, BEARER)
+        self.backend = self.Recorder()
+        patcher = mock.patch.object(osbackend, "service", lambda: self.backend)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        linger = mock.patch.object(osbackend, "linger_state", lambda **kw: "on")
+        linger.start()
+        self.addCleanup(linger.stop)
+
+    def run_serve(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = serve.run_serve(argv, store=self.store,
+                                   run=lambda s: self.fail("it bound a socket"))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_it_installs_the_command_it_was_given(self):
+        code, _out, _err = self.run_serve(
+            ["--oauth", "--public-url", "https://brain.example/mcp",
+             "--port", "8787", "--install-service"])
+        self.assertEqual(code, 0)
+        argv = self.backend.installed["argv"]
+        self.assertIn("serve", argv)
+        self.assertIn("--oauth", argv)
+        self.assertIn("https://brain.example/mcp", argv)
+
+    def test_the_service_flag_itself_is_not_carried_into_the_unit(self):
+        """Or the service would try to install itself on every restart."""
+        self.run_serve(["--read-only", "--install-service"])
+        self.assertNotIn("--install-service", self.backend.installed["argv"])
+
+    def test_it_never_binds_a_socket(self):
+        """The whole run happens before make_server — a command that briefly
+        occupied the port would fight the service it just installed."""
+        code, _out, _err = self.run_serve(["--install-service"])
+        self.assertEqual(code, 0)
+
+    def test_bad_flags_are_refused_BEFORE_anything_is_installed(self):
+        """A unit whose flags were never checked restarts forever, fails
+        identically each time, and reports nothing — which is exactly the
+        failure a service is supposed to prevent."""
+        code, _out, err = self.run_serve(
+            ["--oauth", "--public-url", "http://brain.example/mcp",
+             "--install-service"])
+        self.assertEqual(code, 2)
+        self.assertIsNone(self.backend.installed)
+        self.assertIn("https", err)
+
+    def test_it_refuses_without_a_token_like_serving_does(self):
+        empty = osbackend.FileKeystore(Path(self.tmp.name) / "empty")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = serve.run_serve(["--install-service"], store=empty,
+                                   run=lambda s: None)
+        self.assertEqual(code, 1)
+        self.assertIsNone(self.backend.installed)
+
+    def test_it_serves_this_brain(self):
+        self.run_serve(["--install-service"])
+        self.assertEqual(self.backend.installed["cwd"], str(mcp.ROOT))
+        self.assertIn(str(mcp.ROOT), " ".join(self.backend.installed["argv"]))
+
+    def test_the_job_gets_a_path_because_a_user_unit_starts_with_almost_none(self):
+        self.run_serve(["--install-service"])
+        self.assertIn("PATH", self.backend.installed["env"])
+
+    def test_uninstall_and_status_do_not_need_a_token_or_a_socket(self):
+        code, out, _err = self.run_serve(["--uninstall-service"])
+        self.assertEqual(code, 0)
+        self.assertIn("removed", out)
+        code, out, _err = self.run_serve(["--service-status"])
+        self.assertEqual(code, 0)
+        self.assertIn("running", out)
+
+    def test_the_flags_are_documented_in_the_help(self):
+        for flag in serve.SERVICE_FLAGS:
+            self.assertIn(flag, serve.USAGE)
+
+
+class TestLingerIsReportedNotAssumed(unittest.TestCase):
+    """Handoff requirement 1 was an ALWAYS-ON host. On Linux a user unit is
+    stopped at logout unless lingering is enabled, silently — so installing one
+    without saying so would hand back a service that looks installed and is
+    not.
+
+    Deliberately NOT a subclass of the class above: inheriting its tests would
+    re-run assertions written for a healthy machine against a broken one, and
+    they would fail for the right reason at the wrong time.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = osbackend.FileKeystore(Path(self.tmp.name))
+        self.store.set(serve.TOKEN_NAME, BEARER)
+        self.backend = TestTheServiceFlags.Recorder()
+        for target, value in (("service", lambda: self.backend),
+                              ("linger_state", lambda **kw: "off")):
+            patcher = mock.patch.object(osbackend, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_serve(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = serve.run_serve(argv, store=self.store,
+                                   run=lambda s: self.fail("it bound a socket"))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_install_says_so_and_exits_non_zero(self):
+        code, out, _err = self.run_serve(["--install-service"])
+        self.assertEqual(code, 1, "a service that stops at logout is not installed")
+        self.assertIn("enable-linger", out)
+
+    def test_status_says_so_too(self):
+        code, out, _err = self.run_serve(["--service-status"])
+        self.assertEqual(code, 1)
+        self.assertIn("enable-linger", out)

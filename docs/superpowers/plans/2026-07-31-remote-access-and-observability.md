@@ -732,6 +732,51 @@ deliverable that decides whether any of this is usable.** It must contain:
 
 ---
 
+## Task 11 — supervision, added after the plan was complete
+
+**Not in the original plan, and that is the finding.** With all ten tasks done
+and green, the owner asked whether they could go and set up the real brain. A
+check of the actual machine said no, and the reason is that this plan and its
+predecessors had all treated `brain serve` as a command rather than as a
+service:
+
+1. **Nothing kept it running.** `SCHEDULES` covers `doctor` and `consolidate`
+   only. `brain serve` is a foreground process — it dies with the terminal and
+   does not come back after a reboot. Requirement 1 of the handoff was an
+   *always-on host*, and no task in this plan delivered one.
+2. **`Linger=no`, and the word "linger" appeared nowhere in the repo.** On
+   Linux, `systemd --user` stops every unit you own when your last session
+   ends. That silently breaks a `brain serve` unit AND `brain schedule install`
+   — which has shipped since 2026-07-25 producing nightly and weekly jobs that
+   never fire on any box where nobody ran `loginctl enable-linger`. A
+   pre-existing defect this work happened to walk into.
+
+**Built:** `osbackend.Service` (systemd `--user`, launchd, and a base class
+Windows deliberately gets — a scheduled task will not restart a process that
+died, which is the whole property), `linger_state()`, `brain serve
+--install-service / --service-status / --uninstall-service`, a `doctor` line
+for both, and the runbook's "Keeping it running" section.
+
+Three decisions worth keeping:
+
+- **`--install-service` runs after every flag is validated and before a socket
+  is opened.** Installing a unit whose flags were never checked produces a
+  service that restarts forever, fails identically each time, and reports
+  nothing — the exact failure a service exists to prevent.
+- **Arguments are quoted (systemd) and XML-escaped (launchd).** The scheduler's
+  `" ".join` is fine for the fixed argv it builds; this one carries operator
+  input, and an unquoted space would truncate the command into something that
+  still starts and serves the wrong thing.
+- **Lingering is reported, never repaired.** `enable-linger` needs root. So
+  `--install-service` exits NON-ZERO when it is off: a service that stops at
+  logout is not installed, and returning 0 would be the same silence this task
+  exists to end.
+
+**Verified on this machine, not only in tests:** installed, confirmed serving
+its metadata over HTTP, `kill -9`'d the process and watched systemd bring it
+back with a new PID, then uninstalled it and removed the test credential. The
+RED lingering warning fired throughout, correctly, because this box has it off.
+
 ## Self-review — answered 2026-07-31
 
 Every answer below is from a run, not from reading the code. The rig was a real

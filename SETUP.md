@@ -670,6 +670,29 @@ client that speaks it works. Dynamic client registration is **not** implemented:
 the specification now deprecates it, and `brain serve --new-client` covers
 anything that needs a client id instead.
 
+### Keeping it running
+
+`brain serve` is a foreground process: it dies with the terminal and does not
+come back after a reboot. Once your flags are right, add `--install-service` to
+the same command and the OS takes over — a `systemd --user` unit or a launchd
+agent that restarts it on failure and starts it at boot.
+
+```sh
+brain serve --oauth --public-url https://brain.example.com/mcp --install-service
+brain serve --service-status
+```
+
+**On Linux there is a second step, and skipping it is silent:**
+
+```sh
+sudo loginctl enable-linger $USER
+```
+
+Without lingering, `systemd --user` stops every unit you own when your last
+session ends — the service AND the schedules from Part 3. `--install-service`
+exits non-zero rather than pretend, and `brain doctor` reports it whenever you
+have something that lingering would break.
+
 ### The tunnel contract
 
 Reaching the server from outside your machine needs something in front of it.

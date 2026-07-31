@@ -73,6 +73,7 @@ they are a MAY and this server is stateless.
 import hmac
 import json
 import math
+import os
 import re
 import secrets
 import sys
@@ -1024,6 +1025,8 @@ USAGE = """brain serve — reach this brain from another device.
   brain serve [--read-only] [--bind <addr>] [--port <n>] [--allow-origin <origin>]
   brain serve --oauth --public-url <url> [--read-only] [--bind <addr>] ...
   brain serve --drop-box --source <slug> [--daily-cap <n>] [--bind <addr>] ...
+  brain serve <any of the above> --install-service
+  brain serve --service-status | --uninstall-service
   brain serve --new-token
 
   --new-token           mint a value, store it in the OS keystore, print it ONCE
@@ -1048,6 +1051,14 @@ USAGE = """brain serve — reach this brain from another device.
   --port <n>            default {port}
   --allow-origin <o>    permit one browser Origin. Repeatable. Empty by default,
                         because no legitimate client of this server is a browser
+  --install-service     hand this exact command to the OS (systemd --user or
+                        launchd) so it restarts on failure and survives a
+                        reboot. Add it to a serve command you have already got
+                        right; every flag is validated before anything is
+                        installed. On Linux it also checks whether user
+                        services survive logout, which by default they DO NOT
+  --service-status      is it installed, running, and serving THIS brain
+  --uninstall-service   stop it and remove the unit
 
 Serves the same tools as the stdio server, over HTTP, behind a bearer token.
 By default that includes brain_capture, which WRITES to your brain and
@@ -1191,6 +1202,11 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None) -> int:
 
     if "--new-client" in argv:
         return _new_client(argv, oauth_store)
+    if "--uninstall-service" in argv:
+        print(osbackend.service().uninstall())
+        return 0
+    if "--service-status" in argv:
+        return _service_status()
 
     if "--new-token" in argv:
         minted = mint_token()
@@ -1300,6 +1316,14 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None) -> int:
     elif read_only:
         allow_tools = mcp.READ_ONLY_TOOLS
 
+    if "--install-service" in argv:
+        # Deliberately HERE, after every flag has been validated and before a
+        # socket is opened. Installing a unit whose flags this process never
+        # checked is how an operator ends up with a service that restarts
+        # forever, fails identically each time, and reports nothing — which is
+        # exactly the failure a service is supposed to prevent.
+        return install_service(argv, host, port)
+
     # Machine-local, per brain, outside the repository. Built here rather than
     # in make_server so the tests — which must never write to the operator's
     # real log — get one only when they ask for one.
@@ -1344,6 +1368,91 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None) -> int:
     finally:
         server.server_close()
     return 0
+
+
+SERVICE_FLAGS = ("--install-service", "--uninstall-service", "--service-status")
+
+
+def service_argv(argv: list, root=None) -> list:
+    """The command a supervisor should run, built from the one just validated.
+
+    The service flags are stripped and everything else is carried through
+    verbatim, so what gets installed is the command the operator typed and this
+    process already checked — rather than a second command line assembled from
+    remembered flags, which is how the unit and the documentation drift apart.
+    """
+    root = root or mcp.ROOT
+    rest = [arg for arg in argv if arg not in SERVICE_FLAGS]
+    return [sys.executable, str(Path(root) / "bin" / "brain"), "serve"] + rest
+
+
+def install_service(argv: list, host: str, port: int) -> int:
+    """Hand `brain serve` to the OS so it survives a logout and a reboot.
+
+    Everything before this point has already validated the flags and confirmed
+    a token exists, so what is installed is known to at least start.
+
+    What this does NOT do is fix lingering, because it cannot: `loginctl
+    enable-linger` needs root. It reports it instead, loudly, because a Linux
+    user unit installed without it is stopped the moment the operator logs
+    out — and the failure is completely silent.
+    """
+    backend = osbackend.service()
+    if not backend.available():
+        print(backend.install([], None, None), file=sys.stderr)
+        return 1
+
+    job_env = {"PATH": f"{Path.home()}/.local/bin:/opt/homebrew/bin:"
+                       "/usr/local/bin:/usr/bin:/bin"}
+    outcome = backend.install(service_argv(argv), cwd=str(mcp.ROOT), env=job_env)
+    print(f"brain serve: {outcome}")
+    if not outcome.startswith("installed"):
+        return 1
+
+    print(f"\n  It serves {mcp.ROOT}, restarts if it dies, and comes back after "
+          "a reboot.")
+    print(f"  Listening on {host}:{port}. Check it with:\n"
+          "    brain serve --service-status")
+
+    linger = osbackend.linger_state()
+    if linger == "off":
+        # The whole reason this command exists rather than a documentation
+        # paragraph. Stated as a REQUIREMENT, not a suggestion: without it the
+        # unit that was just installed and started stops at logout, and nothing
+        # anywhere reports that it has.
+        print("\n  [RED] LINGERING IS OFF, so this service — and every schedule "
+              "you install —\n        stops the moment you log out, silently. "
+              "Fix it now:\n\n"
+              f"    sudo loginctl enable-linger {os.environ.get('USER', '$USER')}\n\n"
+              "        Then re-check with `brain serve --service-status`.")
+        return 1
+    if linger == "unknown":
+        print("\n  [-- ] Could not tell whether user services survive logout on "
+              "this machine.\n        If it has systemd, run: "
+              f"sudo loginctl enable-linger {os.environ.get('USER', '$USER')}")
+    return 0
+
+
+def _service_status() -> int:
+    backend = osbackend.service()
+    state = backend.status()
+    print(f"brain serve service ({backend.kind}): {state}")
+    if state != "not installed" and not backend.serves(str(mcp.ROOT)):
+        # The same warning `brain schedule status` gives, for the same reason:
+        # these names are machine-global, so a second brain on one host claims
+        # the service from the first and nothing says so.
+        print(f"  [RED] but it serves a DIFFERENT brain, not {mcp.ROOT} — "
+              "re-run --install-service from here to claim it")
+        return 1
+    linger = osbackend.linger_state()
+    if linger == "off":
+        print("  [RED] lingering is off: this stops when you log out, and so do "
+              "your schedules\n        sudo loginctl enable-linger "
+              f"{os.environ.get('USER', '$USER')}")
+        return 1
+    if linger == "on":
+        print("  [ok ] lingering is on — it survives logout")
+    return 0 if state == "running" else 1
 
 
 def oauth_store_for(root=None):

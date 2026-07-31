@@ -32,7 +32,7 @@ this project does not have.
 | [2026-07-29-serve-hardening.md](plans/2026-07-29-serve-hardening.md) | backlog items 1, 2, 5 | closed, 18/18 |
 | — | items 8 and 9, found while verifying the above | closed, no plan |
 | [2026-07-30-business-partition.md](plans/2026-07-30-business-partition.md) | M/P partition, the drop box, `publish` | closed, 6/6 |
-| [2026-07-31-remote-access-and-observability.md](plans/2026-07-31-remote-access-and-observability.md) | backlog item 3: OAuth, and something to look at when it breaks | closed, 10/10 |
+| [2026-07-31-remote-access-and-observability.md](plans/2026-07-31-remote-access-and-observability.md) | backlog item 3: OAuth, and something to look at when it breaks | closed, 11/11 |
 
 The four commands the spec set out to build all exist and all end in a working
 state: `brain setup`, `brain connect`, `brain serve`, `brain retire`. A fifth,
@@ -214,6 +214,28 @@ Metadata Document, plus protected-resource metadata and a `401` carrying
 authorization server, not a flag — and it is the reason the spec split `serve`
 into its own stage in the first place. Re-check the beta status before starting:
 if `static_headers` leaves beta for individuals, this becomes unnecessary.
+
+## 10. `systemd --user` jobs never ran without lingering — CLOSED 2026-07-31
+
+**Opened and closed the same day**, found by checking a real machine before
+telling the owner they were ready to deploy rather than by reading code.
+
+`brain schedule install` has shipped since 2026-07-25 writing `systemd --user`
+timers. On Linux those are stopped when the user's last session ends unless
+`loginctl enable-linger` has been run — so on any box where nobody knew to do
+that, the nightly `doctor` and the weekly consolidation were installed,
+reported as installed, and never fired. The word "linger" appeared nowhere in
+the repo. This box had `Linger=no`.
+
+**Closed by:** `osbackend.linger_state()`, reported by `brain doctor` whenever
+there is a schedule or a service that lingering would break, by `brain serve
+--service-status`, and by `--install-service` — which exits NON-ZERO on it,
+because a service that stops at logout is not installed. It is reported and
+never repaired: `enable-linger` needs root.
+
+Recorded because the lesson outlives the fix: **a scheduler that reports
+"installed" is not reporting "runs".** The status check asked the filesystem
+whether a unit file existed, which was true, and that was never the question.
 
 ## 4. Windows is verified by CI only — OPEN
 

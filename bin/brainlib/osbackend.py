@@ -410,6 +410,279 @@ def scheduler() -> Scheduler:
     return scheduler_for(os_family())
 
 
+def linger_state(user: str = None, runner=None) -> str:
+    """'on' | 'off' | 'unknown' | 'n/a' — does this user's systemd survive logout?
+
+    The trap this exists to catch is silent and specific to `systemd --user`,
+    which is what Linux boxes get. With lingering OFF, every user unit is
+    stopped the moment your last session ends. On a rented VM that means:
+    you SSH in, `brain schedule install`, log out — and the nightly doctor and
+    the weekly consolidation never run again, with nothing anywhere saying so.
+    A long-running `brain serve` dies the same way.
+
+    `loginctl enable-linger <user>` fixes it, and it needs root, which is why
+    this reports rather than repairs.
+
+    'n/a' on platforms with no such concept (macOS LaunchAgents and Windows
+    scheduled tasks both survive logout on their own), so a caller can print
+    nothing at all there rather than an irrelevant reassurance.
+    """
+    if os_family() != "linux":
+        return "n/a"
+    if not shutil.which("loginctl"):
+        # A Linux box with no logind — a container, WSL1 — has no lingering to
+        # enable and usually no systemd --user either. Unknown, not off: saying
+        # "off" would send somebody chasing a setting that does not exist.
+        return "unknown"
+    runner = runner or subprocess.run
+    user = user or os.environ.get("USER") or ""
+    try:
+        done = runner(["loginctl", "show-user", user, "-p", "Linger"],
+                      capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if done.returncode != 0:
+        return "unknown"
+    value = (done.stdout or "").strip().lower()
+    if value.endswith("=yes"):
+        return "on"
+    if value.endswith("=no"):
+        return "off"
+    return "unknown"
+
+
+class Service:
+    """A brain process the OS keeps ALIVE, as opposed to one it starts on a clock.
+
+    `Scheduler` runs a job at a time and lets it finish. `brain serve` is the
+    other shape: it must be running continuously, restart if it crashes, and
+    come back after a reboot. Those are different enough that sharing one
+    interface would mean a `when` parameter that a service ignores and a
+    `Restart=` that a schedule cannot express.
+
+    Same contract as Scheduler in every other respect: one interface, one
+    implementation per platform, and every method returns a human sentence
+    rather than raising, because a machine with no service manager is a normal
+    state that everything else must still work on.
+    """
+    kind = "none"
+    name = "brain-serve"
+
+    def available(self) -> bool:
+        return False
+
+    def install(self, argv: list, cwd: str = None, env: dict = None) -> str:
+        return ("no service manager available on this platform — run "
+                "`brain serve` under whatever supervisor you already use "
+                "(a terminal multiplexer will do; it will not survive a reboot)")
+
+    def uninstall(self) -> str:
+        return "no service manager available on this platform — nothing to remove"
+
+    def status(self) -> str:
+        return "no service manager available on this platform"
+
+    def serves(self, marker: str) -> bool:
+        return False
+
+
+class SystemdService(Service):
+    """A `systemd --user` unit. Read `linger_state` before trusting one."""
+    kind = "systemd"
+
+    def __init__(self, runner=None):
+        self.units = Path.home() / ".config" / "systemd" / "user"
+        # Injected so tests can assert on what would be run without running it.
+        # Installing a real unit from a test would leave a service behind on
+        # the developer's machine — and this one restarts itself forever.
+        self._run = runner or subprocess.run
+
+    def available(self) -> bool:
+        return bool(shutil.which("systemctl"))
+
+    def unit_path(self) -> Path:
+        return self.units / f"{self.name}.service"
+
+    def render_unit(self, argv: list, cwd: str = None, env: dict = None) -> str:
+        import shlex
+        # Quoted per argument. The scheduler's " ".join is fine for the fixed
+        # argv it builds; this one carries operator input (--public-url, a
+        # --source slug), and an unquoted space would silently truncate the
+        # command into something that still starts and serves the wrong thing.
+        # systemd accepts POSIX single-quoting, which is what shlex produces.
+        exec_line = " ".join(shlex.quote(str(a)) for a in argv)
+        extra = f"WorkingDirectory={cwd}\n" if cwd else ""
+        if env:
+            extra += "".join(f"Environment={k}={v}\n" for k, v in env.items())
+        return ("[Unit]\n"
+                "Description=brain serve — this brain over HTTP\n"
+                # Not just network.target: a tunnel dialling out on boot needs
+                # routing to actually be up, and Restart= would otherwise paper
+                # over it with a crash loop nobody reads.
+                "After=network-online.target\nWants=network-online.target\n\n"
+                "[Service]\nType=simple\n"
+                f"{extra}"
+                f"ExecStart={exec_line}\n"
+                # The whole point of a service rather than a shell command.
+                "Restart=always\nRestartSec=5\n"
+                "NoNewPrivileges=true\n\n"
+                # default.target, not multi-user.target: this is a --user unit.
+                "[Install]\nWantedBy=default.target\n")
+
+    def install(self, argv: list, cwd: str = None, env: dict = None) -> str:
+        if not self.available():
+            return Service.install(self, argv, cwd, env)
+        try:
+            self.units.mkdir(parents=True, exist_ok=True)
+            self.unit_path().write_text(self.render_unit(argv, cwd, env),
+                                        encoding="utf-8")
+        except OSError as exc:
+            return f"could not write {self.unit_path()} — {exc}"
+        self._run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        done = self._run(["systemctl", "--user", "enable", "--now",
+                          f"{self.name}.service"], capture_output=True, text=True)
+        if getattr(done, "returncode", 0) != 0:
+            return (f"unit written to {self.unit_path()} but systemd refused to "
+                    f"start it — {(getattr(done, 'stderr', '') or '').strip()[:200]}")
+        return f"installed and started ({self.unit_path()})"
+
+    def uninstall(self) -> str:
+        if not self.available():
+            return Service.uninstall(self)
+        self._run(["systemctl", "--user", "disable", "--now",
+                   f"{self.name}.service"], capture_output=True)
+        existed = self.unit_path().exists()
+        if existed:
+            try:
+                self.unit_path().unlink()
+            except OSError as exc:
+                return f"could not remove {self.unit_path()} — {exc}"
+        self._run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        return "removed" if existed else "was not installed"
+
+    def status(self) -> str:
+        if not self.unit_path().exists():
+            return "not installed"
+        if not self.available():
+            return "installed"
+        done = self._run(["systemctl", "--user", "is-active",
+                          f"{self.name}.service"], capture_output=True, text=True)
+        return ("running" if (getattr(done, "stdout", "") or "").strip() == "active"
+                else "installed, not running")
+
+    def serves(self, marker: str) -> bool:
+        try:
+            text = self.unit_path().read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return marker in text
+
+
+class LaunchdService(Service):
+    """A LaunchAgent with KeepAlive. Survives logout without any linger step."""
+    kind = "launchd"
+
+    def __init__(self, runner=None):
+        self.agents = Path.home() / "Library" / "LaunchAgents"
+        self._run = runner or subprocess.run
+
+    def available(self) -> bool:
+        return bool(shutil.which("launchctl"))
+
+    def plist_path(self) -> Path:
+        return self.agents / f"com.secondbrain.{self.name}.plist"
+
+    def render_plist(self, argv: list, cwd: str = None, env: dict = None,
+                     log: str = None) -> str:
+        from xml.sax.saxutils import escape
+        # Escaped, unlike the scheduler's fixed argv: --public-url is operator
+        # input and a bare & would produce a plist launchd silently refuses.
+        args = "".join(f"      <string>{escape(str(a))}</string>\n" for a in argv)
+        extra = ""
+        if cwd:
+            extra += f"    <key>WorkingDirectory</key><string>{escape(cwd)}</string>\n"
+        if env:
+            pairs = "".join(f"      <key>{escape(k)}</key><string>{escape(str(v))}</string>\n"
+                            for k, v in env.items())
+            extra += ("    <key>EnvironmentVariables</key>\n    <dict>\n"
+                      f"{pairs}    </dict>\n")
+        if log:
+            extra += (f"    <key>StandardOutPath</key><string>{escape(log)}</string>\n"
+                      f"    <key>StandardErrorPath</key><string>{escape(log)}</string>\n")
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<plist version="1.0">\n  <dict>\n'
+                f'    <key>Label</key><string>com.secondbrain.{self.name}</string>\n'
+                f'    <key>ProgramArguments</key>\n    <array>\n{args}    </array>\n'
+                f'{extra}'
+                '    <key>RunAtLoad</key><true/>\n'
+                '    <key>KeepAlive</key><true/>\n'
+                '  </dict>\n</plist>\n')
+
+    def install(self, argv: list, cwd: str = None, env: dict = None) -> str:
+        if not self.available():
+            return Service.install(self, argv, cwd, env)
+        try:
+            self.agents.mkdir(parents=True, exist_ok=True)
+            self.plist_path().write_text(self.render_plist(argv, cwd, env),
+                                         encoding="utf-8")
+        except OSError as exc:
+            return f"could not write {self.plist_path()} — {exc}"
+        self._run(["launchctl", "unload", str(self.plist_path())],
+                  capture_output=True)
+        done = self._run(["launchctl", "load", "-w", str(self.plist_path())],
+                         capture_output=True, text=True)
+        if getattr(done, "returncode", 0) != 0:
+            return (f"plist written to {self.plist_path()} but launchctl refused "
+                    f"it — {(getattr(done, 'stderr', '') or '').strip()[:200]}")
+        return f"installed and started ({self.plist_path()})"
+
+    def uninstall(self) -> str:
+        if not self.available():
+            return Service.uninstall(self)
+        self._run(["launchctl", "unload", "-w", str(self.plist_path())],
+                  capture_output=True)
+        if self.plist_path().exists():
+            try:
+                self.plist_path().unlink()
+            except OSError as exc:
+                return f"could not remove {self.plist_path()} — {exc}"
+            return "removed"
+        return "was not installed"
+
+    def status(self) -> str:
+        if not self.plist_path().exists():
+            return "not installed"
+        if not self.available():
+            return "installed"
+        done = self._run(["launchctl", "list"], capture_output=True, text=True)
+        return ("running" if f"com.secondbrain.{self.name}" in
+                (getattr(done, "stdout", "") or "") else "installed, not running")
+
+    def serves(self, marker: str) -> bool:
+        try:
+            return marker in self.plist_path().read_text(encoding="utf-8",
+                                                         errors="replace")
+        except OSError:
+            return False
+
+
+def service_for(family: str) -> Service:
+    """Windows deliberately gets the base class.
+
+    A scheduled task is not a service manager: `schtasks` can start something
+    at logon, but it will not restart it when it dies, which is the property
+    this exists for. Claiming support and delivering a process that vanishes on
+    its first exception is worse than saying plainly that this platform needs
+    NSSM or a real Windows service, which the returned sentence does.
+    """
+    return {"macos": LaunchdService, "linux": SystemdService}.get(
+        family, Service)()
+
+
+def service() -> Service:
+    return service_for(os_family())
+
+
 class Keystore:
     """Where a secret lives on this machine.
 

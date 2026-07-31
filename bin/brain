@@ -5214,9 +5214,8 @@ def cmd_logs(argv: list) -> int:
     """
     import json
     from brainlib import eventlog
-    from brainlib import osbackend as _os
 
-    where = _os.state_dir(ROOT) / eventlog.FILENAME
+    where = osbackend.state_dir(ROOT) / eventlog.FILENAME
     if "--path" in argv:
         print(where)
         return 0
@@ -5282,6 +5281,50 @@ DOCTOR_ERROR_WINDOW_DAYS = 7
 DOCTOR_ERROR_THRESHOLD = 10
 
 
+def doctor_supervision(ok: bool) -> bool:
+    """Is anything keeping this brain running, and will it survive a logout?
+
+    Two questions that look like operations trivia and are not. A brain nobody
+    can reach is not a brain, and BOTH failures here are silent: a `brain serve`
+    started in a terminal dies with the terminal, and on Linux a user unit —
+    the service AND every schedule — is stopped at logout unless lingering is
+    enabled, with nothing anywhere reporting it.
+
+    Lingering is checked even when no service is installed, because it breaks
+    `brain schedule install` exactly as thoroughly and that command has existed
+    far longer than this one.
+    """
+    import os
+
+    linger = osbackend.linger_state()
+    scheduled = any(osbackend.scheduler().status(name) == "installed"
+                    for name in SCHEDULES)
+    backend = osbackend.service()
+    state = backend.status()
+
+    if state == "running" and backend.serves(str(ROOT)):
+        print("  [ok ] brain serve is running as a service")
+    elif state == "running":
+        ok = False
+        print(f"  [RED] a brain serve service is running, but for a DIFFERENT "
+              f"brain than {ROOT} — brain serve --install-service")
+    elif state != "not installed":
+        ok = False
+        print(f"  [RED] the brain serve service is {state} — "
+              "brain serve --service-status")
+
+    if linger == "off" and (scheduled or state != "not installed"):
+        # Only RED when there is actually something to lose. On a laptop with
+        # no schedules and no service, lingering is irrelevant and a warning
+        # about it is the kind of noise that teaches people to skip this report.
+        ok = False
+        print("  [RED] user services do NOT survive logout on this machine, so "
+              "your\n        schedules and any brain serve service stop when "
+              "you disconnect:\n        sudo loginctl enable-linger "
+              f"{os.environ.get('USER', '$USER')}")
+    return ok
+
+
 def doctor_serving(ok: bool) -> bool:
     """What `brain serve` recorded, as a COUNT and a pointer.
 
@@ -5296,9 +5339,8 @@ def doctor_serving(ok: bool) -> bool:
     not a health signal.
     """
     from brainlib import eventlog
-    from brainlib import osbackend as _os
 
-    where = _os.state_dir(ROOT) / eventlog.FILENAME
+    where = osbackend.state_dir(ROOT) / eventlog.FILENAME
     since = (date.today() - timedelta(days=DOCTOR_ERROR_WINDOW_DAYS)).isoformat()
     log = eventlog.EventLog(where)
     errors = log.read(limit=0, since=since, errors_only=True)
@@ -5419,6 +5461,7 @@ def cmd_doctor() -> int:
     else:
         print("  [ok ] knowledge/ fully committed")
 
+    ok = doctor_supervision(ok)
     ok = doctor_serving(ok)
     ok = doctor_knowledge(ok)
 

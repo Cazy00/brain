@@ -35,6 +35,11 @@ brain serve --oauth --public-url https://brain.example.com/mcp --port 8787
 cloudflared tunnel run brain                               # in another shell
 ```
 
+Once that works, stop running it by hand — add `--install-service` to the same
+command and, on Linux, `sudo loginctl enable-linger $USER`. See
+[Keeping it running](#keeping-it-running); skipping it is how the brain is
+offline the next time you look.
+
 Then in the assistant, add a custom connector by URL and paste
 **`https://brain.example.com/mcp`** — character for character, the same string
 you gave `--public-url`. You will be sent to a consent page, you paste your
@@ -107,6 +112,68 @@ cloudflared tunnel run brain
 A `--url` quick tunnel is fine for a first look and useless for living with —
 the hostname is random and changes every run, and here that means every token
 you have issued stops being valid.
+
+---
+
+## Keeping it running
+
+Everything above shows `brain serve` as a shell command. That is right for
+trying it and **wrong for living with it**: it is a foreground process, so it
+dies with the terminal, and it does not come back after a reboot.
+
+Once the flags are right, hand the same command to the OS:
+
+```sh
+brain serve --oauth --public-url https://brain.example.com/mcp --install-service
+```
+
+It validates every flag first, then installs a `systemd --user` unit (or a
+launchd agent on macOS) that runs **that exact command**, restarts it if it
+dies, and starts it at boot.
+
+```sh
+brain serve --service-status      # installed? running? serving THIS brain?
+brain serve --uninstall-service
+```
+
+### On Linux, do this too — or none of it survives
+
+```sh
+sudo loginctl enable-linger $USER
+```
+
+Without it, `systemd --user` stops **every** unit you own the moment your last
+session ends. You SSH in, install the service, log out, and it is gone — and so
+are the nightly `doctor` and the weekly consolidation from `brain schedule
+install`, which have the same problem and always did.
+
+Nothing warns you at the OS level. `brain serve --install-service` exits
+non-zero and says so, `--service-status` says so, and `brain doctor` says so
+whenever you have a service or a schedule that lingering would break. It cannot
+fix it for you: `enable-linger` needs root.
+
+macOS and Windows have no equivalent step — LaunchAgents and scheduled tasks
+survive logout on their own, so nothing is printed about it there.
+
+### The tunnel needs the same treatment
+
+`cloudflared tunnel run brain` is a foreground process too. `cloudflared`
+installs its own service:
+
+```sh
+sudo cloudflared service install
+```
+
+That one is a system service, so lingering does not apply to it — which is
+worth knowing, because it means the tunnel can be up while the brain behind it
+is down, and the symptom is a connector that reaches your hostname and gets a
+502.
+
+**Windows:** `--install-service` deliberately refuses. `schtasks` can start
+something at logon but will not restart it when it dies, which is the entire
+property this is for; claiming support and handing back a process that vanishes
+on its first exception would be worse than saying so. Use NSSM or a real
+Windows service.
 
 ---
 

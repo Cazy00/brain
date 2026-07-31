@@ -669,3 +669,175 @@ if sys.platform == "win32":
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeRun:
+    """A subprocess.run stand-in. No test here may install a real unit: this
+    one restarts itself forever, so a leaked one outlives the test session."""
+
+    def __init__(self, stdout="", returncode=0):
+        self.calls = []
+        self.stdout = stdout
+        self.returncode = returncode
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return type("Done", (), {"returncode": self.returncode,
+                                 "stdout": self.stdout, "stderr": ""})()
+
+
+class TestLingerDetection(unittest.TestCase):
+    """The silent trap: with lingering off, every `systemd --user` unit stops
+    at logout — the brain serve service AND every schedule — and nothing
+    anywhere reports it."""
+
+    def test_yes_is_on(self):
+        run = FakeRun(stdout="Linger=yes\n")
+        with mock.patch.object(osbackend, "os_family", lambda: "linux"), \
+             mock.patch.object(osbackend.shutil, "which", lambda t: "/bin/loginctl"):
+            self.assertEqual(osbackend.linger_state("u", runner=run), "on")
+
+    def test_no_is_off(self):
+        run = FakeRun(stdout="Linger=no\n")
+        with mock.patch.object(osbackend, "os_family", lambda: "linux"), \
+             mock.patch.object(osbackend.shutil, "which", lambda t: "/bin/loginctl"):
+            self.assertEqual(osbackend.linger_state("u", runner=run), "off")
+
+    def test_a_failed_call_is_unknown_not_off(self):
+        """Reporting 'off' when we could not tell would send somebody chasing a
+        setting that may not exist on their machine."""
+        run = FakeRun(returncode=1)
+        with mock.patch.object(osbackend, "os_family", lambda: "linux"), \
+             mock.patch.object(osbackend.shutil, "which", lambda t: "/bin/loginctl"):
+            self.assertEqual(osbackend.linger_state("u", runner=run), "unknown")
+
+    def test_no_loginctl_is_unknown(self):
+        with mock.patch.object(osbackend, "os_family", lambda: "linux"), \
+             mock.patch.object(osbackend.shutil, "which", lambda t: None):
+            self.assertEqual(osbackend.linger_state("u"), "unknown")
+
+    def test_other_platforms_are_not_applicable(self):
+        """LaunchAgents and scheduled tasks survive logout on their own, so a
+        warning about lingering there is noise that teaches people to skip the
+        health report."""
+        for family in ("macos", "windows"):
+            with mock.patch.object(osbackend, "os_family", lambda: family):
+                self.assertEqual(osbackend.linger_state("u"), "n/a")
+
+
+class TestServiceSelection(unittest.TestCase):
+    def test_each_family_gets_its_own_backend(self):
+        self.assertEqual(osbackend.service_for("macos").kind, "launchd")
+        self.assertEqual(osbackend.service_for("linux").kind, "systemd")
+
+    def test_windows_gets_the_base_class_deliberately(self):
+        """A scheduled task starts something at logon and will NOT restart it
+        when it dies, which is the entire property a service is for. Claiming
+        support and delivering a process that vanishes is worse than saying so."""
+        backend = osbackend.service_for("windows")
+        self.assertEqual(backend.kind, "none")
+        self.assertFalse(backend.available())
+        self.assertIn("no service manager", backend.install([]))
+
+    def test_the_unavailable_backend_never_raises(self):
+        backend = osbackend.Service()
+        for sentence in (backend.install([]), backend.uninstall(), backend.status()):
+            self.assertTrue(sentence)
+        self.assertFalse(backend.serves("/anywhere"))
+
+
+class TestSystemdServiceUnit(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.backend = osbackend.SystemdService(runner=FakeRun())
+        self.backend.units = Path(self.tmp.name)
+
+    def test_it_restarts_which_is_the_whole_point(self):
+        unit = self.backend.render_unit([sys.executable, "/b/bin/brain", "serve"])
+        self.assertIn("Restart=always", unit)
+        self.assertIn("Type=simple", unit)
+
+    def test_it_waits_for_the_network(self):
+        """A tunnel dialling out at boot needs routing actually up; Restart=
+        would otherwise hide it as a crash loop nobody reads."""
+        unit = self.backend.render_unit(["/b/bin/brain"])
+        self.assertIn("network-online.target", unit)
+
+    def test_it_is_a_user_unit_not_a_system_one(self):
+        self.assertIn("WantedBy=default.target",
+                      self.backend.render_unit(["/b/bin/brain"]))
+
+    def test_arguments_are_quoted(self):
+        """--public-url is operator input. An unquoted space would silently
+        truncate the command into something that still starts and serves the
+        wrong thing."""
+        unit = self.backend.render_unit(
+            ["/b/bin/brain", "serve", "--public-url", "https://x/mcp",
+             "--source", "a b"])
+        self.assertIn("'a b'", unit)
+
+    def test_the_working_directory_names_the_brain(self):
+        unit = self.backend.render_unit(["/b/bin/brain"], cwd="/home/u/brain")
+        self.assertIn("WorkingDirectory=/home/u/brain", unit)
+        self.assertTrue(self.backend.render_unit(["/b/bin/brain"], cwd="/home/u/brain"))
+
+    def test_install_writes_and_enables(self):
+        run = FakeRun()
+        self.backend._run = run
+        self.backend.available = lambda: True
+        outcome = self.backend.install(["/b/bin/brain", "serve"], cwd="/b")
+        self.assertTrue(outcome.startswith("installed"))
+        self.assertTrue(self.backend.unit_path().exists())
+        self.assertIn(["systemctl", "--user", "daemon-reload"], run.calls)
+        self.assertIn(["systemctl", "--user", "enable", "--now",
+                       "brain-serve.service"], run.calls)
+
+    def test_a_refused_start_is_reported_not_claimed(self):
+        self.backend._run = FakeRun(returncode=1)
+        self.backend.available = lambda: True
+        self.assertNotIn("installed and started",
+                         self.backend.install(["/b/bin/brain", "serve"]))
+
+    def test_status_and_serves(self):
+        self.backend.available = lambda: True
+        self.assertEqual(self.backend.status(), "not installed")
+        self.backend._run = FakeRun(stdout="active\n")
+        self.backend.install(["/b/bin/brain", "serve"], cwd="/home/u/mybrain")
+        self.assertEqual(self.backend.status(), "running")
+        self.assertTrue(self.backend.serves("/home/u/mybrain"))
+        self.assertFalse(self.backend.serves("/home/u/somebody-elses-brain"))
+
+    def test_uninstall_when_absent_says_so(self):
+        self.backend.available = lambda: True
+        self.assertEqual(self.backend.uninstall(), "was not installed")
+
+    def test_unavailable_never_raises(self):
+        self.backend.available = lambda: False
+        self.assertIn("no service manager", self.backend.install(["x"]))
+        self.assertIn("nothing to remove", self.backend.uninstall())
+
+
+class TestLaunchdServicePlist(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.backend = osbackend.LaunchdService(runner=FakeRun())
+        self.backend.agents = Path(self.tmp.name)
+
+    def test_keepalive_is_what_makes_it_a_service(self):
+        plist = self.backend.render_plist(["/b/bin/brain", "serve"])
+        self.assertIn("<key>KeepAlive</key><true/>", plist)
+        self.assertIn("<key>RunAtLoad</key><true/>", plist)
+
+    def test_arguments_are_xml_escaped(self):
+        """A bare & in a --public-url would produce a plist launchd silently
+        refuses to load."""
+        plist = self.backend.render_plist(
+            ["/b/bin/brain", "--public-url", "https://x/mcp?a&b"])
+        self.assertIn("&amp;", plist)
+        self.assertNotIn("?a&b", plist)
+
+    def test_unavailable_never_raises(self):
+        self.backend.available = lambda: False
+        self.assertIn("no service manager", self.backend.install(["x"]))
