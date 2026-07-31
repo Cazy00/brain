@@ -87,16 +87,20 @@ comes up, so the questions matter more than the estimates.
 
 | Ask | Why it decides the work | Item |
 |---|---|---|
-| **Do you want the brain inside the claude.ai app** (phone, web, Desktop) — as opposed to Claude Code, which already works? | "No" keeps item 3 closed forever, at zero cost. "Yes" means an authorization server, and even then the `static_headers` re-check below comes first. | 3 |
+| ~~**Do you want the brain inside the claude.ai app**~~ | **ANSWERED 2026-07-31: yes.** The owner has a domain and a Max plan, and wants the brain reachable from a phone — but explicitly NOT Claude-only, so the target is the MCP authorization spec with claude.ai as its first client. Re-checked the same day: individuals still get OAuth only, and `static_headers` is org-admin by design rather than a beta flag waiting to flip. **Next step is a plan, from [handoffs/2026-07-31-remote-access-and-observability.md](handoffs/2026-07-31-remote-access-and-observability.md)** — which also corrects this file: dynamic client registration turns out NOT to be required. | 3 |
 | **Do you have a Windows machine to hand yet?** | It is the only thing that can close item 4. Nothing on macOS or Linux moves it, and CI already covers everything CI can reach. | 4 |
 
-Two things NOT to ask, because they are settled:
+One thing NOT to ask, because it is settled:
 
 - **Do not re-raise item 7 as a defect.** `doctor` calling this repo public is
   correct and is supposed to stay.
-- **Do not offer to install a brain on the development machine.** Asked and
-  answered 2026-07-30: `brain setup` was run there as a demonstration, verified,
-  and removed at the owner's request. This checkout is the public template.
+
+**Reversed 2026-07-31:** a brain IS now wanted on the development machine. The
+2026-07-30 position ("this box is the template workshop, not a place notes
+live") was right while that was all it was; the owner has since decided to run
+their real brain there and expose it, which is what item 3 is now for. The real
+brain is a SEPARATE clone — this checkout stays the public template, and
+nothing personal is ever committed here.
 
 Before starting item 3 on a "yes", re-check `static_headers` first — it was
 still OAuth-only for individuals on 2026-07-29, and if that changes the item
