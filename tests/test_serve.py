@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bin"))
 from brainlib import eventlog  # noqa: E402
 from brainlib import mcp  # noqa: E402
+from brainlib import oauth  # noqa: E402
 from brainlib import osbackend  # noqa: E402
 from brainlib import serve  # noqa: E402
 
@@ -1133,6 +1134,11 @@ class TestTheCli(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = osbackend.FileKeystore(directory=Path(self.tmp.name))
+        # Both otherwise resolve to this MACHINE's real state directory, so a
+        # test without them writes an issued-token database and an event log
+        # into the developer's own home.
+        self.oauth_store = oauth.Store(Path(self.tmp.name) / "oauth.db")
+        self.log = eventlog.EventLog(Path(self.tmp.name) / "events.jsonl")
         self.started = []
         self.out = io.StringIO()
         self.err = io.StringIO()
@@ -1140,6 +1146,7 @@ class TestTheCli(unittest.TestCase):
     def run_serve(self, *argv):
         with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(self.err):
             return serve.run_serve(list(argv), store=self.store,
+                                   oauth_store=self.oauth_store, log=self.log,
                                    run=self.started.append)
 
     def test_it_refuses_to_start_without_one_and_names_the_fix(self):
@@ -1448,6 +1455,8 @@ class TestTheServiceFlags(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.store = osbackend.FileKeystore(Path(self.tmp.name))
         self.store.set(serve.TOKEN_NAME, BEARER)
+        self.oauth_store = oauth.Store(Path(self.tmp.name) / "oauth.db")
+        self.log = eventlog.EventLog(Path(self.tmp.name) / "events.jsonl")
         self.backend = self.Recorder()
         patcher = mock.patch.object(osbackend, "service", lambda: self.backend)
         patcher.start()
@@ -1460,6 +1469,7 @@ class TestTheServiceFlags(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = serve.run_serve(argv, store=self.store,
+                                   oauth_store=self.oauth_store, log=self.log,
                                    run=lambda s: self.fail("it bound a socket"))
         return code, out.getvalue(), err.getvalue()
 
@@ -1500,6 +1510,7 @@ class TestTheServiceFlags(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = serve.run_serve(["--install-service"], store=empty,
+                                   oauth_store=self.oauth_store, log=self.log,
                                    run=lambda s: None)
         self.assertEqual(code, 1)
         self.assertIsNone(self.backend.installed)
@@ -1542,6 +1553,8 @@ class TestLingerIsReportedNotAssumed(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.store = osbackend.FileKeystore(Path(self.tmp.name))
         self.store.set(serve.TOKEN_NAME, BEARER)
+        self.oauth_store = oauth.Store(Path(self.tmp.name) / "oauth.db")
+        self.log = eventlog.EventLog(Path(self.tmp.name) / "events.jsonl")
         self.backend = TestTheServiceFlags.Recorder()
         for target, value in (("service", lambda: self.backend),
                               ("linger_state", lambda **kw: "off")):
@@ -1553,6 +1566,7 @@ class TestLingerIsReportedNotAssumed(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = serve.run_serve(argv, store=self.store,
+                                   oauth_store=self.oauth_store, log=self.log,
                                    run=lambda s: self.fail("it bound a socket"))
         return code, out.getvalue(), err.getvalue()
 

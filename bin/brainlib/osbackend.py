@@ -964,7 +964,7 @@ def keystore() -> Keystore:
     return keystore_for(os_family())
 
 
-def state_dir(root, env=None, home=None) -> Path:
+def state_dir(root, env=None, home=None, create: bool = False) -> Path:
     """Where THIS brain keeps machine-local state: `~/.local/state/brain/<name>`.
 
     Two properties, and both are the point rather than the convention:
@@ -989,6 +989,16 @@ def state_dir(root, env=None, home=None) -> Path:
     0700 at creation time rather than chmod-ed afterwards, for the same reason
     FileKeystore opens with the mode already set: the window between the two is
     exactly when a backup job runs.
+
+    **`create` defaults to False, and that default is load-bearing.** Asking
+    where state WOULD live is not the same as wanting it to exist: `doctor`,
+    `logs` and `retire` all need the path in order to look, and creating a
+    directory as a side effect of looking meant every `brain doctor` against
+    every throwaway repo left one behind. The test suite noticed first — it ran
+    `bin/brain` over temp roots and littered the developer's real
+    `~/.local/state/brain` with one empty directory per fixture — but a real
+    user running `doctor` on a brain that never served would have got the same.
+    Only the two callers that are about to WRITE pass create=True.
     """
     import hashlib
     import re
@@ -1004,6 +1014,8 @@ def state_dir(root, env=None, home=None) -> Path:
     # path component contained something the filesystem dislikes.
     stem = re.sub(r"[^a-z0-9-]+", "-", root.name.lower()).strip("-") or "brain"
     where = base / "brain" / f"{stem}-{digest}"
+    if not create:
+        return where
     try:
         where.mkdir(parents=True, exist_ok=True)
         os.chmod(str(where), 0o700)

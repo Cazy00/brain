@@ -76,7 +76,7 @@ class StateDirTests(unittest.TestCase):
         """An operator who finds this directory can tell whose it is."""
         brain = Path(self.tmp.name) / "brain"
         brain.mkdir()
-        where = osbackend.state_dir(brain, env=self.env)
+        where = osbackend.state_dir(brain, env=self.env, create=True)
         self.assertEqual((where / "root").read_text(encoding="utf-8").strip(),
                          str(brain.resolve()))
         self.assertIn("brain", where.name)
@@ -87,8 +87,57 @@ class StateDirTests(unittest.TestCase):
         afterwards — the window between the two is when a backup job runs."""
         brain = Path(self.tmp.name) / "brain"
         brain.mkdir()
-        where = osbackend.state_dir(brain, env=self.env)
+        where = osbackend.state_dir(brain, env=self.env, create=True)
         self.assertEqual(stat.S_IMODE(where.stat().st_mode) & 0o077, 0)
+
+    def test_asking_where_it_is_does_not_create_it(self):
+        """The default, and it is load-bearing. `doctor`, `logs` and `retire`
+        all need this path in order to LOOK, and creating a directory as a side
+        effect of looking littered the developer's real ~/.local/state with one
+        empty directory per test fixture — and would have done the same to any
+        user running `doctor` on a brain that never served."""
+        brain = Path(self.tmp.name) / "brain"
+        brain.mkdir()
+        where = osbackend.state_dir(brain, env=self.env)
+        self.assertFalse(where.exists())
+        self.assertTrue(osbackend.state_dir(brain, env=self.env, create=True).exists())
+
+    def test_the_read_only_commands_leave_nothing_behind(self):
+        """Asserted through the CLI, because that is where the leak happened:
+        a subprocess run against a throwaway root, with no state of its own."""
+        import subprocess
+        env = dict(os.environ, XDG_STATE_HOME=str(self.home))
+        for args in (["logs", "--path"], ["logs"]):
+            subprocess.run([sys.executable, str(ROOT / "bin" / "brain")] + args,
+                           capture_output=True, text=True, cwd=str(ROOT), env=env)
+        created = list(self.home.rglob("*")) if self.home.exists() else []
+        self.assertEqual(created, [],
+                         f"reading the log created {created}")
+
+    def test_the_whole_suite_leaves_the_real_state_directory_alone(self):
+        """A guard on the thing that actually went wrong.
+
+        Every test that calls `run_serve` has to inject BOTH an oauth store and
+        an event log, because either one omitted resolves to this machine's
+        real state directory — and the test then writes an issued-token
+        database into the developer's home. That is not hypothetical: it is
+        what the suite was doing until 2026-07-31, found by looking at what it
+        had left behind rather than by any assertion.
+
+        Reading the source is the only way to catch it, because the symptom is
+        a file somewhere else entirely.
+        """
+        import re
+        for name in ("test_serve.py", "test_oauth.py"):
+            source = (ROOT / "tests" / name).read_text(encoding="utf-8")
+            for call in re.findall(r"serve\.run_serve\((?:[^()]|\([^()]*\))*\)",
+                                   source):
+                self.assertIn("log=", call,
+                              f"{name}: this run_serve writes to the real event "
+                              f"log — {call[:90]}")
+                self.assertIn("oauth_store=", call,
+                              f"{name}: this run_serve writes to the real token "
+                              f"store — {call[:90]}")
 
     def test_falls_back_without_xdg(self):
         brain = Path(self.tmp.name) / "brain"
@@ -265,7 +314,7 @@ class LogsCommandTests(unittest.TestCase):
                               capture_output=True, text=True, cwd=str(ROOT), env=self.env)
 
     def seed(self):
-        where = osbackend.state_dir(ROOT, env=self.env)
+        where = osbackend.state_dir(ROOT, env=self.env, create=True)
         log = eventlog.EventLog(where / eventlog.FILENAME, clock=FakeClock())
         log.record("request", method="POST", path_class="mcp", status=200)
         log.record("auth_failed", reason="bad_token")
@@ -323,7 +372,7 @@ class DoctorSurfacesTheLogTests(unittest.TestCase):
                               env=self.env)
 
     def log(self):
-        where = osbackend.state_dir(ROOT, env=self.env)
+        where = osbackend.state_dir(ROOT, env=self.env, create=True)
         return eventlog.EventLog(where / eventlog.FILENAME, clock=FakeClock())
 
     def test_a_quiet_log_is_reported_as_quiet(self):
@@ -371,7 +420,7 @@ class RetireCleansUpTests(unittest.TestCase):
 
     def test_forget_removes_the_directory_and_says_what_it_revoked(self):
         from brainlib import oauth
-        where = osbackend.state_dir(ROOT, env=self.env)
+        where = osbackend.state_dir(ROOT, env=self.env, create=True)
         eventlog.EventLog(where / eventlog.FILENAME).record("request", status=200)
         store = oauth.Store(where / "oauth.db")
         grant = store.create_grant("a-client", "https://x/mcp", "brain:read")

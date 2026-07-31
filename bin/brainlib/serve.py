@@ -1185,13 +1185,18 @@ def startup_notes(host: str, port: int, read_only: bool = False,
     return notes, warnings
 
 
-def run_serve(argv: list, store=None, run=None, oauth_store=None) -> int:
+def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None) -> int:
     """The `brain serve` command.
 
     `run` is injected so the wiring can be tested without a socket, the same
     way phase_backup takes its runner. The tests that genuinely bind one go
-    through make_server directly. `oauth_store` is injected for the same
-    reason: no test may write to the machine's real one.
+    through make_server directly.
+
+    `oauth_store` and `log` are injected for a different reason, and it is not
+    convenience: both otherwise resolve to this MACHINE's real state directory,
+    so a test that called this function would write an issued-token database
+    and an event log into the developer's own home. Found by running the suite
+    and looking at what it had left behind.
     """
     if "--help" in argv or "-h" in argv:
         print(USAGE)
@@ -1327,7 +1332,8 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None) -> int:
     # Machine-local, per brain, outside the repository. Built here rather than
     # in make_server so the tests — which must never write to the operator's
     # real log — get one only when they ask for one.
-    log = eventlog.EventLog(osbackend.state_dir(mcp.ROOT) / eventlog.FILENAME)
+    log = log or eventlog.EventLog(
+        osbackend.state_dir(mcp.ROOT, create=True) / eventlog.FILENAME)
 
     try:
         server = make_server(existing, host, port, allow_origin=allow_origin,
@@ -1465,7 +1471,8 @@ def oauth_store_for(root=None):
     other, which is the shared-keystore trap the business partition already
     found once.
     """
-    return oauthlib.Store(osbackend.state_dir(root or mcp.ROOT) / "oauth.db")
+    return oauthlib.Store(
+        osbackend.state_dir(root or mcp.ROOT, create=True) / "oauth.db")
 
 
 def _new_client(argv: list, store=None) -> int:

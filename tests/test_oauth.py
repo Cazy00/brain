@@ -382,6 +382,11 @@ class CliFlagTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         store = osbackend.FileKeystore(Path(tmp.name))
         store.set(serve.TOKEN_NAME, BEARER)
+        # Both otherwise resolve to this MACHINE's real state directory, so a
+        # test without them writes an issued-token database and an event log
+        # into the developer's own home.
+        self.oauth_store = oauth.Store(Path(tmp.name) / "oauth.db")
+        self.log = eventlog.EventLog(Path(tmp.name) / "events.jsonl")
         err = io.StringIO()
         started = {}
 
@@ -389,7 +394,9 @@ class CliFlagTests(unittest.TestCase):
             started["public"] = getattr(server, "oauth", None)
 
         with contextlib.redirect_stderr(err):
-            code = serve.run_serve(argv, store=store, run=fake_run)
+            code = serve.run_serve(argv, store=store, run=fake_run,
+                                   oauth_store=self.oauth_store,
+                                   log=self.log)
         return code, err.getvalue(), started
 
     def test_oauth_without_public_url_refuses(self):
@@ -812,7 +819,8 @@ class NewClientCliTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = serve.run_serve(argv, store=store, run=lambda s: None,
-                                   oauth_store=oauth.Store(self.db))
+                                   oauth_store=oauth.Store(self.db),
+                                   log=eventlog.EventLog(Path(tmp.name) / "e.jsonl"))
         return code, out.getvalue(), err.getvalue()
 
     def test_it_mints_and_prints_once(self):
