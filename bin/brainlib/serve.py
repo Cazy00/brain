@@ -44,14 +44,25 @@ carry an acknowledgement and an id, never the CLI's output: a response that
 varies with the brain's contents is a way to read the brain one question at a
 time.
 
-NOT BUILT, and tracked in docs/superpowers/BACKLOG.md rather than left as
-folklore — a decision somebody may need to revisit:
+`--oauth` adds the MCP authorization spec beside all of that, for the clients a
+header cannot reach. Two populations, one URL, and they coexist rather than
+replace each other:
 
-- **No OAuth.** Bearer only, which is what Claude Code and anything else that
-  can set a header takes. claude.ai on the web, Desktop and mobile cannot use
-  it: checked 2026-07-29, their per-user custom connector flow accepts OAuth
-  client credentials, and the fixed-header path is beta and org-admin-only.
-  Closing that gap means OAuth 2.1 with dynamic client registration.
+- **Local clients** set `Authorization: Bearer <the operator token>` and always
+  did. Nothing about that path changed, with the flag on or off.
+- **Hosted assistants** run on somebody else's servers, never see a config
+  file, and can only obtain a credential a person consented to in a browser.
+  That is what the authorization server in oauth.py issues, and `_allowed`
+  accepts on the same header.
+
+Built to the SPECIFICATION, not to a vendor: this file contains no product
+name outside a comment, and neither does oauth.py. See that module for what is
+implemented and what is deliberately not — the short version is that dynamic
+client registration is now deprecated in the MCP spec and is not built, and
+`--new-client` is the fallback for anything that needs a client id.
+
+Everything the server does is recorded through eventlog, which can hold no
+query text and no note content by construction. `brain logs` reads it.
 
 Transport: Streamable HTTP per the 2025-06-18 MCP specification, minus the
 optional parts. One endpoint, POST only, a single JSON object per request. GET
@@ -70,13 +81,18 @@ import time
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import eventlog
 from . import mcp
 from . import notes
+from . import oauth as oauthlib
 from . import osbackend
 
 ENDPOINT = "/mcp"
+# Re-exported so the startup banner can name it without importing the module
+# into every f-string. One definition, in oauth.py, where the RFC lives.
+WELL_KNOWN_AS_PATH = oauthlib.WELL_KNOWN_AS
 TOKEN_NAME = "brain-serve-token"
 DEFAULT_PORT = 8787
 
@@ -93,6 +109,11 @@ DEFAULT_DAILY_CAP = 200
 # The same ceiling the stdio loop uses: a single request larger than this is
 # not real traffic.
 MAX_BODY_BYTES = 10_000_000
+# The authorization-server endpoints get a far smaller ceiling. An OAuth form
+# is a few hundred bytes, and these are the endpoints that answer WITHOUT a
+# token — the one place on this server where an anonymous caller can send a
+# body at all.
+MAX_FORM_BYTES = 16_384
 
 # Versions this server has actually been checked against. The spec requires a
 # 400 for anything else, and keeping the list a literal means widening it is a
@@ -339,7 +360,20 @@ class _Server(ThreadingHTTPServer):
 # classification is not an authorization decision, but the two live close
 # enough together that keeping one habit for both is cheaper than remembering
 # which is which.
-PATH_CLASSES = {ENDPOINT: "mcp"}
+PATH_CLASSES = {
+    ENDPOINT: "mcp",
+    oauthlib.WELL_KNOWN_PRM: "discovery",
+    oauthlib.WELL_KNOWN_AS: "discovery",
+    "/authorize": "authorize",
+    "/token": "token",
+    "/revoke": "revoke",
+}
+
+
+def _first(form: dict, name: str) -> str:
+    """One value from a parsed form. First, never last — see oauth._one."""
+    values = form.get(name) or [""]
+    return values[0] if isinstance(values, (list, tuple)) else str(values)
 
 
 def _tool_name(msg) -> str:
@@ -403,7 +437,30 @@ class _Handler(BaseHTTPRequestHandler):
         BaseHTTPRequestHandler.send_response_only(self, code, message)
 
     def _path_class(self) -> str:
-        return PATH_CLASSES.get(self.path.split("?")[0], "other")
+        path = self.path.split("?")[0]
+        kind = self._oauth_kind()
+        if kind:
+            return "discovery" if kind in ("prm", "as") else kind
+        return PATH_CLASSES.get(path, "other")
+
+    def _oauth_kind(self) -> str:
+        """Which authorization-server endpoint this is, or "" for none.
+
+        EXACT-MATCH lookup, and that is the security property rather than an
+        implementation detail. These paths are answered WITHOUT a token, so the
+        set of them is an authentication exemption — and `startswith` on a path
+        is how an exemption becomes a bypass:
+        `/.well-known/oauth-protected-resourceX` and
+        `/.well-known/oauth-protected-resource/../../mcp` both pass a prefix
+        test, and neither is discovery.
+
+        Empty when `--oauth` is off, so nothing is exempt on a server that has
+        no authorization server to hand a client on to.
+        """
+        cfg = getattr(self.server, "oauth", None)
+        if cfg is None:
+            return ""
+        return cfg.public_paths().get(self.path.split("?")[0], "")
 
     def _served(self, started: float) -> None:
         """One `request` entry per answered request, whatever the outcome."""
@@ -448,6 +505,109 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _blocked(self) -> bool:
+        """The rate limiter, and it runs ahead of EVERYTHING.
+
+        Including the discovery exemption: an unauthenticated path is still a
+        path, and an address that has been guessing tokens does not get to
+        spend the server's time on metadata instead.
+        """
+        wait = self.server.limiter.retry_after(self.client_address[0])
+        if not wait:
+            return False
+        self._log("rate_limited", retry_after=wait)
+        self._refuse(429, "too many failed authentication attempts from "
+                          f"this address; retry in {wait}s",
+                     {"Retry-After": str(wait)})
+        return True
+
+    def _origin_ok(self, extra=()) -> bool:
+        """Refuse a browser Origin unless it is allowlisted.
+
+        `extra` is how the authorization-server endpoints stay usable: the
+        consent form is a browser POST from this server's OWN public origin, so
+        that origin has to be acceptable there — and only there. Passing it in
+        per call, rather than adding it to `allow_origin` at startup, keeps the
+        widening scoped to the endpoints that need it instead of opening /mcp
+        to a page served from the same host.
+        """
+        origin = self.headers.get("Origin")
+        if origin and origin not in tuple(self.server.allow_origin) + tuple(extra):
+            # Not counted against the limiter, on purpose — see Limiter. The
+            # Origin VALUE is not logged either: it is a string the caller
+            # chose, and a refused origin tells the operator nothing that its
+            # own contents would improve on.
+            self._log("origin_refused")
+            self._refuse(403, "this server does not accept browser origins")
+            return False
+        return True
+
+    def _allow_set(self):
+        """Which tools THIS request may reach: the process, then the token.
+
+        Two boundaries, and the order is the design. `--read-only` and
+        `--drop-box` decide what the PROCESS will serve at all; a scope decides
+        what one token may do inside that. So a token granted `brain:write`
+        against a read-only process still reaches no write tool — the flag is
+        the outer boundary and the scope can only narrow it.
+
+        Returned as an allow-set rather than enforced here, so the refusal
+        still happens in the dispatcher: a client that never read tools/list
+        and calls a tool by name has to be refused too, and the client is the
+        thing being defended against.
+        """
+        allow = self.server.allow_tools
+        if self.grant is None:
+            return allow
+        return oauthlib.tools_for_scopes(
+            str(self.grant.get("scope", "")).split(), allow)
+
+    def _insufficient_scope(self, tool: str) -> str:
+        """RFC 6750's 403 challenge, naming the scope that would have worked.
+
+        A client that is told only "no" re-authorizes with the same scopes and
+        fails identically; one told which scope it needs can step up in a
+        single round trip.
+        """
+        needed = (oauthlib.SCOPE_WRITE if tool in mcp.WRITE_ONLY_TOOLS
+                  else oauthlib.SCOPE_READ)
+        cfg = getattr(self.server, "oauth", None)
+        parts = ['Bearer error="insufficient_scope"', f'scope="{needed}"']
+        if cfg is not None:
+            parts.append(f'resource_metadata="{cfg.prm_url}"')
+        return ", ".join(parts)
+
+    def _challenge(self) -> str:
+        """What a 401 tells a client to do about it.
+
+        With no authorization server there is nothing to point at, so it stays
+        exactly the string it has always been. With one, it carries
+        `resource_metadata` — which is the entire difference between a client
+        that starts an OAuth flow and one that reports only that it could not
+        reach the server.
+        """
+        cfg = getattr(self.server, "oauth", None)
+        return cfg.challenge() if cfg is not None else 'Bearer realm="brain"'
+
+    def _json(self, status: int, payload: dict, headers=None) -> None:
+        """A JSON answer that does NOT close the connection.
+
+        Distinct from `_refuse` on purpose. `_refuse` closes because it answers
+        before reading the request body, leaving those bytes in the socket to
+        be misparsed as the next request line (backlog item 9, found with a
+        real tunnel). Nothing here has an unread body: these are GETs, or POSTs
+        this handler read in full. Closing anyway would make a client
+        re-handshake for every step of a flow that has four of them.
+        """
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _allowed(self) -> bool:
         """Backoff, then Origin, then token. Everything else follows all three.
 
@@ -457,43 +617,47 @@ class _Handler(BaseHTTPRequestHandler):
         token from a blocked address waits too, which is deliberate and is the
         same trade every SSH server on the internet makes.
         """
+        if self._blocked() or not self._origin_ok():
+            return False
+
         peer = self.client_address[0]
-        wait = self.server.limiter.retry_after(peer)
-        if wait:
-            self._log("rate_limited", retry_after=wait)
-            self._refuse(429, "too many failed authentication attempts from "
-                              f"this address; retry in {wait}s",
-                         {"Retry-After": str(wait)})
-            return False
-
-        origin = self.headers.get("Origin")
-        if origin and origin not in self.server.allow_origin:
-            # Not counted against the limiter, on purpose — see Limiter. The
-            # Origin VALUE is not logged either: it is a string the caller
-            # chose, and a refused origin tells the operator nothing that its
-            # own contents would improve on.
-            self._log("origin_refused")
-            self._refuse(403, "this server does not accept browser origins")
-            return False
-
         supplied = self.headers.get("Authorization", "")
         scheme, _, value = supplied.partition(" ")
-        # compare_digest on BOTH the scheme and the token: an early return on
-        # the scheme is harmless (it is not a secret), but the token comparison
-        # must not short-circuit.
-        if scheme.lower() != "bearer" or not hmac.compare_digest(
-                value.strip(), self.server.token):
+        # Per-REQUEST, never on the server object: ThreadingHTTPServer runs
+        # handlers concurrently, and a grant parked where two requests can see
+        # it is one request answering with another's permissions.
+        self.grant = None
+
+        # The operator token FIRST, and unchanged. compare_digest on the token:
+        # a naive `==` returns on the first wrong byte and hands the value over
+        # one byte at a time to anything that can measure a response.
+        operator = (scheme.lower() == "bearer"
+                    and hmac.compare_digest(value.strip(), self.server.token))
+        if not operator:
+            # Only then the issued-token store, and only if this deployment has
+            # one. With --oauth off this branch does not exist, so the header
+            # path costs exactly what it always did.
+            auth = getattr(self.server, "auth", None)
+            if auth is not None and scheme.lower() == "bearer" and value.strip():
+                self.grant = auth.validate_bearer(value.strip())
+                if self.grant is not None:
+                    self._log("oauth_token_accepted")
+                else:
+                    # A reason CLASS. The presented value is a string the
+                    # caller chose, and it is quite often the real token for a
+                    # different server.
+                    self._log("oauth_token_rejected", reason="unknown_token")
+
+        if not operator and self.grant is None:
             self.server.limiter.failed(peer)
             # Which of the three, so a stale client is distinguishable from a
-            # guessing run — but never the guess itself. It is a string the
-            # caller chose, and it is quite often the real token for a
-            # DIFFERENT server.
+            # guessing run — but never the guess itself.
             self._log("auth_failed",
                       reason=("no_header" if not supplied.strip()
                               else "bad_scheme" if scheme.lower() != "bearer"
                               else "bad_token"))
             self._refuse(401, "a bearer token is required",
-                         {"WWW-Authenticate": 'Bearer realm="brain"'})
+                         {"WWW-Authenticate": self._challenge()})
             return False
         self.server.limiter.succeeded(peer)
 
@@ -522,6 +686,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._served(started)
 
     def _post(self):
+        kind = self._oauth_kind()
+        if kind:
+            self._oauth_post(kind)
+            return
         if not self._allowed():
             return
         if self.path.split("?")[0] != ENDPOINT:
@@ -558,9 +726,21 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         tool = _tool_name(msg)
+        allow = self._allow_set()
+        if tool and allow is not None and tool not in allow and self.grant is not None:
+            # The spec's answer for a token that is valid but not sufficient:
+            # 403 with the scope needed, so a client can step up rather than
+            # guess. It is checked here as well as in the dispatcher — this one
+            # gets the STATUS right, and the dispatcher below is what still
+            # refuses a caller who never read tools/list.
+            self._log("insufficient_scope", tool=tool)
+            self._refuse(403, f"{tool} needs a scope this token was not granted",
+                         {"WWW-Authenticate": self._insufficient_scope(tool)})
+            return
+
         began = time.monotonic()
         try:
-            out = mcp.handle(msg, allow=self.server.allow_tools,
+            out = mcp.handle(msg, allow=allow,
                              source=self.server.source, cap=self.server.cap,
                              log=self._log)
         except Exception as exc:
@@ -619,6 +799,10 @@ class _Handler(BaseHTTPRequestHandler):
         started = time.monotonic()
         self._status = 0
         try:
+            kind = self._oauth_kind()
+            if kind:
+                self._oauth_get(kind)
+                return
             if not self._allowed():
                 return
             # No SSE stream here. The spec permits saying so with a 405, and a
@@ -627,6 +811,164 @@ class _Handler(BaseHTTPRequestHandler):
             self._refuse(405, "this endpoint does not offer an SSE stream")
         finally:
             self._served(started)
+
+    # -------------------------------------------- the authorization server
+
+    def _oauth_get(self, kind: str) -> None:
+        """The unauthenticated half of the handshake.
+
+        A client with no token MUST be able to read both metadata documents and
+        reach the consent screen — that is the entire point of a 401 that
+        carries `resource_metadata`. The rate limiter still runs first.
+        """
+        cfg = self.server.oauth
+        if self._blocked() or not self._origin_ok(extra=(cfg.issuer,)):
+            return
+        if kind == "prm":
+            self._log("oauth_metadata_served")
+            self._json(200, cfg.protected_resource_metadata())
+            return
+        if kind == "as":
+            self._log("oauth_metadata_served")
+            self._json(200, cfg.authorization_server_metadata())
+            return
+        if kind == "authorize":
+            from urllib.parse import parse_qs
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            outcome = self.server.auth.authorize(query)
+            self._log_outcome(outcome)
+            self._deliver(outcome)
+            return
+        # /token and /revoke are POST-only. Saying so beats a 404, which reads
+        # to whoever is debugging as "this server has no such endpoint" when
+        # the metadata it just served says it does.
+        self._json(405, {"error": "invalid_request",
+                         "error_description": "this endpoint accepts POST"})
+
+    def _oauth_post(self, kind: str) -> None:
+        cfg = self.server.oauth
+        if self._blocked() or not self._origin_ok(extra=(cfg.issuer,)):
+            return
+        form = self._read_form()
+        if form is None:
+            return
+        if kind == "authorize":
+            outcome = self.server.auth.consent(
+                form, _first(form, "operator_token"),
+                # The comparison is constant time and lives HERE rather than in
+                # the authorization server, because the operator token is the
+                # transport's credential — oauth.py never sees it, and cannot
+                # accidentally log or return it.
+                verify=lambda supplied: hmac.compare_digest(
+                    supplied, self.server.token))
+            if outcome.credential_failed:
+                # The consent screen is one of only two places on this server
+                # where a credential can be guessed over the network. Both back
+                # off on the same table.
+                self.server.limiter.failed(self.client_address[0])
+                self._log("oauth_consent_failed", reason="consent_refused")
+            elif outcome.kind == "redirect":
+                self._log("oauth_code_issued")
+            self._log_outcome(outcome)
+            self._deliver(outcome)
+            return
+
+        if kind == "token":
+            status, payload, headers = self.server.auth.token(form)
+            if status == 200:
+                self._log("oauth_token_issued"
+                          if _first(form, "grant_type") == "authorization_code"
+                          else "oauth_token_refreshed")
+            else:
+                # The CODE, not the description: the description names the
+                # specific grant that failed, and a grant is a credential.
+                self._log("oauth_error", code=payload.get("error", "server_error"))
+            self._json(status, payload, headers)
+            return
+
+        if kind == "revoke":
+            status, payload, headers = self.server.auth.revoke(form)
+            self._log("oauth_grant_revoked")
+            self._json(status, payload, headers)
+            return
+
+        self._log("oauth_error", code="server_error")
+        self._json(503, {"error": "server_error",
+                         "error_description": "this endpoint is not built yet"})
+
+    def _read_form(self):
+        """A form-urlencoded body, parsed, or None if it was refused.
+
+        `application/x-www-form-urlencoded` is what RFC 6749 requires and what
+        every OAuth client sends. A server that accepts JSON only here answers
+        415 and breaks the flow for everyone — a documented, common failure.
+        """
+        from urllib.parse import parse_qs
+        try:
+            declared = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._log("body_refused", reason="bad_content_length")
+            self._refuse(400, "malformed Content-Length")
+            return None
+        if declared > MAX_FORM_BYTES:
+            # A far smaller ceiling than /mcp's: an OAuth form is a few hundred
+            # bytes, and these endpoints are the unauthenticated ones.
+            self._log("body_refused", reason="too_large")
+            self._refuse(413, f"request body exceeds {MAX_FORM_BYTES} bytes")
+            return None
+        raw = self.rfile.read(declared) if declared else b""
+        try:
+            return parse_qs(raw.decode("utf-8"))
+        except Exception:
+            self._log("body_refused", reason="bad_form")
+            self._refuse(400, "body is not application/x-www-form-urlencoded")
+            return None
+
+    def _log_outcome(self, outcome) -> None:
+        """Record WHY the authorization server refused something.
+
+        Found by running the server rather than by reading it: an SSRF refusal
+        produced `request status=400` and nothing else, which tells an operator
+        that something was refused and nothing at all about what. Both values
+        are vocabulary constants chosen by oauth.py, never text from the
+        request.
+        """
+        if outcome.event:
+            self._log(outcome.event, reason=outcome.reason or None)
+
+    def _deliver(self, outcome) -> None:
+        """Carry out what the authorization server decided.
+
+        The transport has no opinions about OAuth: every rule lives in
+        oauth.py, where it can be tested without a socket, and this turns the
+        answer into bytes.
+        """
+        if outcome.kind == "redirect":
+            self.send_response(302)
+            self.send_header("Location", outcome.url)
+            # A redirect carrying an authorization code must never be stored.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            for key, value in outcome.headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            return
+        body = outcome.body.encode("utf-8")
+        self.send_response(outcome.status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        # The consent page carries a credential field and nothing else. It
+        # loads nothing, so nothing may be loaded into it either.
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; "
+                         "form-action 'self'; frame-ancestors 'none'")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        for key, value in outcome.headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_DELETE(self):
         started = time.monotonic()
@@ -680,10 +1022,19 @@ def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
 USAGE = """brain serve — reach this brain from another device.
 
   brain serve [--read-only] [--bind <addr>] [--port <n>] [--allow-origin <origin>]
+  brain serve --oauth --public-url <url> [--read-only] [--bind <addr>] ...
   brain serve --drop-box --source <slug> [--daily-cap <n>] [--bind <addr>] ...
   brain serve --new-token
 
   --new-token           mint a value, store it in the OS keystore, print it ONCE
+  --oauth               also act as an OAuth 2.1 authorization server, so a
+                        HOSTED assistant — one that cannot be given a header —
+                        can connect after a person consents in a browser.
+                        Requires --public-url. The header path is unaffected
+  --public-url <url>    the address a client will actually type, exactly.
+                        Behind a tunnel this process only sees 127.0.0.1, and
+                        every token it issues is bound to the PUBLIC url, so it
+                        has to be told. https:// (http:// on loopback only)
   --read-only           serve the four read tools; refuse brain_capture
   --drop-box            serve brain_capture and NOTHING else; refuse all four
                         read tools. Requires --source
@@ -721,7 +1072,7 @@ preserves the Authorization header, and adds no Origin header.
 
 def startup_notes(host: str, port: int, read_only: bool = False,
                   drop_box: bool = False, source: str = "",
-                  daily_cap: int = 0, log_path=None) -> tuple:
+                  daily_cap: int = 0, log_path=None, oauth=None) -> tuple:
     """(what to tell the operator, what to warn them about).
 
     Split from the serving so both halves can be read — and tested — without
@@ -752,6 +1103,19 @@ def startup_notes(host: str, port: int, read_only: bool = False,
         "",
     ] + mode + [
         "",
+    ] + ([
+        f"  OAUTH ON — this brain is also an authorization server for",
+        f"    {oauth.resource}",
+        "  which is the address a client must use, character for character.",
+        "  A hosted assistant that has never seen a config file can connect by",
+        "  pasting that URL and consenting in a browser. Discovery:",
+        f"    {oauth.prm_url}",
+        f"    {oauth.issuer}{WELL_KNOWN_AS_PATH}",
+        "  Your tunnel must forward those two paths and /authorize and /token,",
+        "  not only the MCP path. A route mapped to the MCP path alone produces",
+        "  a client that can never discover anything and cannot say why.",
+        "",
+    ] if oauth is not None else []) + [
         "  Register it with a client that can set a header:",
         f'    claude mcp add --transport http brain {url} \\',
         '      --header "Authorization: Bearer $BRAIN_TOKEN"',
@@ -810,12 +1174,13 @@ def startup_notes(host: str, port: int, read_only: bool = False,
     return notes, warnings
 
 
-def run_serve(argv: list, store=None, run=None) -> int:
+def run_serve(argv: list, store=None, run=None, oauth_store=None) -> int:
     """The `brain serve` command.
 
     `run` is injected so the wiring can be tested without a socket, the same
     way phase_backup takes its runner. The tests that genuinely bind one go
-    through make_server directly.
+    through make_server directly. `oauth_store` is injected for the same
+    reason: no test may write to the machine's real one.
     """
     if "--help" in argv or "-h" in argv:
         print(USAGE)
@@ -823,6 +1188,9 @@ def run_serve(argv: list, store=None, run=None) -> int:
 
     store = store or osbackend.keystore()
     run = run or (lambda server: server.serve_forever())
+
+    if "--new-client" in argv:
+        return _new_client(argv, oauth_store)
 
     if "--new-token" in argv:
         minted = mint_token()
@@ -857,6 +1225,34 @@ def run_serve(argv: list, store=None, run=None) -> int:
     read_only = "--read-only" in argv
     drop_box = "--drop-box" in argv
     source = _flag(argv, "--source")
+    use_oauth = "--oauth" in argv
+    public_url = _flag(argv, "--public-url")
+
+    if drop_box and use_oauth:
+        # Refused by name, like --drop-box --read-only before it. A drop box is
+        # an endpoint an untrusted bot holds a fixed token for; an OAuth flow
+        # ends at a consent screen that assumes a human with a browser, and
+        # there is nobody at the other end of a drop box to be that human.
+        print("--drop-box and --oauth are two deployments, not two flags.\n\n"
+              "  A drop box is for an agent you do NOT trust, holding a token you\n"
+              "  issued it. OAuth exists for a hosted assistant a PERSON consents\n"
+              "  to in a browser. Nothing is sitting at a drop box to give consent.",
+              file=sys.stderr)
+        return 2
+    if public_url and not use_oauth:
+        # Half a pairing is a surprise waiting to happen — the same rule
+        # --source and --drop-box already follow.
+        print("--public-url only means something with --oauth.\n\n"
+              "  It is the address a client will type, and the audience every\n"
+              "  issued token is bound to. Without --oauth nothing issues tokens\n"
+              "  and nothing reads it.", file=sys.stderr)
+        return 2
+    if use_oauth:
+        try:
+            public_url = oauthlib.parse_public_url(public_url)
+        except oauthlib.ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     if drop_box and read_only:
         # The operator will reach for the combination, so it is refused by
@@ -919,12 +1315,23 @@ def run_serve(argv: list, store=None, run=None) -> int:
         print(f"could not listen on {host}:{port} — {exc}", file=sys.stderr)
         return 1
 
+    if use_oauth:
+        # Set after make_server rather than through it: the authorization
+        # server is a property of this DEPLOYMENT, and every test that is not
+        # about OAuth builds a server without one.
+        server.oauth = oauthlib.Config(public_url,
+                                       scopes=oauthlib.scopes_for(allow_tools))
+        server.auth = oauthlib.AuthServer(server.oauth,
+                                          oauth_store or oauth_store_for())
+
     log.record("server_started",
-               mode="drop_box" if drop_box else "read_only" if read_only else "default")
+               mode="drop_box" if drop_box else "read_only" if read_only else "default",
+               oauth=use_oauth)
 
     notes, warnings = startup_notes(host, server.server_address[1], read_only=read_only,
                                     drop_box=drop_box, source=source,
-                                    daily_cap=daily_cap, log_path=log.path)
+                                    daily_cap=daily_cap, log_path=log.path,
+                                    oauth=getattr(server, "oauth", None))
     for line in notes:
         print(line, file=sys.stderr)
     for line in warnings:
@@ -937,6 +1344,78 @@ def run_serve(argv: list, store=None, run=None) -> int:
     finally:
         server.server_close()
     return 0
+
+
+def oauth_store_for(root=None):
+    """The issued-credential database for THIS brain.
+
+    Beside the event log, under `osbackend.state_dir`: machine-local, per
+    brain, and outside the repository so it cannot reach git. Per brain
+    matters here more than anywhere — two endpoints on one host sharing one
+    token database would mean a token consented to for one brain opening the
+    other, which is the shared-keystore trap the business partition already
+    found once.
+    """
+    return oauthlib.Store(osbackend.state_dir(root or mcp.ROOT) / "oauth.db")
+
+
+def _new_client(argv: list, store=None) -> int:
+    """`brain serve --new-client "<name>" --redirect-uri <uri>`.
+
+    The third registration mechanism the MCP specification names, and the
+    answer for any client that speaks neither Client ID Metadata Documents nor
+    something this server has. It is GENERIC — one code path, no vendor in it —
+    which is the point: "works with any provider" cannot rest on every provider
+    having implemented the same optional thing.
+    """
+    name = _flag(argv, "--new-client")
+    uris = _flags(argv, "--redirect-uri")
+    if not name.strip() or name.startswith("--"):
+        print('--new-client needs a name: brain serve --new-client "My Assistant" '
+              "--redirect-uri <uri>", file=sys.stderr)
+        return 2
+    if not uris:
+        print("--new-client requires at least one --redirect-uri.\n\n"
+              "  It is where the authorization server may send a user back to, and it\n"
+              "  is matched EXACTLY. A client with no registered redirect URI cannot\n"
+              "  complete a flow, and one with a loose match is an open redirect.\n\n"
+              "  Your client's own documentation names its callback URL.",
+              file=sys.stderr)
+        return 2
+    for uri in uris:
+        problem = _bad_redirect_uri(uri)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
+
+    store = store or oauth_store_for()
+    client_id = store.register_client(name, uris)
+    print("Registered a client. Paste this id into that client's configuration:\n")
+    print(f"  {client_id}\n")
+    print("There is no client secret: this authorization server authenticates\n"
+          "clients as PUBLIC clients (`none`), which is what the MCP\n"
+          "specification's registration mechanisms all produce, and PKCE is what\n"
+          "protects the exchange instead.\n"
+          f"Registered redirect URI(s): {', '.join(uris)}", file=sys.stderr)
+    return 0
+
+
+def _bad_redirect_uri(uri: str) -> str:
+    """"" if this redirect URI may be registered, else why not.
+
+    OAuth 2.1's communication-security rule — every redirect URI is loopback or
+    HTTPS — and the open-redirect control, in one check. A plain-http redirect
+    to a public host hands the authorization code to anything on the path.
+    """
+    parts = urlsplit(uri)
+    if parts.scheme == "https" and parts.netloc:
+        return ""
+    if parts.scheme == "http" and (parts.hostname or "") in oauthlib.LOOPBACK_HOSTS:
+        return ""
+    return (f"--redirect-uri {uri!r} must be https:// or a loopback http:// address.\n\n"
+            "  OAuth 2.1 requires it: a plain-http redirect to a public host hands\n"
+            "  the authorization code to anything on the network path. Loopback is\n"
+            "  the exception, for a client running on the user's own machine.")
 
 
 def _flag(argv: list, name: str) -> str:
