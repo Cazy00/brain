@@ -71,6 +71,7 @@ from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import eventlog
 from . import mcp
 from . import notes
 from . import osbackend
@@ -332,6 +333,31 @@ class _Server(ThreadingHTTPServer):
         ThreadingHTTPServer.handle_error(self, request, client_address)
 
 
+# A request path is text the CLIENT wrote, so it is recorded as a CLASS and
+# never as itself — `/mcp?q=<the owner's question>` is exactly how a query
+# would otherwise reach the event log. Exact keys, never a prefix match:
+# classification is not an authorization decision, but the two live close
+# enough together that keeping one habit for both is cheaper than remembering
+# which is which.
+PATH_CLASSES = {ENDPOINT: "mcp"}
+
+
+def _tool_name(msg) -> str:
+    """The tool being called, IF it is one this brain actually has.
+
+    A name arrives inside the message, so it is caller-supplied text until it
+    has been matched against the table — and the event log refuses any string
+    it has not already agreed to. This is the matching, and returning "" for
+    anything unrecognised is what keeps `{"name": "../../etc/passwd"}` out of
+    a file on disk.
+    """
+    if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+        return ""
+    params = msg.get("params")
+    name = params.get("name") if isinstance(params, dict) else None
+    return name if name in mcp.TOOLS_BY_NAME else ""
+
+
 class _Handler(BaseHTTPRequestHandler):
     # Set by make_server on the server object; read through self.server.
     protocol_version = "HTTP/1.1"     # keep-alive, so a client is not reconnecting per call
@@ -350,6 +376,42 @@ class _Handler(BaseHTTPRequestHandler):
         if self.server.quiet:
             return
         sys.stderr.write("  %s %s\n" % (self.address_string(), fmt % args))
+
+    # ------------------------------------------------------------ event log
+
+    def _log(self, event: str, **fields) -> None:
+        """Record one event, or do nothing if this server has no log.
+
+        Deliberately not gated on `quiet`: that flag is about a terminal
+        nobody is reading, and this file exists precisely because nobody is
+        reading that terminal.
+        """
+        log = getattr(self.server, "log", None)
+        if log is not None:
+            log.record(event, **fields)
+
+    def send_response_only(self, code, message=None):
+        """Remember the status so the request can be logged with it.
+
+        The lowest of the three status-setting methods — send_response and
+        send_error both come through here — so one override catches every
+        answer this handler can give, including the ones BaseHTTPRequestHandler
+        produces without asking (a 501 for an unimplemented verb, a 400 for a
+        malformed request line).
+        """
+        self._status = code
+        BaseHTTPRequestHandler.send_response_only(self, code, message)
+
+    def _path_class(self) -> str:
+        return PATH_CLASSES.get(self.path.split("?")[0], "other")
+
+    def _served(self, started: float) -> None:
+        """One `request` entry per answered request, whatever the outcome."""
+        self._log("request",
+                  method=self.command if self.command in eventlog.METHODS else "other",
+                  path_class=self._path_class(),
+                  status=getattr(self, "_status", 0),
+                  ms=int((time.monotonic() - started) * 1000))
 
     # ---------------------------------------------------------------- guards
 
@@ -398,6 +460,7 @@ class _Handler(BaseHTTPRequestHandler):
         peer = self.client_address[0]
         wait = self.server.limiter.retry_after(peer)
         if wait:
+            self._log("rate_limited", retry_after=wait)
             self._refuse(429, "too many failed authentication attempts from "
                               f"this address; retry in {wait}s",
                          {"Retry-After": str(wait)})
@@ -405,7 +468,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         origin = self.headers.get("Origin")
         if origin and origin not in self.server.allow_origin:
-            # Not counted against the limiter, on purpose — see Limiter.
+            # Not counted against the limiter, on purpose — see Limiter. The
+            # Origin VALUE is not logged either: it is a string the caller
+            # chose, and a refused origin tells the operator nothing that its
+            # own contents would improve on.
+            self._log("origin_refused")
             self._refuse(403, "this server does not accept browser origins")
             return False
 
@@ -417,6 +484,14 @@ class _Handler(BaseHTTPRequestHandler):
         if scheme.lower() != "bearer" or not hmac.compare_digest(
                 value.strip(), self.server.token):
             self.server.limiter.failed(peer)
+            # Which of the three, so a stale client is distinguishable from a
+            # guessing run — but never the guess itself. It is a string the
+            # caller chose, and it is quite often the real token for a
+            # DIFFERENT server.
+            self._log("auth_failed",
+                      reason=("no_header" if not supplied.strip()
+                              else "bad_scheme" if scheme.lower() != "bearer"
+                              else "bad_token"))
             self._refuse(401, "a bearer token is required",
                          {"WWW-Authenticate": 'Bearer realm="brain"'})
             return False
@@ -426,6 +501,7 @@ class _Handler(BaseHTTPRequestHandler):
         if version and version not in SUPPORTED_PROTOCOL_VERSIONS:
             # The spec's MUST. Absent is fine — it says to assume 2025-03-26,
             # not to refuse.
+            self._log("protocol_refused", reason="unsupported_version")
             self._refuse(400, "unsupported MCP-Protocol-Version "
                               f"{version!r}; this server speaks "
                               f"{', '.join(SUPPORTED_PROTOCOL_VERSIONS)}")
@@ -435,21 +511,37 @@ class _Handler(BaseHTTPRequestHandler):
     # --------------------------------------------------------------- methods
 
     def do_POST(self):
+        started = time.monotonic()
+        self._status = 0
+        try:
+            self._post()
+        finally:
+            # In a finally, so a request that raised out of the handler is
+            # still recorded. A crash that leaves no trace is the exact
+            # failure this log exists to end.
+            self._served(started)
+
+    def _post(self):
         if not self._allowed():
             return
         if self.path.split("?")[0] != ENDPOINT:
+            # No event of its own: the `request` entry already carries the
+            # status and the path CLASS, which is everything that can safely
+            # be said about a path somebody else wrote.
             self._refuse(404, "not found")
             return
 
         try:
             declared = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            self._log("body_refused", reason="bad_content_length")
             self._refuse(400, "malformed Content-Length")
             return
         if declared > MAX_BODY_BYTES:
             # Judged on the header, before a byte is read. Reading first and
             # deciding after is how a size limit becomes the thing that
             # exhausts the memory it was added to protect.
+            self._log("body_refused", reason="too_large")
             self._refuse(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
             return
 
@@ -457,18 +549,27 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             msg = json.loads(raw.decode("utf-8"))
         except Exception:
+            self._log("body_refused", reason="not_json")
             self._refuse(400, "body is not valid JSON")
             return
         if not isinstance(msg, dict):
+            self._log("body_refused", reason="not_object")
             self._refuse(400, "body must be a single JSON-RPC object")
             return
 
+        tool = _tool_name(msg)
+        began = time.monotonic()
         try:
             out = mcp.handle(msg, allow=self.server.allow_tools,
-                             source=self.server.source, cap=self.server.cap)
+                             source=self.server.source, cap=self.server.cap,
+                             log=self._log)
         except Exception as exc:
             # Same containment as stdio: one malformed request must never take
-            # down a server other sessions are sharing.
+            # down a server other sessions are sharing. The exception's text is
+            # NOT logged: it is built from whatever the tool layer was holding,
+            # which on this server is note content.
+            if tool:
+                self._log("tool_error", tool=tool)
             msg_id = msg.get("id")
             if msg_id is None:
                 self.send_response(202)
@@ -477,6 +578,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             out = {"jsonrpc": "2.0", "id": msg_id,
                    "error": {"code": -32603, "message": f"internal error: {exc!r}"}}
+        else:
+            self._log_tool(msg, tool, out, began)
 
         if out is None:
             # A notification or a response: the spec says 202 with no body.
@@ -492,24 +595,54 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        if not self._allowed():
+    def _log_tool(self, msg, tool: str, out, began: float) -> None:
+        """One `tool_call` per tools/call, and nothing for any other method.
+
+        The OUTCOME comes from the reply's own `isError`, not from the HTTP
+        status: a tool that refused still answers 200, and "the request
+        succeeded" is not the question an operator reading this log is asking.
+        """
+        if not isinstance(msg, dict) or msg.get("method") != "tools/call":
             return
-        # No SSE stream here. The spec permits saying so with a 405, and a
-        # server that pretends to stream and then does not is worse than one
-        # that is honest about it.
-        self._refuse(405, "this endpoint does not offer an SSE stream")
+        ms = int((time.monotonic() - began) * 1000)
+        if not tool:
+            # Named a tool this brain does not have. The name is not recorded:
+            # it is text the caller wrote, and `_tool_name` returning "" is the
+            # boundary that keeps it off the disk.
+            self._log("tool_call", reason="not_found", ms=ms)
+            return
+        result = out.get("result") if isinstance(out, dict) else None
+        failed = bool(result.get("isError")) if isinstance(result, dict) else True
+        self._log("tool_call", tool=tool, outcome="error" if failed else "ok", ms=ms)
+
+    def do_GET(self):
+        started = time.monotonic()
+        self._status = 0
+        try:
+            if not self._allowed():
+                return
+            # No SSE stream here. The spec permits saying so with a 405, and a
+            # server that pretends to stream and then does not is worse than
+            # one that is honest about it.
+            self._refuse(405, "this endpoint does not offer an SSE stream")
+        finally:
+            self._served(started)
 
     def do_DELETE(self):
-        if not self._allowed():
-            return
-        self._refuse(405, "this server does not use sessions")
+        started = time.monotonic()
+        self._status = 0
+        try:
+            if not self._allowed():
+                return
+            self._refuse(405, "this server does not use sessions")
+        finally:
+            self._served(started)
 
 
 def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
                 allow_origin=(), quiet: bool = False,
                 allow_tools=None, limiter=None,
-                source=None, cap=None) -> ThreadingHTTPServer:
+                source=None, cap=None, log=None) -> ThreadingHTTPServer:
     """A configured, unstarted server. Refuses to exist without a token.
 
     Raising here rather than at the call site is deliberate: this is the
@@ -521,6 +654,10 @@ def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
     `source` and `cap` are the drop box's two other properties — what a write
     is stamped with, and how much may be written today. All three are read off
     the server object per request and never off the message.
+
+    `log` is an eventlog.EventLog or None. None is not a degraded mode: it is
+    what every test in this file that is not ABOUT the log runs with, and it is
+    what a caller who never wanted one gets.
     """
     if not (token or "").strip():
         raise ValueError("brain serve requires a token; mint one with "
@@ -532,6 +669,7 @@ def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
     server.allow_tools = None if allow_tools is None else frozenset(allow_tools)
     server.source = source
     server.cap = cap
+    server.log = log
     # Always one, never optional: there is no flag to turn it off, because the
     # only argument for turning it off is that guessing was never going to work
     # anyway — which is an argument, and this is a control.
@@ -583,7 +721,7 @@ preserves the Authorization header, and adds no Origin header.
 
 def startup_notes(host: str, port: int, read_only: bool = False,
                   drop_box: bool = False, source: str = "",
-                  daily_cap: int = 0) -> tuple:
+                  daily_cap: int = 0, log_path=None) -> tuple:
     """(what to tell the operator, what to warn them about).
 
     Split from the serving so both halves can be read — and tested — without
@@ -627,7 +765,16 @@ def startup_notes(host: str, port: int, read_only: bool = False,
         "  Behind a tunnel, swap the host for your hostname. The tunnel must",
         "  terminate TLS, forward to this port, preserve the Authorization",
         "  header, and add no Origin header.",
-    ]
+    ] + ([
+        "",
+        # Said at START, not only when something breaks. An operator who does
+        # not know this file exists is one who infers a failure from an
+        # agent's bad answer, which is the thing it was built to replace.
+        "  Failures are recorded. Read them with `brain logs --errors`:",
+        f"    {log_path}",
+        "  It holds no query text and no note content — by construction, not",
+        "  by filtering. See bin/brainlib/eventlog.py.",
+    ] if log_path else [])
     warnings = []
     if not _is_loopback(host) and drop_box:
         # A drop box on a public interface is the NORMAL deployment — the bot
@@ -757,18 +904,27 @@ def run_serve(argv: list, store=None, run=None) -> int:
     elif read_only:
         allow_tools = mcp.READ_ONLY_TOOLS
 
+    # Machine-local, per brain, outside the repository. Built here rather than
+    # in make_server so the tests — which must never write to the operator's
+    # real log — get one only when they ask for one.
+    log = eventlog.EventLog(osbackend.state_dir(mcp.ROOT) / eventlog.FILENAME)
+
     try:
         server = make_server(existing, host, port, allow_origin=allow_origin,
                              allow_tools=allow_tools,
                              source=source or None,
-                             cap=DailyCap(daily_cap, source) if drop_box else None)
+                             cap=DailyCap(daily_cap, source) if drop_box else None,
+                             log=log)
     except OSError as exc:
         print(f"could not listen on {host}:{port} — {exc}", file=sys.stderr)
         return 1
 
+    log.record("server_started",
+               mode="drop_box" if drop_box else "read_only" if read_only else "default")
+
     notes, warnings = startup_notes(host, server.server_address[1], read_only=read_only,
                                     drop_box=drop_box, source=source,
-                                    daily_cap=daily_cap)
+                                    daily_cap=daily_cap, log_path=log.path)
     for line in notes:
         print(line, file=sys.stderr)
     for line in warnings:

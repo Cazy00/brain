@@ -285,7 +285,7 @@ def drop_box_reply(run):
                          "text": f"captured {note_id}".strip()}], "isError": False}
 
 
-def call_tool(name, args, allow=None, source=None, cap=None):
+def call_tool(name, args, allow=None, source=None, cap=None, log=None):
     # isinstance first: a non-string name (dict/list) is unhashable and would
     # raise on the membership test instead of reporting an unknown tool.
     if not isinstance(name, str) or name not in TOOLS_BY_NAME:
@@ -363,6 +363,19 @@ def call_tool(name, args, allow=None, source=None, cap=None):
                              f"Fallback: search the files directly with rg in {ROOT} "
                              "(archive/ and vault/ are excluded by .rgignore)."}],
                 "isError": True}
+    if name == "brain_capture" and log is not None:
+        # Whether a write actually landed, for an operator who is not at the
+        # terminal. `brain capture` exits non-zero when the NOTE reached disk
+        # but the COMMIT failed — an unconfigured git identity, a consolidation
+        # branch in the way — and that is the failure this exists to surface:
+        # it is invisible to the caller by design (see drop_box_reply), so
+        # without this line it is invisible to everybody. `count` is how many
+        # notes reached disk, which separates "written but not committed" from
+        # "nothing happened at all".
+        landed = sum(1 for line in (run.stdout or "").splitlines()
+                     if line.strip().endswith(".md"))
+        log("capture_committed" if run.returncode == 0 else "capture_uncommitted",
+            count=landed)
     # A stamped source means an untrusted caller — see drop_box_reply.
     if name == "brain_capture" and source:
         return drop_box_reply(run)
@@ -370,7 +383,7 @@ def call_tool(name, args, allow=None, source=None, cap=None):
     return {"content": [{"type": "text", "text": text}], "isError": run.returncode != 0}
 
 
-def handle(msg, allow=None, source=None, cap=None):
+def handle(msg, allow=None, source=None, cap=None, log=None):
     """One JSON-RPC message in, one reply out — or None for a notification.
 
     Returns rather than writes, which is the whole reason a second transport is
@@ -407,7 +420,7 @@ def handle(msg, allow=None, source=None, cap=None):
         args = params.get("arguments")
         return _reply(msg_id, call_tool(params.get("name", ""),
                                         args if args is not None else {}, allow=allow,
-                                        source=source, cap=cap))
+                                        source=source, cap=cap, log=log))
     if method == "ping":
         return _reply(msg_id, {})
     if msg_id is not None:

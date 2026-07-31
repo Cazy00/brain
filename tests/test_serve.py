@@ -25,6 +25,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 
 sys.path.insert(0, str(ROOT / "bin"))
+from brainlib import eventlog  # noqa: E402
 from brainlib import mcp  # noqa: E402
 from brainlib import osbackend  # noqa: E402
 from brainlib import serve  # noqa: E402
@@ -40,18 +41,50 @@ PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
 NOTIFY = {"jsonrpc": "2.0", "method": "notifications/initialized"}
 
 
+class _SignallingLog(eventlog.EventLog):
+    """An EventLog that says when it has finished writing a request.
+
+    The server logs AFTER answering — deliberately, so a client never waits on
+    a disk append — which means a test that reads the file the instant the
+    response arrives is racing the handler thread. This is the barrier that
+    removes the race without a sleep: `request` is the last event of every
+    request (it is emitted from a `finally`), so waiting for it also guarantees
+    every other event for that request is already on disk.
+    """
+
+    def __init__(self, *args, **kwargs):
+        eventlog.EventLog.__init__(self, *args, **kwargs)
+        self.answered = threading.Event()
+
+    def record(self, event, **fields):
+        eventlog.EventLog.record(self, event, **fields)
+        if event == "request":
+            self.answered.set()
+
+
 class ServeCase(unittest.TestCase):
     ALLOW_ORIGIN = ()
     ALLOW_TOOLS = None          # None means every tool, which is the default
     FREE_ATTEMPTS = None        # None means the server's own limiter settings
+    LOGGING = False             # subclasses that assert on the event log set this
 
     def setUp(self):
         limiter = None if self.FREE_ATTEMPTS is None else \
             serve.Limiter(free=self.FREE_ATTEMPTS)
+        self.log = None
+        if self.LOGGING:
+            # A temp directory, never the machine's real state directory: a
+            # test that wrote there would leave the operator's own log holding
+            # fixture traffic.
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            self.log_path = Path(tmp.name) / "events.jsonl"
+            self.log = _SignallingLog(self.log_path)
         self.server = serve.make_server(BEARER, "127.0.0.1", 0,
                                         allow_origin=self.ALLOW_ORIGIN,
                                         allow_tools=self.ALLOW_TOOLS,
-                                        limiter=limiter)
+                                        limiter=limiter,
+                                        log=self.log)
         self.port = self.server.server_address[1]
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
@@ -75,14 +108,183 @@ class ServeCase(unittest.TestCase):
         headers.update(extra or {})
         if content_length is not None:
             headers["Content-Length"] = str(content_length)
+        if self.log is not None:
+            self.log.answered.clear()
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
         try:
             conn.request(method, path, body=payload.encode("utf-8"), headers=headers)
             response = conn.getresponse()
-            return response.status, dict(response.getheaders()), \
-                response.read().decode("utf-8", "replace")
+            out = (response.status, dict(response.getheaders()),
+                   response.read().decode("utf-8", "replace"))
         finally:
             conn.close()
+        self.settle()
+        return out
+
+    # ------------------------------------------------- the event log, if any
+
+    def settle(self):
+        """Block until the handler has finished logging. Not a sleep: it
+        returns the moment the entry is written, and the timeout is only there
+        so a broken server fails the test instead of hanging CI."""
+        if self.log is None:
+            return
+        self.assertTrue(self.log.answered.wait(timeout=15),
+                        "the server answered but never recorded the request")
+        self.log.answered.clear()
+
+    def logged(self, event=None) -> list:
+        entries = self.log.read(limit=1000)
+        return [e for e in entries if event is None or e["event"] == event]
+
+    def log_text(self) -> str:
+        """The raw bytes on disk. Every leak assertion reads THIS rather than
+        the parsed entries — a value that arrived in a field nobody thought to
+        check is still on the disk, and grepping the file is the only test that
+        would notice."""
+        try:
+            return self.log_path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+
+class TestTheEventLog(ServeCase):
+    """What the server records, and — mostly — what it must never record.
+
+    The handoff that asked for this named the risk in one sentence: *a log of a
+    brain server can contain the brain*. Queries are the owner's own questions,
+    results are note content, and the headers carry the credential. So the
+    tests that matter here are the negative ones.
+    """
+    LOGGING = True
+
+    def test_a_served_request_is_recorded(self):
+        self.request(PING)
+        entry, = self.logged("request")
+        self.assertEqual(entry["status"], 200)
+        self.assertEqual(entry["method"], "POST")
+        self.assertEqual(entry["path_class"], "mcp")
+        self.assertIsInstance(entry["ms"], int)
+
+    def test_the_bearer_token_is_never_written(self):
+        self.request(PING)
+        self.assertNotIn(BEARER, self.log_text())
+        self.assertNotIn("Authorization", self.log_text())
+
+    def test_a_wrong_token_is_recorded_without_the_guess(self):
+        """The guess is a string the caller chose. It is also, quite often, the
+        real token for a DIFFERENT server."""
+        self.request(PING, bearer="wrong-value-a-caller-picked")
+        entry, = self.logged("auth_failed")
+        self.assertEqual(entry["reason"], "bad_token")
+        self.assertNotIn("wrong-value-a-caller-picked", self.log_text())
+
+    def test_a_missing_header_is_distinguished_from_a_wrong_one(self):
+        self.request(PING, bearer=None)
+        self.assertEqual(self.logged("auth_failed")[0]["reason"], "no_header")
+
+    def test_a_search_records_the_tool_but_never_the_query(self):
+        """The single most important assertion in this file."""
+        needle = "zzqqxx-distinctive-nonsense-nobody-writes"
+        self.request({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                      "params": {"name": "brain_search",
+                                 "arguments": {"query": needle}}})
+        entry, = self.logged("tool_call")
+        self.assertEqual(entry["tool"], "brain_search")
+        self.assertIn(entry["outcome"], ("ok", "error"))
+        self.assertNotIn(needle, self.log_text())
+
+    def test_an_unknown_tool_name_is_not_written(self):
+        """A tool name arrives in the message, so it is caller-supplied text
+        until it has been matched against the table. An unmatched one is
+        recorded as `not_found` and never as itself."""
+        self.request({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                      "params": {"name": "brain_../../etc/passwd",
+                                 "arguments": {}}})
+        self.assertNotIn("passwd", self.log_text())
+        self.assertEqual(self.logged("tool_call")[0]["reason"], "not_found")
+
+    def test_an_unusual_path_is_recorded_as_a_class(self):
+        """`/mcp?q=<the owner's question>` is exactly how a query would reach
+        this file, so the path is a class and never itself."""
+        self.request(PING, path="/not-the-endpoint-but-a-string-a-caller-chose")
+        entry, = self.logged("request")
+        self.assertEqual(entry["path_class"], "other")
+        self.assertNotIn("not-the-endpoint", self.log_text())
+
+    def test_an_origin_refusal_is_recorded(self):
+        self.request(PING, extra={"Origin": "https://evil.example"})
+        self.assertEqual(len(self.logged("origin_refused")), 1)
+        self.assertNotIn("evil.example", self.log_text())
+
+    def test_an_oversized_body_is_recorded(self):
+        self.request(PING, content_length=serve.MAX_BODY_BYTES + 1)
+        self.assertEqual(self.logged("body_refused")[0]["reason"], "too_large")
+
+    def test_a_bad_protocol_version_is_recorded(self):
+        self.request(PING, extra={"MCP-Protocol-Version": "1999-01-01"})
+        self.assertEqual(self.logged("protocol_refused")[0]["reason"],
+                         "unsupported_version")
+        self.assertNotIn("1999-01-01", self.log_text())
+
+    def test_unparseable_json_is_recorded(self):
+        self.log.answered.clear()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        try:
+            conn.request("POST", serve.ENDPOINT, body=b"{ not json",
+                         headers={"Authorization": f"Bearer {BEARER}",
+                                  "Content-Type": "application/json"})
+            conn.getresponse().read()
+        finally:
+            conn.close()
+        self.settle()
+        self.assertEqual(self.logged("body_refused")[0]["reason"], "not_json")
+
+
+class TestRateLimitingIsRecorded(ServeCase):
+    LOGGING = True
+    FREE_ATTEMPTS = 1
+
+    def test_a_blocked_caller_is_recorded_with_the_wait(self):
+        for _ in range(3):
+            self.request(PING, bearer="not-the-value")
+        entry = self.logged("rate_limited")[0]
+        self.assertGreaterEqual(entry["retry_after"], 1)
+
+
+class TestServingWithoutALogStillWorks(ServeCase):
+    """The log is optional, and its absence is not a degraded mode — every
+    test above this class in this file runs with no log at all."""
+
+    def test_no_log_configured(self):
+        self.assertIsNone(self.server.log)
+        status, _headers, _body = self.request(PING)
+        self.assertEqual(status, 200)
+
+
+class TestTheEventLogVocabularyCoversWhatServeEmits(unittest.TestCase):
+    """A guard against the one way this design fails silently.
+
+    `record` raises on an unknown event or value, and every call in serve.py is
+    inside a request handler with broad exception containment around it. So a
+    typo'd event name would not crash the server — it would simply stop logging
+    that case, which is indistinguishable from that case never happening. This
+    reads the source and checks every literal event name serve.py passes.
+    """
+
+    def test_every_event_name_in_serve_is_in_the_vocabulary(self):
+        import re
+        source = (ROOT / "bin" / "brainlib" / "serve.py").read_text(encoding="utf-8")
+        used = set(re.findall(r"_log\(\s*[\"']([a-z_]+)[\"']", source))
+        self.assertTrue(used, "no _log calls found — has the helper been renamed?")
+        self.assertEqual(used - eventlog.EVENTS, set())
+
+    def test_every_reason_in_serve_is_in_the_vocabulary(self):
+        import re
+        source = (ROOT / "bin" / "brainlib" / "serve.py").read_text(encoding="utf-8")
+        used = set(re.findall(r"reason=[\"']([a-z_]+)[\"']", source))
+        self.assertTrue(used)
+        self.assertEqual(used - set(eventlog.REASONS), set())
 
 
 class TestTheTokenIsMandatory(ServeCase):
