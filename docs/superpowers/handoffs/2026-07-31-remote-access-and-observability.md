@@ -22,7 +22,9 @@ Three things, in one deployment:
    was only a template workshop, and the owner has now decided otherwise.
 2. **Reachable over the internet, on their own domain**, so they can talk to it
    from a phone or a laptop through a hosted assistant and have it actually use
-   the brain — the thing `brain serve` cannot do today.
+   the brain — the thing `brain serve` cannot do today. Confirmed 2026-07-31:
+   this is wanted **now**, it will be wired and connected, and it will serve
+   claude.ai *and* ChatGPT *and* others — not one of them.
 3. **Enough visibility to run it in a testing phase**: when something fails,
    they want to be able to SEE it afterwards and fix it, rather than infer it
    from an agent's bad answer. Errors, and the health of the knowledge itself.
@@ -38,6 +40,38 @@ first client to connect, not the target. That reframes the work:
 Anything Claude-specific must be identifiable as such and small: as far as this
 session could tell, that is the redirect URI and Anthropic's egress range, and
 nothing else. Every other requirement below is an RFC.
+
+**Checked 2026-07-31, and the two big providers converge.** ChatGPT's custom
+MCP connectors want the same things Claude's do — OAuth with PKCE, protected
+resource metadata, token validation on the MCP server, HTTPS — and OpenAI
+*recommends* **CIMD** (Client ID Metadata Documents) for client registration,
+supporting public-client token exchange (`none`). Claude selects CIMD when the
+authorization server metadata advertises both
+`"client_id_metadata_document_supported": true` and `"none"` in
+`token_endpoint_auth_methods_supported`. **Those are the same server.** So CIMD
++ PKCE + PRM + AS metadata looks like the shape that serves both without DCR
+and without a per-provider branch — the plan should test that hypothesis first,
+because if it holds, "works with any provider" costs almost nothing extra.
+
+### Two populations of client, and both must work at once
+
+This is the design point most likely to be missed:
+
+- **Hosted assistants** (claude.ai, ChatGPT, and whatever follows) cannot take
+  a token from a config file. They need the OAuth flow above.
+- **Local clients** (Claude Code, Codex CLI, Gemini CLI, Cursor, VS Code) take
+  a bearer token in a header and **already work today**, through `brain serve`
+  as it stands.
+
+The endpoint therefore has to accept **both** an operator-minted bearer token
+and an OAuth-issued access token, on the same URL, at the same time — without
+the OAuth work regressing what already works. Anything that replaces the
+existing token path rather than sitting beside it breaks every client the
+project currently supports.
+
+Per-provider variation, so far, is small and enumerable: the redirect URI, the
+client-authentication method, and each vendor's egress range if anything is
+allowlisted. Everything else is shared.
 
 ### Hosting is not settled
 
@@ -142,10 +176,14 @@ Nobody should start writing code until these have answers.
 4. **Where do issued tokens live**, how are they revoked, and what happens on
    `brain retire`?
 5. **Which second provider proves "not Claude-only"?** The claim needs one
-   non-Anthropic client actually connected, or it is an assertion. Candidates
-   the repo already knows about: Codex CLI, Gemini CLI, Cursor, VS Code —
-   whichever of them speaks MCP authorization rather than a config file with a
-   header in it.
+   non-Anthropic hosted assistant actually connected, or it is an assertion.
+   **ChatGPT is the owner's stated second** and is the right one: it exercises
+   the OAuth path rather than the header path, which is where the risk is. Two
+   things to establish early — custom MCP connectors live behind ChatGPT's
+   *developer mode* and need a Plus/Pro-tier account (which plan does the owner
+   have?), and on Business/Enterprise workspaces an admin has to enable custom
+   connectors at all. The header-only clients (Codex CLI, Gemini CLI, Cursor,
+   VS Code) prove nothing new about auth — they already work.
 6. **What is exposed, and for how long?** Full-time internet-facing is a
    different posture from today's loopback-plus-a-tunnel. The read-only mode,
    the drop box (which must NOT be public), and the auth server each need a
