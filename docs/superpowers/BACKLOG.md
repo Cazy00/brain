@@ -9,15 +9,15 @@ deliberate decision, not an oversight, and each one is flagged in the code at
 the point where somebody would trip over it — this is the index, not the only
 record.
 
-**Nothing here is blocking.** The four commands work and 474 tests pass, with no
+**Nothing here is blocking.** The commands work and 860 tests pass, with no
 known failures on any platform this project can run.
 
 The numbering is stable: items keep their number once closed, because "item 3"
-in a commit message should still mean item 3 in a year. Six of the nine are
+in a commit message should still mean item 3 in a year. Seven of the nine are
 closed and stay listed with what closed them. Items 8 and 9 were both opened AND
 closed on 2026-07-29 by the work that closed the others — 8 by verifying the new
 documentation, 9 by running a real tunnel in front of the server rather than
-reasoning about one. Two of the three still open need hardware or an account
+reasoning about one. The one still open needs a Windows machine
 this project does not have.
 
 ---
@@ -32,6 +32,7 @@ this project does not have.
 | [2026-07-29-serve-hardening.md](plans/2026-07-29-serve-hardening.md) | backlog items 1, 2, 5 | closed, 18/18 |
 | — | items 8 and 9, found while verifying the above | closed, no plan |
 | [2026-07-30-business-partition.md](plans/2026-07-30-business-partition.md) | M/P partition, the drop box, `publish` | closed, 6/6 |
+| [2026-07-31-remote-access-and-observability.md](plans/2026-07-31-remote-access-and-observability.md) | backlog item 3: OAuth, and something to look at when it breaks | closed, 10/10 |
 
 The four commands the spec set out to build all exist and all end in a working
 state: `brain setup`, `brain connect`, `brain serve`, `brain retire`. A fifth,
@@ -87,7 +88,7 @@ comes up, so the questions matter more than the estimates.
 
 | Ask | Why it decides the work | Item |
 |---|---|---|
-| ~~**Do you want the brain inside the claude.ai app**~~ | **ANSWERED 2026-07-31: yes.** The owner has a domain and a Max plan, and wants the brain reachable from a phone — but explicitly NOT Claude-only, so the target is the MCP authorization spec with claude.ai as its first client. Re-checked the same day: individuals still get OAuth only, and `static_headers` is org-admin by design rather than a beta flag waiting to flip. **Next step is a plan, from [handoffs/2026-07-31-remote-access-and-observability.md](handoffs/2026-07-31-remote-access-and-observability.md)** — which also corrects this file: dynamic client registration turns out NOT to be required. | 3 |
+| ~~**Do you want the brain inside the claude.ai app**~~ | **ANSWERED and BUILT.** The owner said yes on 2026-07-31, and explicitly not Claude-only, so the target became the MCP authorization spec itself. Item 3 below is closed. What remains is not work: the owner stands up their real brain and connects an assistant to it, then says what happened. | 3 |
 | **Do you have a Windows machine to hand yet?** | It is the only thing that can close item 4. Nothing on macOS or Linux moves it, and CI already covers everything CI can reach. | 4 |
 
 One thing NOT to ask, because it is settled:
@@ -102,9 +103,11 @@ their real brain there and expose it, which is what item 3 is now for. The real
 brain is a SEPARATE clone — this checkout stays the public template, and
 nothing personal is ever committed here.
 
-Before starting item 3 on a "yes", re-check `static_headers` first — it was
-still OAuth-only for individuals on 2026-07-29, and if that changes the item
-becomes a settings change instead of a codebase.
+**Done 2026-07-31.** Item 3 was re-checked before it was started, as this file
+said to, and the check changed the shape of the work twice: `static_headers` is
+still org-admin by product design rather than a beta flag waiting to flip, and
+dynamic client registration turned out to be deprecated rather than required.
+Both corrections are recorded in item 3 below.
 
 ---
 
@@ -140,7 +143,48 @@ clients share one bucket); `Origin` refusals are not counted (or any web page
 could lock the operator out with a `fetch` loop); and the table is bounded (an
 unbounded one is a memory exhaustion primitive reachable without a token).
 
-## 3. claude.ai web, Desktop and mobile cannot use `brain serve` — OPEN
+## 3. Hosted assistants cannot use `brain serve` — CLOSED 2026-07-31
+
+**Closed by:** [plans/2026-07-31-remote-access-and-observability.md](plans/2026-07-31-remote-access-and-observability.md),
+`bin/brainlib/oauth.py` and `brain serve --oauth --public-url <url>`.
+
+**Two things this entry got wrong, corrected here rather than quietly:**
+
+1. **Dynamic client registration is not required — it is DEPRECATED.** "Done
+   looks like: OAuth 2.1 with dynamic client registration or a Client ID
+   Metadata Document" was written from 2026-07-29 documentation. By 2026-07-31
+   the MCP specification marks RFC 7591 deprecated and makes Client ID Metadata
+   Documents the default. `/register` is deliberately not built: it would ship
+   both a deprecated mechanism and an endpoint an unauthenticated caller
+   creates database rows through.
+2. **The framing was Claude-shaped and the answer is not.** The owner was
+   explicit on 2026-07-31 that this must not be Claude-only, so what got built
+   is the specification. There is no vendor name in `oauth.py` or `serve.py`
+   outside a comment and no per-provider branch anywhere — under CIMD the
+   redirect URIs come from the *client's own* document, which the server fetches
+   and validates, so the part that looked vendor-specific turned out to be zero
+   lines of code.
+
+**What is done:** RFC 9728 protected-resource metadata, RFC 8414
+authorization-server metadata, PKCE S256, RFC 8707 audience binding checked on
+every request, RFC 9207 `iss`, CIMD with an SSRF-hardened fetcher, pre-registered
+clients as the generic fallback, opaque tokens stored hashed, refresh rotation
+with family revocation on reuse, two scopes enforced in the dispatcher, and a
+consent screen that needs no accounts because the brain has one owner. The
+bearer path is untouched and both credentials work on one URL at once.
+
+**What is NOT done, and is the owner's next step:** no hosted assistant has been
+connected to it. The flow was driven end to end against a live server with
+`curl` and there is a test that walks the whole handshake the way a client walks
+it — but the real connection needs the owner's domain and their real brain, and
+they said on 2026-07-31 that they would stand that up themselves. When they do,
+`setup/runbooks/remote-oauth.md` has a section for what actually happened.
+
+Observability shipped alongside it — `brain logs`, and a failure count in
+`doctor` — because the same handoff asked for it and because an authorization
+handshake with a dozen failure modes needs somewhere to report them.
+
+## 3b. The original entry, for the record — SUPERSEDED BY THE ABOVE
 
 **Where:** `bin/brainlib/serve.py` (module docstring), `SETUP.md` Part 8,
 `README.md` ("what it deliberately does not do").

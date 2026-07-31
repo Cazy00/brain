@@ -349,12 +349,15 @@ remote/cloud sessions cannot reach local folders or local MCP servers. The
 commit gate validates whatever any agent writes, and the nightly doctor flags
 anything left uncommitted.
 
-### claude.ai web and mobile
+### Hosted assistants (claude.ai on the web and mobile, ChatGPT, and others)
 
-Not supported. They cannot run a local process, and the remote transport
-(`brain serve`, Part 8) authenticates with a bearer token, which claude.ai's
-per-user custom connector flow does not accept — see that part for the detail
-and the date it was checked.
+They cannot run a local process and cannot be handed a header, so they take the
+other route: `brain serve --oauth`, which makes this brain an OAuth 2.1
+authorization server as well as an MCP one. You add a custom connector by URL,
+consent in a browser, and it connects.
+
+That is Part 8, and the whole setup — including the tunnel clause people miss —
+is in [`setup/runbooks/remote-oauth.md`](setup/runbooks/remote-oauth.md).
 
 ---
 
@@ -632,14 +635,40 @@ claude mcp add --transport http brain http://127.0.0.1:8787/mcp \
   --header "Authorization: Bearer $BRAIN_TOKEN"
 ```
 
-Any client that lets you set a request header works the same way. Clients that
-do not — including **claude.ai on the web, Claude Desktop and mobile** — cannot
-use this. Checked against Anthropic's connector documentation on 2026-07-29:
-adding a custom connector by URL offers OAuth Client ID and Client Secret only;
-a fixed bearer token is supported through `static_headers`, which is in beta and
-is entered by an **organization administrator**, not by an individual. Closing
-that gap means implementing OAuth 2.1 with dynamic client registration, which is
-a much larger piece and is not built.
+Any client that lets you set a request header works the same way.
+
+### Clients that cannot set a header — `--oauth`
+
+A **hosted** assistant runs on somebody else's servers. You never touch a config
+file, so there is nowhere to put a header, and the only credential it can hold
+is one you consented to in a browser. That is what this flag is for:
+
+```sh
+brain serve --oauth --public-url https://brain.example.com/mcp
+```
+
+The brain then answers the OAuth discovery questions as well as the MCP ones,
+and a hosted assistant can connect by pasting that URL as a custom connector.
+Both credentials work on the same URL at the same time — adding this changes
+nothing about the header path above.
+
+Three things worth knowing before you try it, each covered properly in
+[`setup/runbooks/remote-oauth.md`](setup/runbooks/remote-oauth.md):
+
+- **`--public-url` must be exactly what you will type into the client**, path
+  and all. Behind a tunnel the server only sees `127.0.0.1`, and every token it
+  issues is bound to the public URL.
+- **Your tunnel must forward `/.well-known/*`, `/authorize` and `/token`**, not
+  only `/mcp`. Forwarding the MCP path alone produces a failure that looks
+  identical to the server being down.
+- **Consent is proved with the token you already have** — the value
+  `brain serve --new-token` printed. There are no accounts; the brain has one
+  owner.
+
+Built to the MCP authorization specification rather than to one vendor, so any
+client that speaks it works. Dynamic client registration is **not** implemented:
+the specification now deprecates it, and `brain serve --new-client` covers
+anything that needs a client id instead.
 
 ### The tunnel contract
 
@@ -656,7 +685,15 @@ It is an example, not a recommendation — the contract below is the requirement
 2. **Forward to this port**, path and all — the endpoint is `/mcp`.
 3. **Preserve the `Authorization` header.** A tunnel that strips or rewrites it
    makes every request a 401.
-4. **Add no `Origin` header.** The server refuses requests that carry one.
+4. **Add no `Origin` header.** The server refuses requests that carry one — with
+   one deliberate exception: the consent form is a browser POST from the
+   server's own public origin, and that origin is accepted at the OAuth
+   endpoints only.
+5. **With `--oauth`, forward the whole hostname**, not one path.
+   `/.well-known/*`, `/authorize`, `/token` and `/revoke` all have to arrive.
+   A route mapped to `/mcp` alone means the MCP server sees the first request,
+   the authorization server sees nothing at all, and the client reports only
+   that it could not reach you.
 
 And one thing it must not be relied upon for: **authentication.** A tunnel that
 publishes an unauthenticated origin to a public hostname is one mis-scoped

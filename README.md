@@ -227,17 +227,32 @@ trusting.
   search that ignores this repo's ignore rules and would return superseded and
   unconsolidated notes as current, stripped of their trust signals. Retrieval
   goes through the brain's own tools.
-- **Remote access is bearer-token only, and opt-in.** `brain serve` puts the
-  same tools on HTTP behind a token you mint, refuses to start without one,
-  binds loopback unless told otherwise, and backs off after repeated failed
-  authentication. It works with Claude Code and anything else that can set a
-  request header; it does **not** work with claude.ai on the web, Desktop or
-  mobile, whose per-user custom connector flow takes OAuth credentials and not
-  a token (checked 2026-07-29). Closing that means OAuth 2.1, which is not
-  built. `--read-only` serves the four read tools and refuses `brain_capture`,
+- **Remote access is opt-in, and takes two kinds of credential.** `brain serve`
+  puts the same tools on HTTP behind a token you mint, refuses to start without
+  one, binds loopback unless told otherwise, and backs off after repeated failed
+  authentication. That covers every client that can set a request header —
+  Claude Code, Codex CLI, Cursor, VS Code. `--oauth --public-url <url>` adds an
+  OAuth 2.1 authorization server beside it, for **hosted** assistants that never
+  see a config file and can only hold a credential a person consented to in a
+  browser. It is built to the MCP authorization specification rather than to any
+  one vendor — PKCE, protected-resource and authorization-server metadata,
+  Client ID Metadata Documents, audience-bound opaque tokens, rotation — so any
+  client speaking that spec works, and there is no per-provider code anywhere.
+  Both credentials work on the same URL at the same time; the header path is
+  unchanged. Dynamic client registration is deliberately absent (the MCP spec
+  deprecates it); `serve --new-client` covers anything that needs a client id.
+  See [`setup/runbooks/remote-oauth.md`](setup/runbooks/remote-oauth.md), which
+  is honest about the two things in it that have not been verified.
+  `--read-only` serves the four read tools and refuses `brain_capture`,
   which limits what a holder of the token can *change* — every note is still
-  readable, and read-only is a property of the process rather than of the
-  token, so there is no such thing as a read-only token here.
+  readable. Read-only is a property of the process; a `brain:read` OAuth token
+  is the same question asked of one credential rather than one server.
+- **The server records what happens, and cannot record what you asked it.**
+  `brain logs` shows failed authentication, refused requests, tool errors and
+  every step of an OAuth handshake. It holds no query text, no note content and
+  no credential — by construction rather than by filtering: the log accepts only
+  field names and values from fixed vocabularies, so caller-supplied text cannot
+  reach it at all. It lives outside the repository, so it cannot reach git.
 - **The privacy rule is instruction-enforced.** "Ask before recording anything
   about a person's private life" is followed by the model, not enforced by code,
   and commits auto-push. Weaker harnesses will eventually get this wrong.

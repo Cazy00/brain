@@ -37,9 +37,11 @@ setup/            templates, runbooks (this system's own docs)
 bin/brain         toolbelt: setup | connect | new | capture | search | read |
                   links | recent | supersede | index | sessions | consolidate |
                   schedule | template | publish | plugin | lint | doctor |
-                  stats | reset
+                  logs | stats | reset
                   (`bin/brain --help` is authoritative; doctor reports whether
-                  the machinery works, stats whether the KNOWLEDGE still does)
+                  the machinery works, stats whether the KNOWLEDGE still does,
+                  and logs what `brain serve` recorded — machine-local, outside
+                  this repo, and holding no query text or note content)
 bin/brain-mcp     the same tools over MCP, for any agent that speaks stdio
 tests/            runtime tests for the toolbelt itself — lint proves the NOTES
                   are well-formed, these prove the TOOLS work:

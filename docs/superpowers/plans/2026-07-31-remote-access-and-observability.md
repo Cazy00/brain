@@ -272,16 +272,16 @@ of this plan, not an epilogue to it.
 YYYY-MM-DD`, `--json` (raw lines, for anything else), `--path` (print the file
 location and exit — the answer to "where is it" without printing the contents).
 
-- [ ] **Step 1: Write the failing tests.** `state_dir` is per-root and two roots
+- [x] **Step 1: Write the failing tests.** `state_dir` is per-root and two roots
       differ; it is `0700` and names its brain. `record` writes one line of
       JSON; an unknown event name raises; an arbitrary string value raises; a
       log over `max_bytes` rolls and keeps exactly one generation; a write to an
       unwritable path is swallowed; `brain logs` renders, filters by `--errors`
       and `--since`, and `--path` prints without reading.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `logs: an event log that cannot contain the brain`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `logs: an event log that cannot contain the brain`
 
 ---
 
@@ -307,16 +307,16 @@ well-known path is `discovery`, anything else is `other`. A path is
 caller-supplied text and D11 says caller-supplied text does not enter this log
 — and `/mcp?q=<the owner's question>` is exactly how it would get there.
 
-- [ ] **Step 1: Write the failing tests.** A successful request logs `request`
+- [x] **Step 1: Write the failing tests.** A successful request logs `request`
       with status 200 and no header value anywhere in the file; a wrong token
       logs `auth_failed` and the token's bytes appear nowhere in the file; a
       `brain_search` call logs `tool_call` with the tool name and **not** the
       query; a 429 logs `rate_limited`; an unusual path is logged as `other`
       rather than as itself; serving with no log configured still works.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `serve: record what happened, never what was asked`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `serve: record what happened, never what was asked`
 
 ---
 
@@ -384,7 +384,7 @@ tunnel), no fragment, no query, no trailing slash, and a warning if it is
 loopback while `--bind` is not — that combination means a tunnel is in front and
 the two do not agree, which produces a resource mismatch nothing explains.
 
-- [ ] **Step 1: Write the failing tests.** Both metadata paths return the
+- [x] **Step 1: Write the failing tests.** Both metadata paths return the
       documents unauthenticated; `resource` is byte-identical to `--public-url`
       including its path; `issuer` is the origin; a `--read-only` process
       advertises only `brain:read`; the 401 carries `resource_metadata` with
@@ -394,10 +394,10 @@ the two do not agree, which produces a resource mismatch nothing explains.
       exact-match (`/.well-known/oauth-protected-resource/../mcp` and
       `/.well-known/oauth-protected-resourceX` are **not** exempt); with
       `--oauth` off the well-known paths 401 like anything else.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `oauth: the metadata that makes any client start the flow`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `oauth: the metadata that makes any client start the flow`
 
 ---
 
@@ -452,7 +452,7 @@ accommodation, and the comment should say so.
 which is the spec's communication-security requirement and the open-redirect
 control in one check.
 
-- [ ] **Step 1: Write the failing tests.** A well-formed document resolves;
+- [x] **Step 1: Write the failing tests.** A well-formed document resolves;
       a document whose `client_id` differs from its URL is refused; a missing
       `redirect_uris` or `client_name` is refused; `http://` is refused; a URL
       with no path is refused; a host resolving to `127.0.0.1`, `10.x`,
@@ -463,10 +463,10 @@ control in one check.
       matches and a different one does not; a loopback redirect matches on any
       port; `--new-client` mints and prints once and refuses a plain-`http`
       non-loopback redirect URI.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `oauth: resolve a client without becoming its request forger`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `oauth: resolve a client without becoming its request forger`
 
 ---
 
@@ -511,7 +511,7 @@ it must actually be sent).
 canonical resource URI at authorization time, so a token for somewhere else is
 never even minted.
 
-- [ ] **Step 1: Write the failing tests.** A valid request renders the page; a
+- [x] **Step 1: Write the failing tests.** A valid request renders the page; a
       missing or non-`S256` `code_challenge` is refused; an unknown `client_id`
       renders an error page and does **not** redirect; a mismatched
       `redirect_uri` does not redirect; a `resource` that is not this server is
@@ -521,10 +521,10 @@ never even minted.
       one issues a code that redirects with `code` and `iss`; the code is
       single-use; an expired code is invalid on a parameterised clock; the code
       is stored hashed and its plaintext is absent from the database file.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `oauth: a consent screen with one user and no accounts`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `oauth: a consent screen with one user and no accounts`
 
 ---
 
@@ -558,7 +558,7 @@ token, its family. Always `200`, even for an unknown token — the spec's rule,
 and a differing answer is an oracle for whether a token exists. This is
 half of handoff question 4; the other half is Task 8's `retire`.
 
-- [ ] **Step 1: Write the failing tests.** A valid exchange returns
+- [x] **Step 1: Write the failing tests.** A valid exchange returns
       `access_token`, `token_type`, `expires_in`, `refresh_token`, `scope`; a
       wrong `code_verifier` is `invalid_grant`; a reused code is `invalid_grant`
       **and** the previously issued token stops working; a mismatched
@@ -569,10 +569,10 @@ half of handoff question 4; the other half is Task 8's `retire`.
       `no-store` is set; every error body is an RFC 6749 code; `/revoke`
       answers 200 for a known and an unknown token alike and the known one
       stops working.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `oauth: tokens that rotate, and die together when one leaks`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `oauth: tokens that rotate, and die together when one leaks`
 
 ---
 
@@ -602,7 +602,7 @@ unchanged** (D5).
 - Every outcome logs: `oauth_token_accepted`, `oauth_token_rejected` (reason
   class), `insufficient_scope`.
 
-- [ ] **Step 1: Write the failing tests.** The operator token still works with
+- [x] **Step 1: Write the failing tests.** The operator token still works with
       `--oauth` on and with it off; an OAuth access token works; an expired one
       401s; a revoked one 401s; one whose audience is a different resource 401s
       **even though the row exists**; a read-scoped token is refused
@@ -611,10 +611,10 @@ unchanged** (D5).
       the limiter exactly once; the refusal still closes the connection
       (`TestConnectionReuse` must still hold — backlog item 9 was invisible to
       tests that opened one connection per request).
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `serve: one endpoint, two credentials, one audience`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `serve: one endpoint, two credentials, one audience`
 
 ---
 
@@ -641,14 +641,14 @@ real gap is that nobody is looking at either on a server.
   a token store that survives `retire` is a credential outliving the brain it
   authorised.
 
-- [ ] **Step 1: Write the failing tests.** `doctor` reports the error count and
+- [x] **Step 1: Write the failing tests.** `doctor` reports the error count and
       is RED above a threshold; it reports knowledge health and is RED on an
       overdue review; `retire` removes the state directory and says what it
       revoked; `retire` on a brain that never served does not fail.
-- [ ] **Step 2: Run tests to verify they fail**
-- [ ] **Step 3: Implement**
-- [ ] **Step 4: Run tests to verify they pass**, then the whole suite
-- [ ] **Step 5: Commit** — `doctor: the errors and the graph, where somebody will see them`
+- [x] **Step 2: Run tests to verify they fail**
+- [x] **Step 3: Implement**
+- [x] **Step 4: Run tests to verify they pass**, then the whole suite
+- [x] **Step 5: Commit** — `doctor: the errors and the graph, where somebody will see them`
 
 ---
 
@@ -674,14 +674,14 @@ fail.
 The deliberate omission gets a test too: DCR. Assert `registration_endpoint` is
 absent, so a future change that adds one is a decision somebody made on purpose.
 
-- [ ] **Step 1: Write the test.** The full flow, plus: the flow with a
+- [x] **Step 1: Write the test.** The full flow, plus: the flow with a
       pre-registered client id instead of CIMD; the flow refused at consent
       issues nothing; the access token from a completed flow is refused by a
       second server with a different `--public-url`.
-- [ ] **Step 2: Run it, fix what it finds** — expect it to find something the
+- [x] **Step 2: Run it, fix what it finds** — expect it to find something the
       unit tests could not.
-- [ ] **Step 3: Whole suite**
-- [ ] **Step 4: Commit** — `oauth: the whole handshake, end to end, in one test`
+- [x] **Step 3: Whole suite**
+- [x] **Step 4: Commit** — `oauth: the whole handshake, end to end, in one test`
 
 ---
 
@@ -721,20 +721,83 @@ deliverable that decides whether any of this is usable.** It must contain:
   entry (the known trap, unchanged by this work), and a tunnel putting every
   client behind one limiter bucket.
 
-- [ ] **Step 1: Write the runbook and the doc changes**
-- [ ] **Step 2: Run every command in it that can be run without the owner's
+- [x] **Step 1: Write the runbook and the doc changes**
+- [x] **Step 2: Run every command in it that can be run without the owner's
       domain** — the server, the flags, the refusals, `brain logs`, `doctor` —
       and correct the document to match what actually happened, not what it
       should have done. The tunnel runbook was written this way and it is why
       backlog item 9 was found.
-- [ ] **Step 3: `bin/brain lint`, then the whole suite**
-- [ ] **Step 4: Commit** — `docs: the brain on the internet, and what is still unverified`
+- [x] **Step 3: `bin/brain lint`, then the whole suite**
+- [x] **Step 4: Commit** — `docs: the brain on the internet, and what is still unverified`
 
 ---
 
-## Self-review — to answer when the plan is done
+## Self-review — answered 2026-07-31
 
-Answer from a run, not from reading the code.
+Every answer below is from a run, not from reading the code. The rig was a real
+`brain serve --oauth` process on 127.0.0.1, driven with `curl`, under a
+throwaway `HOME` and `XDG_STATE_HOME` so nothing touched this machine's own
+keystore or log.
+
+1. **Does the bearer path still work exactly as it did?** Yes, both ways. With
+   `--oauth` off the `WWW-Authenticate` value is byte-for-byte
+   `Bearer realm="brain"` and the well-known paths 401 like anything else
+   (`WithoutOAuthTests`). With it on, the operator token answered `ping` with
+   `{"jsonrpc": "2.0", "id": 1, "result": {}}` over a real socket. It is tried
+   FIRST and never falls through to the token store — asserted by a test that
+   checks the store is still empty afterwards.
+2. **Can an unauthenticated caller make this server fetch a URL of their
+   choosing?** Not usefully, and each stop has its own test. `http://` →
+   refused before any DNS. No path component → refused before any DNS. A
+   private, loopback, link-local, reserved or IPv4-mapped-loopback address →
+   refused before any connection, with `net.connected_to == []` asserted so a
+   refusal that had already connected would fail. A host answering with one
+   public and one private address → the whole fetch refused, because choosing
+   the good one means the check passed on an address the connection might not
+   use. DNS rebinding → the connection is pinned to the checked address by
+   `_PinnedHTTPSConnection`, keeping the hostname only for SNI. A redirect →
+   never followed. A 10 GB body → capped at 64 KB, read with an explicit `amt`,
+   and refused rather than truncated. Live check: `client_id=https://169.254.169.254/c.json`
+   came back `400` and the log recorded `oauth_client_refused reason=blocked_address`.
+3. **Is there any string in the event log that a caller supplied?** No. Drove
+   real traffic through it including a `brain_search` for a distinctive word,
+   then grepped the file for seven things that must not be there — the query,
+   the operator token, the access token, `169.254`, the wrong consent guess, the
+   redirect host, and the client name. All seven absent. The property is
+   structural: `record` refuses any string outside its vocabularies.
+4. **Does a token issued for one resource work against another?** No. Two
+   `AuthServer`s over ONE database, differing only in `--public-url`: the first
+   validates the token, the second returns None. Tested twice — once at the unit
+   level and once at the end of the full handshake.
+5. **What happens when the operator token is rotated?** Existing OAuth grants
+   SURVIVE — they were consented to, not derived from it — and no new consent is
+   possible with the old value, because `consent` compares against
+   `self.server.token` at request time. That is the intended answer, and it is
+   now stated in the runbook's residual-risks section along with how to revoke
+   the grants that survived.
+6. **Did any new MCP tool appear?** No. Still the same five names. Everything
+   here is transport: `mcp.py`'s only change is an optional `log` parameter,
+   which stdio does not pass.
+7. **Full suite.** 585 before this plan, **860** after, all green. Every number
+   is traceable, and they add up exactly: Task 1 +30 (`test_eventlog.py`),
+   Task 2 +15 (in `test_serve.py`), Tasks 3-7 and 9 +223 (`test_oauth.py`,
+   which is now the largest file here), Task 8 +7 (also `test_eventlog.py`,
+   which ends at 37). 585 + 30 + 15 + 223 + 7 = 860. Task 10 added no tests —
+   it is documentation, and the two claims in it that could be tested (the
+   flags appear in `serve --help`, the vocabulary covers what serve emits)
+   were written as tests in Tasks 2 and 3 instead.
+8. **Would this survive the owner deploying it wrong?** The three failure modes
+   each produce something to read rather than silence. A quick tunnel instead of
+   a named one: tokens stop validating on the audience check and the log says
+   `oauth_token_rejected`; the runbook names it as the first thing to check. A
+   route forwarding only `/mcp`: the log shows one `request` and nothing else,
+   which is the exact symptom the runbook documents by name. A `--public-url`
+   that disagrees with the hostname: refused at startup for the shapes that can
+   be judged locally (plain http, trailing slash, query, fragment, no host), and
+   for the rest it is one `invalid_grant` line in the log with the runbook entry
+   pointing at it.
+
+### The questions the plan asked, for reference
 
 1. **Does the bearer path still work exactly as it did?** With `--oauth` off and
    with it on. This is the regression that matters most.
