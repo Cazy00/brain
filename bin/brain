@@ -40,6 +40,12 @@ Commands:
                                    nothing else, for an agent allowed to
                                    contribute but not to read (`serve --help`)
   brain doctor                     health report (hooks, backup, lint, tools)
+  brain logs [--errors] [--since YYYY-MM-DD] [--limit N] [--json] [--path]
+                                   what `brain serve` recorded: failed
+                                   authentication, refused requests, tool
+                                   errors, the OAuth handshake. Machine-local,
+                                   outside the repo, and it holds NO query text
+                                   and no note content by construction
   brain stats [--json] [--record]  is the KNOWLEDGE still healthy: findability,
                                    capture rate, staleness, curation, link graph
   brain retire [--dry-run] [--explain]   retire this brain and start clean.
@@ -5182,6 +5188,67 @@ def cmd_stats(argv: list) -> int:
     return 0
 
 
+def cmd_logs(argv: list) -> int:
+    """What the server recorded — handoff question 8, answered as a subcommand.
+
+    A file the operator has to know the path of is a file nobody reads, and
+    folding this into `doctor` would bury a 200-line tail inside a health
+    report. So it is its own verb, and `doctor` gets a COUNT plus a pointer
+    here (Task 8) rather than the contents.
+
+    Nothing in this command can print a note or a query: the log physically
+    cannot hold one. See bin/brainlib/eventlog.py for why that is a property
+    of the writer rather than a promise made here.
+    """
+    import json
+    from brainlib import eventlog
+    from brainlib import osbackend as _os
+
+    where = _os.state_dir(ROOT) / eventlog.FILENAME
+    if "--path" in argv:
+        print(where)
+        return 0
+
+    try:
+        limit = int(_arg_after(argv, "--limit") or 50)
+    except ValueError:
+        print("--limit needs a number", file=sys.stderr)
+        return 2
+    since = _arg_after(argv, "--since")
+    log = eventlog.EventLog(where)
+    entries = log.read(limit=limit, since=since, errors_only="--errors" in argv)
+
+    if "--json" in argv:
+        for entry in entries:
+            print(json.dumps(entry, sort_keys=False))
+        return 0
+
+    if not entries:
+        # Say which of the two "nothings" this is. "No output" reads as a
+        # broken command; "nothing has failed" is a health report.
+        scope = "errors" if "--errors" in argv else "events"
+        print(f"\nbrain logs — no {scope} recorded"
+              + (f" since {since}" if since else "") + ".\n")
+        print(f"  {where}")
+        print("  Written by `brain serve`. A brain that has never served has "
+              "nothing here.\n")
+        return 0
+
+    print(f"\nbrain logs — {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+          + (", errors only" if "--errors" in argv else "") + "\n")
+    for entry in entries:
+        print(eventlog.render(entry))
+    print(f"\n  {where}\n")
+    return 0
+
+
+def _arg_after(argv: list, name: str) -> str:
+    if name not in argv:
+        return ""
+    index = argv.index(name)
+    return argv[index + 1] if index + 1 < len(argv) else ""
+
+
 def cmd_doctor_notify() -> int:
     run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "doctor"],
                          capture_output=True, text=True, cwd=ROOT)
@@ -5493,6 +5560,8 @@ def main() -> int:
         return cmd_doctor()
     if cmd == "stats":
         return cmd_stats(rest)
+    if cmd == "logs":
+        return cmd_logs(rest)
     if cmd == "plugin":
         return cmd_plugin(rest)
     if cmd == "doctor-notify":

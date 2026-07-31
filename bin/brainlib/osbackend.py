@@ -691,6 +691,59 @@ def keystore() -> Keystore:
     return keystore_for(os_family())
 
 
+def state_dir(root, env=None, home=None) -> Path:
+    """Where THIS brain keeps machine-local state: `~/.local/state/brain/<name>`.
+
+    Two properties, and both are the point rather than the convention:
+
+    **Outside the repository.** The event log and the issued-token database go
+    here, and the rule they have to satisfy is "never reaches git". A
+    .gitignore line satisfies it only for as long as somebody maintains the
+    pattern file and nobody runs `git add -f`; a path that is not inside the
+    working tree satisfies it by geography. The secret gate stays as the
+    backstop it was, rather than becoming the last line of defence.
+
+    **Per brain, not per machine.** The business partition found two `brain
+    serve` endpoints on one host sharing ONE keystore entry, so the read-only
+    brain's token also opened the drop box — a real finding, from a real
+    deployment, and the direct ancestor of this function. State keyed by the
+    brain it belongs to cannot repeat it. The directory name carries a readable
+    stem AND a digest of the resolved path: the stem so an operator can tell at
+    a glance whose it is, the digest so two brains that are both called
+    `brain` do not collide.
+
+    `env` and `home` are parameters so tests never touch the real one. Created
+    0700 at creation time rather than chmod-ed afterwards, for the same reason
+    FileKeystore opens with the mode already set: the window between the two is
+    exactly when a backup job runs.
+    """
+    import hashlib
+    import re
+
+    env = os.environ if env is None else env
+    root = Path(root).resolve()
+    base = env.get("XDG_STATE_HOME")
+    base = Path(base) if base else Path(home or Path.home()) / ".local" / "state"
+
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+    # The stem is for a human reading `ls`; the digest is what makes it unique.
+    # Sanitised, because a directory name is not the place to find out that a
+    # path component contained something the filesystem dislikes.
+    stem = re.sub(r"[^a-z0-9-]+", "-", root.name.lower()).strip("-") or "brain"
+    where = base / "brain" / f"{stem}-{digest}"
+    try:
+        where.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(where), 0o700)
+        marker = where / "root"
+        if not marker.exists():
+            marker.write_text(str(root) + "\n", encoding="utf-8")
+    except OSError:
+        # Same fail-soft contract as everything else in this module: a machine
+        # that cannot create it still runs everything that does not need it.
+        pass
+    return where
+
+
 # A marker file dropped beside a COPY so a later run can tell its own copy from
 # a directory somebody else created. Without it, the copy path has no safe way
 # to refuse, and "overwrite whatever is there" is how you delete a stranger's
