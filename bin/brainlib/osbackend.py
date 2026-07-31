@@ -410,6 +410,47 @@ def scheduler() -> Scheduler:
     return scheduler_for(os_family())
 
 
+def path_shim(env=None, home=None):
+    """Where a `brain` command would live, or None if there is nowhere good.
+
+    The toolbelt ships as `bin/brain` inside the repo and nothing puts it on
+    PATH — which is correct (this project installs nothing globally without
+    being asked) right up until the setup summary says "Next: brain connect"
+    and the shell answers `command not found`. That happened on a real first
+    install on 2026-07-31 and it is the first instruction a new user follows.
+
+    So: a shim is OFFERED, never created, and only where it would actually
+    work. `~/.local/bin` has to already be on PATH — a symlink into a
+    directory the shell does not search is a second way to say the same wrong
+    thing. Windows gets None: a symlink there needs Developer Mode or admin,
+    and `brain.cmd` already exists for that platform.
+    """
+    if os_family() == "windows":
+        return None
+    env = os.environ if env is None else env
+    home = Path(home) if home else Path.home()
+    where = home / ".local" / "bin"
+    entries = (env.get("PATH") or "").split(os.pathsep)
+    return where if str(where) in entries else None
+
+
+def shim_owner(shim) -> Path:
+    """What brain a `brain` shim resolves into, or None.
+
+    Used to decide OWNERSHIP before removing one, the same way the global
+    skill link is checked: a shim pointing at somebody else's brain is
+    reported and left exactly where it is.
+    """
+    if shim is None:
+        return None
+    try:
+        if not shim.is_symlink():
+            return None
+        return shim.resolve()
+    except OSError:
+        return None
+
+
 def linger_state(user: str = None, runner=None) -> str:
     """'on' | 'off' | 'unknown' | 'n/a' — does this user's systemd survive logout?
 

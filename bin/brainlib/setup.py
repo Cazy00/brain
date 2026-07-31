@@ -426,9 +426,21 @@ def run_setup(argv: list, home=None, cwd=None, source=None) -> int:
         # because verify ran and passed: doctor calls a remote-less brain RED,
         # so this line is unreachable unless there really is a remote.
         say(f"\n  Your brain is at {dest}. It works and it is backed up.")
-        say("\n  Next: let your agents reach it —  brain connect")
+        # The exact command, not the name of it. This line used to read
+        # "Next: … brain connect", and on a real first install the shell
+        # answered `command not found` — nothing here puts the toolbelt on
+        # PATH, deliberately, so the first instruction anybody follows has to
+        # be one that works from where they are standing.
+        say("\n  Next: let your agents reach it —")
+        say(f"    cd {dest} && bin/brain connect")
+        shim = osbackend.path_shim()
+        if shim is not None:
+            # Offered, never created. Only where PATH already includes it, so
+            # this cannot become a second way of saying the same wrong thing.
+            say(f"\n  Prefer typing `brain` from anywhere? One symlink, yours to remove:")
+            say(f"    ln -s {dest}/bin/brain {shim}/brain")
         say("\n  Only using this on this computer? That is everything.")
         say("  Reaching it from other devices is a separate, optional step: "
-            "brain serve --help")
+            f"cd {dest} && bin/brain serve --help")
 
     return 0 if overall_status(results) == "ok" else 1

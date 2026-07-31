@@ -841,3 +841,58 @@ class TestLaunchdServicePlist(unittest.TestCase):
     def test_unavailable_never_raises(self):
         self.backend.available = lambda: False
         self.assertIn("no service manager", self.backend.install(["x"]))
+
+
+class TestPathShim(unittest.TestCase):
+    """`bin/brain` is not on PATH, deliberately — this project installs nothing
+    globally without being asked. The defect was that setup's summary said
+    "Next: brain connect" anyway, and on a real first install the shell
+    answered `command not found`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        (self.home / ".local" / "bin").mkdir(parents=True)
+
+    def test_offered_when_the_directory_is_already_on_path(self):
+        env = {"PATH": f"/usr/bin:{self.home}/.local/bin"}
+        self.assertEqual(osbackend.path_shim(env=env, home=self.home),
+                         self.home / ".local" / "bin")
+
+    def test_not_offered_when_it_is_not_on_path(self):
+        """A symlink into a directory the shell does not search is a second way
+        of saying the same wrong thing."""
+        self.assertIsNone(osbackend.path_shim(env={"PATH": "/usr/bin"},
+                                              home=self.home))
+
+    def test_not_offered_on_windows(self):
+        """A symlink there needs Developer Mode or admin, and brain.cmd already
+        exists for that platform."""
+        env = {"PATH": f"{self.home}/.local/bin"}
+        with mock.patch.object(osbackend, "os_family", lambda: "windows"):
+            self.assertIsNone(osbackend.path_shim(env=env, home=self.home))
+
+    def test_ownership_is_resolvable(self):
+        brain = self.home / "mybrain"
+        (brain / "bin").mkdir(parents=True)
+        (brain / "bin" / "brain").write_text("#!/usr/bin/env python3\n")
+        shim = self.home / ".local" / "bin" / "brain"
+        shim.symlink_to(brain / "bin" / "brain")
+        self.assertEqual(osbackend.shim_owner(shim), (brain / "bin" / "brain").resolve())
+
+    def test_a_plain_file_has_no_owner(self):
+        """Something that is not a symlink was not put there by this project,
+        and must never be removed by it."""
+        shim = self.home / ".local" / "bin" / "brain"
+        shim.write_text("#!/bin/sh\necho not ours\n")
+        self.assertIsNone(osbackend.shim_owner(shim))
+
+    def test_a_missing_shim_has_no_owner(self):
+        self.assertIsNone(osbackend.shim_owner(self.home / ".local" / "bin" / "brain"))
+        self.assertIsNone(osbackend.shim_owner(None))
+
+    def test_a_dangling_symlink_does_not_raise(self):
+        shim = self.home / ".local" / "bin" / "brain"
+        shim.symlink_to(self.home / "gone" / "bin" / "brain")
+        osbackend.shim_owner(shim)      # must not raise

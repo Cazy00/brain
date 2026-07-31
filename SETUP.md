@@ -197,6 +197,32 @@ gh repo edit <you>/my-brain --visibility private --accept-visibility-change-cons
 
 ---
 
+### The toolbelt is `bin/brain`, not `brain`
+
+Every command in this guide is written `bin/brain …`, run from inside your
+brain. That is not a typo and there is no installer step you missed: **nothing
+here puts anything on your PATH**, because this project installs nothing
+globally without being asked.
+
+If you would rather type `brain` from anywhere, that is one symlink and it is
+yours to remove:
+
+```sh
+ln -s ~/brain/bin/brain ~/.local/bin/brain     # if ~/.local/bin is on your PATH
+```
+
+`brain setup` offers you that exact line when — and only when — `~/.local/bin`
+is already on your PATH.
+
+**Point it at the brain you actually use.** With two brains on one machine (a
+template and a real one, which is the normal case here) a `brain` on PATH
+resolving into the wrong one means every command typed without a path — `brain
+capture` included — writes to the wrong notes. `bin/brain doctor` reports it
+when it does, and `bin/brain retire` removes a shim that points into the brain
+being retired while leaving anyone else's alone.
+
+---
+
 ## Part 2 — `brain connect`
 
 Two things have to be true for an agent to use your brain: it must be able to

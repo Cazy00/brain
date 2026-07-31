@@ -4710,6 +4710,29 @@ def reset_dewire() -> tuple:
     elif link.exists():
         preserved.append(f"{link} exists and is not a symlink — left alone")
 
+    # A `brain` on PATH, if setup's optional symlink was taken up. Same
+    # ownership check as the skill link above and for the same reason: one
+    # pointing at a DIFFERENT brain is somebody else's command, and removing it
+    # would break a brain this retire has nothing to do with. Left behind, it
+    # would be worse than useless — a `brain` command resolving into a
+    # directory that has just been moved aside.
+    shim = osbackend.path_shim()
+    shim = (shim / "brain") if shim is not None else None
+    owner = osbackend.shim_owner(shim)
+    if owner is not None:
+        here = ROOT.resolve()
+        if owner == here or here in owner.parents:
+            try:
+                shim.unlink()
+                done.append(f"removed {shim} from your PATH")
+            except OSError as exc:
+                preserved.append(f"{shim} could not be removed — {exc}")
+        else:
+            preserved.append(f"{shim} — points at {owner}, NOT this clone. Left "
+                             "alone: it belongs to another brain.")
+    elif shim is not None and shim.exists():
+        preserved.append(f"{shim} exists and is not a symlink — left alone")
+
     # The routing block, now that `connect --apply` writes it between markers.
     # A block left behind points every future session at a directory that is no
     # longer there — which is exactly the state every machine that ever ran the
@@ -5295,6 +5318,22 @@ def doctor_supervision(ok: bool) -> bool:
     far longer than this one.
     """
     import os
+
+    # A `brain` on PATH that resolves into a DIFFERENT brain is the same hazard
+    # `connect` already reports for the MCP registration, and a worse one: every
+    # command typed without a path — capture included — silently operates on
+    # somebody else's notes. Two brains on one machine is the normal case here
+    # (a template and a real one), so this is not hypothetical.
+    shim = osbackend.path_shim()
+    shim = (shim / "brain") if shim is not None else None
+    owner = osbackend.shim_owner(shim)
+    if owner is not None:
+        here = ROOT.resolve()
+        if owner == here or here in owner.parents:
+            print(f"  [ok ] `brain` on your PATH points at this brain")
+        else:
+            print(f"  [-- ] `brain` on your PATH points at {owner}, not {ROOT} — "
+                  "every\n        command you type without a path acts on THAT brain")
 
     linger = osbackend.linger_state()
     scheduled = any(osbackend.scheduler().status(name) == "installed"
