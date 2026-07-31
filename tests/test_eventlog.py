@@ -303,3 +303,85 @@ class LogsCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DoctorSurfacesTheLogTests(unittest.TestCase):
+    """`doctor` is what the nightly schedule already runs and what already
+    notifies on a non-zero exit. Putting the error count there is how it
+    reaches the operator with no new mechanism to build or remember."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+        self.env = dict(os.environ, XDG_STATE_HOME=str(self.state))
+
+    def run_doctor(self):
+        import subprocess
+        return subprocess.run([sys.executable, str(ROOT / "bin" / "brain"), "doctor"],
+                              capture_output=True, text=True, cwd=str(ROOT),
+                              env=self.env)
+
+    def log(self):
+        where = osbackend.state_dir(ROOT, env=self.env)
+        return eventlog.EventLog(where / eventlog.FILENAME, clock=FakeClock())
+
+    def test_a_quiet_log_is_reported_as_quiet(self):
+        done = self.run_doctor()
+        self.assertIn("serve", done.stdout.lower())
+
+    def test_recent_errors_are_counted_and_pointed_at(self):
+        log = self.log()
+        for _ in range(3):
+            log.record("auth_failed", reason="bad_token")
+        done = self.run_doctor()
+        self.assertIn("3", done.stdout)
+        self.assertIn("brain logs --errors", done.stdout)
+
+    def test_the_knowledge_health_summary_appears(self):
+        done = self.run_doctor()
+        self.assertIn("knowledge", done.stdout.lower())
+
+    def test_doctor_never_prints_a_log_entry_verbatim(self):
+        """It reports a COUNT and a command. A doctor report that tailed the
+        log would put whatever the log holds into a nightly notification."""
+        log = self.log()
+        log.record("tool_call", tool="brain_search", outcome="error")
+        done = self.run_doctor()
+        self.assertNotIn("brain_search", done.stdout)
+
+
+class RetireCleansUpTests(unittest.TestCase):
+    """Handoff question 4, second half: a token store that survives `retire` is
+    a credential outliving the brain it authorised."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+        self.env = {"XDG_STATE_HOME": str(self.state)}
+
+    def test_the_plan_names_the_state_directory(self):
+        import importlib.util
+        spec = importlib.util.spec_from_loader("brainmod", loader=None)
+        module = importlib.util.module_from_spec(spec)
+        source = (ROOT / "bin" / "brain").read_text(encoding="utf-8")
+        self.assertIn("state_dir", source,
+                      "retire must know the state directory exists")
+
+    def test_forget_removes_the_directory_and_says_what_it_revoked(self):
+        from brainlib import oauth
+        where = osbackend.state_dir(ROOT, env=self.env)
+        eventlog.EventLog(where / eventlog.FILENAME).record("request", status=200)
+        store = oauth.Store(where / "oauth.db")
+        grant = store.create_grant("a-client", "https://x/mcp", "brain:read")
+        store.create_token("tok", grant, "access", 9e9)
+        removed, tokens = osbackend.forget_state(ROOT, env=self.env)
+        self.assertTrue(removed)
+        self.assertEqual(tokens, 1)
+        self.assertFalse(where.exists())
+
+    def test_forgetting_a_brain_that_never_served_is_not_an_error(self):
+        removed, tokens = osbackend.forget_state(
+            Path(self.tmp.name) / "never-served", env=self.env)
+        self.assertEqual(tokens, 0)

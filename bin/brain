@@ -72,7 +72,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -4797,6 +4797,11 @@ def retire_plan(remote_url: str, retired: Path, bundle: Path) -> tuple:
         f"({osbackend.scheduler().kind}), the /brain skill link is removed, the "
         "MCP registration is removed, and the routing block is taken back out "
         "of your agents' instruction files.",
+        "every credential `brain serve` issued is DESTROYED, along with its "
+        "event log. Any hosted assistant connected to this brain stops working "
+        "immediately and has to be connected again to the new one — which is "
+        "the point: a token store that outlives the brain it authorised is a "
+        "live credential nobody is watching any more.",
     ]
     kept = [
         f"your remote. Every note and every commit stays at "
@@ -4933,6 +4938,13 @@ def cmd_retire(argv: list, alias: bool = False) -> int:
         print("The de-wiring above already happened; re-run `bin/brain init` to undo it.")
         return 1
     print(f"  [done] {ROOT} → {retired}")
+
+    # AFTER the move, so a run that aborted anywhere above leaves the issued
+    # credentials with the brain they belong to rather than half-destroyed.
+    forgotten, live = osbackend.forget_state(ROOT)
+    if forgotten:
+        print(f"  [done] issued credentials and event log destroyed"
+              + (f" — {live} connected client(s) stopped working" if live else ""))
 
     # Only what this run found and deliberately left alone — a foreign skill
     # link, an MCP entry pointing elsewhere, a hand-written routing block. The
@@ -5263,6 +5275,82 @@ def cmd_doctor_notify() -> int:
     return run.returncode
 
 
+DOCTOR_ERROR_WINDOW_DAYS = 7
+# Above this many recorded failures in the window, doctor goes RED. Chosen so a
+# stale client retrying a rotated token is noticed but a handful of one-off
+# refusals is not — a health check that cries wolf is one people stop reading.
+DOCTOR_ERROR_THRESHOLD = 10
+
+
+def doctor_serving(ok: bool) -> bool:
+    """What `brain serve` recorded, as a COUNT and a pointer.
+
+    Never the entries themselves. `doctor` is what the nightly schedule runs
+    and what fires a notification on a non-zero exit, so anything printed here
+    ends up in places the operator did not choose — and the log, though it
+    holds no note content by construction, is still not something to scatter.
+    The number brings them here; `brain logs --errors` shows them the rest.
+
+    This is also the whole reason the error count lives in doctor rather than
+    in a command of its own: a health signal nobody has a habit of running is
+    not a health signal.
+    """
+    from brainlib import eventlog
+    from brainlib import osbackend as _os
+
+    where = _os.state_dir(ROOT) / eventlog.FILENAME
+    since = (date.today() - timedelta(days=DOCTOR_ERROR_WINDOW_DAYS)).isoformat()
+    log = eventlog.EventLog(where)
+    errors = log.read(limit=0, since=since, errors_only=True)
+    if not where.exists() and not Path(str(where) + ".1").exists():
+        print("  [-- ] brain serve has recorded nothing on this machine "
+              "(it has not been run, or not since this was added)")
+        return ok
+    if not errors:
+        print(f"  [ok ] brain serve recorded no failures in "
+              f"{DOCTOR_ERROR_WINDOW_DAYS} days")
+        return ok
+    level = "RED" if len(errors) > DOCTOR_ERROR_THRESHOLD else "-- "
+    print(f"  [{level}] brain serve recorded {len(errors)} failure(s) in "
+          f"{DOCTOR_ERROR_WINDOW_DAYS} days — read them: brain logs --errors")
+    return ok and level != "RED"
+
+
+def doctor_knowledge(ok: bool) -> bool:
+    """Is the KNOWLEDGE still healthy, not just the machinery.
+
+    Everything here already existed in `brain stats`; what did not exist was
+    anybody looking at it on a server. So this is a summary and a pointer, on
+    the one command that already runs nightly — the gap the handoff asked about
+    was never that these signals were missing.
+    """
+    try:
+        snap = stats_snapshot()
+    except Exception as exc:
+        print(f"  [-- ] could not measure knowledge health: {exc!r}")
+        return ok
+    total = snap["total_current"]
+    if not total:
+        return ok
+    find = snap["findability"]
+    unfindable = len(find["unfindable"])
+    overdue = len(snap["freshness"]["overdue"])
+    if unfindable or overdue:
+        # RED on the same conditions `stats` already treats as RED, rather than
+        # on a second opinion invented here. Two health checks that disagree
+        # about what is wrong are two health checks nobody trusts.
+        ok = False
+        print(f"  [RED] knowledge: {unfindable} note(s) not findable by their own "
+              f"title, {overdue} past their review date — brain stats")
+    else:
+        print(f"  [ok ] knowledge: {total} current note(s), all findable, "
+              "none overdue for review")
+    if snap["capture"]["added_30d"] == 0:
+        print("  [-- ] knowledge: nothing captured in 30 days — a brain stops "
+              "being written to long before anyone notices")
+    return ok
+
+
 def cmd_doctor() -> int:
     print("brain doctor\n")
     ok = True
@@ -5330,6 +5418,9 @@ def cmd_doctor() -> int:
         ok = False
     else:
         print("  [ok ] knowledge/ fully committed")
+
+    ok = doctor_serving(ok)
+    ok = doctor_knowledge(ok)
 
     import shutil
     for tool, why in (("gitleaks", "second secret scanner at commit time"),

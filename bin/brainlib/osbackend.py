@@ -744,6 +744,40 @@ def state_dir(root, env=None, home=None) -> Path:
     return where
 
 
+def forget_state(root, env=None, home=None) -> tuple:
+    """Delete this brain's machine-local state. Returns (removed, live tokens).
+
+    Called by `brain retire`, and it is not tidiness. This directory holds the
+    issued-token database: every credential a hosted assistant was ever
+    consented to hold. A token store that survives the brain it authorised is a
+    credential nobody is watching any more, still valid, still able to open a
+    repository that has moved — the exact shape of a secret that turns up in an
+    incident two years later.
+
+    The count is read BEFORE the delete so `retire` can say how many live
+    grants it just ended. Saying "and 3 connected clients stopped working" is
+    the difference between an operator understanding what happened and one
+    filing a bug about their phone.
+    """
+    where = state_dir(root, env=env, home=home)
+    live = 0
+    database = where / "oauth.db"
+    if database.exists():
+        try:
+            from . import oauth
+            live = oauth.Store(database).count_tokens()
+        except Exception:
+            # A store this version cannot read is still a store to delete.
+            # Refusing to clean up because the count failed would leave the
+            # credentials behind for the sake of a number.
+            live = 0
+    try:
+        shutil.rmtree(str(where))
+        return True, live
+    except OSError:
+        return False, live
+
+
 # A marker file dropped beside a COPY so a later run can tell its own copy from
 # a directory somebody else created. Without it, the copy path has no safe way
 # to refuse, and "overwrite whatever is there" is how you delete a stranger's
