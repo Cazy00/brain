@@ -5,7 +5,12 @@ Commands:
   brain init                       wire a fresh clone into Claude Code (run once)
   brain connect [<client>|--all]   wire it into any other MCP-capable agent
   brain new <kind> "<title>" [--topics a,b] [--sensitivity normal|personal]
-  brain capture "<text>" [--commit]  quick note into knowledge/inbox/
+  brain capture "<text>" [--commit] [--atomic] [--json]
+                                   quick note into knowledge/inbox/. --atomic
+                                   removes the note if the commit fails instead
+                                   of leaving it behind (what the remote write
+                                   path asks for); --json reports the result as
+                                   one object instead of prose.
   brain lint [--staged]            validate every note; exit 1 on errors
   brain search "<query>" [--scope all] [--limit N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
@@ -355,14 +360,21 @@ def hooks_path() -> str:
     return ".githooks" if ROOT == ENGINE else str(ENGINE / ".githooks")
 
 
-def ensure_hooks() -> None:
+def ensure_hooks(quiet: bool = False) -> None:
+    """Install the commit gate, and say so — unless the caller wants JSON.
+
+    The notice is genuinely useful to a person running their first command in a
+    fresh clone. It is actively harmful ahead of `--json`: it is printed to
+    stdout, so it lands in front of the object and the caller's parse fails on
+    the very first request a freshly-mounted container serves."""
     try:
         want = hooks_path()
         if git("config", "core.hooksPath") != want:
             subprocess.run(
                 ["git", "config", "core.hooksPath", want], cwd=ROOT, check=False
             )
-            print(f"brain: installed git hooks (core.hooksPath = {want})")
+            if not quiet:
+                print(f"brain: installed git hooks (core.hooksPath = {want})")
     except Exception:
         pass
 
@@ -2009,11 +2021,63 @@ def cmd_new(argv: list) -> int:
     return 0
 
 
+def atomic_write(path: Path, body: str) -> None:
+    """Write a note so a reader never sees half of one.
+
+    Temp file on the SAME filesystem, fsync, rename. `Path.write_text` opens the
+    destination and streams into it, so a crash or a full disk mid-write leaves
+    a truncated note that lint then rejects and consolidation then has to
+    reason about. Rename is atomic within a filesystem, so the note either
+    exists complete or does not exist.
+
+    The directory is fsynced too. Without that the rename itself can be lost on
+    power failure while the file's contents are safely on disk — which produces
+    the one outcome the whole transaction exists to prevent: a commit that
+    references a note that is not there."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+        try:
+            fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            # Directory fsync is not available everywhere (and is a no-op on
+            # some filesystems). Losing the durability guarantee is acceptable;
+            # losing the note because we insisted on it is not.
+            pass
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def cmd_capture(argv: list) -> int:
     do_commit = "--commit" in argv
-    text = " ".join(a for a in argv if a != "--commit").strip()
+    # --atomic is what the REMOTE write path asks for, and it changes exactly one
+    # thing: what happens when the commit fails. The CLI default is to leave the
+    # note on disk and say so, because a person at their own keyboard can see it
+    # and the text would otherwise be gone. A remote caller still has the text,
+    # cannot see the disk, and an uncommitted note there is strictly harmful —
+    # it is invisible to backup, it dirties the tree, and a dirty tree blocks the
+    # consolidation pass that is the inbox's only drain. So remotely the note is
+    # removed and the failure is reported, which is the honest answer to "did you
+    # save it": no.
+    atomic = "--atomic" in argv
+    as_json = "--json" in argv
+    flags = {"--commit", "--atomic", "--json"}
+    text = " ".join(a for a in argv if a not in flags).strip()
     if not text:
-        print("usage: brain capture \"<text>\" [--commit]")
+        print("usage: brain capture \"<text>\" [--commit] [--atomic] [--json]")
         return 2
     today = date.today().isoformat()
     stamp = time.strftime("%H%M%S")
@@ -2024,6 +2088,22 @@ def cmd_capture(argv: list) -> int:
         path = K / "inbox" / f"{today}-{stamp}-{slug}-{n}.md"
         n += 1
     body = f"---\ncreated: {today}\nstatus: draft\n---\n\n{text}\n"
+
+    def report(status: str, detail: str = "", commit_id: str = "") -> None:
+        if not as_json:
+            return
+        rel = ""
+        if status in ("committed", "written"):
+            # Only name a note that actually exists. A failed or rolled-back
+            # capture has no path to report, and reporting one invites a caller
+            # to tell its user the note was saved under a name nothing is at.
+            try:
+                rel = str(path.relative_to(ROOT))
+            except ValueError:                # pragma: no cover - path is under ROOT
+                rel = path.name
+        print(_json_dumps({"status": status, "note": rel, "commit": commit_id,
+                           "provisional": True, "detail": _safe_detail(detail)}))
+
     # Scan BEFORE the write, not after. Without this the only moment an inbox
     # note ever meets scan_secrets is --commit -> pre-commit -> lint --staged,
     # so a capture without --commit (the CLI default) reached disk unexamined
@@ -2033,15 +2113,18 @@ def cmd_capture(argv: list) -> int:
     problems = []
     scan_secrets(path, problems, raw=body.encode("utf-8"))
     if problems:
-        print("REFUSED — the text looks like it contains a credential:")
-        for _p, msg in problems:
-            print(f"  - {msg}")
-        print("Nothing was written. Put the value in Keychain and capture a note that "
-              "names it instead (see .env.example).")
+        if not as_json:
+            print("REFUSED — the text looks like it contains a credential:")
+            for _p, msg in problems:
+                print(f"  - {msg}")
+            print("Nothing was written. Put the value in Keychain and capture a note that "
+                  "names it instead (see .env.example).")
+        else:
+            report("refused", "; ".join(msg for _p, msg in problems))
         return 1
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    print(path)
+    atomic_write(path, body)
+    if not as_json:
+        print(path)
     if do_commit:
         # --commit was ASKED for, so failing to commit is a failure: the note
         # exists only on this machine, unvetted and unbacked. Returning 0 here
@@ -2056,12 +2139,22 @@ def cmd_capture(argv: list) -> int:
         # the gap, and the capture would commit onto it anyway — the exact
         # outcome this test exists to prevent. consolidate takes the same lock
         # around its own branch switches, so the two can no longer interleave.
+        commit_id = ""
         with repo_lock():
             branch = git("rev-parse", "--abbrev-ref", "HEAD")
             if branch.startswith("consolidate/"):
                 # A capture committed onto the consolidation branch gets carried
                 # off to a review branch and vanishes from main's working tree.
                 # Write to disk (never lost), skip the commit, tell the truth.
+                if atomic:
+                    _unstage_and_remove(path)
+                    if not as_json:
+                        print("NOT SAVED: a consolidation pass is running, so this brain "
+                              "cannot accept a write right now. Nothing was left behind. "
+                              "Retry shortly.")
+                    else:
+                        report("retry", "consolidation in progress")
+                    return 1
                 print(f"SAVED BUT NOT COMMITTED: currently on branch {branch!r} "
                       "(a consolidation pass is running). The note is on disk at the path "
                       "above and is NOT lost — commit it from main once consolidation lands.")
@@ -2072,16 +2165,69 @@ def cmd_capture(argv: list) -> int:
                 ["git", "commit", "-m", f"capture: {slug}", "--", str(path)],
                 cwd=ROOT, capture_output=True, text=True,
             )
+            if add.returncode == 0 and commit.returncode == 0:
+                commit_id = git("rev-parse", "HEAD")[:40]
+            elif atomic:
+                # Roll back ONLY the note this call created: unstage that one
+                # path and delete that one file. Never `git reset --hard`, never
+                # `git clean` — a broad reset here would destroy whatever else
+                # the working tree happened to be holding, which on a server is
+                # somebody else's half-finished consolidation.
+                _unstage_and_remove(path)
         if add.returncode != 0 or commit.returncode != 0:
             detail = (commit.stderr.strip() or commit.stdout.strip()
                       or add.stderr.strip() or "git failed")
+            if atomic:
+                if not as_json:
+                    print(f"NOT SAVED: {detail}. The attempted note was removed, so "
+                          "nothing was half-written. Retry.")
+                else:
+                    report("failed", detail)
+                return 1
             print(f"SAVED BUT NOT COMMITTED: {detail}")
             print("The note is on disk at the path above and is NOT lost — do not "
                   "capture it again. Commit it once the problem is fixed.")
             return 1
-        print("captured and committed — push runs in background "
-              "(bin/brain doctor verifies backup)")
+        if not as_json:
+            print("captured and committed — push runs in background "
+                  "(bin/brain doctor verifies backup)")
+        else:
+            report("committed", "", commit_id)
+        return 0
+    report("written", "not committed")
     return 0
+
+
+def _safe_detail(detail: str) -> str:
+    """A failure explanation with the filesystem taken out of it.
+
+    git reports errors by absolute path, and that path is the container's
+    internal layout. The remote contract forbids an absolute path in a
+    response, and it is right to: it is not actionable from the other end of a
+    tunnel and it describes the inside of the machine holding the brain."""
+    if not detail:
+        return ""
+    cleaned = str(detail).replace(str(ROOT), "<data>").replace(str(ENGINE), "<engine>")
+    # Anything still starting at / is a path this function did not know about.
+    cleaned = re.sub(r"(?<![\w<])/[\w./-]{4,}", "<path>", cleaned)
+    return " ".join(cleaned.split())[:300]
+
+
+def _unstage_and_remove(path: Path) -> None:
+    """Undo one attempted capture and nothing else.
+
+    Scoped to a single pathspec on purpose. The tempting one-liner —
+    `git reset --hard` — would also discard every other uncommitted change in
+    the tree, and on the production VPS the tree can legitimately be holding a
+    consolidation pass's work. Silence is deliberate: this runs on a path that
+    is already reporting a failure, and a second error message about the
+    cleanup would bury the first."""
+    subprocess.run(["git", "reset", "--quiet", "HEAD", "--", str(path)],
+                   cwd=ROOT, capture_output=True, text=True)
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 INDEX_DB = state_dir() / "index.db"
@@ -5092,7 +5238,7 @@ def main() -> int:
         INDEX_DB = state_dir() / "index.db"
         argv = argv[:i] + argv[i + 2:]
     else:
-        ensure_hooks()
+        ensure_hooks(quiet="--json" in argv)
     if not argv:
         print(__doc__)
         return 2

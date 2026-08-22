@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""brain-http — the second brain as an authenticated remote MCP server.
+
+The only socket this project opens, and the tool layer behind it can WRITE to a
+git repository that pushes to a private remote. So the contract is short and
+every clause is enforced somewhere a test can reach:
+
+1. It refuses to start without a complete configuration. A refusal, not a
+   warning, and not a default — a brain that starts with half a config is a
+   brain serving somebody's notes under rules nobody chose.
+2. Every request carries a Cloudflare Access assertion, verified here on the
+   origin, on every request. See brainlib/access.py for why the tunnel is not
+   a substitute for that.
+3. The capability profile comes from the audience the assertion was minted for,
+   paired with the hostname it arrived on. Never from a parameter.
+4. It publishes no port of its own in production: it binds inside a container
+   that publishes nothing, on a network shared only with the tunnel connector.
+5. Nothing it writes anywhere can contain a query, a note, an address or a
+   credential. See brainlib/eventlog.py, which enforces that by vocabulary
+   rather than by scrubbing.
+
+No TLS here, deliberately. Cloudflare terminates TLS at the edge and the tunnel
+carries the request to this process over its own encrypted connection; adding a
+certificate here would be a second thing to rotate and no additional secrecy.
+
+Usage:
+  brain-http [--config PATH] [--check] [--bind ADDR] [--port N]
+
+  --check   validate the configuration and the data root, report, and exit.
+            This is what the container entrypoint runs before it execs the
+            server, so a misconfigured deployment fails at start rather than on
+            the first request an agent makes hours later.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from brainlib import access, capture, eventlog, httpmcp, mcpcore  # noqa: E402
+
+ENGINE = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG = "/etc/brain/brain-http.json"
+
+# Below this, refuse to accept writes rather than discover the disk is full
+# midway through a commit. Reads keep working: the spec's failure table says
+# mutation fails closed and safe reads continue.
+MIN_FREE_BYTES = 512 * 1024 * 1024
+
+REQUIRED_KEYS = ("team_domain", "owner_email", "endpoints", "principal_key_file")
+
+
+class ConfigError(Exception):
+    """The configuration is unusable. Always fatal, always explained."""
+
+
+def load_config(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except FileNotFoundError:
+        raise ConfigError("no configuration at %s" % path)
+    except ValueError as exc:
+        raise ConfigError("configuration at %s is not valid JSON: %s" % (path, exc))
+    if not isinstance(config, dict):
+        raise ConfigError("configuration must be a JSON object")
+    missing = [key for key in REQUIRED_KEYS if not config.get(key)]
+    if missing:
+        raise ConfigError("configuration is missing: %s" % ", ".join(missing))
+
+    endpoints = config["endpoints"]
+    if not isinstance(endpoints, list) or not endpoints:
+        raise ConfigError("configuration needs at least one endpoint")
+    seen_hosts, seen_auds = set(), set()
+    for entry in endpoints:
+        if not isinstance(entry, dict):
+            raise ConfigError("each endpoint must be an object")
+        for field in ("hostname", "aud", "profile"):
+            if not entry.get(field):
+                raise ConfigError("endpoint is missing %s" % field)
+        if entry["profile"] not in mcpcore.PROFILES:
+            raise ConfigError("unknown profile %r — expected one of %s"
+                              % (entry["profile"], sorted(mcpcore.PROFILES)))
+        host = str(entry["hostname"]).strip().lower()
+        if host in seen_hosts:
+            raise ConfigError("hostname %s is configured twice" % host)
+        if entry["aud"] in seen_auds:
+            # Two endpoints sharing an audience is the one misconfiguration
+            # that silently destroys the read/write boundary: an assertion
+            # minted for the read-only application would authorize a capture.
+            # It is refused here rather than being merely unlikely.
+            raise ConfigError("two endpoints share an audience — the read/capture "
+                              "boundary IS the audience, so they must differ")
+        seen_hosts.add(host)
+        seen_auds.add(entry["aud"])
+
+    for name, profile in dict(config.get("service_principals") or {}).items():
+        if profile not in mcpcore.PROFILES:
+            raise ConfigError("service principal %r has unknown profile %r"
+                              % (name, profile))
+    return config
+
+
+def read_secret(path: str) -> bytes:
+    """Load a secret from a file, and complain if the file is world-readable.
+
+    The mode check is advisory on purpose — refusing to start over a permission
+    bit would strand a brain that is otherwise perfectly safe on a
+    single-tenant box — but it is loud, because 0644 on a mounted secret is
+    exactly the kind of thing that is invisible until it matters."""
+    try:
+        raw = Path(path).read_bytes().strip()
+    except OSError as exc:
+        raise ConfigError("cannot read the secret at %s: %s" % (path, exc.strerror))
+    if not raw:
+        raise ConfigError("the secret at %s is empty" % path)
+    if len(raw) < 32:
+        raise ConfigError("the secret at %s is shorter than 32 bytes — generate one "
+                          "with: head -c 48 /dev/urandom | base64" % path)
+    try:
+        mode = os.stat(path).st_mode & 0o077
+        if mode:
+            sys.stderr.write("brain-http: WARNING %s is readable by others (mode %o)\n"
+                             % (path, os.stat(path).st_mode & 0o777))
+    except OSError:                            # pragma: no cover
+        pass
+    return raw
+
+
+def git(data_root, *args):
+    return subprocess.run(["git", *args], cwd=str(data_root), capture_output=True,
+                          text=True, timeout=30)
+
+
+def check_data_root(data_root) -> tuple:
+    """(ok, reason). Never creates anything.
+
+    The spec is explicit that a missing data volume must fail readiness and
+    must NEVER produce an empty brain over the missing mount. So every check
+    here is a question, and none of them is a repair — a `mkdir -p` on this
+    path would turn a detached volume into a brand-new empty brain that then
+    cheerfully pushes its emptiness to the private remote."""
+    root = Path(data_root)
+    if not root.is_dir():
+        return False, "data root missing"
+    if not (root / "knowledge").is_dir():
+        return False, "no knowledge directory"
+    if not (root / ".git").exists():
+        return False, "data root is not a git repository"
+    if not os.access(str(root), os.W_OK):
+        return False, "data root not writable"
+    head = git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if head.returncode != 0:
+        return False, "git unusable"
+    if head.stdout.strip().startswith("consolidate/"):
+        return False, "consolidation branch checked out"
+    return True, ""
+
+
+def free_bytes(path) -> int:
+    try:
+        stat = os.statvfs(str(path))
+        return stat.f_bavail * stat.f_frsize
+    except OSError:                            # pragma: no cover
+        return -1
+
+
+def build(config: dict, data_root, state_dir):
+    principal_key = read_secret(config["principal_key_file"])
+    endpoints = [access.Endpoint(entry["hostname"], entry["aud"], entry["profile"])
+                 for entry in config["endpoints"]]
+    verifier = access.Verifier(
+        team_domain=config["team_domain"],
+        endpoints=endpoints,
+        owner_email=config["owner_email"],
+        service_principals=config.get("service_principals") or {},
+        principal_key=principal_key,
+    )
+    log = eventlog.EventLog(state_dir)
+    queue = capture.BackupQueue(data_root, log=log,
+                                enabled=bool(config.get("git_push", True)))
+    capturer = capture.Capturer(
+        brain_bin=str(ENGINE / "bin" / "brain"), data_root=data_root,
+        ledger=capture.Ledger(state_dir, principal_key), queue=queue, log=log,
+        timeout=httpmcp.CAPTURE_TIMEOUT_SECONDS)
+
+    def readiness():
+        ok, reason = check_data_root(data_root)
+        if not ok:
+            return False, reason
+        if not os.access(str(state_dir), os.W_OK):
+            return False, "state directory not writable"
+        available = free_bytes(data_root)
+        if 0 <= available < MIN_FREE_BYTES:
+            return False, "low disk"
+        try:
+            # Proves the signing keys are reachable AND parseable. Cached, so
+            # this costs a network round-trip only when the cache has expired.
+            verifier.jwks.key_for("readiness-probe")
+        except access.AccessDenied as denied:
+            if denied.category == "keys_unavailable":
+                return False, "access keys unavailable"
+            # "unknown_key" is the expected answer for a made-up id and proves
+            # the key set was fetched and parsed, which is what we asked.
+        return True, ""
+
+    service = httpmcp.Service(
+        verifier=verifier, capturer=capturer, log=log,
+        allowed_origins=config.get("allowed_origins") or [],
+        origin_policy=config.get("origin_policy", "strict"),
+        readiness=readiness)
+    return service, queue, log
+
+
+def report_check(config_path: str, config: dict, data_root, state_dir) -> int:
+    print("brain-http configuration check")
+    print("  config           %s" % config_path)
+    print("  data root        %s" % data_root)
+    print("  state directory  %s" % state_dir)
+    ok, reason = check_data_root(data_root)
+    print("  data             %s" % ("ok" if ok else "FAILED — " + reason))
+    writable = os.access(str(state_dir), os.W_OK)
+    print("  state            %s" % ("writable" if writable else "FAILED — not writable"))
+    available = free_bytes(data_root)
+    enough = available < 0 or available >= MIN_FREE_BYTES
+    print("  disk             %s" % ("ok" if enough else "LOW — %d MiB free"
+                                     % (available // (1024 * 1024))))
+    for entry in config["endpoints"]:
+        # The audience is deployment configuration, not a secret, but it is not
+        # printed: it identifies the Access application and there is no reason
+        # for it to reach a terminal, a log file or a screenshot.
+        print("  endpoint         %s -> %s" % (entry["hostname"], entry["profile"]))
+    principals = config.get("service_principals") or {}
+    print("  service clients  %d configured" % len(principals))
+    print("  origin policy    %s" % config.get("origin_policy", "strict"))
+    print("  git push         %s" % ("on" if config.get("git_push", True) else "off"))
+    try:
+        read_secret(config["principal_key_file"])
+        print("  principal key    ok")
+    except ConfigError as exc:
+        print("  principal key    FAILED — %s" % exc)
+        return 1
+    return 0 if (ok and writable and enough) else 1
+
+
+def main(argv) -> int:
+    config_path = _flag(argv, "--config") or os.environ.get("BRAIN_HTTP_CONFIG") \
+        or DEFAULT_CONFIG
+    data_root = os.environ.get("BRAIN_DATA_ROOT") or str(ENGINE)
+    state_dir = os.environ.get("BRAIN_STATE_DIR") or str(Path(data_root) / ".cache")
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        sys.stderr.write("brain-http: %s\n" % exc)
+        return 2
+
+    if "--check" in argv:
+        try:
+            return report_check(config_path, config, data_root, state_dir)
+        except ConfigError as exc:
+            sys.stderr.write("brain-http: %s\n" % exc)
+            return 2
+
+    try:
+        service, queue, log = build(config, data_root, state_dir)
+    except (ConfigError, ValueError) as exc:
+        sys.stderr.write("brain-http: %s\n" % exc)
+        return 2
+
+    ok, reason = check_data_root(data_root)
+    if not ok:
+        # Refuse to start rather than serve an empty or half-mounted brain. A
+        # server that starts here would answer every search with "no hits",
+        # which reads to an agent exactly like "the brain does not know that".
+        sys.stderr.write("brain-http: refusing to start — %s\n" % reason)
+        return 3
+
+    host = _flag(argv, "--bind") or config.get("bind") or "127.0.0.1"
+    port = int(_flag(argv, "--port") or config.get("port") or 8787)
+    server = httpmcp.make_server(service, host, port)
+    queue.start()
+    queue.nudge()                              # push anything a crash left behind
+    log.record("server_started", endpoint=host, count=len(config["endpoints"]))
+
+    stopping = threading.Event()
+
+    def stop(_signum, _frame):
+        if stopping.is_set():
+            return
+        stopping.set()
+        log.record("server_stopping")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for name in ("SIGTERM", "SIGINT"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
+
+    sys.stderr.write("brain-http: listening on %s:%d (%d endpoint(s))\n"
+                     % (host, port, len(config["endpoints"])))
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+    return 0
+
+
+def _flag(argv, name: str) -> str:
+    if name in argv:
+        index = argv.index(name)
+        if index + 1 < len(argv):
+            return argv[index + 1]
+    for arg in argv:
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    if argv[:1] in (["--help"], ["-h"]):
+        print(__doc__)
+        sys.exit(0)
+    sys.exit(main(argv))
