@@ -3001,7 +3001,12 @@ class ConsolidatorConfigTests(unittest.TestCase):
         self.tmp = temp_dir()
         self.repo = make_sandbox(self.tmp.name)
         self.module = load_brain_module()
-        self.module.ROOT = self.repo
+        # Both roots, because the sandbox is a combined-layout brain: it holds
+        # the engine AND the knowledge. consolidator.conf lives under setup/ and
+        # so resolves from ENGINE — leave ENGINE pointing at the developer's own
+        # checkout and every case below would read the real shipped config
+        # instead of the fixture it just wrote.
+        self.module.ROOT = self.module.ENGINE = self.repo
         self.conf = self.repo / "setup" / "consolidator.conf"
 
     def tearDown(self):

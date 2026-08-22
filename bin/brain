@@ -34,6 +34,7 @@ capture).
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 import subprocess
@@ -43,8 +44,61 @@ import time
 from datetime import date
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# Three roots, not one, and the distinction only becomes visible in production.
+#
+# ENGINE is where this code, its templates, its skills and its hooks live. It is
+# always the checkout this file was run from and it is never configurable —
+# resolving executable code through an environment variable is how a config
+# change becomes arbitrary code execution.
+#
+# ROOT is where the KNOWLEDGE lives, and it is also the git repository every
+# git() call runs inside. Locally the two are the same directory and nothing
+# below can tell the difference, which is the point: the combined layout stays
+# the default and stays untouched. On the production VPS the owner's notes are a
+# separate private repository mounted at /srv/brain/data, and the public engine
+# image must be able to hold no knowledge at all.
+#
+# STATE is derived and disposable — index, locks, session digest, reports. It
+# lives inside ROOT by default because that is where .cache/ has always been;
+# split mode moves it out so the data mount can hold notes and history only.
+#
+# Environment rather than a flag, deliberately. bin/brain:main() already refuses
+# to honour --root for anything but `lint`, and the comment there says why: a
+# user searching for the literal text "--root" must not silently rebind the repo
+# and write a capture outside the brain. Argument-shaped configuration is
+# reachable from a tool call; environment is set once by whoever started the
+# process. `--root` still wins over both, because `lint --staged` depends on it.
+ENGINE = Path(__file__).resolve().parent.parent
+
+
+def _root_from_env(name: str, fallback, env=None):
+    """Resolve one configurable root, falling back to the combined layout.
+
+    A blank or whitespace-only value is treated as unset rather than as the
+    current directory: an unset variable and an empty one look identical in a
+    Docker env-file, and resolving "" would silently point the brain at the
+    process's cwd.
+    """
+    raw = (env if env is not None else os.environ).get(name, "")
+    if not raw or not raw.strip():
+        return fallback
+    return Path(raw.strip()).expanduser().resolve()
+
+
+ROOT = _root_from_env("BRAIN_DATA_ROOT", ENGINE)
 K = ROOT / "knowledge"
+_STATE_OVERRIDE = _root_from_env("BRAIN_STATE_DIR", None)
+
+
+def state_dir() -> Path:
+    """Where derived, disposable state lives: index, locks, digest, reports.
+
+    Computed rather than a module constant, for the reason digest_path() gives:
+    main() rebinds ROOT for --root and the tests rebind it to a sandbox, and a
+    constant captured at import would go on pointing at the previous brain's
+    index and, worse, at its lock — two brains sharing one lock file is not a
+    theoretical failure, it is the one this function prevents."""
+    return _STATE_OVERRIDE if _STATE_OVERRIDE is not None else ROOT / ".cache"
 
 # bin/ on sys.path is what makes brainlib importable without a package
 # install — see bin/brainlib/__init__.py. Explicit rather than relying on
@@ -252,8 +306,8 @@ class repo_lock:
     platforms fall back to no lock (best-effort), same as the index builder."""
 
     def __enter__(self):
-        (ROOT / ".cache").mkdir(exist_ok=True)
-        self._lf = open(ROOT / ".cache" / "git.lock", "w")
+        state_dir().mkdir(parents=True, exist_ok=True)
+        self._lf = open(state_dir() / "git.lock", "w")
         try:
             import fcntl
             fcntl.flock(self._lf, fcntl.LOCK_EX)
@@ -289,13 +343,26 @@ def is_local_remote(url: str) -> bool:
     return ":" not in url                 # scp-style git@host:owner/repo is remote
 
 
+def hooks_path() -> str:
+    """Where git should look for this brain's hooks.
+
+    Relative in the combined layout, which is what every existing clone already
+    has configured and what keeps a published template portable. Absolute in
+    split mode, because there the git repository is the DATA repo and it holds
+    no `.githooks/` — a relative path there silently configures a hooks
+    directory that does not exist, and the content gate stops running with no
+    error anywhere."""
+    return ".githooks" if ROOT == ENGINE else str(ENGINE / ".githooks")
+
+
 def ensure_hooks() -> None:
     try:
-        if git("config", "core.hooksPath") != ".githooks":
+        want = hooks_path()
+        if git("config", "core.hooksPath") != want:
             subprocess.run(
-                ["git", "config", "core.hooksPath", ".githooks"], cwd=ROOT, check=False
+                ["git", "config", "core.hooksPath", want], cwd=ROOT, check=False
             )
-            print("brain: installed git hooks (core.hooksPath = .githooks)")
+            print(f"brain: installed git hooks (core.hooksPath = {want})")
     except Exception:
         pass
 
@@ -1373,7 +1440,7 @@ def lint(staged_only: bool = False) -> int:
 
 
 def render_template(kind: str, values: dict) -> str:
-    template_path = ROOT / "setup" / "templates" / f"{kind}.md"
+    template_path = ENGINE / "setup" / "templates" / f"{kind}.md"
     text = template_path.read_text(encoding="utf-8")
     for key, value in values.items():
         text = text.replace("{{" + key + "}}", value)
@@ -1409,18 +1476,18 @@ def cmd_init(argv: list) -> int:
     import json as _json
     import shutil
 
-    mcp_server = ROOT / "bin" / "brain-mcp"
-    skill_dir = ROOT / "setup" / "skills" / "brain"
+    mcp_server = ENGINE / "bin" / "brain-mcp"
+    skill_dir = ENGINE / "setup" / "skills" / "brain"
     template = skill_dir / "SKILL.md.template"
     skill = skill_dir / "SKILL.md"
     failures = []
 
     # 1. git hooks — the commit gate. Report what git actually did: claiming
     # the gate is installed when it is not is worse than saying nothing.
-    hooks = subprocess.run(["git", "config", "core.hooksPath", ".githooks"],
+    hooks = subprocess.run(["git", "config", "core.hooksPath", hooks_path()],
                            cwd=ROOT, capture_output=True, text=True)
     if hooks.returncode == 0:
-        print("  [1/5] git hooks       core.hooksPath = .githooks")
+        print(f"  [1/5] git hooks       core.hooksPath = {hooks_path()}")
     else:
         failures.append(f"could not set core.hooksPath ({hooks.stderr.strip() or 'git failed'})"
                         " — is this a git clone? the commit gate is NOT active")
@@ -1429,7 +1496,7 @@ def cmd_init(argv: list) -> int:
     # 2. .mcp.json — brain tools for Claude Code sessions started INSIDE the repo.
     # MERGE rather than overwrite: this file is gitignored now, so clobbering
     # another server's entry here would destroy it with no way to get it back.
-    mcp_file = ROOT / ".mcp.json"
+    mcp_file = ENGINE / ".mcp.json"
     try:
         config = {}
         if mcp_file.exists():
@@ -1745,7 +1812,7 @@ def routing_block() -> str:
     makes it RETRIEVE, the second makes it OFFER TO CAPTURE. Ship only the
     first and you get a brain that answers but never grows.
     """
-    path = ROOT / "setup" / "templates" / "routing-block.md"
+    path = ENGINE / "setup" / "templates" / "routing-block.md"
     if not path.exists():
         return f"(missing {path.relative_to(ROOT)})"
     return path.read_text(encoding="utf-8").replace("{{REPO}}", str(ROOT)).rstrip()
@@ -1753,7 +1820,7 @@ def routing_block() -> str:
 
 def print_client(key: str) -> None:
     client = CONNECT_CLIENTS[key]
-    server = str(ROOT / "bin" / "brain-mcp")
+    server = str(ENGINE / "bin" / "brain-mcp")
     print(f"\n=== {client['name']}  ({key}) " + "=" * max(0, 46 - len(client['name'])))
     print(f"\n1. Register the server        {client['config']}")
     if client["format"]:
@@ -2017,7 +2084,7 @@ def cmd_capture(argv: list) -> int:
     return 0
 
 
-INDEX_DB = ROOT / ".cache" / "index.db"
+INDEX_DB = state_dir() / "index.db"
 FOLDER_WEIGHTS = {"decisions": 1.2, "reference": 1.2, "topics": 1.0, "projects": 1.0,
                   "people": 1.0, "life": 1.0, "journal": 0.6, "inbox": 0.6}
 
@@ -2983,7 +3050,7 @@ _REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 def digest_path() -> Path:
     # Computed, not a module constant: main() rebinds ROOT for --root.
-    return ROOT / ".cache" / "session-digest.md"
+    return state_dir() / "session-digest.md"
 
 
 def _human_turns(path: Path, max_turn: int = 2000) -> tuple:
@@ -3156,7 +3223,7 @@ def load_consolidator() -> dict:
     one: the difference between the two invocations IS the audit boundary, and
     a boundary that repairs itself on the way past is not a boundary.
     """
-    path = ROOT / CONSOLIDATOR_CONF
+    path = ENGINE / CONSOLIDATOR_CONF
     conf, source = dict(CONSOLIDATOR_DEFAULTS), "built-in defaults"
     if path.exists():
         source = CONSOLIDATOR_CONF
@@ -3296,7 +3363,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     import tempfile
 
     timeout = runner["audit_timeout"] if timeout is None else timeout
-    prompt_path = ROOT / "setup" / "audit-prompt.md"
+    prompt_path = ENGINE / "setup" / "audit-prompt.md"
     if not prompt_path.exists():
         return "error", "missing setup/audit-prompt.md"
     diff, diff_error = staged_diff_vs_main()
@@ -3358,20 +3425,20 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     reason = body.split("—", 1)[-1].strip() if "—" in body else body
     # The findings themselves are the useful part; keep them with the branch.
     try:
-        (ROOT / ".cache").mkdir(exist_ok=True)
-        (ROOT / ".cache" / "audit-report.md").write_text(out, encoding="utf-8")
+        state_dir().mkdir(parents=True, exist_ok=True)
+        (state_dir() / "audit-report.md").write_text(out, encoding="utf-8")
     except OSError:
         pass
     return "block", (reason or "unspecified")[:300] + " (full report: .cache/audit-report.md)"
 
 
 def cmd_consolidate(argv: list) -> int:
-    prompt_path = ROOT / "setup" / "consolidate-prompt.md"
+    prompt_path = ENGINE / "setup" / "consolidate-prompt.md"
     if not prompt_path.exists():
         print("missing setup/consolidate-prompt.md")
         return 1
     inbox_items = [p for p in (K / "inbox").glob("*.md")]
-    audit_path = ROOT / "setup" / "audit-prompt.md"
+    audit_path = ENGINE / "setup" / "audit-prompt.md"
     # Resolve the runner BEFORE anything else, --dry-run included. A config that
     # would drop the audit boundary must fail here, on the ground, rather than
     # after a branch has been cut and a model has spent half an hour writing.
@@ -3720,6 +3787,20 @@ def cmd_template(argv: list) -> int:
     machine-local wiring.
     """
     import shutil
+    # Split mode publishes nothing. Everything below reasons about ONE tree —
+    # `git ls-files` for what is tracked, the identity scan for whose machine it
+    # came from, `bin/brain lint` inside the emitted copy — and in split mode
+    # that tree is the DATA repository: the owner's actual notes, with the
+    # engine's allowlist applied to a directory the allowlist was never written
+    # for. Refusing is the only safe reading. Publish from a plain clone of the
+    # engine, which is what the combined layout already is.
+    if ROOT != ENGINE:
+        print("refusing to publish: this brain is running in split mode "
+              f"(BRAIN_DATA_ROOT={ROOT}).\n"
+              "`brain template` publishes the ENGINE checkout, and here that is a "
+              f"different tree ({ENGINE}).\n"
+              "Run it from a clone with no BRAIN_DATA_ROOT set.")
+        return 1
     # --allow-identity accepts either spelling: `--allow-identity a,b` or
     # `--allow-identity=a,b`. Its value must not be mistaken for the
     # destination, so both the flag and a detached value are consumed here.
@@ -4132,8 +4213,8 @@ def schedule_serves_this_repo(name: str) -> bool:
 # rewrites is a trap for whoever edits that line next.
 
 
-PLUGIN_SKILL = ROOT / "plugins" / "brain" / "skills" / "brain" / "SKILL.md"
-SKILL_TEMPLATE = ROOT / "setup" / "skills" / "brain" / "SKILL.md.template"
+PLUGIN_SKILL = ENGINE / "plugins" / "brain" / "skills" / "brain" / "SKILL.md"
+SKILL_TEMPLATE = ENGINE / "setup" / "skills" / "brain" / "SKILL.md.template"
 # What {{REPO}} becomes in the PLUGIN copy. A plugin is installed once and used
 # against whatever brain the user configured, so there is no absolute path to
 # bake in — unlike the symlinked copy `init` renders, which belongs to exactly
@@ -4217,10 +4298,10 @@ def cmd_schedule(argv: list) -> int:
             print(f"removed schedule: {name}")
             continue
         spec = SCHEDULES[name]
-        job_argv = [sys.executable, str(ROOT / "bin" / "brain")] + spec["argv_tail"]
+        job_argv = [sys.executable, str(ENGINE / "bin" / "brain")] + spec["argv_tail"]
         outcome = backend.install(name, job_argv, spec["when"], cwd=str(ROOT),
                                   env=job_env,
-                                  log=str(ROOT / ".cache" / f"{name}-launchd.log"))
+                                  log=str(state_dir() / f"{name}-launchd.log"))
         if outcome.startswith("installed ("):
             # The backend's sentence already names exactly where it wrote the
             # job — splice the schedule name into that same sentence rather
@@ -4374,7 +4455,7 @@ def reset_dewire() -> tuple:
     if shutil.which("claude"):
         got = subprocess.run(["claude", "mcp", "get", "brain"], cwd=ROOT,
                              capture_output=True, text=True, timeout=60)
-        registered = str(ROOT / "bin" / "brain-mcp") in got.stdout
+        registered = str(ENGINE / "bin" / "brain-mcp") in got.stdout
         if registered:
             removed = subprocess.run(["claude", "mcp", "remove", "brain", "-s", "user"],
                                      cwd=ROOT, capture_output=True, text=True, timeout=60)
@@ -4758,9 +4839,9 @@ def cmd_doctor_notify() -> int:
     run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "doctor"],
                          capture_output=True, text=True, cwd=ROOT)
     report = run.stdout + run.stderr
-    (ROOT / ".cache").mkdir(exist_ok=True)
+    state_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y-%m-%d %H:%M")
-    (ROOT / ".cache" / "doctor-report.txt").write_text(f"{stamp}\n\n{report}", encoding="utf-8")
+    (state_dir() / "doctor-report.txt").write_text(f"{stamp}\n\n{report}", encoding="utf-8")
     if run.returncode != 0:
         subprocess.run(["osascript", "-e",
                         'display notification "red state — see .cache/doctor-report.txt" '
@@ -4772,7 +4853,7 @@ def cmd_doctor() -> int:
     print("brain doctor\n")
     ok = True
 
-    hooks = git("config", "core.hooksPath") == ".githooks"
+    hooks = git("config", "core.hooksPath") == hooks_path()
     if hooks:
         print("  [ok ] git hooks installed")
     else:
@@ -4910,7 +4991,7 @@ def cmd_doctor() -> int:
     if _runner_error:
         ok = False
         print(f"  [RED] consolidation runner misconfigured — {_runner_error}")
-    elif _runner["propose"][0] == "claude" and (ROOT / ".claude" / "settings.json").exists():
+    elif _runner["propose"][0] == "claude" and (ENGINE / ".claude" / "settings.json").exists():
         trusted = False
         try:
             import json as _json
@@ -4999,10 +5080,16 @@ def main() -> int:
     # capture, a write outside the brain). Gate it to the lint subcommand.
     if argv[:1] == ["lint"] and "--root" in argv:
         i = argv.index("--root")
-        global ROOT, K, INDEX_DB
+        global ROOT, K, _STATE_OVERRIDE, INDEX_DB
         ROOT = Path(argv[i + 1]).resolve()
         K = ROOT / "knowledge"
-        INDEX_DB = ROOT / ".cache" / "index.db"
+        # Clearing the override makes state follow the tree being linted, and it
+        # must beat BRAIN_STATE_DIR: the re-invocation inherits the parent's
+        # environment, so without this a split-mode `lint --staged` would point
+        # the throwaway checkout's index and lock at the LIVE state directory,
+        # and rebuild the real index from a temporary tree.
+        _STATE_OVERRIDE = None
+        INDEX_DB = state_dir() / "index.db"
         argv = argv[:i] + argv[i + 2:]
     else:
         ensure_hooks()

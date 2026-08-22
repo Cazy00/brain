@@ -10,8 +10,16 @@
 # subshell that inherits that pipe keeps it open, so the caller blocks until the
 # reindex AND the network push finish — making "asynchronous" backup fully
 # synchronous, and making every capture wait on the network.
+
+# Where the engine is. The hooks directory is inside the engine checkout, so the
+# toolbelt is one level up from this script — true in the combined layout and
+# still true in split mode, where git's top-level is the DATA repository and
+# holds no bin/. `git rev-parse --show-toplevel` would give the wrong answer
+# there; $0 cannot, because git always invokes the hook by the path it found it.
+BRAIN="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/brain"
+
 (
-  python3 bin/brain index --quiet
+  python3 "$BRAIN" index --quiet
 
   # Push ONLY to a genuine off-machine remote.
   #
