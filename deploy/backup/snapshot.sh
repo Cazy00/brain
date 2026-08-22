@@ -122,7 +122,14 @@ say "brain snapshot $STAMP"
 # credentials, the S3 secret, the git deploy key and anything under
 # /run/secrets are the second kind, and they are rotated during recovery
 # anyway — carrying them would add risk and buy nothing.
-META="$STAGE/meta"
+# The directory name IS the warning, and it is long on purpose. This holds
+# brain-http.json -- the owner address, both Access audiences, the team domain --
+# and it sits at the archive root beside knowledge/ and .git/. The restore path a
+# tired operator reaches for is `rsync -a extracted/ /srv/brain/data/`, which
+# would commit the deployment configuration into the knowledge repository and
+# push it to the private remote. A short name like "meta" relies on remembering
+# an --exclude; this one cannot be typed past without reading it.
+META="$STAGE/RESTORE-METADATA-DELETE-BEFORE-RSYNC"
 mkdir -p "$META"
 
 if [ -r "$HTTP_CONF" ]; then
@@ -157,6 +164,11 @@ BRANCH="$(git -C "$DATA_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo un
     echo
     echo "# To restore:"
     echo "#   age -d -i <offline-identity> brain-$STAMP.tar.gz.age | tar -xz -C <empty-dir>"
+    echo "#   rm -rf <empty-dir>/RESTORE-METADATA-DELETE-BEFORE-RSYNC"
+    echo "#"
+    echo "# That second line is not optional: this directory holds the deployment"
+    echo "# configuration, not knowledge, and copying it back into the data root"
+    echo "# would commit the endpoint audiences and the owner address into the brain."
     echo "# Then follow setup/runbooks/remote-brain.md procedure 5."
 } > "$META/manifest.txt"
 
@@ -181,7 +193,7 @@ exec 9>"$STATE_DIR/git.lock"
 flock -w "$LOCK_WAIT" -x 9 || die 75 "repository lock still held after ${LOCK_WAIT}s — retrying next timer"
 
 set +e
-tar --numeric-owner -C "$STAGE" -cz meta -C "$DATA_ROOT" . 2>"$STAGE/tar.err" \
+tar --numeric-owner -C "$STAGE" -cz "RESTORE-METADATA-DELETE-BEFORE-RSYNC" -C "$DATA_ROOT" . 2>"$STAGE/tar.err" \
     | age -R "$RECIPIENTS" -o "$STAGE/archive.age"
 status=("${PIPESTATUS[@]}")
 set -e

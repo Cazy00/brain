@@ -31,12 +31,19 @@ EnvironmentFile=-/etc/brain/deploy.env
 Environment=BRAIN_DATA_ROOT=/srv/brain/data
 Environment=BRAIN_STATE_DIR=/srv/brain/state
 Environment=BRAIN_BACKUP_LOCAL_DIR=/srv/brain/backups
-Environment=BRAIN_BACKUP_RECIPIENTS=/etc/brain/backup-recipients.txt
+# The age recipients file comes through LoadCredential like everything else in
+# /etc/brain, and $CREDENTIALS_DIRECTORY is where systemd puts it. Pointing this
+# at the absolute path instead was the bug: this unit runs as uid 10001 with an
+# empty CapabilityBoundingSet and a hardened filesystem view, so /etc/brain is
+# not reachable — snapshot.sh would die 69 on an unreadable recipients file and
+# the nightly backup would never run.
+Environment=BRAIN_BACKUP_RECIPIENTS=%d/backup-recipients.txt
 
 # Named exactly as the script expects to find them under
 # $CREDENTIALS_DIRECTORY. Nothing else from /etc/brain is exposed — in
 # particular not the tunnel credential and not the git deploy key.
 LoadCredential=backup.env:/etc/brain/backup.env
+LoadCredential=backup-recipients.txt:/etc/brain/backup-recipients.txt
 LoadCredential=brain-http.json:/etc/brain/brain-http.json
 
 ExecStart=/srv/brain/engine/deploy/backup/snapshot.sh

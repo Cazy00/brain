@@ -362,11 +362,11 @@ rm -f "$WORK/archive.tar.gz" "$WORK/archive.age"
 # The metadata rides one level up, out of the restored data root, so that a
 # restored tree is byte-identical to what /srv/brain/data held and can be moved
 # straight into place during a real recovery.
-if [ -d "$WORK/data/meta" ]; then
-    mv "$WORK/data/meta" "$WORK/meta"
+if [ -d "$WORK/data/RESTORE-METADATA-DELETE-BEFORE-RSYNC" ]; then
+    mv "$WORK/data/RESTORE-METADATA-DELETE-BEFORE-RSYNC" "$WORK/meta"
     ok "manifest: $(sed -n 's/^git_head: *//p' "$WORK/meta/manifest.txt")"
 else
-    bad "no meta/ in the archive — the manifest is missing"
+    bad "no RESTORE-METADATA-DELETE-BEFORE-RSYNC/ in the archive — the manifest is missing"
 fi
 [ -d "$WORK/data/.git" ] || die 70 "restored tree has no .git — this is not a brain repository"
 [ -d "$WORK/data/knowledge" ] || die 70 "restored tree has no knowledge/ — this is not a brain repository"
