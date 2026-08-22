@@ -303,15 +303,81 @@ re-login no client can explain). Dynamic client registration enabled, with
 localhost and loopback redirects on — Claude Code, `mcp-remote` and the MCP
 Inspector all use them.
 
+**10b. Render the deployment files and install the connector credential.**
+Nothing in `deploy/` is usable as shipped: three files are `.example`, and
+`compose.yaml` refuses to start without them. All three are gitignored because
+they carry the tunnel id, the audiences and the owner's address.
+
+```sh
+cd /srv/brain/engine/deploy
+sudo cp env.example .env && sudo chmod 600 .env
+sudo $EDITOR .env                       # BRAIN_VERSION and the four host paths
+sudo cp cloudflared/config.yml.example cloudflared/config.yml
+sudo $EDITOR cloudflared/config.yml     # replace <TUNNEL_ID>
+```
+
+The connector credential is the one file an agent cannot fetch for you — it is
+a credential, and retrieving it is deliberately a human action. Take it from
+**Zero Trust → Networks → Tunnels → brain → Configure**, and write it as a
+credentials file, not a token, because this tunnel is locally configured:
+
+```sh
+sudo install -o 65532 -g 65532 -m 0600 /dev/null /etc/brain/tunnel-credentials.json
+sudo $EDITOR /etc/brain/tunnel-credentials.json
+#   {"AccountTag": "...", "TunnelID": "...", "TunnelSecret": "..."}
+```
+
+`65532`, not `10001`: the `cloudflared` image is distroless and runs as its own
+nonroot uid, and a bind-mounted secret carries the host's ownership straight
+through. A file owned by the brain's uid is unreadable to the connector, and
+the error looks like a missing file rather than a permission one.
+
+**10c. DNS, and it goes LAST.** Everything before this is invisible to the
+world; this is the step that makes the hostnames reachable, so nothing that can
+fail should be left after it. Access needs its ~85 seconds *before* a record
+exists, not after.
+
+`brain.qodevia.com` is a special case: it is **already** routed, by the host
+`workhorse` tunnel, to the old service on `localhost:8787`. Repointing it is the
+cutover, and it has an order:
+
+1. Bring the new stack up and prove it on `brain-read.qodevia.com` first — a
+   brand-new hostname with nothing depending on it. Create its proxied CNAME
+   onto `<brain-tunnel-id>.cfargotunnel.com` and run the acceptance list below.
+2. Only then touch `brain.qodevia.com`. `GET` the **workhorse** tunnel's
+   ingress, remove *only* its `brain.qodevia.com` entry, and `PUT` the whole
+   remaining list back with the catch-all last. Removing it from the old tunnel
+   before repointing DNS means the hostname 502s for a few seconds rather than
+   being served by two origins at once.
+3. Convert the existing `brain` Access application from its `bypass` policy to
+   Managed OAuth plus an owner-email Allow policy. Its audience does not change,
+   so `/etc/brain/brain-http.json` needs no edit.
+4. Repoint the `brain.qodevia.com` CNAME onto the brain tunnel, proxied.
+5. Stop the old service and re-sync anything it captured in the meantime — see
+   the note in procedure 1 step 7. Two writable copies is the one failure this
+   design exists to prevent, so this step is not optional and not deferrable.
+
 **11. Bring it up.**
 
 ```sh
 cd /srv/brain/engine/deploy
-sudo docker compose --project-name brain up -d
-sudo docker compose --project-name brain ps
-curl -fsS localhost:8787/healthz     # from inside the VPS only
-sudo docker compose --project-name brain exec brain /opt/brain/bin/brain doctor
+sudo docker compose up -d
+sudo docker compose ps
+
+# There is NO host port to curl -- that is the point of the design. Reach the
+# container on its address on the egress bridge, which is the same path the
+# host-side monitoring uses.
+EG=$(sudo docker inspect -f '{{(index .NetworkSettings.Networks "brain_egress").IPAddress}}' brain-brain-1)
+curl -fsS "http://$EG:8787/healthz"      # {"status": "ok", ...}
+curl -fsS "http://$EG:8787/readyz"       # proves the live Cloudflare JWKS fetch
+
+sudo docker compose --profile maintenance run --rm maintenance doctor
 ```
+
+`readyz` is the one that matters here: it returns 200 only after the container
+has reached `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`, parsed
+the RSA keys and found the data mount, git and the locks all usable. A 200 from
+`healthz` alone only says a Python process is answering.
 
 `cloudflared` in a container binds its metrics server to `0.0.0.0` on
 20241–20245 and serves `/ready` and `/healthcheck`. Reach it from the compose
@@ -324,9 +390,16 @@ sudo cp /srv/brain/engine/deploy/systemd/*.service /etc/systemd/system/
 sudo cp /srv/brain/engine/deploy/systemd/*.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now brain-backup.timer brain-maintenance.timer \
-     brain-consolidate.timer brain-restore-drill.timer
+     brain-restore-drill.timer
 systemctl list-timers 'brain-*'
 ```
+
+There is deliberately **no consolidation timer**. The pinned runner is the
+`claude` CLI and the production image does not contain it, so a unit would have
+failed every week while looking scheduled. `deploy/systemd/README.md` has the
+three options and the reason the gap is currently visible rather than silent:
+`doctor` goes RED on an inbox over 25 items or an oldest item past 21 days, so
+consolidation is a manual step with an alarm on it.
 
 **13. Acceptance, before any client is repointed.** Every one of these, in
 order, and stop at the first failure:
