@@ -1,0 +1,472 @@
+# deploy/compose.yaml — the production brain, as three roles on one VPS.
+#
+# Run from this directory, with `deploy/.env` present:
+#
+#     docker compose build
+#     docker compose up -d
+#     docker compose --profile maintenance run --rm maintenance doctor
+#
+# Everything private lives outside this file. Hostnames appear because they are
+# already public in the design spec; the Cloudflare account id, the two Access
+# audiences, the application ids, the tunnel id, the owner's email and every
+# credential live in /etc/brain/ and in deploy/.env, neither of which is
+# tracked. Nothing here is a value that would matter if this file were pasted
+# into the public template — that is the test each line had to pass.
+name: brain
+
+# ---------------------------------------------------------------------------
+# Shared fragments
+# ---------------------------------------------------------------------------
+
+# The container-side paths from the interface contract. They are FIXED strings,
+# never ${...} substitutions, and the host-side paths in `volumes:` are the ones
+# that vary. Keeping the two sides differently named (BRAIN_HOST_DATA on the
+# host, /srv/brain/data inside) is deliberate: a single BRAIN_DATA_DIR used for
+# both is one typo away from a container that mounts the wrong tree and then
+# writes a "brain" into it, and bin/brain will happily create a knowledge/
+# skeleton wherever it is pointed.
+x-brain-env: &brain-env
+  BRAIN_DATA_ROOT: /srv/brain/data
+  BRAIN_STATE_DIR: /srv/brain/state
+  BRAIN_HTTP_CONFIG: /etc/brain/brain-http.json
+  # The third durability layer, wired. A capture is ACCEPTED once the local
+  # commit exists, but it is not BACKED UP until it reaches the private remote,
+  # and the push runs as uid 10001 inside a container with no HOME, no agent
+  # and no ssh config — so without this git offers no key and every push fails
+  # authentication. The failure is the quiet kind: captures keep succeeding and
+  # report `backup_pending` forever, which reads like a network problem.
+  #
+  # IdentitiesOnly stops ssh offering anything else it happens to find.
+  # StrictHostKeyChecking=yes with an explicit known_hosts is deliberate: `no`
+  # would accept whatever host answers, which on a push path that carries the
+  # owner's entire knowledge repository is not a trade worth making. Both files
+  # come from /etc/brain, which is mounted read-only, and ssh(1) refuses a
+  # private key that is group- or world-readable — so the key must be 0600 and
+  # owned by uid 10001 on the host.
+  #
+  # This implies the data repository's `origin` is an SSH remote. An HTTPS
+  # remote ignores every one of these settings and fails asking for a password
+  # that nothing can supply.
+  GIT_SSH_COMMAND: >-
+    ssh -i /etc/brain/git-deploy-key
+    -o IdentitiesOnly=yes
+    -o StrictHostKeyChecking=yes
+    -o UserKnownHostsFile=/etc/brain/known_hosts
+    -o BatchMode=yes
+
+# The three mounts, and there are exactly three. Data and state are writable
+# because knowledge and derived state are the only things this system may
+# change; /etc/brain is read-only because a service that can rewrite its own
+# authentication configuration has no authentication configuration.
+#
+# The ownership rule that bites everyone once: a bind mount carries the HOST's
+# uid/gid and mode straight through, and this container is uid 10001 with every
+# capability dropped, so it cannot read a root-owned 0600 file. /srv/brain/data
+# and /srv/brain/state are chown 10001:10001 on the host; brain-http.json is
+# 0600 owned by 10001, NOT by root. deploy/entrypoint.sh checks all three
+# before the server starts and dies with the reason, which is the intended way
+# to discover this — a half-started service that fails its first capture is not.
+x-brain-mounts: &brain-mounts
+  - ${BRAIN_HOST_DATA:-/srv/brain/data}:/srv/brain/data:rw
+  - ${BRAIN_HOST_STATE:-/srv/brain/state}:/srv/brain/state:rw
+  - ${BRAIN_HOST_ETC:-/etc/brain}:/etc/brain:ro
+
+# Applied to every service that can take it. `read_only` plus a capped tmpfs is
+# what makes "the image contains code and empty templates only" enforceable at
+# runtime instead of aspirational: there is nowhere to write except the two
+# mounts that hold knowledge and derived state.
+x-hardening: &hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - "no-new-privileges:true"
+
+# Size-capped, not time-capped, and that is the honest description. The spec
+# asks for 30-day runtime log retention; Docker's json-file driver cannot
+# express a time bound, so 3x10 MiB is a disk ceiling that at this service's
+# volume (allowlisted event fields, no payloads, no note bodies) holds far more
+# than thirty days. Enforcing the retention floor is the log shipper's job and
+# is recorded as such rather than pretended here.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+services:
+
+  brain:
+    # Built from the repository root because the engine — bin/, setup/,
+    # templates — is what goes in the image. The build context must exclude
+    # knowledge/ and .git/ via .dockerignore: the spec's rule is that private
+    # data cannot enter an image LAYER or a build CONTEXT, and a context is
+    # uploaded to the daemon whether or not a COPY ever references it.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    # An explicit, required tag. Production deploys a tagged release and never
+    # a moving branch, and naming the tag here means the previous release's
+    # image is still on disk under its own tag when a rollback is needed —
+    # which is the whole of the spec's "retain the previous image".
+    image: brain:${BRAIN_VERSION:?set BRAIN_VERSION in deploy/.env — production never runs an untagged build}
+
+    # Both halves stated explicitly, so that a change to the image's default
+    # ENTRYPOINT cannot silently repurpose a service. The only thing this asks
+    # of the image is that bin/ is on PATH.
+    entrypoint: ["brain-http"]
+
+    restart: unless-stopped
+    user: "10001:10001"
+    <<: *hardening
+    logging: *logging
+
+    # bin/brain-http forks bin/brain once per tool call, and bin/brain forks
+    # git, which forks its own helpers. When a call hits the read (30s) or
+    # capture (120s) timeout the child is killed, but git's grandchildren are
+    # reparented to PID 1 — and PID 1 in a container does not reap unless it is
+    # an init. Without this the pids limit below fills with zombies over weeks
+    # and the service stops being able to fork at all.
+    init: true
+
+    environment: *brain-env
+    volumes: *brain-mounts
+
+    secrets:
+      # Addressed as its own mount rather than read out of /etc/brain, even
+      # though /etc/brain is already mounted. Two reasons: the HMAC key that
+      # derives the stable principal id in the event log can then be rotated by
+      # swapping one host file and restarting, without editing brain-http.json;
+      # and `principal_key_file` keeps one stable value across hosts. Compose
+      # outside swarm bind-mounts the source file as-is — uid, gid and mode
+      # come from the host, so this file too must be readable by uid 10001.
+      - principal_key
+
+    # /tmp exists because git wants a writable TMPDIR and Python's tempfile
+    # module is used for the atomic write-then-rename in the capture
+    # transaction — though that temporary file lands on the DATA filesystem,
+    # not here, because rename(2) cannot cross a mount boundary. noexec and
+    # nosuid because nothing in this service ever executes from a temporary
+    # file; the size cap because a tmpfs with no cap is a memory limit with no
+    # cap. mode 1777 matches /tmp semantics for a process that is not root.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+
+    # Deliberately IDENTICAL to the HEALTHCHECK in deploy/Dockerfile — same
+    # URL, same timings — and restated here only because `depends_on:
+    # service_healthy` on cloudflared below cannot be read without knowing what
+    # "healthy" means. If the two ever have to diverge, delete THIS block and
+    # keep the Dockerfile's: the image has to be health-checkable when it is run
+    # without compose.
+    #
+    # It probes /healthz (liveness), not /readyz, and that is the Dockerfile's
+    # reasoning carried over rather than re-litigated: a failed readiness is
+    # almost always a wedged data mount, an unreadable config or a JWKS outage,
+    # none of which a container restart fixes, and all of which are better
+    # surfaced as an edge 502 that the spec's alerting sees than as a container
+    # that flaps and destroys the evidence. Readiness is what the maintenance
+    # profile and host-side monitoring poll; it is not a restart signal.
+    #
+    # This works on a read-only rootfs with every capability dropped because
+    # python3 is already in the image and there is no curl — a URL-fetching
+    # binary with a CVE history has no place in the container guarding the
+    # brain.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys,urllib.request as u; r=u.urlopen('http://127.0.0.1:8787/healthz',timeout=4); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    # Longer than the 120-second capture ceiling. A SIGTERM in the middle of a
+    # capture must be allowed to finish its commit and release the repository
+    # lock; killing it there is how a lock file outlives the process that held
+    # it and mutation wedges into maintenance mode on the next start.
+    stop_grace_period: 130s
+
+    networks:
+      # egress first and at the higher priority so the default route is taken
+      # from it. The mcp network is `internal: true` and therefore has no
+      # gateway to offer, but stating the priority makes the outcome a
+      # decision rather than a consequence of Docker's connection ordering.
+      egress:
+        priority: 100
+      mcp:
+        priority: 10
+        # Static, and paired with cloudflared's extra_hosts below. See the
+        # networks section for why the request path has to be pinned.
+        ipv4_address: 10.77.0.10
+
+    # Sized as a CAP, not as an allocation, on a box that is not dedicated to
+    # this: the VPS has 4 OCPU and 24 GB but already runs a host cloudflared
+    # and five dev hostnames. Steady state here is one stdlib Python process
+    # answering low-volume MCP calls; the peaks are an FTS index rebuild and a
+    # git push. 512 MiB is generous for that and small enough that a runaway
+    # search is OOM-killed — one dead container the healthcheck reports —
+    # rather than pushing the box into swap and taking the other work with it.
+    # A limit that occasionally kills is strictly better than one that never
+    # binds, because only the first kind is ever observed to be wrong.
+    #
+    # Both the top-level keys and deploy.resources.limits are honoured by
+    # `docker compose up` without swarm, and deploy is applied second and wins.
+    # Only deploy is used here so there is exactly one place to read the answer.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          # One subprocess per in-flight tool call plus git's own helpers is
+          # a handful; 256 is orders of magnitude above normal and still low
+          # enough that a fork loop dies inside its own container. Set here
+          # rather than as the top-level `pids_limit`, because Compose rejects
+          # a project that sets both to different values and having one place
+          # to read every limit is worth more than the shorter spelling.
+          pids: 256
+        reservations:
+          memory: 128M
+
+  cloudflared:
+    # Pinned to an immutable release, never :latest. Multi-arch with a
+    # linux/arm64 image, distroless (gcr.io/distroless/base-debian13:nonroot),
+    # and its ENTRYPOINT already carries --no-autoupdate — which is precisely
+    # what makes read_only safe below, since self-update is the only thing this
+    # binary ever writes to its own filesystem.
+    image: cloudflare/cloudflared:2026.8.2
+
+    # A LOCALLY configured tunnel: the ingress list is the mounted config file,
+    # not dashboard state. This is a second tunnel, dedicated to the brain, and
+    # not the host systemd connector that serves the dev hostnames. All
+    # replicas of one tunnel share one ingress list and traffic is spread
+    # across them with no affinity, so joining the existing tunnel would put
+    # the brain's two hostnames into the same configuration as five unrelated
+    # dev servers — and would remove the ability to cut the brain off the edge
+    # without cutting everything else off, which is step one of the spec's
+    # incident containment.
+    command: ["tunnel", "--config", "/etc/cloudflared/config.yml", "run"]
+
+    restart: unless-stopped
+    # The image's own nonroot uid. Stated rather than inherited, because the
+    # two files mounted below have to be readable by exactly this uid and a
+    # future base-image change that moved it would otherwise fail at runtime
+    # with a permission error nobody can trace back to here.
+    user: "65532:65532"
+    <<: *hardening
+    logging: *logging
+
+    volumes:
+      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+      - ${BRAIN_HOST_TUNNEL_CREDENTIALS:?set BRAIN_HOST_TUNNEL_CREDENTIALS in deploy/.env}:/etc/cloudflared/credentials.json:ro
+
+    # Ordering only: do not advertise an origin to the edge before that origin
+    # is answering. "Healthy" here is liveness — see brain's healthcheck above
+    # — and that is enough for a startup gate, because the image entrypoint has
+    # already refused to start at all if the config is unreadable or either
+    # bind mount is missing. Docker does not stop or restart cloudflared if
+    # brain goes unhealthy later, and that is correct: a brain that is up but
+    # not serving should surface as a 502 through the edge, where the spec's
+    # tunnel and application alerting can see it, rather than as a tunnel that
+    # has silently vanished.
+    depends_on:
+      brain:
+        condition: service_healthy
+
+    # No healthcheck, deliberately. cloudflared serves /ready on its metrics
+    # listener, but a Docker healthcheck runs INSIDE the container and this
+    # image is distroless: no shell, no curl, and cloudflared itself is not an
+    # HTTP client. Writing a healthcheck here would mean adding a binary to a
+    # distroless image, which costs more than it buys. Readiness is scraped
+    # instead from the HOST, at this container's address on the egress bridge,
+    # port 20241 — the metrics listener the config file below pins — and the
+    # authoritative signal is Cloudflare's own tunnel health alerting.
+
+    # Slightly above cloudflared's own 30-second grace period, so it gets to
+    # drain in-flight requests and deregister its connections with the edge
+    # before Docker kills it. Killing it early makes the edge hold dead
+    # connections until they time out, which shows up as intermittent 502s
+    # during an otherwise clean restart.
+    stop_grace_period: 35s
+
+    networks:
+      egress:
+        priority: 100
+      mcp:
+        priority: 10
+
+    # /etc/hosts wins over Docker's embedded DNS, and that is the point. See
+    # the networks section: without this, `brain` resolves to two addresses and
+    # which network carries MCP traffic is unspecified.
+    extra_hosts:
+      - "brain:10.77.0.10"
+
+    # A Go connector holding a handful of QUIC streams to one origin. 256 MiB
+    # is roughly an order of magnitude over what this shape of workload uses
+    # and still leaves the box untouched; the CPU share exists so that a
+    # pathological reconnect loop cannot starve the brain it is fronting.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+          pids: 64
+
+  maintenance:
+    # Behind a profile, so `docker compose up` NEVER starts it. That is the
+    # whole reason the profile exists: consolidation, lint, index, doctor,
+    # backup and the restore drill all mutate the same repository the brain
+    # writes captures into, and they are serialised against it by the lock on
+    # the shared state mount. A maintenance container that came up with the
+    # stack would sit there holding nothing and doing nothing, until the day
+    # someone gave it a default command and it raced a capture.
+    #
+    # Invoked one-shot, by systemd timers on the host:
+    #     docker compose --profile maintenance run --rm maintenance lint
+    #     docker compose --profile maintenance run --rm maintenance consolidate
+    # The compose project prefix makes the container brain-maintenance-*, which
+    # is the service role the design spec names.
+    profiles: ["maintenance"]
+
+    image: brain:${BRAIN_VERSION:?set BRAIN_VERSION in deploy/.env — production never runs an untagged build}
+    # Deliberately the toolbelt, not the HTTP server. `run` appends the timer's
+    # arguments to this, so the timer names a subcommand and nothing else.
+    # Non-interactive only: `brain reset` is TTY-only and refuses here, which
+    # is the correct outcome and not a limitation to work around.
+    entrypoint: ["brain"]
+    command: ["doctor"]
+
+    # One-shot. `restart: unless-stopped` on a container that exits 0 by design
+    # would restart it forever.
+    restart: "no"
+
+    user: "10001:10001"
+    <<: *hardening
+    logging: *logging
+    init: true
+
+    environment: *brain-env
+    volumes: *brain-mounts
+    secrets:
+      - principal_key
+
+    # Larger than brain's, because this is where the FTS index is rebuilt and
+    # where the nightly archive is assembled. The archive stages on the state
+    # mount, never here — /tmp is capped and non-persistent, and an archive
+    # that half-fits is a backup that silently is not one.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+
+    # egress ONLY, and never the mcp network. This service does not serve
+    # anything, so it has no business being addressable from the connector; it
+    # does need to reach the private git remote, the encrypted backup bucket
+    # and the pinned consolidator's provider.
+    networks:
+      - egress
+
+    # Twice the brain's ceiling on both axes, because consolidation and an
+    # index rebuild are the two genuinely heavy things this system does, and
+    # they run at a scheduled time when nothing else is contending. Still a
+    # small fraction of a 24 GB box that has other tenants.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+          pids: 512
+
+# ---------------------------------------------------------------------------
+# Networks — the reachability argument, written down
+# ---------------------------------------------------------------------------
+#
+# There is NO `ports:` stanza anywhere in this file, and that is the first and
+# largest control. Docker's published ports bypass the host firewall: the DNAT
+# happens before INPUT, so an iptables ruleset with a terminal REJECT — which
+# this VPS has — does not see the packet at all. Filtering published container
+# traffic means writing rules into DOCKER-USER and matching with conntrack
+# because the destination has already been rewritten. Publishing nothing means
+# none of that machinery has to be right for the brain to be unreachable.
+#
+# WHAT EACH SERVICE CAN REACH, exactly:
+#
+#   brain        outbound: full internet, via `egress`. It has to be: it fetches
+#                          the Access JWKS from the Cloudflare team domain and
+#                          it runs `git push` to the private remote. Docker has
+#                          no per-container egress ACL, so "full" is the honest
+#                          word — narrowing it to those two destinations is a
+#                          DOCKER-USER job on the host and belongs in the
+#                          firewall runbook, not in this file, and it is
+#                          recorded there as a residual rather than implied
+#                          away here.
+#                inbound:  cloudflared, over `mcp`. Also the VPS host root, via
+#                          brain's address on the `egress` bridge — accepted,
+#                          because host root already owns the data mount and
+#                          SSH to this box is separately secured. NOT the
+#                          internet (no published port, so no DNAT rule exists)
+#                          and NOT other compose projects (Docker's bridge
+#                          isolation chains drop inter-bridge traffic).
+#
+#   cloudflared  outbound: full internet, via `egress`. It must reach the
+#                          Cloudflare edge on 7844 over QUIC and TCP.
+#                inbound:  nothing. It originates every connection it has.
+#
+#   maintenance  outbound: full internet, via `egress` — private git remote,
+#                          backup object storage, consolidator provider.
+#                inbound:  nothing. It is not on `mcp` at all.
+#
+# WHY TWO NETWORKS RATHER THAN ONE BRIDGE. `mcp` is `internal: true`, which
+# means Docker creates it with no gateway and gives the host no address on it.
+# The MCP request path therefore runs entirely on a segment that has no route
+# on or off it, and it stays that way for free: nothing about a future change
+# to firewall rules, published ports or host routing can expose it, because
+# there is nothing to route to. `egress` exists only because both long-running
+# services must ORIGINATE connections, and it carries no service traffic.
+#
+# WHY THE STATIC IP AND extra_hosts. brain and cloudflared are both on both
+# networks, and Docker's embedded DNS answers a service name with one address
+# per shared network — so `http://brain:8787` would resolve to two addresses
+# and which segment carried MCP traffic would be unspecified. An unspecified
+# answer cannot be audited, and the acceptance gates require demonstrating that
+# no brain port is reachable and that both tunnel routes reach the intended
+# service. Pinning `brain` in cloudflared's /etc/hosts to its fixed address on
+# the internal network makes the answer deterministic and keeps the ingress
+# config's `http://brain:8787` — which is the fixed interface contract —
+# unchanged. The alternative, a third bridge per service so that the two share
+# only the internal network, buys the same determinism for an extra network and
+# an extra subnet to keep out of everyone else's way.
+networks:
+  mcp:
+    internal: true
+    ipam:
+      config:
+        # Chosen outside Docker's default 172.17.0.0/16 address pool and away
+        # from the Oracle VCN's 10.0.0.0/16, so it collides with neither. If it
+        # ever does collide, change it here and in cloudflared's extra_hosts —
+        # those two are the only places the address appears.
+        - subnet: 10.77.0.0/24
+
+  egress:
+    # An ordinary bridge. Named and declared rather than left to the implicit
+    # `default` network, so that "which network gives this container a route to
+    # the internet" is answerable by reading this file.
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+#
+# Compose outside swarm bind-mounts each source file read-only at
+# /run/secrets/<name>. It does NOT apply uid/gid/mode — those are swarm-only
+# fields and are silently ignored here — so the host file's own ownership and
+# mode are what the container sees. Every file below must therefore be readable
+# by uid 10001.
+#
+# The source paths are host paths under /etc/brain and contain no value in this
+# repository. The private git deploy key is deliberately NOT listed here: it
+# lives at /etc/brain/git-deploy-key, reached through the /etc/brain mount that
+# already exists, because ssh(1) refuses a key file that is group- or
+# world-readable and a second mount would not change that requirement — it
+# would only add a second place to get the mode wrong.
+secrets:
+  principal_key:
+    file: ${BRAIN_HOST_ETC:-/etc/brain}/principal-key

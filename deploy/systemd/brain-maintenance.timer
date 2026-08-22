@@ -1,0 +1,19 @@
+# Nightly, after the backup window.
+[Unit]
+Description=brain nightly maintenance
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+
+[Timer]
+# UTC explicitly. The scripts these timers drive reason in UTC — snapshot.sh
+# decides the weekly and monthly retention class from the UTC day — so a
+# calendar in local time would, twice a year, move the trigger across the UTC
+# date boundary and silently skip a monthly recovery point.
+OnCalendar=*-*-* 03:20:00 UTC
+RandomizedDelaySec=20min
+# Catch up after a reboot. An A1 instance that came back at 04:00 has already
+# missed the window, and a missed night is exactly when the report matters.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

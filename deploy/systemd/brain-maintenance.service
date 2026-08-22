@@ -1,0 +1,67 @@
+# The nightly one-shot: rebuild the index, gate the content, report health.
+#
+# All three run INSIDE the pinned image, through the compose project's
+# `brain-maintenance` service, so maintenance sees exactly the code and the
+# mounts the live server sees. Running bin/brain from a host checkout would be
+# easier and would be wrong: it would validate a different engine than the one
+# answering requests, which is precisely the difference a nightly check exists
+# to catch.
+#
+# Order matters. The index is rebuilt first so lint and doctor judge a current
+# one; doctor runs last because its output is the report an operator reads, and
+# a Type=oneshot unit stops at the first ExecStart that fails — so if lint
+# fails, the alert carries lint's exit code and nothing else has run to muddy
+# it.
+[Unit]
+Description=brain nightly maintenance (index, lint, doctor)
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+# Ordering only, not a dependency: if the backup is queued for the same window
+# it should finish first, but a missing backup must never cancel maintenance.
+After=brain-backup.service docker.service
+Requires=docker.service
+OnFailure=brain-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30min
+EnvironmentFile=-/etc/brain/deploy.env
+Environment=BRAIN_COMPOSE=/srv/brain/engine/deploy/compose.yaml
+# PrivateTmp gives the docker CLI somewhere to write its config that vanishes
+# with the invocation; DOCKER_CLI_HINTS silences the update nag, which would
+# otherwise be the only line in a green run's journal entry.
+Environment=DOCKER_CONFIG=/tmp/docker
+Environment=DOCKER_CLI_HINTS=false
+
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps brain-maintenance index --quiet
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps brain-maintenance lint
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps brain-maintenance doctor
+
+# Hardening. This unit is a docker CLI client and nothing else: it opens one
+# AF_UNIX socket, and the work happens in a container with its own, stricter
+# profile. Root is required only because /run/docker.sock is root-owned — as
+# the socket's owner it passes the permission check with no capabilities at
+# all, which is why the bounding set is empty rather than holding DAC_OVERRIDE.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# AF_UNIX only. Nothing here talks to the network — image pulls are an explicit
+# step of the upgrade procedure, never something a nightly timer does on its
+# own. If this ever starts failing on a DNS lookup, that is the finding.
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077

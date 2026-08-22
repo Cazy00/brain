@@ -1,0 +1,14 @@
+[Unit]
+Description=brain weekly consolidation
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+
+[Timer]
+OnCalendar=Sun *-*-* 04:10:00 UTC
+# Wide, because this one calls a provider. A fixed minute across every host
+# running this engine would arrive as a thundering herd at a rate limiter.
+RandomizedDelaySec=45min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

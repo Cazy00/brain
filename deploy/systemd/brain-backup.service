@@ -1,0 +1,76 @@
+# The nightly encrypted archive — deploy/backup/snapshot.sh.
+#
+# This one runs on the HOST rather than in the compose project, and that is a
+# deliberate inversion of the rule the maintenance units follow. Two reasons:
+#
+#   1. Its job is to survive the container. A backup driven by the same image,
+#      the same compose file and the same daemon it is backing up shares every
+#      failure mode with the thing it protects.
+#   2. It needs `age` and outbound HTTPS to a storage vendor. Putting those in
+#      the brain image would give the request-serving process both the ability
+#      to encrypt to the recovery recipient and a credential for the object
+#      store, neither of which it has any business holding.
+#
+# It runs as the SERVICE UID, not root. The two root-owned config files it
+# needs arrive through LoadCredential=, which hands this invocation — and
+# nothing else on the box — a readable copy. That is what removes the last
+# reason to give a nightly job DAC override over the whole filesystem.
+[Unit]
+Description=brain nightly encrypted snapshot
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=brain-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2h
+User=10001
+Group=10001
+EnvironmentFile=-/etc/brain/deploy.env
+Environment=BRAIN_DATA_ROOT=/srv/brain/data
+Environment=BRAIN_STATE_DIR=/srv/brain/state
+Environment=BRAIN_BACKUP_LOCAL_DIR=/srv/brain/backups
+Environment=BRAIN_BACKUP_RECIPIENTS=/etc/brain/backup-recipients.txt
+
+# Named exactly as the script expects to find them under
+# $CREDENTIALS_DIRECTORY. Nothing else from /etc/brain is exposed — in
+# particular not the tunnel credential and not the git deploy key.
+LoadCredential=backup.env:/etc/brain/backup.env
+LoadCredential=brain-http.json:/etc/brain/brain-http.json
+
+ExecStart=/srv/brain/engine/deploy/backup/snapshot.sh
+
+# Every non-zero exit is a failure, exit 78 (offsite storage never configured)
+# included. That is the point: an archive sitting on one disk is not a backup,
+# and the day the bucket is created is the day this unit goes green on its own.
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Reads the knowledge repository, writes the archive next to it and the success
+# stamp into derived state. Everything else on the filesystem is read-only for
+# this unit, including /etc/brain — the credentials it may see arrive by
+# LoadCredential, not by path.
+ReadWritePaths=/srv/brain/backups /srv/brain/state
+ReadOnlyPaths=/srv/brain/data
+# HTTPS to the object store. AF_UNIX stays for DNS over the resolver socket.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077

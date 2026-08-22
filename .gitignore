@@ -13,6 +13,15 @@ graphify-out/
 !.env.example
 *.local.md
 
+# Rendered deployment configuration. The .example files ARE tracked and hold
+# placeholders; these are what an operator fills in on the VPS, and they carry
+# the tunnel id, the Access audiences and the owner's address. One `git add -A`
+# on the server is all it would take, so the rule is geography rather than
+# discipline.
+/deploy/cloudflared/config.yml
+/deploy/cloudflare/desired-state.json
+/deploy/.env
+
 # Claude workspace state. settings.json IS tracked — the headless consolidation
 # pass needs its permission allowlist, and a machine without it silently falls
 # back to an agent that cannot run bin/brain. The rest is per-machine.

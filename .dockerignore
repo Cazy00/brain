@@ -1,0 +1,96 @@
+# What is allowed to reach the Docker daemon when the brain image is built.
+#
+# The spec's rule is absolute: private data "cannot enter an image layer or
+# build context". A conventional ignore file — a list of things to leave out —
+# cannot deliver that, because it is only ever as complete as the last person to
+# think about it, and the cost of one forgotten line is the owner's entire brain
+# uploaded to a daemon and cached there. So this file is written the other way
+# round: DENY EVERYTHING, then re-admit the handful of paths the engine is made
+# of. A new directory in this repo is excluded by default, on the day it is
+# created, by someone who has never read this file.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE WIRING THE BUILD.
+#
+# THIS FILE LIVES AT THE REPOSITORY ROOT, and it has to.
+#
+# BuildKit does not look for an ignore file next to the Dockerfile. It looks for
+#   1. <dockerfile-path>.dockerignore   e.g. deploy/Dockerfile.dockerignore
+#   2. <context-root>/.dockerignore     e.g. ./.dockerignore
+# and the build context for this image MUST be the repository root, because the
+# engine lives in bin/ and setup/. It was originally written as
+# deploy/.dockerignore, next to the Dockerfile, where anyone editing the build
+# would look for it — and where Docker never reads it. A build with no effective
+# ignore file uploads knowledge/ and .git/ to the daemon, which is the exact
+# thing the spec forbids, and it does so silently.
+#
+# The root spelling is chosen over deploy/Dockerfile.dockerignore because it is
+# the one name BOTH builders honour: candidate 2 for BuildKit, and the only
+# candidate the classic builder has ever looked at. One file, no second copy to
+# drift out of step with this one.
+#
+# Every pattern below is written RELATIVE TO THE REPOSITORY ROOT.
+#
+# This file is defence in depth, not the guarantee. deploy/Dockerfile copies an
+# explicit allowlist of paths and then ASSERTS, in a build step that fails the
+# build, that no knowledge/, no .git/ and no secret-shaped file made it into the
+# image. If this file is ever mis-wired, the build breaks loudly instead of
+# publishing an image full of private notes.
+# ---------------------------------------------------------------------------
+
+# Deny everything. In .dockerignore, unlike a shell, `*` matches dotfiles too,
+# so this covers .git, .env and every editor and agent directory.
+*
+
+# The engine, and only the engine.
+!bin
+!bin/**
+!setup
+!setup/**
+!.githooks
+!.githooks/**
+!AGENTS.md
+!CLAUDE.md
+!README.md
+
+# The entrypoint, which is the one thing under deploy/ that is copied INTO the
+# image. The Dockerfile itself does not need to be in the context.
+!deploy/entrypoint.sh
+
+# ---------------------------------------------------------------------------
+# Re-denied, after the allowances above. These paths live INSIDE directories
+# that were just re-admitted wholesale, so `*` no longer protects them.
+# ---------------------------------------------------------------------------
+
+# Bytecode from the host. The image compiles its own (see the Dockerfile);
+# importing a .pyc built by another interpreter version is at best dead weight
+# and at worst a stale copy of code that has since changed.
+**/__pycache__
+**/*.pyc
+
+# The AUTHOR's age recipient. It is a public key, so this is not a leak — but it
+# is the wrong key for this deployment. The VPS encrypts its disaster-recovery
+# archives to the recipient supplied in /etc/brain, and an image that quietly
+# carried the laptop's recipient would produce backups the server can create and
+# the operator cannot explain.
+setup/vault-recipient.txt
+
+# Machine-local wiring: absolute paths from whichever checkout ran `brain init`.
+# Both are gitignored, so they only exist in a working tree — which is exactly
+# the tree a build runs from.
+.mcp.json
+setup/skills/brain/SKILL.md
+
+# Belt and braces. Every one of these is already denied by `*` and none of them
+# is under an allowed directory, so these lines change nothing today. They are
+# here as a statement of intent that survives someone loosening a rule above:
+# whatever else this build admits, it never admits these.
+.git
+.git/**
+knowledge
+knowledge/**
+.cache
+.env
+.env.*
+**/*.age
+**/.DS_Store

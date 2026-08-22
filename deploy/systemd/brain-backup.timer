@@ -1,0 +1,15 @@
+[Unit]
+Description=brain nightly encrypted snapshot
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+
+[Timer]
+# UTC, and early: snapshot.sh derives the weekly (Sunday) and monthly (day 01)
+# retention classes from the UTC date, so the trigger and the classifier must
+# agree about which day it is.
+OnCalendar=*-*-* 02:30:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

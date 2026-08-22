@@ -1,0 +1,60 @@
+# Monthly proof that the archives are more than a belief.
+#
+# On the VPS this necessarily runs in --verify-only mode: the recovery identity
+# is offline by design, so this host cannot decrypt what it uploads. Verify-only
+# proves the bucket holds the bytes that were sent, audits retention and
+# freshness, and — the part that matters — goes RED when nobody has run a real
+# restore in 60 days. See procedure 10 in the runbook; the full drill is an
+# operator task on a machine that has the identity.
+[Unit]
+Description=brain monthly restore drill (verify-only)
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=brain-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2h
+User=10001
+Group=10001
+EnvironmentFile=-/etc/brain/deploy.env
+Environment=BRAIN_DATA_ROOT=/srv/brain/data
+Environment=BRAIN_STATE_DIR=/srv/brain/state
+Environment=BRAIN_DRILL_REPORT_DIR=/var/lib/brain/drills
+# PrivateTmp gives this invocation its own /tmp AND its own /var/tmp, which
+# systemd removes when the unit finishes. The script destroys its scratch
+# directory itself; this is the second answer to "what if it dies before it
+# gets there", and it needs no trust in the script at all.
+Environment=BRAIN_DRILL_SCRATCH=/var/tmp
+LoadCredential=backup.env:/etc/brain/backup.env
+
+ExecStart=/srv/brain/engine/deploy/backup/restore-drill.sh --verify-only
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# The live data root is not in ReadWritePaths and not in ReadOnlyPaths: this
+# unit has no business reading the live brain at all. ProtectSystem=strict
+# already makes it read-only, and the script's own isolation assertions make it
+# unreachable — this is the layer that means a bug cannot even try.
+ReadWritePaths=/var/lib/brain/drills
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
