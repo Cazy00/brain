@@ -33,6 +33,7 @@ because a client can construct a call for a tool that was never advertised.
 """
 from __future__ import annotations
 
+import difflib
 import subprocess
 import sys
 from pathlib import Path
@@ -222,6 +223,33 @@ def validate_args(tool: dict, args):
     if not isinstance(args, dict):
         return None, "arguments must be a JSON object"
     required = set(schema.get("required", []))
+    # An argument this tool does not declare is REFUSED, not ignored.
+    #
+    # JSON Schema without `additionalProperties: false` says to ignore extras,
+    # and for a search that would be the friendlier reading. For a capture it
+    # is a trap, and it sprang on the first live run of the cutover: a probe
+    # sent `request_id` where the tool declares `client_request_id`. The
+    # capture succeeded, the retry-safety it had asked for was silently off,
+    # and the only reason a duplicate note did not land is that the content
+    # happened to match the dedup fingerprint too. A client retrying after a
+    # timeout — which is the entire reason that argument exists — would have
+    # written the note twice and had no way to know.
+    #
+    # Keys beginning with an underscore are tolerated: `_meta` and friends are
+    # a reserved namespace a client may decorate a call with, and refusing
+    # those would break conformant clients to catch nothing.
+    unknown = sorted(k for k in args if k not in props and not k.startswith("_"))
+    if unknown:
+        accepted = ", ".join(sorted(props)) or "no arguments"
+        hint = ""
+        near = difflib.get_close_matches(unknown[0], list(props), n=1, cutoff=0.6)
+        if near:
+            # The failure is nearly always a typo, and naming the intended
+            # argument is the difference between a message that fixes it and a
+            # message that starts a search.
+            hint = " Did you mean %r?" % near[0]
+        return None, ("unknown argument %r.%s %s accepts: %s"
+                      % (unknown[0], hint, tool.get("name", "this tool"), accepted))
     for field in schema.get("required", []):
         if field not in args or args[field] is None \
                 or (isinstance(args[field], str) and not args[field].strip()):

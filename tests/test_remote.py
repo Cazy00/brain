@@ -1078,6 +1078,71 @@ def _shell_commands(markdown: str):
     return joined
 
 
+class UnknownArgumentTests(unittest.TestCase):
+    """Prevents: a capture that quietly forgets the retry-safety it was asked for.
+
+    JSON Schema without `additionalProperties: false` says to ignore an
+    undeclared argument. For a search that is the friendlier reading; for a
+    capture it is a trap, and it sprang on the first live run of the cutover.
+    A probe sent `request_id` where the tool declares `client_request_id`. The
+    capture succeeded and the idempotency was silently off — a client retrying
+    after a timeout, which is the ONLY reason that argument exists, would have
+    written the note twice with nothing to tell it so."""
+
+    def tool(self, name, transport="remote"):
+        return [t for t in mcpcore.tool_table(transport) if t["name"] == name][0]
+
+    def test_the_typo_that_started_this_is_refused(self):
+        clean, error = mcpcore.validate_args(
+            self.tool("brain_capture"), {"text": "x", "request_id": "a"})
+        self.assertIsNone(clean)
+        self.assertIn("request_id", error)
+
+    def test_the_message_names_the_argument_that_was_meant(self):
+        """A near miss is nearly always a typo, and naming the intended
+        argument is the difference between a message that fixes it and a
+        message that starts a search."""
+        _, error = mcpcore.validate_args(
+            self.tool("brain_capture"), {"text": "x", "request_id": "a"})
+        self.assertIn("Did you mean 'client_request_id'?", error)
+        _, error = mcpcore.validate_args(
+            self.tool("brain_search"), {"query": "x", "scop": "all"})
+        self.assertIn("Did you mean 'scope'?", error)
+
+    def test_the_message_lists_what_the_tool_does_accept(self):
+        _, error = mcpcore.validate_args(
+            self.tool("brain_capture"), {"text": "x", "colour": "blue"})
+        for accepted in ("text", "client_request_id", "allow_duplicate"):
+            self.assertIn(accepted, error)
+
+    def test_the_correct_spelling_still_works(self):
+        clean, error = mcpcore.validate_args(
+            self.tool("brain_capture"), {"text": "x", "client_request_id": "a"})
+        self.assertIsNone(error)
+        self.assertEqual(clean["client_request_id"], "a")
+
+    def test_a_reserved_underscore_key_is_tolerated(self):
+        """`_meta` and friends are a namespace a conformant client may decorate
+        a call with. Refusing those would break real clients to catch nothing."""
+        clean, error = mcpcore.validate_args(
+            self.tool("brain_capture"), {"text": "x", "_meta": {"trace": 1}})
+        self.assertIsNone(error)
+        self.assertNotIn("_meta", clean)
+
+    def test_every_tool_refuses_an_undeclared_argument(self):
+        """Not just capture — a silently dropped `scope` turns an explicit
+        search of the inbox into a search that never looked at it."""
+        for transport in ("local", "remote"):
+            for tool in mcpcore.tool_table(transport):
+                args = {field: "x" for field in
+                        tool["inputSchema"].get("required", [])}
+                args["definitely_not_an_argument"] = "x"
+                clean, error = mcpcore.validate_args(tool, args)
+                self.assertIsNone(clean, "%s/%s accepted an unknown argument"
+                                  % (transport, tool["name"]))
+                self.assertIn("definitely_not_an_argument", error)
+
+
 class ReleaseVersionTests(unittest.TestCase):
     """Prevents: three version numbers that are each believable alone.
 
