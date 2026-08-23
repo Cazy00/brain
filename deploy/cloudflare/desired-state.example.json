@@ -1,0 +1,235 @@
+{
+  "_readme": [
+    "The SHAPE of the brain's Cloudflare configuration. This file is tracked and",
+    "therefore holds placeholders only. Copy it to a private location outside",
+    "this repository — /etc/brain/cloudflare.json, root-owned, mode 0600 — fill",
+    "in the real values there, and point provision.py at that copy. Keys",
+    "beginning with an underscore are documentation and are stripped before",
+    "validation, because JSON has no comments.",
+    "",
+    "  python3 deploy/cloudflare/provision.py --state /etc/brain/cloudflare.json",
+    "  python3 deploy/cloudflare/provision.py --state /etc/brain/cloudflare.json --apply",
+    "",
+    "Nothing here is a secret and nothing here may become one: the API token",
+    "comes from CLOUDFLARE_API_TOKEN in the environment, the tunnel connector",
+    "token lives in the file named by tunnel.token_file, and a service token's",
+    "client secret is created by a human and never passes through this file or",
+    "through provision.py. The script refuses to start if it finds anything",
+    "shaped like a credential in here.",
+    "",
+    "Two hostnames means two applications, deliberately. There are no OAuth",
+    "scopes on this tenant [verified 2026-08-23] — the authorization-server",
+    "metadata advertises none and the token response returns an empty scope — so",
+    "read versus capture cannot be a scope and has to be two audiences. The two",
+    "hostnames must NOT be merged into one multi-domain application: an OAuth",
+    "token issued through any domain of an application is valid for all of them,",
+    "which would make a read-only token work against the capture endpoint.",
+    "",
+    "The audience of each application is assigned by Cloudflare, not declared",
+    "here. provision.py prints it under 'PRIVATE'; copy it into the endpoints",
+    "list in /etc/brain/brain-http.json, which is where the origin learns which",
+    "aud belongs to which hostname."
+  ],
+
+  "account_id": "<ACCOUNT_ID>",
+  "zone_id": "<ZONE_ID>",
+  "team_domain": "<TEAM_DOMAIN>.cloudflareaccess.com",
+  "owner_email": "<OWNER_EMAIL>",
+
+  "tunnel": {
+    "_why_dedicated": [
+      "The brain gets its own tunnel rather than joining the host's existing",
+      "connector. All replicas of one tunnel share ONE ingress list and traffic",
+      "is spread across them with no affinity [verified 2026-08-23], so reusing",
+      "the host tunnel would put the brain's routes in the same configuration as",
+      "unrelated dev servers — and the ingress PUT replaces that list whole. A",
+      "dedicated tunnel is also what makes the first step of incident",
+      "containment possible: stop this connector, and only the brain goes dark."
+    ],
+    "name": "brain",
+    "id": "<TUNNEL_ID>",
+    "config_src": "local",
+    "create_if_missing": false,
+    "credentials_file": "/etc/brain/cloudflared/credentials.json",
+    "_local_config_note": [
+      "The host path of the connector's config file — deploy/cloudflared/config.yml",
+      "in the compose project, which compose mounts read-only at",
+      "/etc/cloudflared/config.yml. Adjust it to wherever this repository is",
+      "checked out on the VPS, or drop the key entirely when running",
+      "provision.py from a machine that does not have the file; the check is",
+      "skipped rather than guessed at."
+    ],
+    "local_config": "/srv/brain/deploy/cloudflared/config.yml",
+    "prune_ingress": false,
+    "_ingress_note": [
+      "With config_src 'local' the connector reads its ingress from the mounted",
+      "config file and the API holds nothing to reconcile; provision.py verifies",
+      "that the file and this list agree, and refuses if they diverge. The list",
+      "is still load-bearing here because it is what drives the DNS step. The",
+      "service host is the compose service name — no host port is published, so",
+      "'brain:8787' is reachable only from inside the project network."
+    ],
+    "ingress": [
+      { "hostname": "brain.qodevia.com", "service": "http://brain:8787" },
+      { "hostname": "brain-read.qodevia.com", "service": "http://brain:8787" }
+    ]
+  },
+
+  "applications": [
+    {
+      "name": "brain — read and capture",
+      "hostname": "brain.qodevia.com",
+      "profile": "capture",
+      "_session_note": [
+        "session_duration must equal oauth_configuration.grant.session_duration.",
+        "They are two separate clocks and the shorter one wins: a refresh grant",
+        "that outlives the Access identity session forces an interactive",
+        "re-login the client cannot explain. provision.py refuses a mismatch.",
+        "336h is the design's 14 days."
+      ],
+      "session_duration": "336h",
+      "service_auth_401_redirect": true,
+      "oauth_configuration": {
+        "enabled": true,
+        "dynamic_client_registration": {
+          "_note": [
+            "localhost and loopback are enabled because they are required, not",
+            "as a convenience: with no such application configured, the team",
+            "domain's registration endpoint rejects http://localhost:<port>/... ",
+            "and http://127.0.0.1:... [verified 2026-08-23], which is what Claude",
+            "Code, mcp-remote and the MCP Inspector all use. The setting is a",
+            "union across every Managed-OAuth application on the account, so this",
+            "is an account-wide relaxation and is recorded as one.",
+            "allowed_uris holds the non-loopback redirect URIs proven necessary",
+            "by the client qualification matrix — add one only with an observed",
+            "failure behind it."
+          ],
+          "enabled": true,
+          "allowed_uris": ["<CLIENT_REDIRECT_URI>"],
+          "allow_any_on_localhost": true,
+          "allow_any_on_loopback": true
+        },
+        "grant": {
+          "access_token_lifetime": "15m",
+          "session_duration": "336h"
+        }
+      },
+      "extra": {
+        "app_launcher_visible": false,
+        "auto_redirect_to_identity": false
+      },
+      "policies": [
+        {
+          "_note": "Exactly one identity. Not a group, not a domain.",
+          "name": "brain owner",
+          "decision": "allow",
+          "precedence": 1,
+          "include": [{ "email": { "email": "<OWNER_EMAIL>" } }]
+        },
+        {
+          "_note": [
+            "Service Auth for headless clients. The token is named, never",
+            "any_valid_service_token — that rule reads as 'service tokens are",
+            "allowed here' and means 'every service token in this entire account",
+            "is allowed here', including ones minted years from now for something",
+            "unrelated. provision.py refuses it outright and resolves this name to",
+            "a token_id at run time, because ids are per-account and cannot be",
+            "written down in a tracked file.",
+            "service_auth_401_redirect above cannot be turned on until this",
+            "policy exists, so the first run against a fresh account reports it",
+            "as blocked and the run after the token is created enables it."
+          ],
+          "name": "brain capture service clients",
+          "decision": "non_identity",
+          "precedence": 2,
+          "include": [{ "service_token": { "name": "brain-capture-headless" } }]
+        }
+      ]
+    },
+    {
+      "name": "brain — read only",
+      "hostname": "brain-read.qodevia.com",
+      "profile": "read",
+      "session_duration": "336h",
+      "service_auth_401_redirect": true,
+      "oauth_configuration": {
+        "enabled": true,
+        "dynamic_client_registration": {
+          "enabled": true,
+          "allowed_uris": ["<CLIENT_REDIRECT_URI>"],
+          "allow_any_on_localhost": true,
+          "allow_any_on_loopback": true
+        },
+        "grant": {
+          "access_token_lifetime": "15m",
+          "session_duration": "336h"
+        }
+      },
+      "extra": {
+        "app_launcher_visible": false,
+        "auto_redirect_to_identity": false
+      },
+      "policies": [
+        {
+          "name": "brain owner",
+          "decision": "allow",
+          "precedence": 1,
+          "include": [{ "email": { "email": "<OWNER_EMAIL>" } }]
+        },
+        {
+          "name": "brain read-only service clients",
+          "decision": "non_identity",
+          "precedence": 2,
+          "include": [{ "service_token": { "name": "brain-read-headless" } }]
+        }
+      ]
+    }
+  ],
+
+  "_service_tokens_note": [
+    "provision.py never creates these. Cloudflare shows a service token's client",
+    "secret exactly once, in the create response, and never again — so a script",
+    "forbidden to print or persist a secret can only mint a credential nobody",
+    "can use. A human creates the token where the secret is displayed to them",
+    "and puts it straight into secret_file. provision.py does the parts a human",
+    "is bad at: it checks the token exists, that it is bound to the right",
+    "profile's policy, and that it is not about to lapse.",
+    "profile must match the application whose Service Auth policy names the",
+    "token; provision.py fails the run if a read-only credential is bound to the",
+    "capture endpoint.",
+    "2160h is the design's 90-day expiry; expiry_warning_days is its 7-day alert."
+  ],
+  "service_tokens": [
+    {
+      "name": "brain-capture-headless",
+      "profile": "capture",
+      "duration": "2160h",
+      "secret_file": "/etc/brain/service-tokens/brain-capture-headless",
+      "expiry_warning_days": 7
+    },
+    {
+      "name": "brain-read-headless",
+      "profile": "read",
+      "duration": "2160h",
+      "secret_file": "/etc/brain/service-tokens/brain-read-headless",
+      "expiry_warning_days": 7
+    }
+  ],
+
+  "_dns_note": [
+    "One proxied CNAME per ingress hostname, pointing at",
+    "<tunnel_id>.cfargotunnel.com. Proxied is not a preference: an unproxied",
+    "record for a tunnel hostname resolves to nothing that can serve it, and it",
+    "would take the request out of Access, which is the whole authentication",
+    "boundary. provision.py reconciles DNS LAST, because DNS is the step that",
+    "completes the reachable path — Access takes about 85 seconds to begin",
+    "enforcing on a new application [verified 2026-08-23], and that window is",
+    "spent on a name that does not resolve yet.",
+    "Nothing here deletes: this zone carries other hostnames on a different",
+    "tunnel, and a record of another type on one of these names stops the run",
+    "for a human to look at rather than being replaced."
+  ],
+  "dns": {
+    "comment": "brain remote MCP — managed by deploy/cloudflare/provision.py"
+  }
+}
