@@ -312,7 +312,7 @@ fi
 # never both fail to add a recovery point and delete an old one.
 
 prune_class() {  # prune_class <class> <keep>
-    local class="$1" keep="$2" keys n i key
+    local class="$1" keep="$2" keys n i key rc
     keys="$(s3_list "$S3_PREFIX/$class/" | grep -v '\.meta\.json$' || true)"
     n="$(printf '%s\n' "$keys" | grep -c . || true)"
     [ "$n" -gt "$keep" ] || { note "$class: $n/$keep recovery points"; return 0; }
@@ -328,7 +328,14 @@ prune_class() {  # prune_class <class> <keep>
             "$S3_PREFIX/$class/brain-"*"Z.tar.gz.age") ;;
             *) warn "skipping unrecognised object: $key"; continue ;;
         esac
-        s3_delete "$key" && note "pruned $key"
+        # `|| rc=$?` rather than a bare call: under `set -e` a non-zero return
+        # here would end the run, and two of the three returns are not errors.
+        rc=0; s3_delete "$key" || rc=$?
+        case "$rc" in
+            0) note "pruned $key" ;;
+            2) note "$class: $key is still under its retention lock — not prunable yet" ;;
+            *) warn "could not prune $key (see the DELETE line above)" ;;
+        esac
         s3_delete "$key.meta.json" >/dev/null 2>&1 || true
     done <<< "$keys"
 }

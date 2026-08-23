@@ -209,6 +209,20 @@ s3_get() {
 }
 
 # s3_delete <key>
+#
+# Three outcomes, not two, and the third is the point:
+#
+#   0  deleted
+#   2  REFUSED by the bucket's object lock, and that is expected. The
+#      credential this script holds can both write and delete, so a single
+#      stolen key could otherwise erase every recovery point it just created.
+#      The lock is what stops that, and it necessarily also stops a legitimate
+#      prune of anything younger than the retention window. Reporting that as
+#      a failure teaches an operator to ignore the one message that would
+#      matter if the lock were ever removed.
+#   1  anything else — a 403 from a credential that lost its permissions, a
+#      500, a signature mismatch. Those are real and must not be filed under
+#      the same heading as "working as designed".
 s3_delete() {
     local out code
     out="$(mktemp)"
@@ -216,6 +230,7 @@ s3_delete() {
     rm -f "$out"
     case "$code" in
         2*) return 0 ;;
+        409) return 2 ;;
         *) printf 'DELETE %s -> HTTP %s\n' "$1" "$code" >&2; return 1 ;;
     esac
 }

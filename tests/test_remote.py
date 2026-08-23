@@ -1111,6 +1111,70 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn('org.opencontainers.image.version="${BRAIN_VERSION}"', dockerfile)
 
 
+class S3DeleteTests(unittest.TestCase):
+    """Prevents: an operator learning to ignore the DELETE line.
+
+    The bucket has a three-day object lock, and it is load-bearing: the
+    credential that uploads a snapshot can also delete one, so without the lock
+    a single stolen key erases every recovery point it just made. The lock
+    necessarily also refuses a legitimate prune of anything younger than the
+    window — with a 409, every night, forever.
+
+    Filing that under the same heading as a real failure is how the message
+    that WOULD matter (a 403 from a credential that lost its permissions)
+    becomes invisible. So `s3_delete` has three returns rather than two, and
+    this exercises all three through the real function with only the HTTP layer
+    replaced."""
+
+    LIB = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.LIB = (Path(__file__).resolve().parent.parent
+                   / "deploy" / "backup" / "lib-s3.sh")
+
+    def delete_returning(self, status):
+        """Source the real library, stub only `_s3_request`, call s3_delete."""
+        script = (
+            'set -uo pipefail\n'
+            'S3_BUCKET=b; S3_ENDPOINT=https://example.invalid; S3_REGION=auto\n'
+            'source "%s"\n'
+            '_s3_request() { printf "%s"; }\n'
+            's3_delete some/key.tar.gz.age\n'
+            'echo "rc=$?"\n' % (self.LIB, status))
+        return subprocess.run(["/bin/bash", "-c", script],
+                              capture_output=True, text=True)
+
+    def test_a_successful_delete_returns_zero(self):
+        result = self.delete_returning("204")
+        self.assertIn("rc=0", result.stdout)
+        self.assertEqual(result.stderr.strip(), "")
+
+    def test_a_retention_lock_is_its_own_return_and_is_silent(self):
+        """Silent on stderr because it is not a failure; distinct because the
+        caller has to say something different about it."""
+        result = self.delete_returning("409")
+        self.assertIn("rc=2", result.stdout)
+        self.assertNotIn("DELETE", result.stderr)
+
+    def test_a_permission_failure_is_loud_and_is_not_the_lock(self):
+        result = self.delete_returning("403")
+        self.assertIn("rc=1", result.stdout)
+        self.assertIn("DELETE", result.stderr)
+        self.assertIn("403", result.stderr)
+
+    def test_the_prune_caller_handles_all_three(self):
+        """The library can be as careful as it likes if the caller writes
+        `s3_delete "$key" && note ...`, which is what it used to do: a 409 and
+        a 403 were both simply nothing."""
+        snapshot = (Path(__file__).resolve().parent.parent
+                    / "deploy" / "backup" / "snapshot.sh").read_text(encoding="utf-8")
+        prune = snapshot[snapshot.index("prune_class() {"):snapshot.index("prune_class daily")]
+        self.assertIn("retention lock", prune)
+        self.assertIn("could not prune", prune)
+        self.assertNotIn('s3_delete "$key" && note', prune)
+
+
 class SbomTests(unittest.TestCase):
     """Prevents: a bill of materials that is a correct document about a broken
     promise.
