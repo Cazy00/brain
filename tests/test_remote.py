@@ -678,6 +678,44 @@ class ModernEraTests(RemoteTestCase):
                                 "params": params},
                                assertion=sign_assertion(owner_claims()), headers=headers)
 
+    def test_every_modern_result_carries_resultType_and_serverInfo(self):
+        """Prevents the bug a real client found on the first connection.
+
+        Claude Code negotiated 2026-07-28, authenticated, and then refused
+        tools/list with "missing required resultType". The revision makes
+        resultType mandatory on EVERY result — it is the discriminator between a
+        finished answer and an `input_required` one — and the absent-means-
+        complete rule is a bridge for earlier-revision servers only, so a modern
+        server that omits it is simply invalid. It had been added to
+        server/discover and nowhere else, which is exactly the shape of mistake
+        a per-method assertion misses and a sweep catches."""
+        cases = [
+            ("server/discover", None, None),
+            ("ping", None, None),
+            ("tools/list", None, None),
+            ("tools/call", {"name": "brain_search", "arguments": {"query": "connector"}},
+             "brain_search"),
+        ]
+        for method, params, name in cases:
+            status, _h, body = self.modern(method, params, name=name)
+            self.assertEqual(status, 200, method)
+            result = body["result"]
+            self.assertEqual(result.get("resultType"), "complete",
+                             "%s result has no resultType" % method)
+            self.assertEqual(
+                result.get("_meta", {}).get(httpmcp.META_SERVER_INFO, {}).get("name"),
+                "brain", "%s result does not identify the server" % method)
+
+    def test_a_legacy_result_does_not_carry_resultType(self):
+        """The mirror, and it matters as much: resultType did not exist before
+        2026-07-28. Adding it to the handshake era would be inventing a field in
+        a revision that never defined one, and the eras must not bleed."""
+        for method in ("ping", "tools/list"):
+            status, _h, body = self.brain.rpc(method)
+            self.assertEqual(status, 200)
+            self.assertNotIn("resultType", body["result"], method)
+            self.assertNotIn("_meta", body["result"], method)
+
     def test_server_discover_reports_every_supported_version(self):
         status, _h, body = self.modern("server/discover")
         self.assertEqual(status, 200)

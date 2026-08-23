@@ -494,7 +494,7 @@ class Handler(BaseHTTPRequestHandler):
                                 endpoint=principal.endpoint, mode=principal.mode,
                                 client=client_name, client_version=client_version,
                                 protocol=body_version, outcome="ok", ms=_ms(started))
-            return self._send(200, _result(msg_id, {
+            return self._send(200, _modern_result(msg_id, {
                 "resultType": "complete",
                 "supportedVersions": list(SUPPORTED_VERSIONS),
                 "capabilities": {"tools": {}},
@@ -504,13 +504,13 @@ class Handler(BaseHTTPRequestHandler):
             }), cid=cid)
 
         if method == "ping":
-            return self._send(200, _result(msg_id, {}), cid=cid)
+            return self._send(200, _modern_result(msg_id, {}), cid=cid)
 
         if method == "tools/list":
             allowed, retry = self.service.limiter.take(principal.stable_id, "protocol")
             if not allowed:
                 return self._rate_limited(cid, principal, retry)
-            return self._send(200, _result(msg_id, {
+            return self._send(200, _modern_result(msg_id, {
                 "tools": mcpcore.tools_for(principal.profile, "remote")}), cid=cid)
 
         if method == "tools/call":
@@ -520,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
                                               "Mcp-Name header does not match the "
                                               "request body"), cid=cid)
             return self._tools_call(msg_id, params, principal, cid, started,
-                                    client_name, client_version)
+                                    client_name, client_version, modern=True)
 
         # An unimplemented method is 404 in the modern era, not 200. The status
         # is what lets a dual-era CLIENT tell a modern server from a legacy one.
@@ -530,7 +530,11 @@ class Handler(BaseHTTPRequestHandler):
     # -- the tools ---------------------------------------------------------
 
     def _tools_call(self, msg_id, params, principal, cid, started,
-                    client_name, client_version) -> None:
+                    client_name, client_version, modern: bool = False) -> None:
+        # Shared by both eras, so the result shape has to be chosen here rather
+        # than assumed. A 2026-07-28 result carries resultType and serverInfo; a
+        # legacy one must NOT, because those revisions never defined them.
+        reply = _modern_result if modern else _result
         name = params.get("name")
         args = params.get("arguments")
         writes = name == "brain_capture"
@@ -543,7 +547,7 @@ class Handler(BaseHTTPRequestHandler):
                                 principal=principal.stable_id, profile=principal.profile,
                                 endpoint=principal.endpoint, outcome="denied",
                                 ms=_ms(started))
-            return self._send(200, _result(msg_id, mcpcore.error_result(
+            return self._send(200, reply(msg_id, mcpcore.error_result(
                 "brain_capture is not available on this endpoint. This is the read-only "
                 "brain; use the read/capture endpoint to save a note.")), cid=cid)
 
@@ -571,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
                             client=client_name, client_version=client_version,
                             outcome="error" if result.get("isError") else "ok",
                             ms=_ms(started))
-        return self._send(200, _result(msg_id, result), cid=cid)
+        return self._send(200, reply(msg_id, result), cid=cid)
 
     def _capture(self, args, principal, cid) -> dict:
         table = {tool["name"]: tool for tool in mcpcore.tool_table("remote")}
@@ -633,6 +637,36 @@ def _ms(started: float) -> int:
 
 
 def _result(msg_id, result: dict) -> dict:
+    """A legacy-era result: the payload, exactly as the handshake revisions expect."""
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _modern_result(msg_id, payload: dict) -> dict:
+    """A 2026-07-28 result, which is not the same shape as a legacy one.
+
+    Two additions the revision requires of EVERY result, and one choke point so
+    that adding a method later cannot forget them:
+
+    `resultType` is mandatory — "The `result` MUST include a `resultType` field
+    to indicate the type of the result." It is the discriminator that lets a
+    client tell a finished answer from an `input_required` one under
+    multi-round-trip requests. This server never asks the client for input, so
+    every result it produces is `complete`; that is a fact about this server,
+    not a default to lean on. The spec's absent-means-complete rule is a bridge
+    for EARLIER-revision servers only, so a modern server that omits it is
+    simply invalid — which is exactly how the first real client failed: it
+    authenticated, negotiated 2026-07-28, and then refused `tools/list`.
+
+    `serverInfo` in `_meta` is a SHOULD, and it is included because the
+    revision is stateless: there is no handshake left in which to say who is
+    answering, so a response that omits it leaves a client with no way to
+    identify the server it is talking to. It is self-reported and unverified,
+    which is why nothing here depends on it."""
+    result = dict(payload)
+    result["resultType"] = "complete"
+    meta = dict(result.get("_meta") or {})
+    meta.setdefault(META_SERVER_INFO, {"name": SERVER_NAME, "version": SERVER_VERSION})
+    result["_meta"] = meta
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
