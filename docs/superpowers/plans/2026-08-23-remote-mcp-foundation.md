@@ -27,7 +27,9 @@ Carried forward from `plans/2026-07-25-setup-foundation.md` and still binding:
 - **Absolute dates** in code, comments and docs.
 - **No test binds a public interface** — `127.0.0.1`, port 0.
 - **No test sleeps to observe a timeout** — clocks are parameters.
-- **305 existing tests stay green**: `python3 -m unittest discover -s tests`.
+- **The suite stays green**: `python3 -m unittest discover -s tests`. It was 305
+  tests when this plan was written and is 453 now; the number is not the point,
+  never deleting one to make a change pass is.
 - New files under `bin/` ship automatically: `cmd_template` publishes what
   `git ls-files` tracks. Machine-local artifacts go in `TEMPLATE_DROP` **and**
   `.gitignore`.
@@ -240,16 +242,165 @@ gains nothing: production stdio is not configured with a data root.
 
 ## Order of work
 
-1. `rs256.py` + vectors. **Done first, because everything else trusts it.**
-2. `access.py` + a JWKS fixture and a forged-assertion suite.
-3. `mcpcore.py` — extracted from `bin/brain-mcp` verbatim, then shared.
-4. `httpmcp.py` + `bin/brain-http`, legacy era first, then modern.
-5. `capture.py` — transaction, ledger, queue.
-6. `eventlog.py`.
-7. Docker image, compose, systemd units.
-8. Cloudflare provisioning script (idempotent, declarative desired state).
-9. Backup, restore drill, runbooks.
-10. Deploy, probe, and the client qualification matrix.
+Steps 1-9 are **complete**. Step 10 is partly done and is the whole of what
+remains; see "Remaining work" below.
+
+1. ~~`rs256.py` + vectors.~~ Done first, because everything else trusts it.
+2. ~~`access.py` + a JWKS fixture and a forged-assertion suite.~~
+3. ~~`mcpcore.py` — extracted from `bin/brain-mcp`, then shared.~~
+4. ~~`httpmcp.py` + `bin/brain-http`, legacy era first, then modern.~~
+5. ~~`capture.py` — transaction, ledger, queue.~~
+6. ~~`eventlog.py`.~~
+7. ~~Docker image, compose, systemd units.~~
+8. ~~Cloudflare provisioning script.~~
+9. ~~Backup, restore drill, runbooks.~~
+10. Deploy, probe, and the client qualification matrix. **In progress.**
+
+What each step produced, and the evidence for it, is in
+[`../handbacks/2026-08-23-remote-mcp-foundation-status.md`](../handbacks/2026-08-23-remote-mcp-foundation-status.md).
+
+---
+
+## Remaining work
+
+An independent audit of all 194 spec requirements on 2026-08-23 returned
+**69 done, 81 partial, 25 missing, 17 deliberate deviations**. Almost the whole
+"partial" column has one cause: `brain.qodevia.com` is not cut over, so the
+capture endpoint has never been exercised over the network.
+
+The tasks below are ordered so that each one is safe to stop after. **R1 is the
+hinge** — a dozen acceptance gates cannot be evaluated until it is done, and
+several later tasks are only meaningful afterwards.
+
+### R1. Cut `brain.qodevia.com` over to the new stack
+
+The single largest gap. Until this is done, `brain_capture` has never run over
+the real network, and the spec's read/capture endpoint does not exist.
+
+Preconditions, both owner actions: a client has listed tools successfully
+against `brain-read.qodevia.com`, and the owner accepts a brief interruption of
+the old endpoint.
+
+The order matters and is not the obvious one — see `setup/runbooks/remote-brain.md`
+procedure 1 step 10c:
+
+1. `GET` the **workhorse** tunnel's ingress, remove *only* its
+   `brain.qodevia.com` entry, `PUT` the whole remaining list back with the
+   catch-all last. Doing this BEFORE repointing DNS means the hostname 502s for
+   a few seconds rather than being served by two origins at once.
+2. Convert the existing `brain` Access application from its `bypass`/Everyone
+   policy to Managed OAuth plus an owner-email Allow policy. Its audience does
+   not change, so `/etc/brain/brain-http.json` needs no edit.
+3. Wait out the Access propagation delay (~85s) and confirm an unauthenticated
+   request is challenged, not served.
+4. Repoint the `brain.qodevia.com` CNAME onto the brain tunnel, proxied.
+5. **Freeze and retire the old copy** — cutover steps 3 and 11. Stop the
+   orphaned `:8787` process, re-sync anything it captured since the migration,
+   and make the old tree non-writable. Two writable copies is the one failure
+   this whole design exists to prevent, and the window is open until this is
+   done.
+
+Then re-run these gates, which are currently unevaluable: owner OAuth on both
+endpoints; both tunnel routes reach the intended service; the read-only denial
+observed live; a canary capture over the network that commits, returns
+provisional, appears under `scope: all`, survives a restart, pushes, and enters
+the encrypted backup.
+
+### R2. Access service tokens, and prove revocation isolates
+
+Unmet gate: *"One headless credential can be revoked without affecting
+another."* Owner action — the secret is shown once and cannot be retrieved.
+
+1. Create two named service tokens with explicit finite durations.
+2. Give each its own Service Auth policy using
+   `{"service_token": {"token_id": …}}` — **never** `any_valid_service_token`,
+   which admits every token in the account, including ones minted years later
+   for something unrelated.
+3. Add each `common_name` to `service_principals` in
+   `/etc/brain/brain-http.json`, mapped to exactly one profile.
+4. Authenticate a headless client with each, delete one, and show that client
+   blocked while the other still works.
+5. Only then set `service_auth_401_redirect: true` — it cannot be enabled until
+   a Service Auth policy exists.
+
+### R3. The client compatibility matrix
+
+The spec requires an **observed** matrix, not an assumption. One row per client
+per endpoint, recording client/version, endpoint, authentication result,
+advertised tools, a safe search/read probe, capture where permitted, and the
+exact limitation where it fails.
+
+Expect, from published defect reports: Claude Code works; Gemini CLI should
+work; ChatGPT connectors need developer mode; **Codex has open RFC 8707 defects**
+and may authenticate then fail at token expiry; **claude.ai web/mobile has a
+long-running unresolved failure against Access Managed OAuth**. A plan or
+account restriction is reported as such, never disguised as a server failure.
+
+### R4. Cloudflare-side alerting
+
+Missing entirely: nothing notices the brain or the tunnel being down. A
+container restart loop is not an alert. Create Cloudflare notification policies
+for tunnel health and application health, and record how they are addressed.
+
+The other alerts in the spec's list are now covered: backup age and disk
+headroom by `bin/brain doctor` (`bin/brain:5013`, `:5040`) under the nightly
+timer whose `OnFailure=` raises; push-pending by the queue's own escalation.
+Service-credential expiry is checked by `deploy/cloudflare/provision.py` but
+**nothing schedules it** — wire it to a timer as part of this task.
+
+### R5. Runbook: the egress allowlist and SSH hardening
+
+Two sections the spec asks for and the runbook does not contain.
+
+- **Egress.** The spec limits outbound access "as practical" to the tunnel,
+  Cloudflare JWKS, the private git provider, backup storage, registries during
+  controlled updates, and the consolidator provider. Docker has no per-container
+  egress ACL, so this is a `DOCKER-USER` job on the host. Write the rules, or
+  record the residual risk explicitly — the compose file already says the honest
+  word is "full" and points here.
+- **SSH.** The only administrative path to the single production writer, and the
+  runbook says nothing about it. Key-only authentication, root-login policy,
+  rate limiting. Note the standing rule: **never close SSH until a second,
+  tested way in already works.**
+
+### R6. Finish the durability evidence
+
+- Demonstrate a **live push outage and recovery**: break the remote, capture,
+  observe `backup_pending`, restore, observe the queue drain. Unit coverage
+  exists (`BackupQueueTests`); the gate asks for a demonstration.
+- Let the **nightly timer** produce an unattended backup and the **monthly
+  drill** run once on its own schedule, rather than by hand.
+
+### R7. Release tag and the deployment discipline
+
+The spec says production deploys tagged releases, never a moving branch. The
+VPS currently runs branch `remote-mcp-foundation`. Tag a release, retag the
+image to match, and record the image digest — which the handback also owes,
+along with a software bill of materials and a vulnerability scan.
+
+### R8. Resolve the inherited consolidation branches
+
+`brain doctor` is RED on three unreviewed `consolidate/*` branches that came
+across in the migration. They predate this work. Until they are reviewed or
+dropped, the nightly maintenance timer alerts every night, and the acceptance
+gate "`brain lint` and `brain doctor` pass on the migrated private data" cannot
+pass. **Owner decision**, not an implementation task.
+
+### R9. Declare cutover complete
+
+Cutover step 12: only after every applicable gate passes. Produce the final
+handback — branch/commit and tag, test commands and outputs, image digest and
+SBOM, sanitized service evidence, redacted Cloudflare evidence, the separation
+scan and export inventory, capture/concurrency/failure-injection results, git
+push and backup/restore reports, the completed client matrix, and the
+deviations. No credential, assertion, owner address, or note content in any of
+it.
+
+### Not in scope, deliberately
+
+Consolidation scheduling stays out until a runner decision is made — see
+`deploy/systemd/README.md`. Everything in the spec's "Non-goals for v1" stays
+out; the audit confirmed none of it has crept in.
 
 ## Known client risks, before anything is built
 
