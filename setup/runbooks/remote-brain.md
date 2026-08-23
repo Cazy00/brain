@@ -578,8 +578,14 @@ data repository.
 
 ## 4. Rotate an Access service token
 
-Service credentials expire after 90 days. Rotate at day 83, not at day 90 —
-the old token stays valid throughout, so there is no outage window.
+Rotate a week before the expiry `provision.py` reports, not on the day — the
+old token stays valid throughout, so there is no outage window. The duration is
+whatever was chosen at creation and is recorded in `/etc/brain/cloudflare.json`;
+this deployment uses one year, and `expiry_warning_days` is the seven-day
+alert. Do not trust a remembered number: `provision.py --check` reads the real
+`expires_at` from the account, and a token whose expiry it cannot read is
+reported as blocked rather than ok, because an unreadable expiry is a
+credential with no rotation alarm at all.
 
 ```sh
 # 1. Create the replacement. The secret is shown ONCE and is never retrievable.
@@ -609,13 +615,61 @@ restart the brain service.
 
 **4. Update the client**, and confirm it works with the new credential.
 
-**5. Delete the old token and its policy.** Deleting a service token must block
-that client immediately and affect no other credential and no OAuth session.
-Verify both halves: the old credential now gets a 403, and a browser session on
-the same endpoint still works.
+**5. Delete the old token — POLICY FIRST, and that order is not optional.**
+Cloudflare refuses to delete a service token while any policy still references
+it:
 
-Alert at seven days before expiry. A silently expired headless client looks
-exactly like a broken server.
+```
+12139 access.api.error.service_token_in_use: cannot delete service token
+because it is used by a policy, group, or app SCIM configuration.
+```
+
+[verified 2026-08-23]. So: delete the token's own Service Auth policy, then the
+token. Reaching for the token first gets an error that reads like a permissions
+problem and is not one.
+
+```sh
+# 1. the policy that names this token
+curl -sS -X DELETE -H "Authorization: Bearer $CF_API_TOKEN" \
+  ".../accounts/<ACCOUNT_ID>/access/apps/<APP_ID>/policies/<POLICY_ID>"
+# 2. only now, the token
+curl -sS -X DELETE -H "Authorization: Bearer $CF_API_TOKEN" \
+  ".../accounts/<ACCOUNT_ID>/access/service_tokens/<TOKEN_UUID>"
+```
+
+If you need the client blocked *without* unpicking the policy — an incident
+rather than a rotation — **rotate** the token instead
+(`POST .../service_tokens/<uuid>/rotate`). That invalidates every existing
+client immediately and leaves the policy alone. The secret it returns is, once
+again, shown only once.
+
+**Verify both halves, and the second half is the one that matters.** The
+revoked credential must be refused and every other credential must be
+untouched:
+
+```
+BEFORE   brain-read-headless      -> HTTP 200  4 tools
+         brain-revocation-canary  -> HTTP 200  4 tools
+AFTER    brain-read-headless      -> HTTP 200  4 tools
+         brain-revocation-canary  -> HTTP 401  Unauthorized      [verified 2026-08-23]
+```
+
+Access answers **401**, not 403, for a revoked service credential on a Managed
+OAuth application — the same `invalid_token` shape an unauthenticated request
+gets. Both credentials in that demonstration sat on the same endpoint with the
+same profile, so the only thing separating them was the per-token policy. With
+`any_valid_service_token` the revocation would have broken both or neither.
+
+Alert at seven days before expiry — `brain-edge-check.timer` does this, and
+Cloudflare's own `expiring_service_token_alert` does it independently. A
+silently expired headless client looks exactly like a broken server.
+
+**One more thing that looks like an auth failure and is not.** A client whose
+User-Agent looks automated gets Cloudflare **error 1010** — "blocked access
+based on your browser's signature" — as a 403 from the edge, *before* Access is
+consulted [verified 2026-08-23: `Python-urllib/3.12` was refused; any ordinary
+User-Agent string was not]. The 403 body is a Cloudflare error page, not an
+Access challenge, which is how to tell the two apart at a glance.
 
 ---
 
