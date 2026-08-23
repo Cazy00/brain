@@ -4995,6 +4995,67 @@ def cmd_doctor_notify() -> int:
     return run.returncode
 
 
+
+# The spec asks for an alert when the encrypted backup is older than 24 hours and
+# when disk drops below 20%. Both live HERE rather than in a bespoke monitor, and
+# the reason is that doctor is already the thing that runs nightly under a timer
+# whose OnFailure= raises an alert. A second watcher would be a second thing to
+# install, schedule and forget; a check nobody runs is not an alert.
+#
+# Both degrade to an advisory rather than a failure where the feature is simply
+# not configured: a laptop clone has no offsite backup and should not be told it
+# is broken for that.
+BACKUP_STAMP = "backup-last-success.json"
+BACKUP_STALE_SECONDS = 24 * 3600
+DISK_FLOOR_FRACTION = 0.20
+
+
+def _report_offsite_backup() -> bool:
+    """Whether the nightly encrypted archive is fresh. Returns False on a RED."""
+    stamp = state_dir() / BACKUP_STAMP
+    if not stamp.exists():
+        print("  [-- ] no offsite backup configured (encrypted archive) — "
+              "see setup/runbooks/remote-brain.md")
+        return True
+    try:
+        import json as _j
+        completed = _j.loads(stamp.read_text(encoding="utf-8")).get("completed", "")
+        # The stamp is ISO-8601 UTC with a fixed shape, written by our own
+        # snapshot script — parsed strictly so a malformed one reads as a
+        # problem rather than as a very old backup or a very fresh one.
+        age = time.time() - time.mktime(time.strptime(completed, "%Y-%m-%dT%H:%M:%SZ")) \
+            + time.timezone
+    except Exception:
+        print(f"  [RED] {BACKUP_STAMP} is unreadable — the offsite backup cannot be "
+              "verified, which is not the same as it being fine")
+        return False
+    if age > BACKUP_STALE_SECONDS:
+        print(f"  [RED] encrypted backup is {int(age // 3600)}h old — the nightly "
+              "archive has not completed in over 24h; check brain-backup.service")
+        return False
+    print(f"  [ok ] encrypted backup {int(age // 3600)}h old")
+    return True
+
+
+def _report_disk_headroom() -> bool:
+    """Headroom where the KNOWLEDGE lives, which is the volume that matters."""
+    try:
+        stat = os.statvfs(str(ROOT))
+    except OSError:
+        return True
+    total = stat.f_blocks * stat.f_frsize
+    free = stat.f_bavail * stat.f_frsize
+    if total <= 0:
+        return True
+    fraction = free / total
+    if fraction < DISK_FLOOR_FRACTION:
+        print(f"  [RED] disk {fraction * 100:.0f}% free on the knowledge volume — "
+              "below the 20% floor; a capture that cannot write is a lost capture")
+        return False
+    print(f"  [ok ] disk {fraction * 100:.0f}% free")
+    return True
+
+
 def cmd_doctor() -> int:
     print("brain doctor\n")
     ok = True
@@ -5062,6 +5123,11 @@ def cmd_doctor() -> int:
         ok = False
     else:
         print("  [ok ] knowledge/ fully committed")
+
+    if not _report_offsite_backup():
+        ok = False
+    if not _report_disk_headroom():
+        ok = False
 
     import shutil
     for tool, why in (("gitleaks", "second secret scanner at commit time"),
