@@ -268,7 +268,8 @@ An independent audit of all 194 spec requirements on 2026-08-23 returned
 "partial" column has one cause: `brain.qodevia.com` is not cut over, so the
 capture endpoint has never been exercised over the network.
 
-**Closed since that audit:** ~~R4 Cloudflare alerting~~, ~~R5 the egress
+**Closed since that audit:** ~~R0 the two credentials~~, ~~R2 Access service
+tokens and the revocation gate~~, ~~R4 Cloudflare alerting~~, ~~R5 the egress
 allowlist and SSH hardening~~, ~~R7 the release, its identity, bill of
 materials and vulnerability scan~~. What they produced, with the evidence, is
 in [`../handbacks/2026-08-23-remote-mcp-foundation-status.md`](../handbacks/2026-08-23-remote-mcp-foundation-status.md).
@@ -277,33 +278,16 @@ Everything below is ordered so that each item is safe to stop after. **R1 is
 still the hinge** — a dozen acceptance gates cannot be evaluated until it is
 done, and R6 and R9 are only meaningful afterwards.
 
-### R0. Two credentials the owner has to make
+### ~~R0. Two credentials the owner has to make~~ — done
 
-Neither is work; both block work, and R0 exists so they are not discovered
-half way through R1.
+An API token scoped to Access, Tunnel, Notifications and zone DNS is installed
+at `/etc/brain/cf-api.env`; `provision.py` now runs against the live account and
+`--check` returns 4 (drift) for exactly the cutover items. Both service tokens
+are minted, one year, secrets in `/etc/brain/service-tokens/`.
 
-**a. A Cloudflare API token that can see Access.** The token on the VPS
-(`/etc/brain/cf-api-token`) reaches the tunnel API and can list service tokens,
-and is refused with `1010 auth.forbidden` on `access/apps` — so
-`provision.py` cannot run at all, and `brain-edge-check.timer` is installed and
-**deliberately left disabled**: enabled today it would fail nightly in a way
-that means "the token is wrong", not "the edge is wrong". Create one scoped to:
-
-| Scope | Permission |
-|---|---|
-| Account | Cloudflare Tunnel : Edit |
-| Account | Access: Apps and Policies : Edit |
-| Account | Access: Service Tokens : Edit |
-| Account | Notifications : Edit |
-| Zone (`qodevia.com`) | DNS : Edit |
-
-Install it as `/etc/brain/cf-api.env`, root-owned `0600`, one line:
-`CLOUDFLARE_API_TOKEN=…`. Then
-`sudo systemctl enable --now brain-edge-check.timer` and confirm the first run
-is green.
-
-**b. The Access service tokens** — see R2. They cannot be minted by the
-provisioner by design.
+`brain-edge-check.timer` is installed and **still disabled on purpose**: the
+only drift it would report today is the un-done cutover, so it would alert
+nightly for a planned reason. Enable it as the last step of R1.
 
 ### R1. Cut `brain.qodevia.com` over to the new stack
 
@@ -342,30 +326,23 @@ observed live; a canary capture over the network that commits, returns
 provisional, appears under `scope: all`, survives a restart, pushes, and enters
 the encrypted backup.
 
-### R2. Access service tokens, and prove revocation isolates
+### ~~R2. Access service tokens, and prove revocation isolates~~ — done
 
-Unmet gate: *"One headless credential can be revoked without affecting
-another."* Owner action, and it is a design decision rather than a limitation:
-Cloudflare shows a service token's client secret exactly once, and
-`provision.py` refuses to be a secret-handling tool — see `step_service_tokens`
-for the three options that were weighed.
+Both tokens minted on the VPS, secrets written with `O_EXCL` mode `0600` and
+never printed. Each has its own Service Auth policy naming that one token.
+The gate — *one headless credential can be revoked without affecting another* —
+was demonstrated with a third, disposable credential: before, both returned 200
+and four tools; after revoking one, it returned 401 and the other still
+returned 200 and four tools, on the same endpoint with the same profile.
 
-1. Create two named service tokens with explicit finite durations
-   (`brain-read-headless`, `brain-capture-headless`).
-2. Put each secret in `/etc/brain/service-tokens/<name>`, root-owned `0600`.
-3. Add each `client_id` to `service_principals` in
-   `/etc/brain/brain-http.json`, mapped to exactly one profile.
-4. Add both to `service_tokens` in `/etc/brain/cloudflare.json`, add the
-   Service Auth policies, and run `provision.py --apply`. The policy names the
-   token — **never** `any_valid_service_token`, which admits every token in the
-   account including ones minted years later for something unrelated;
-   `provision.py` refuses that outright.
-5. Authenticate a headless client with each. Then create a third, disposable
-   token, authenticate with it, delete it, and show that client blocked while
-   the other two still work — a cleaner demonstration of the same gate than
-   destroying a credential you intend to keep.
-6. Only then set `service_auth_401_redirect: true`; it cannot be enabled until
-   a Service Auth policy exists, and the provisioner defers it until then.
+Two things the doing taught, both now in runbook procedure 4: Cloudflare
+**refuses to delete a service token while a policy references it**
+(`12139 service_token_in_use`), so the order is policy then token; and Access
+answers **401**, not 403, for a revoked credential on a Managed OAuth app.
+
+The capture endpoint's Service Auth policy is declared in
+`/etc/brain/cloudflare.json` and lands with the cutover — there is no point
+binding a policy to an application still on `bypass`/Everyone.
 
 ### R3. The client compatibility matrix
 

@@ -162,6 +162,42 @@ pre-existing `test_brain` 213, `test_osbackend` 51, `test_setup` 41 — **496**.
 | SSH is stated rather than assumed | code | Runbook procedure 12: the effective `sshd -T` values as read on 2026-08-23, what to change and what each buys, the drop-in ordering trap (first-wins, so `99-` does **not** win), the three accounts with shells, and rate limiting — with the standing rule that SSH is never closed until a second, tested way in works. |
 | A retention lock is not a failure | code + test | `deploy/backup/lib-s3.sh` `s3_delete` returns 0/2/1; `S3DeleteTests` — 4 tests. |
 
+### Headless credentials, and the read/capture boundary over the network
+
+Every row here is **live** — a request that left the VPS, crossed the
+Cloudflare edge, and came back through the tunnel to the container.
+
+| Gate | Result |
+|---|---|
+| A headless client can authenticate without a browser | `tools/list` on `brain-read` with `CF-Access-Client-Id/Secret` → **HTTP 200** |
+| The read endpoint advertises exactly four tools | `brain_links`, `brain_read`, `brain_recent`, `brain_search` — **no `brain_capture`** |
+| `resultType` on every modern result | `resultType: "complete"`, and `serverInfo` reports `{"name":"brain","version":"0.2.2"}` — the release number, end to end |
+| A real read works over the network | `brain_search` → 200, results returned |
+| A hand-built `brain_capture` on the read endpoint is refused | 200 with **`isError: true`** and a message naming the other endpoint — the MCP-correct shape for a tool refusal, not a transport error |
+| A credential authorized elsewhere is refused here | the capture token at `brain-read` → **401** from Access, because the policy names one token rather than `any_valid_service_token` |
+| **One headless credential can be revoked without affecting another** | before: both 200 / 4 tools. after revoking one: revoked → **401**, the other → **200, 4 tools**. Both sat on the same endpoint with the same profile, so the per-token policy is the only thing that separated them |
+| `service_auth_401_redirect` enabled only after a Service Auth policy exists | set on `brain-read` after its policy; the read credential still returns 200 and the unauthenticated `WWW-Authenticate` + `resource_metadata` challenge is unchanged |
+| The origin enforces the profile boundary itself | `access.py:335` — a credential mapped to one profile is refused at another with `wrong_profile`, independent of Access policy (unit-covered; Access blocks it first in production, which is the point) |
+
+Secrets never left the box: the tokens were minted by a script running **on**
+the VPS that wrote `client_secret` straight to `/etc/brain/service-tokens/`
+with `O_EXCL` and mode `0600`, and printed only name, client id and expiry.
+
+### The client matrix, so far
+
+The spec wants observed rows, not assumptions. Two are observed:
+
+| Client | Endpoint | Auth | Tools | Read | Capture | Note |
+|---|---|---|---|---|---|---|
+| Claude Code | `brain-read` | ✔ OAuth | 4 | — | n/a | negotiated `2026-07-28`; the `resultType` defect was found here |
+| service token (headless) | `brain-read` | ✔ `CF-Access-Client-*` | 4 | ✔ `brain_search` | refused, `isError` | no browser involved |
+
+Everything else waits on the cutover or on an interactive login. One trap is
+already recorded for whoever fills the rest in: **a client whose User-Agent
+looks automated is refused by Cloudflare error 1010 before Access is
+consulted** — a 403 whose body is a Cloudflare error page rather than an Access
+challenge. `Python-urllib/3.12` was refused; any ordinary User-Agent was not.
+
 ### Durability — all four layers
 
 | Layer | Evidence |
@@ -272,25 +308,20 @@ because only one of them is work:
   hostnames; it needs an explicit go-ahead, not an inference from "finish the
   plan". Until it happens `brain_capture` has never run over the network, and
   that single fact accounts for most of the audit's "partial" column.
-- **No Access service tokens.** Minting one produces a client secret Cloudflare
-  shows exactly once. The design's answer is that a human creates it in a
-  session where the secret is shown to them and it goes straight into
-  `/etc/brain/service-tokens/` — `provision.py` deliberately does not mint one,
-  and that is the sharpest trade-off in the file. Until then the headless
-  fallback and the revocation gate are unmet.
-- **No Cloudflare API token with Access permissions.** The token on the box can
-  read service tokens and reach the tunnel API; it is refused (`1010
-  auth.forbidden`) on `access/apps`. `brain-edge-check.timer` is therefore
-  installed and **not enabled**: enabling it today would produce a nightly
-  failure that means "the token is wrong", not "the edge is wrong".
+- **`brain-edge-check.timer` is installed and not enabled.** Not for want of a
+  credential any more — it now has one, and `--check` runs green against the
+  live account. It is held back because the only drift it currently reports
+  *is* the un-done cutover, so enabling it would alert nightly for a known,
+  planned reason. That is precisely how an alert becomes one people skip. It
+  goes on the moment the cutover lands.
 - **Three unreviewed `consolidate/*` branches** inherited from the old brain.
   `doctor` is RED on them and will stay RED. Reviewing or dropping them is a
   judgement about the owner's own notes.
 
 **Waiting on the network path, or on the clock.**
 
-- The **client compatibility matrix** needs the other clients, and those need
-  interactive logins.
+- The **client compatibility matrix** has two observed rows and needs the rest;
+  those need interactive logins, and the capture rows need the cutover.
 - The **live push outage demonstration** needs a capture over the HTTP path,
   which needs the cutover.
 - The **unattended** nightly backup and monthly drill need the timers to fire on
