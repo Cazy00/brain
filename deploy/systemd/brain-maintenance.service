@@ -21,6 +21,11 @@ After=brain-backup.service docker.service
 Requires=docker.service
 OnFailure=brain-alert@%n.service
 
+# The compose SERVICE is `maintenance`; the `brain-` prefix belongs to the
+# project, so the CONTAINER is named brain-maintenance-run-*. This unit named the
+# container instead of the service and every run died with "no such service:
+# brain-maintenance" — a nightly failure that would have looked like the
+# maintenance work itself failing rather than a name.
 [Service]
 Type=oneshot
 TimeoutStartSec=30min
@@ -32,9 +37,9 @@ Environment=BRAIN_COMPOSE=/srv/brain/engine/deploy/compose.yaml
 Environment=DOCKER_CONFIG=/tmp/docker
 Environment=DOCKER_CLI_HINTS=false
 
-ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps brain-maintenance index --quiet
-ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps brain-maintenance lint
-ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps brain-maintenance doctor
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance index --quiet
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance lint
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance doctor
 
 # Hardening. This unit is a docker CLI client and nothing else: it opens one
 # AF_UNIX socket, and the work happens in a container with its own, stricter
