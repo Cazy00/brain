@@ -36,3 +36,89 @@ jobs:
       - uses: actions/checkout@v4
       - name: runtime tests
         run: python3 -m unittest discover -s tests -v
+
+  export:
+    # The spec's separation gate: "CI scans that export and fails on unexpected
+    # paths, real knowledge, credentials, private deployment values, Git
+    # metadata, archives, or backups."
+    #
+    # This is deliberately NOT the same as trusting `brain template`'s own leak
+    # scan. That scan runs inside the command being tested, and a bug that
+    # weakened it would weaken its self-check in the same commit. This job
+    # re-inspects the emitted tree from outside, with rules written here, so the
+    # export and its auditor can never fail together.
+    #
+    # It also runs gitleaks over the EXPORT rather than the source, because the
+    # export is the artifact that becomes public and it is the only tree whose
+    # contents are the whole of what gets published.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: emit the public template
+        run: python3 bin/brain template /tmp/export
+      - name: no knowledge beyond the starter skeleton
+        run: |
+          set -eu
+          # The allowlist, restated here on purpose rather than imported from
+          # the code under test.
+          unexpected=$(cd /tmp/export && find knowledge -name '*.md' \
+            ! -path 'knowledge/index.md' \
+            ! -path 'knowledge/vault/README.md' \
+            ! -path 'knowledge/reference/note-conventions.md')
+          if [ -n "$unexpected" ]; then
+            echo "knowledge leaked into the export:"; echo "$unexpected"; exit 1
+          fi
+      - name: no git metadata, archives or backups
+        run: |
+          set -eu
+          found=$(find /tmp/export \( -name '.git' -o -name '*.age' -o -name '*.tar.gz' \
+                                    -o -name '*.tar.gz.age' -o -name '.env' \
+                                    -o -name '.mcp.json' -o -name 'vault-recipient.txt' \) -print)
+          if [ -n "$found" ]; then echo "must not ship:"; echo "$found"; exit 1; fi
+      - name: no private deployment values
+        run: |
+          set -eu
+          # Deployment identifiers are private even though they are not secrets:
+          # an account id, an Access audience, a zone or a tunnel id names
+          # somebody's live deployment. Example files must carry <PLACEHOLDER>
+          # shapes only.
+          #
+          # The check is deliberately narrow. A blanket "any 32/64 hex" rule was
+          # tried first and flagged the DER DigestInfo prefix in rs256.py and the
+          # SHA-256 of the empty string in lib-s3.sh — both protocol constants.
+          # A gate that cries wolf is a gate somebody switches off, so this
+          # matches a hex value ASSIGNED TO a deployment key, and a team domain
+          # that is not a placeholder.
+          #
+          # `evil` is exempt because the negative test for a wrong issuer has to
+          # use a cloudflareaccess.com name to be worth anything: the realistic
+          # attack is a genuine assertion from a DIFFERENT Cloudflare tenant, not
+          # from example.com. Weakening the fixture to please the scanner would
+          # weaken the test.
+          fail=0
+          if grep -rInE \
+              '(account_id|zone_id|tunnel_id|audience|"aud"|client_id)"?[[:space:]]*[:=][[:space:]]*"?[0-9a-f]{32,64}' \
+              /tmp/export; then
+            echo "^ a real deployment identifier reached the export"; fail=1
+          fi
+          if grep -rInE '\b[a-z0-9][a-z0-9-]*\.cloudflareaccess\.com' /tmp/export \
+             | grep -vE '<[A-Za-z_]+>|example|your-team|evil'; then
+            echo "^ a real Cloudflare Access team domain reached the export"; fail=1
+          fi
+          if grep -rInE '(cfut_|cfat_)[A-Za-z0-9]{20,}' /tmp/export; then
+            echo "^ a Cloudflare API token reached the export"; fail=1
+          fi
+          exit $fail
+      - name: the export lints and its own tests pass
+        run: |
+          set -eu
+          cd /tmp/export
+          python3 bin/brain lint
+          python3 -m unittest discover -s tests
+      - name: gitleaks over the emitted tree
+        run: |
+          curl -sSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks detect --source /tmp/export --no-git --no-banner --redact
