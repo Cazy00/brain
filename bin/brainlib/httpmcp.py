@@ -49,10 +49,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import access
 from . import mcpcore
+from . import version
 
 ENDPOINT = "/mcp"
 SERVER_NAME = "brain"
-SERVER_VERSION = "1.0.0"
+# One source of truth for the release number — see brainlib/version.py for why
+# a locally invented one here was a real problem rather than a tidiness issue.
+SERVER_VERSION = version.VERSION
 
 # Every released protocol version, newest first. Membership in an enumerated
 # set, never a string comparison: these are dates, but "2026-07-28" > "2025-11-25"

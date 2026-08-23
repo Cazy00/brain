@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 from brainlib import access, capture, eventlog, httpmcp, mcpcore, rs256  # noqa: E402
+from brainlib import version as brainversion  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_rs256 import (MODULUS, FORGE_EXPONENT, PUBLIC_EXPONENT, K,  # noqa: E402
@@ -1063,7 +1064,7 @@ def _compose_run_service(command: str):
 
 
 def _shell_commands(markdown: str):
-    """Every command line in a fenced block, with `\` continuations joined."""
+    r"""Every command line in a fenced block, with `\` continuations joined."""
     joined, buffer = [], ""
     for line in markdown.splitlines():
         line = line.rstrip()
@@ -1075,6 +1076,116 @@ def _shell_commands(markdown: str):
             continue
         joined.append(line)
     return joined
+
+
+class ReleaseVersionTests(unittest.TestCase):
+    """Prevents: three version numbers that are each believable alone.
+
+    The server used to report `1.0.0` while the box ran `brain:0.1.0` built
+    from a branch with no tag on it at all. Every one of those is plausible in
+    isolation, which is what makes the disagreement expensive: a client's bug
+    report names a version that never existed, and nobody can tell which code
+    it was."""
+
+    def test_the_server_reports_the_release_version(self):
+        self.assertEqual(httpmcp.SERVER_VERSION, brainversion.VERSION)
+
+    def test_the_version_is_a_release_number_and_not_a_branch_name(self):
+        self.assertRegex(brainversion.VERSION, r"^\d+\.\d+\.\d+$")
+
+    def test_serverinfo_carries_it_to_the_client(self):
+        """The modern revision is stateless — there is no handshake left in
+        which to say who is answering — so this is the only place a client can
+        learn it."""
+        result = httpmcp._modern_result(1, {})
+        info = result["result"]["_meta"][httpmcp.META_SERVER_INFO]
+        self.assertEqual(info, {"name": httpmcp.SERVER_NAME,
+                                "version": brainversion.VERSION})
+
+    def test_the_dockerfile_labels_an_unreleased_build_as_one(self):
+        """A build that forgets to pass the version must not inherit a number
+        that looks like a release."""
+        dockerfile = (Path(__file__).resolve().parent.parent
+                      / "deploy" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG BRAIN_VERSION=unreleased", dockerfile)
+        self.assertIn('org.opencontainers.image.version="${BRAIN_VERSION}"', dockerfile)
+
+
+class SbomTests(unittest.TestCase):
+    """Prevents: a bill of materials that is a correct document about a broken
+    promise.
+
+    The image's dependency set is 127 Debian packages and NO third-party Python
+    at all — that emptiness is a design decision restated in half a dozen
+    places, and it is the kind of decision a single `pip install` in a
+    Dockerfile undoes without anyone noticing. So the generator asserts it
+    rather than reporting it: a wheel makes the build fail, not the document
+    longer."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="brain-sbom-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.script = (Path(__file__).resolve().parent.parent / "deploy" / "sbom.sh")
+        self.fake = self.dir / "docker"
+
+    def write_fake_docker(self, pip_output):
+        self.fake.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  inspect)\n"
+            "    case \"$3\" in\n"
+            "      *'.Id'*) echo 'sha256:deadbeef' ;;\n"
+            "      *Created*) echo '2026-08-23T00:00:00Z' ;;\n"
+            "      *Architecture*) echo arm64 ;;\n"
+            "      *base.name*) echo 'python:3.12-slim-bookworm' ;;\n"
+            "      *image.version*) echo '0.2.0' ;;\n"
+            "      *) echo '' ;;\n"
+            "    esac ;;\n"
+            "  run)\n"
+            "    case \"$*\" in\n"
+            "      *platform*) echo '3.12.14' ;;\n"
+            "      *pip*) printf '%s' \"" + pip_output + "\" ;;\n"
+            "      *dpkg-query*) printf 'libc6\\t2.36-9\\tarm64\\ngit\\t1:2.39.5\\tarm64\\n' ;;\n"
+            "    esac ;;\n"
+            "esac\n",
+            encoding="utf-8")
+        self.fake.chmod(0o755)
+
+    def run_sbom(self):
+        env = dict(os.environ)
+        env["DOCKER"] = str(self.fake)
+        return subprocess.run(["/bin/sh", str(self.script), "brain:0.2.0"],
+                              env=env, capture_output=True, text=True)
+
+    def test_it_emits_a_bill_of_materials_for_a_clean_image(self):
+        self.write_fake_docker("pip==25.0.1\n")
+        result = self.run_sbom()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = json.loads(result.stdout)
+        self.assertEqual(document["bomFormat"], "CycloneDX")
+        names = [c["name"] for c in document["components"]]
+        self.assertIn("brain", names)
+        self.assertIn("git", names)
+        properties = {p["name"]: p["value"] for p in document["metadata"]["properties"]}
+        self.assertEqual(properties["python.third_party_packages"], "0")
+
+    def test_a_third_party_wheel_refuses_the_build(self):
+        self.write_fake_docker("pip==25.0.1\nPyJWT==2.9.0\n")
+        result = self.run_sbom()
+        self.assertEqual(result.returncode, 77)
+        self.assertIn("PyJWT", result.stderr)
+        self.assertEqual(result.stdout.strip(), "",
+                         "a refused run must not also emit a document")
+
+    def test_the_digest_is_labelled_as_a_config_id(self):
+        """Nothing here is pushed, so there is no registry manifest digest.
+        Calling the config id a digest is how a handback ends up claiming an
+        immutability it does not have."""
+        self.write_fake_docker("pip==25.0.1\n")
+        document = json.loads(self.run_sbom().stdout)
+        properties = {p["name"]: p["value"] for p in document["metadata"]["properties"]}
+        self.assertIn("image.config_id", properties)
+        self.assertNotIn("image.digest", properties)
 
 
 class DeploymentUnitTests(unittest.TestCase):

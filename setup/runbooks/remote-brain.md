@@ -437,6 +437,25 @@ one failure this whole design exists to prevent.
 
 Never deploy a moving branch. Always a tag, always with a snapshot in front.
 
+**Cutting the release, on the development machine.** One number, in one file,
+and everything else reads it: `bin/brainlib/version.py`. The git tag is `v` +
+that string, the image tag IS that string, and the server reports it to clients
+as `serverInfo.version`. Bump it in the same commit that cuts the release —
+a version claimed on a branch and never tagged is worse than none.
+
+```sh
+$EDITOR bin/brainlib/version.py            # VERSION = "0.2.0"
+python3 -m unittest discover -s tests      # ReleaseVersionTests checks the agreement
+python3 bin/brain lint
+git commit -am "release: 0.2.0"
+V=$(python3 -c 'import sys; sys.path.insert(0, "bin"); from brainlib import version; print(version.VERSION)')
+git tag -a "v$V" -m "brain v$V"
+git push --tags
+```
+
+Read `$V` out of the file rather than typing it twice. Typing it is how the tag
+and the image come to disagree, and they disagree silently.
+
 ```sh
 # 1. Confirm the ground is solid.
 sudo docker compose -p brain exec brain /opt/brain/bin/brain doctor
@@ -457,8 +476,10 @@ sudo docker compose -p brain images --format '{{.Service}} {{.Repository}}@{{.ID
 #    compose file.
 sudo git -C /srv/brain/engine fetch --tags
 sudo git -C /srv/brain/engine checkout <NEW_TAG>
+V=$(sudo python3 -c 'import sys; sys.path.insert(0, "/srv/brain/engine/bin"); from brainlib import version; print(version.VERSION)')
 sudo docker build --pull -f /srv/brain/engine/deploy/Dockerfile \
-     -t brain:<NEW_TAG> /srv/brain/engine
+     --build-arg BRAIN_VERSION="$V" -t "brain:$V" /srv/brain/engine
+sudo sed -i "s/^BRAIN_VERSION=.*/BRAIN_VERSION=$V/" /srv/brain/engine/deploy/.env
 sudo docker compose -p brain pull cloudflared
 
 # 5. Preflight against the real data, without serving traffic.
@@ -475,6 +496,36 @@ EG=$(sudo docker inspect -f '{{(index .NetworkSettings.Networks "brain_egress").
 curl -fsS "http://$EG:8787/readyz"
 sudo docker compose -p brain logs --since 5m brain
 ```
+
+**7. Release evidence, before anyone is told it shipped.** A handback owes an
+image identity, a bill of materials and a vulnerability scan, and all three are
+about the image that is now running rather than the one that was intended.
+
+```sh
+# Identity. This is the image CONFIG id, not a registry manifest digest --
+# nothing here is pushed, so no manifest digest exists. Do not write it down as
+# one: that claims an immutability this deployment does not have.
+sudo docker inspect -f '{{.Id}} {{index .Config.Labels "org.opencontainers.image.version"}}' "brain:$V"
+sudo docker inspect -f '{{index .Config.Labels "org.opencontainers.image.base.name"}}' "brain:$V"
+sudo docker image inspect --format '{{index .RepoDigests 0}}' python:3.12-slim-bookworm  # what the base RESOLVED to
+
+# Bill of materials. Refuses (77) if a third-party Python package ever appears
+# in the image, which is a design invariant and not a preference.
+sudo /srv/brain/engine/deploy/sbom.sh "brain:$V" > "/var/lib/brain/sbom-$V.json"
+
+# Vulnerability scan. Through a saved tarball rather than by mounting
+# /var/run/docker.sock into a scanner: this needs to READ one image, and a
+# scan is not worth handing a third-party container control of the daemon.
+sudo docker save "brain:$V" -o /tmp/brain-image.tar
+sudo docker run --rm -v /tmp:/work:ro aquasec/trivy:latest image \
+     --input /work/brain-image.tar --severity HIGH,CRITICAL --scanners vuln
+sudo rm -f /tmp/brain-image.tar
+```
+
+The scan reports the BASE image's Debian packages -- there is nothing else in
+there to report on. A HIGH or CRITICAL with a fixed version available is a
+reason to rebuild with `--pull` and ship again; one with no fix available is a
+line in the handback, not a blocker.
 
 Then re-run the acceptance probes from procedure 1 step 13 — at minimum: OAuth
 on both hostnames, the four/five tool split, and one canary capture.

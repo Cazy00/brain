@@ -41,9 +41,16 @@ ARG BASE_IMAGE=python:3.12-slim-bookworm
 FROM ${BASE_IMAGE}
 
 ARG BASE_IMAGE
+# Passed in by the release build rather than defaulted, so an image built
+# without it is labelled "unreleased" and says so, instead of quietly claiming
+# a version nobody tagged. The value that belongs here is bin/brainlib/version.py's
+# VERSION, which is also what the server reports to a client as serverInfo and
+# what the git tag is named after — see that file for why all three are one.
+ARG BRAIN_VERSION=unreleased
 LABEL org.opencontainers.image.title="brain" \
       org.opencontainers.image.description="Remote MCP second brain — engine only, contains no knowledge" \
       org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${BRAIN_VERSION}" \
       org.opencontainers.image.base.name="${BASE_IMAGE}"
 
 # The three roots of the fixed interface contract, as defaults so a compose file
