@@ -202,12 +202,7 @@ class BackupQueue(object):
         CALLER waits before being told. The note is already committed before
         the wait starts, so nothing is at risk in it."""
         deadline = self._clock() + timeout
-        # A bounded number of rounds as well as a deadline. The deadline is the
-        # real limit; this is a backstop, because a wait loop in a request path
-        # whose only exit depends on a clock advancing is one stopped clock away
-        # from hanging a capture. It cost nothing to notice: a mutation test
-        # that froze the clock hung instead of failing.
-        for _round in range(int(timeout / 0.1) + 2):
+        while True:
             current = self.state()
             if current != "backup_pending":
                 return current
@@ -216,7 +211,6 @@ class BackupQueue(object):
             if tried_and_failed or self._clock() >= deadline:
                 return current
             self._sleep(0.1)
-        return self.state()
 
     def unpushed(self) -> int:
         """How many commits are accepted locally and not yet on the remote."""

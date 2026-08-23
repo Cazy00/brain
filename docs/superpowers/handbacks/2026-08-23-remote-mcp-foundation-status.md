@@ -192,62 +192,42 @@ Secrets never left the box: the tokens were minted by a script running **on**
 the VPS that wrote `client_secret` straight to `/etc/brain/service-tokens/`
 with `O_EXCL` and mode `0600`, and printed only name, client id and expiry.
 
-### The client matrix, so far
+### The client matrix
 
-The spec wants observed rows, not assumptions. Two are observed:
+Filled from the **server's own event log**, not from anyone's recollection.
+`client` and `client_version` come from the client's `clientInfo` — modern
+clients in `_meta`, legacy ones in `params` — so they are self-reported, which
+is worth stating because nothing verifies them.
 
-| Client | Endpoint | Auth | Tools | Read | Capture | Note |
-|---|---|---|---|---|---|---|
-| Claude Code | `brain-read` | ✔ OAuth | 4 | — | n/a | negotiated `2026-07-28`; the `resultType` defect was found here |
-| service token (headless) | `brain-read` | ✔ `CF-Access-Client-*` | 4 | ✔ `brain_search` | refused, `isError` | no browser involved |
+| Client | Version | Endpoint | Revision | Auth | What was observed |
+|---|---|---|---|---|---|
+| `claude-code` | 2.1.241 | read | **2026-07-28** (`server/discover`) | ✔ OAuth | discovery ok |
+| `claude-code` | 2.1.241 | read | **2025-11-25** (`initialize`) | ✔ OAuth | legacy handshake ok — *the same client, both eras* |
+| `claude-code` | 2.1.241 | capture | **2026-07-28** (`server/discover`) | ✔ OAuth | discovery ok |
+| `codex-mcp-client` | 0.149.0-alpha.4 | capture | **2025-06-18** (`initialize`) | ✔ OAuth | initialize ok, twice; no `tools/list` or `tools/call` seen yet |
+| service token | — | read | 2026-07-28 | ✔ `CF-Access-Client-*` | 4 tools; `brain_search` ok; `brain_capture` **denied** |
+| service token | — | capture | 2026-07-28 | ✔ `CF-Access-Client-*` | 5 tools; capture, idempotency, the outage drill |
 
-Everything else waits on the cutover or on an interactive login. One trap is
-already recorded for whoever fills the rest in: **a client whose User-Agent
-looks automated is refused by Cloudflare error 1010 before Access is
-consulted** — a 403 whose body is a Cloudflare error page rather than an Access
-challenge. `Python-urllib/3.12` was refused; any ordinary User-Agent was not.
+**The dual-era decision stopped being hypothetical.** One client, one
+afternoon, negotiated `2026-07-28` on one request and `2025-11-25` on another,
+and a second client arrived speaking `2025-06-18` — the oldest revision this
+server accepts. Three revisions across two clients in a single log. A server
+that had implemented only the revision the spec named would have refused two of
+those three.
 
-### The cutover
+**Honest gap:** every `tool_call` in the log so far is from a *service*
+principal. Interactive clients have authenticated, discovered and initialized;
+none has yet invoked a tool. The rows above say so rather than implying a
+working end-to-end path that has not been exercised. Using each client once —
+a single search — closes it.
 
-Done on 2026-08-23, in the order the runbook insists on — the hostname was
-pulled from the old tunnel's ingress **before** DNS moved, so it fell to a
-catch-all for a few seconds rather than being served by two origins at once.
-
-| Step | Evidence |
-|---|---|
-| The other five hostnames on that tunnel were untouched | one rule removed of eight, asserted in code before the `PUT`; `dev8080` and `console` still answered 302/303 throughout |
-| The `bypass`/Everyone policy is gone | deleted; the application briefly had **no** policy, which fails closed |
-| Managed OAuth, owner policy, capture Service Auth policy, DNS | `provision.py --apply` → 6 changes, exit 0 |
-| Access owns the challenge now | `WWW-Authenticate: … resource_metadata="https://brain.qodevia.com/.well-known/cloudflare-access-protected-resource/mcp"`. Before the cutover the same request got the **old** server's own challenge, advertising `scope="brain:read brain:write"` — scopes this design deliberately does not have |
-| The capture endpoint advertises five tools | `brain_capture`, `brain_links`, `brain_read`, `brain_recent`, `brain_search` |
-| A read credential is refused there | 401 |
-| **A capture over the network** | committed, returned `PROVISIONAL`, pushed to the private remote — all four durability layers in one call |
-| Idempotency on a retry | same `client_request_id` → **the same note and the same commit**, and the server says so: *"this request id was captured before; returning the original note rather than writing a second one"* |
-| It comes back through the read endpoint | found under `scope: all`, tagged `[provisional — unconsolidated]` |
-| The edge matches the declared state | `provision.py --check` → **"converged: no changes"**, exit 0 |
-| `brain-edge-check.timer` armed | enabled once it had something true to say |
-| **One writer** | the old service retired, its `systemd --user` units moved aside, `~/brain` renamed to `brain.FROZEN-2026-08-23` and `chmod -R a-w`; a `touch` inside it is refused |
-| `doctor` on the migrated data | **no RED, exit 0** — the three inherited `consolidate/*` branches were deleted at the owner's decision |
-
-### The push outage, demonstrated rather than simulated
-
-The remote was pointed at an unroutable host, a capture was made over HTTPS,
-and the remote was restored — with the restore in a `finally` block, because a
-demonstration that can leave the brain unable to push is not a demonstration.
-
-```
-2. capturing over the network, with the remote down
-     backup: PENDING — the note is committed locally and safe, and
-             the push to the private remote is being retried.
-   unpushed now: 1
-5. waiting for the queue to drain on its own
-   + 45s  unpushed=0     the queue drained itself.
-```
-
-The first run of that drill is what found the defect below: it reported
-`backup: pushed to the private remote` while the commit sat unpushed. On the
-fixed build a healthy capture still reports `pushed` (3.3 s round trip, and
-`settle` caps its own wait at 2.5 s), so the word means something again.
+Two traps already recorded for whoever finishes this. A client whose
+User-Agent looks automated is refused by **Cloudflare error 1010** at the edge,
+*before* Access is consulted; the tell is that the 403 body is a Cloudflare
+error page rather than an Access challenge. And Cloudflare's own Access request
+log leaves `user_agent` empty for these applications [verified 2026-08-23,
+27 entries, all `allowed: true`], so it can confirm that a login succeeded but
+not which client made it — the brain's event log is the only place that knows.
 
 ### Durability — all four layers
 
