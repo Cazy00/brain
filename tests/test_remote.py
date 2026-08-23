@@ -1241,15 +1241,19 @@ class SbomTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "",
                          "a refused run must not also emit a document")
 
-    def test_the_digest_is_labelled_as_a_config_id(self):
-        """Nothing here is pushed, so there is no registry manifest digest.
-        Calling the config id a digest is how a handback ends up claiming an
-        immutability it does not have."""
+    def test_the_local_digest_is_not_passed_off_as_a_registry_one(self):
+        """Nothing here is pushed, so no registry manifest digest exists. The
+        first version of this called `.Id` the config id, which is what it is
+        under the classic image store and NOT what it is under containerd —
+        this build's `.Id` was the OCI index digest. Both are local; neither is
+        a registry digest; the document says so rather than picking a name that
+        implies one."""
         self.write_fake_docker("pip==25.0.1\n")
         document = json.loads(self.run_sbom().stdout)
         properties = {p["name"]: p["value"] for p in document["metadata"]["properties"]}
-        self.assertIn("image.config_id", properties)
+        self.assertIn("image.id", properties)
         self.assertNotIn("image.digest", properties)
+        self.assertIn("NOT a registry manifest digest", properties["image.id_kind"])
 
 
 class DeploymentUnitTests(unittest.TestCase):

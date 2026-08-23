@@ -502,9 +502,10 @@ image identity, a bill of materials and a vulnerability scan, and all three are
 about the image that is now running rather than the one that was intended.
 
 ```sh
-# Identity. This is the image CONFIG id, not a registry manifest digest --
-# nothing here is pushed, so no manifest digest exists. Do not write it down as
-# one: that claims an immutability this deployment does not have.
+# Identity. A LOCAL content digest -- the OCI index digest under the containerd
+# image store, the config digest under the classic one. NOT a registry manifest
+# digest: nothing here is pushed, so none exists. Do not write it down as one;
+# that claims an immutability this deployment does not have.
 sudo docker inspect -f '{{.Id}} {{index .Config.Labels "org.opencontainers.image.version"}}' "brain:$V"
 sudo docker inspect -f '{{index .Config.Labels "org.opencontainers.image.base.name"}}' "brain:$V"
 sudo docker image inspect --format '{{index .RepoDigests 0}}' python:3.12-slim-bookworm  # what the base RESOLVED to
@@ -523,9 +524,25 @@ sudo rm -f /tmp/brain-image.tar
 ```
 
 The scan reports the BASE image's Debian packages -- there is nothing else in
-there to report on. A HIGH or CRITICAL with a fixed version available is a
-reason to rebuild with `--pull` and ship again; one with no fix available is a
-line in the handback, not a blocker.
+there to report on. **Read the fix column, not the count.** A HIGH or CRITICAL
+with a fixed version available is a reason to rebuild with `--pull` and ship
+again; one with `affected`, `fix_deferred` or `will_not_fix` and no fixed
+version is a line in the handback, because there is nothing to apply.
+
+```sh
+# The number that decides anything, rather than the total:
+sudo docker run --rm -v /tmp:/work:ro aquasec/trivy:latest image \
+     --input /work/brain-image.tar --severity HIGH,CRITICAL --scanners vuln \
+     --quiet --format json \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); \
+      v=[x for r in d.get("Results") or [] for x in (r.get("Vulnerabilities") or [])]; \
+      print(len(v), "HIGH/CRITICAL,", len([x for x in v if x.get("FixedVersion")]), "fixable")'
+```
+
+Most of what is reported arrives with `git`, which drags in perl and
+util-linux. That is the price of the spec's rule that a capture is not
+accepted until it is committed, and it is worth re-examining at a base-image
+change -- not at every release.
 
 Then re-run the acceptance probes from procedure 1 step 13 — at minimum: OAuth
 on both hostnames, the four/five tool split, and one canary capture.

@@ -84,13 +84,20 @@ json.dump({
             "type": "container",
             "name": os.environ["IMAGE"],
             "version": os.environ["RELEASE"],
-            "purl": "pkg:oci/brain@" + os.environ["DIGEST"],   # config id; see below
+            "purl": "pkg:oci/brain@" + os.environ["DIGEST"],   # local digest; see below
         },
         "properties": [
-            # The image CONFIG id, which is what a locally built image has.
-            # It is not a registry manifest digest and must not be read as one:
-            # nothing here is pushed, so no manifest digest exists.
-            {"name": "image.config_id", "value": os.environ["DIGEST"]},
+            # A LOCAL content digest, and it is worth naming carefully. Under
+            # the containerd image store `docker inspect .Id` is the OCI index
+            # digest; under the classic store it is the image config digest
+            # [both observed 2026-08-23 — this build exported a manifest, a
+            # config and an index, and .Id was the index]. Either way it is not
+            # a registry manifest digest, because nothing here is pushed to a
+            # registry. Writing it down as one would claim an immutability this
+            # deployment does not have.
+            {"name": "image.id", "value": os.environ["DIGEST"]},
+            {"name": "image.id_kind",
+             "value": "local daemon content digest; NOT a registry manifest digest"},
             {"name": "image.architecture", "value": os.environ["ARCH"]},
             {"name": "image.base", "value": os.environ["BASE"]},
             {"name": "python.third_party_packages", "value": "0"},
