@@ -10,6 +10,15 @@
 # subshell that inherits that pipe keeps it open, so the caller blocks until the
 # reindex AND the network push finish — making "asynchronous" backup fully
 # synchronous, and making every capture wait on the network.
+#
+# BRAIN_SYNC_PUSH exists because backgrounding is WRONG in one place, and it
+# fails silently there. A one-shot container (`docker compose run --rm
+# maintenance capture ...`) exits the moment its foreground process finishes,
+# and the exit takes the backgrounded subshell with it — so the commit lands,
+# the push never happens, and the only symptom is `doctor` reporting an
+# unpushed commit some time later. Observed on the VPS 2026-08-23, not
+# theorised. The long-running service is unaffected: it stays alive, and the
+# HTTP capture path has its own retrying queue in brainlib/capture.py.
 
 # Where the engine is. The hooks directory is inside the engine checkout, so the
 # toolbelt is one level up from this script — true in the combined layout and
@@ -18,7 +27,7 @@
 # there; $0 cannot, because git always invokes the hook by the path it found it.
 BRAIN="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/brain"
 
-(
+backup() {
   python3 "$BRAIN" index --quiet
 
   # Push ONLY to a genuine off-machine remote.
@@ -55,4 +64,12 @@ BRAIN="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/brain"
     [ -d "$path" ] && local_remote=yes
     [ "$local_remote" = "no" ] && git push --quiet origin HEAD
   fi
-) </dev/null >/dev/null 2>&1 &
+}
+
+if [ -n "${BRAIN_SYNC_PUSH:-}" ]; then
+  # Synchronous, and the caller waits. Correct wherever the process is about to
+  # exit anyway, because there is no "later" for a background job to run in.
+  backup </dev/null >/dev/null 2>&1
+else
+  ( backup ) </dev/null >/dev/null 2>&1 &
+fi

@@ -69,6 +69,18 @@ ASSUMED_LEGACY_VERSION = "2025-03-26"
 META_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
 META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+META_CLIENT_CAPS = "io.modelcontextprotocol/clientCapabilities"
+
+# Caching hints are REQUIRED on the two results this server produces that the
+# revision calls cacheable. `private` is not a default — both results VARY BY
+# PRINCIPAL: tools_for() hides brain_capture from the read-only profile and the
+# instructions differ. A shared cache is documented as possibly serving one
+# caller's result to another even on an authenticated endpoint, so `public`
+# here would be a way to hand a read-only caller the capture endpoint's tool
+# list. `private` is the correctness fix and the security one at once.
+DISCOVER_TTL_MS = 3_600_000
+TOOLS_TTL_MS = 300_000
+CACHE_SCOPE = "private"
 
 MAX_BODY_BYTES = 1024 * 1024              # the spec's 1 MiB cap
 READ_TIMEOUT_SECONDS = 30.0
@@ -393,10 +405,16 @@ class Handler(BaseHTTPRequestHandler):
         header_version = self.headers.get("MCP-Protocol-Version")
         body_version = meta.get(META_VERSION)
 
-        # Era selection, per the 2026-07-28 backward-compatibility rules: a
-        # request carrying modern per-request metadata is modern; `initialize`
-        # selects legacy. Anything else follows whichever version was named.
-        modern = (body_version in MODERN_VERSIONS
+        # Era selection keys on the SHAPE of the request, never on whether the
+        # named version happens to be one we support. The distinction is not
+        # academic: keying on supported-ness made the UnsupportedProtocolVersion
+        # branch below unreachable, so a client naming a FUTURE revision fell
+        # through to the legacy path and got a plain 400 with no JSON-RPC body —
+        # and the transport tells a dual-era client that a 400 without a
+        # recognised modern error means "fall back to initialize". A client
+        # ahead of this server would therefore have silently downgraded instead
+        # of being told which versions it could retry with.
+        modern = (META_VERSION in meta
                   or (header_version in MODERN_VERSIONS and method != "initialize"))
         client = meta.get(META_CLIENT_INFO) if modern else params.get("clientInfo")
         client_name, client_version = _client_identity(client)
@@ -466,6 +484,31 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch_modern(self, message, method, msg_id, params, meta, header_version,
                          body_version, principal, cid, started, client_name,
                          client_version) -> None:
+        # The required per-request _meta fields come FIRST, and the order is the
+        # point: an absent body field and a mismatched one are different
+        # failures with different codes. Checking the header comparison first
+        # answered a request that simply omitted the version with -32020
+        # HeaderMismatch, when the rule for a missing required field is -32602.
+        #
+        # clientCapabilities is required and an empty object is valid — the
+        # revision is stateless, so a request that does not say what the client
+        # can do leaves the server with no way to find out.
+        if not isinstance(body_version, str) or not body_version:
+            return self._send(400, _error(msg_id, INVALID_PARAMS,
+                                          "missing required _meta field: %s"
+                                          % META_VERSION), cid=cid)
+        if not isinstance(meta.get(META_CLIENT_CAPS), dict):
+            return self._send(400, _error(msg_id, INVALID_PARAMS,
+                                          "missing required _meta field: %s"
+                                          % META_CLIENT_CAPS), cid=cid)
+        # An unsupported version is answered before the header comparison too:
+        # a client naming a version we do not speak needs the list it can retry
+        # with, not a complaint about header mirroring.
+        if body_version not in SUPPORTED_VERSIONS:
+            return self._send(400, _error(
+                msg_id, UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version",
+                data={"supported": list(SUPPORTED_VERSIONS), "requested": body_version}),
+                cid=cid)
         # Header and body must agree. The reason is not pedantry: an
         # intermediary may route on the header while this server executes on
         # the body, and the whole point of mirroring is that the two cannot
@@ -474,11 +517,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, _error(msg_id, HEADER_MISMATCH,
                                           "MCP-Protocol-Version header does not match "
                                           "the request body"), cid=cid)
-        if body_version not in SUPPORTED_VERSIONS:
-            return self._send(400, _error(
-                msg_id, UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version",
-                data={"supported": list(SUPPORTED_VERSIONS), "requested": body_version}),
-                cid=cid)
         header_method = self.headers.get("Mcp-Method")
         if header_method is None or header_method != method:
             return self._send(400, _error(msg_id, HEADER_MISMATCH,
@@ -495,8 +533,9 @@ class Handler(BaseHTTPRequestHandler):
                                 client=client_name, client_version=client_version,
                                 protocol=body_version, outcome="ok", ms=_ms(started))
             return self._send(200, _modern_result(msg_id, {
-                "resultType": "complete",
                 "supportedVersions": list(SUPPORTED_VERSIONS),
+                "ttlMs": DISCOVER_TTL_MS,
+                "cacheScope": CACHE_SCOPE,
                 "capabilities": {"tools": {}},
                 "instructions": _instructions(principal.profile),
                 "_meta": {META_SERVER_INFO: {"name": SERVER_NAME,
@@ -511,11 +550,21 @@ class Handler(BaseHTTPRequestHandler):
             if not allowed:
                 return self._rate_limited(cid, principal, retry)
             return self._send(200, _modern_result(msg_id, {
-                "tools": mcpcore.tools_for(principal.profile, "remote")}), cid=cid)
+                "tools": mcpcore.tools_for(principal.profile, "remote"),
+                "ttlMs": TOOLS_TTL_MS,
+                "cacheScope": CACHE_SCOPE}), cid=cid)
 
         if method == "tools/call":
-            header_name = _decode_header_value(self.headers.get("Mcp-Name") or "")
-            if header_name != (params.get("name") or ""):
+            # Mcp-Name is REQUIRED on tools/call, and absence is its own
+            # failure. Coalescing a missing header to "" made a call with
+            # neither a header nor a body name compare equal and pass — the
+            # exact request an intermediary routing on the header cannot see.
+            raw_name = self.headers.get("Mcp-Name")
+            if raw_name is None:
+                return self._send(400, _error(msg_id, HEADER_MISMATCH,
+                                              "missing required header: Mcp-Name"),
+                                  cid=cid)
+            if _decode_header_value(raw_name) != params.get("name"):
                 return self._send(400, _error(msg_id, HEADER_MISMATCH,
                                               "Mcp-Name header does not match the "
                                               "request body"), cid=cid)

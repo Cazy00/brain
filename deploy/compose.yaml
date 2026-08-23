@@ -345,7 +345,15 @@ services:
     logging: *logging
     init: true
 
-    environment: *brain-env
+    environment:
+      <<: *brain-env
+      # The one-shot role, and the reason this override exists. .githooks/post-commit
+      # backgrounds the push so an interactive capture never waits on the network —
+      # correct for the long-running service, and silently wrong here: this container
+      # exits the instant its command finishes and takes the background job with it.
+      # The commit lands, the push never happens, and the only symptom is `doctor`
+      # reporting an unpushed commit some time later. Observed on the VPS 2026-08-23.
+      BRAIN_SYNC_PUSH: "1"
     volumes: *brain-mounts
     secrets:
       - principal_key

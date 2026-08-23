@@ -668,15 +668,98 @@ class RateLimitTests(RemoteTestCase):
 class ModernEraTests(RemoteTestCase):
     """The 2026-07-28 revision, served from the same endpoint as the old one."""
 
-    def modern(self, method, params=None, name=None, version="2026-07-28"):
+    def modern(self, method, params=None, name=None, version="2026-07-28",
+               caps={}, headers=None):
         params = dict(params or {})
-        params.setdefault("_meta", {})[httpmcp.META_VERSION] = version
-        headers = {"MCP-Protocol-Version": version, "Mcp-Method": method}
+        meta = dict(params.get("_meta") or {})
+        meta[httpmcp.META_VERSION] = version
+        if caps is not None:
+            meta[httpmcp.META_CLIENT_CAPS] = caps
+        params["_meta"] = meta
+        sent = {"MCP-Protocol-Version": version, "Mcp-Method": method}
         if name is not None:
-            headers["Mcp-Name"] = name
+            sent["Mcp-Name"] = name
+        sent.update(headers or {})
         return self.brain.post({"jsonrpc": "2.0", "id": 1, "method": method,
                                 "params": params},
-                               assertion=sign_assertion(owner_claims()), headers=headers)
+                               assertion=sign_assertion(owner_claims()), headers=sent)
+
+    def test_a_request_without_client_capabilities_is_invalid_params(self):
+        """clientCapabilities is a REQUIRED per-request _meta field, and the
+        revision is explicit that a missing required field is -32602, not the
+        -32020 a header check would have produced."""
+        status, _h, body = self.modern("tools/list", caps=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], httpmcp.INVALID_PARAMS)
+        self.assertIn("clientCapabilities", body["error"]["message"])
+
+    def test_an_empty_capabilities_object_is_valid(self):
+        """A client that can do nothing extra still declares that. {} is a
+        statement, not an omission."""
+        status, _h, body = self.modern("tools/list", caps={})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["result"]["tools"]), 5)
+
+    def test_a_missing_protocol_version_in_meta_is_invalid_params(self):
+        status, _h, body = self.brain.post(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+             "params": {"_meta": {httpmcp.META_CLIENT_CAPS: {}}}},
+            assertion=sign_assertion(owner_claims()),
+            headers={"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"})
+        # No modern _meta version and a modern header: still routed modern by
+        # shape, and refused for the field it is actually missing.
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], httpmcp.INVALID_PARAMS)
+
+    def test_a_future_version_gets_the_supported_list_not_a_legacy_fallback(self):
+        """The bug this replaced was silent and expensive: era selection keyed on
+        whether the version was SUPPORTED, so a client naming a future revision
+        fell through to the legacy path and got a bare 400. The transport tells
+        a dual-era client that a 400 without a recognised modern error means
+        'fall back to initialize' — so a client ahead of this server would have
+        downgraded instead of being told what to retry with."""
+        status, _h, body = self.modern("tools/list", version="2027-01-01")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], httpmcp.UNSUPPORTED_PROTOCOL_VERSION)
+        self.assertIn("2026-07-28", body["error"]["data"]["supported"])
+        self.assertEqual(body["error"]["data"]["requested"], "2027-01-01")
+
+    def test_tools_call_without_an_mcp_name_header_is_refused(self):
+        """Absence and mismatch are different failures. Coalescing a missing
+        header to "" made a call with neither a header nor a body name compare
+        equal and pass — the exact request an intermediary routing on the
+        header cannot see."""
+        status, _h, body = self.modern(
+            "tools/call", {"name": "brain_search", "arguments": {"query": "x"}},
+            name=None)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], httpmcp.HEADER_MISMATCH)
+        self.assertIn("Mcp-Name", body["error"]["message"])
+
+    def test_cacheable_results_are_scoped_private(self):
+        """Caching hints are required on these two, and `private` is the
+        security half: both results VARY BY PRINCIPAL — the read-only profile
+        is not shown brain_capture — and a shared cache is documented as
+        possibly serving one caller's result to another even on an
+        authenticated endpoint. `public` here would hand a read-only caller the
+        capture endpoint's tool list."""
+        for method in ("server/discover", "tools/list"):
+            status, _h, body = self.modern(method)
+            self.assertEqual(status, 200, method)
+            result = body["result"]
+            self.assertIsInstance(result.get("ttlMs"), int, method)
+            self.assertGreaterEqual(result["ttlMs"], 0, method)
+            self.assertEqual(result.get("cacheScope"), "private", method)
+
+    def test_tools_call_results_carry_no_caching_hints(self):
+        """Only the listed operations are cacheable. A tool CALL is not one of
+        them, and caching one would be caching an action."""
+        status, _h, body = self.modern(
+            "tools/call", {"name": "brain_search", "arguments": {"query": "connector"}},
+            name="brain_search")
+        self.assertEqual(status, 200)
+        self.assertNotIn("ttlMs", body["result"])
+        self.assertNotIn("cacheScope", body["result"])
 
     def test_every_modern_result_carries_resultType_and_serverInfo(self):
         """Prevents the bug a real client found on the first connection.
@@ -747,7 +830,8 @@ class ModernEraTests(RemoteTestCase):
     def test_a_missing_mcp_method_header_is_a_header_mismatch(self):
         status, _h, body = self.brain.post(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
-             "params": {"_meta": {httpmcp.META_VERSION: "2026-07-28"}}},
+             "params": {"_meta": {httpmcp.META_VERSION: "2026-07-28",
+                                  httpmcp.META_CLIENT_CAPS: {}}}},
             assertion=sign_assertion(owner_claims()),
             headers={"MCP-Protocol-Version": "2026-07-28"})
         self.assertEqual(status, 400)
@@ -756,7 +840,8 @@ class ModernEraTests(RemoteTestCase):
     def test_a_header_that_disagrees_with_the_body_is_refused(self):
         status, _h, body = self.brain.post(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
-             "params": {"_meta": {httpmcp.META_VERSION: "2026-07-28"}}},
+             "params": {"_meta": {httpmcp.META_VERSION: "2026-07-28",
+                                  httpmcp.META_CLIENT_CAPS: {}}}},
             assertion=sign_assertion(owner_claims()),
             headers={"MCP-Protocol-Version": "2025-11-25", "Mcp-Method": "tools/list"})
         self.assertEqual(status, 400)
@@ -771,7 +856,8 @@ class ModernEraTests(RemoteTestCase):
 
     def test_the_read_only_boundary_holds_in_the_modern_era_too(self):
         params = {"name": "brain_capture", "arguments": {"text": "nope"},
-                  "_meta": {httpmcp.META_VERSION: "2026-07-28"}}
+                  "_meta": {httpmcp.META_VERSION: "2026-07-28",
+                            httpmcp.META_CLIENT_CAPS: {}}}
         status, _h, body = self.brain.post(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params},
             host="brain-read.test",
