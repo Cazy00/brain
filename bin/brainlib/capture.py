@@ -59,6 +59,10 @@ CONTENT_TTL_SECONDS = 3600
 # not a blip.
 PUSH_ALERT_SECONDS = 15 * 60
 PUSH_BACKOFF_SECONDS = (5, 15, 45, 120, 300, 600)
+# How long a capture will wait for its push to land before answering. Not a
+# retry budget — the queue keeps retrying long after this — just long enough
+# that a healthy push is reported as what it is. See `settle`.
+PUSH_SETTLE_SECONDS = 2.5
 PUSH_TIMEOUT_SECONDS = 120
 
 
@@ -158,14 +162,61 @@ class BackupQueue(object):
         self._wake.set()
 
     def state(self) -> str:
-        """What to tell the caller about durability, in the spec's vocabulary."""
+        """What to tell the caller about durability, in the spec's vocabulary.
+
+        `_pending_since` alone is not enough to answer this, and reading it as
+        if it were is how a capture came to report "pushed to the private
+        remote" during a live outage drill while the commit sat unpushed. That
+        flag means "a push has been TRIED and failed"; immediately after a
+        commit nothing has been tried yet, so the flag is clear and the old
+        answer was "pushed" — a claim about durability made before any
+        durability existed.
+
+        So the local repository is asked as well. `unpushed()` is a
+        `rev-list --count` against the tracking ref: no network, no lock, and
+        it knows the one thing the flag cannot — whether the commit is actually
+        on the remote."""
         if not self.enabled:
             return "disabled"
         with self._state_lock:
-            if self._pending_since is None:
-                return "pushed"
-            overdue = self._clock() - self._pending_since >= PUSH_ALERT_SECONDS
+            pending_since = self._pending_since
+        if pending_since is None:
+            outstanding = self.unpushed()
+            # -1 means no upstream is configured, which is not the same as a
+            # failure and not something a capture should be alarmed about.
+            return "pushed" if outstanding <= 0 else "backup_pending"
+        overdue = self._clock() - pending_since >= PUSH_ALERT_SECONDS
         return "push_failed" if overdue else "backup_pending"
+
+    def settle(self, timeout: float = PUSH_SETTLE_SECONDS) -> str:
+        """Give the worker a moment to finish, then report the truth.
+
+        Without this every capture would answer `backup_pending` — accurately,
+        because the push genuinely has not happened in the millisecond after
+        the commit — and a signal that fires on every single capture is one
+        nobody reads. With it, `pushed` stays the common answer and `PENDING`
+        goes back to meaning something is wrong.
+
+        This is NOT the queue's retry budget. The worker keeps retrying with
+        its own backoff for as long as it takes; this only bounds how long the
+        CALLER waits before being told. The note is already committed before
+        the wait starts, so nothing is at risk in it."""
+        deadline = self._clock() + timeout
+        # A bounded number of rounds as well as a deadline. The deadline is the
+        # real limit; this is a backstop, because a wait loop in a request path
+        # whose only exit depends on a clock advancing is one stopped clock away
+        # from hanging a capture. It cost nothing to notice: a mutation test
+        # that froze the clock hung instead of failing.
+        for _round in range(int(timeout / 0.1) + 2):
+            current = self.state()
+            if current != "backup_pending":
+                return current
+            with self._state_lock:
+                tried_and_failed = self._pending_since is not None
+            if tried_and_failed or self._clock() >= deadline:
+                return current
+            self._sleep(0.1)
+        return self.state()
 
     def unpushed(self) -> int:
         """How many commits are accepted locally and not yet on the remote."""
@@ -283,7 +334,7 @@ class Capturer(object):
         self.queue.nudge()
         result = {"ok": True, "status": "committed", "note": outcome.get("note", ""),
                   "commit": outcome.get("commit", ""), "provisional": True,
-                  "backup": self.queue.state(), "detail": ""}
+                  "backup": self.queue.settle(), "detail": ""}
         # Remember AFTER the commit exists. Recording first would make a crash
         # between the two look, to the retry that follows, exactly like a
         # success — and the note would never be written at all.

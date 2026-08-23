@@ -980,6 +980,80 @@ class BackupQueueTests(unittest.TestCase):
         self.assertIn('"count":3', written.replace(" ", ""))
 
 
+class DurabilityReportTests(unittest.TestCase):
+    """Prevents: a capture claiming durability it does not have.
+
+    Found in a live push-outage drill, not in a test. The remote was
+    unroutable, the note was committed and unpushed, and the capture answered
+    "backup: pushed to the private remote." The bug was one word of meaning:
+    `_pending_since` records that a push has been TRIED and failed, and in the
+    millisecond after a commit nothing has been tried, so the flag is clear —
+    and the old `state()` read a clear flag as success.
+
+    That line is the caller's ONLY signal about durability. A wrong one is
+    worse than none: it is the failure this whole system is built to avoid,
+    which is being confidently told something untrue."""
+
+    def queue(self, git, sleeper=None):
+        return capture.BackupQueue("/nonexistent", clock=lambda: 1000.0,
+                                   runner=git, sleeper=sleeper or (lambda _s: None))
+
+    def test_an_unpushed_commit_is_never_reported_as_pushed(self):
+        """The exact live defect, in one assertion."""
+        queue = self.queue(FakeGit(unpushed=1))
+        self.assertEqual(queue.state(), "backup_pending")
+
+    def test_a_pushed_commit_is_reported_as_pushed(self):
+        self.assertEqual(self.queue(FakeGit(unpushed=0)).state(), "pushed")
+
+    def test_no_upstream_is_not_an_alarm(self):
+        """`rev-list` against a missing tracking ref fails. That is a brain with
+        no remote configured, which `disabled` and `doctor` already speak about;
+        a capture must not shout PENDING at it forever."""
+        self.assertEqual(self.queue(FakeGit(upstream=False)).state(), "pushed")
+
+    def test_a_disabled_queue_still_says_disabled(self):
+        queue = capture.BackupQueue("/nonexistent", runner=FakeGit(unpushed=5),
+                                    enabled=False)
+        self.assertEqual(queue.state(), "disabled")
+
+    def test_settle_reports_pushed_once_the_push_lands(self):
+        git = FakeGit(unpushed=1)
+        queue = self.queue(git)
+        # The worker is what drains it; drive one round by hand, as it would.
+        queue.push_once()
+        self.assertEqual(queue.settle(timeout=0.0), "pushed")
+
+    def test_settle_does_not_wait_once_a_push_has_actually_failed(self):
+        """A failed push is a decided answer. Waiting out the timeout for one
+        would put the caller's latency in the hands of a broken remote."""
+        git = FakeGit(unpushed=1, push_ok=False)
+        slept = []
+        queue = self.queue(git, sleeper=slept.append)
+        queue.push_once()                       # marks it pending-since
+        self.assertEqual(queue.settle(timeout=60.0), "backup_pending")
+        self.assertEqual(slept, [], "settle waited on a question already answered")
+
+    def test_settle_is_bounded_when_nothing_has_been_tried_yet(self):
+        """Nothing has failed and nothing has succeeded — the worker simply has
+        not run. That is the case settle exists for, and it must end."""
+        ticks = iter([1000.0 + i * 0.5 for i in range(40)])
+        queue = capture.BackupQueue("/nonexistent", clock=lambda: next(ticks),
+                                    runner=FakeGit(unpushed=1), sleeper=lambda _s: None)
+        self.assertEqual(queue.settle(timeout=1.0), "backup_pending")
+
+    def test_the_message_for_each_state_says_the_right_thing(self):
+        """`pushed` must claim the remote; `backup_pending` must reassure that
+        the note is safe, because it is."""
+        pushed = capture.format_result({"ok": True, "status": "committed", "note": "n",
+                                        "commit": "abc", "backup": "pushed"})
+        pending = capture.format_result({"ok": True, "status": "committed", "note": "n",
+                                         "commit": "abc", "backup": "backup_pending"})
+        self.assertIn("pushed to the private remote", pushed)
+        self.assertIn("committed locally and safe", pending)
+        self.assertNotIn("pushed to the private remote", pending)
+
+
 class EventLogVocabularyTests(unittest.TestCase):
     """The redaction control is a list of what MAY exist, not a list of what to hide."""
 
