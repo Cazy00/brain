@@ -363,9 +363,50 @@ cutover, and it has an order:
    Managed OAuth plus an owner-email Allow policy. Its audience does not change,
    so `/etc/brain/brain-http.json` needs no edit.
 4. Repoint the `brain.qodevia.com` CNAME onto the brain tunnel, proxied.
-5. Stop the old service and re-sync anything it captured in the meantime — see
-   the note in procedure 1 step 7. Two writable copies is the one failure this
-   design exists to prevent, so this step is not optional and not deferrable.
+5. Retire the old service, and **look for USER units before you believe it is
+   stopped.** Two writable copies is the one failure this design exists to
+   prevent, so this step is not optional and not deferrable.
+
+   `kill` is not retirement. On this deployment the old server was a
+   `systemd --user` unit with `Restart=always`, on an account with
+   `Linger=yes` — so it came back within five seconds of being killed, under a
+   new pid, and would have returned at the next boot [verified 2026-08-23].
+   None of that is visible to `systemctl list-units`, to `crontab -l`, or to a
+   grep of `/etc/systemd/system`: user units live in `~/.config/systemd/user/`
+   and only `systemctl --user` shows them.
+
+   ```sh
+   systemctl --user list-units --type=service --all | grep -i brain
+   systemctl --user list-unit-files | grep -iE 'brain|consolidate|doctor'
+   ls -la ~/.config/systemd/user/ ~/.config/systemd/user/*.wants/
+   loginctl show-user "$USER" -p Linger        # Linger=yes means it starts at boot
+
+   for u in brain-serve.service consolidate.timer doctor.timer; do
+       systemctl --user stop "$u"; systemctl --user disable "$u"
+   done
+   mkdir -p ~/old-brain-units.disabled
+   mv ~/.config/systemd/user/{brain-serve,consolidate,doctor}.* ~/old-brain-units.disabled/
+   rm -f ~/.config/systemd/user/*.wants/{brain-serve.service,consolidate.timer,doctor.timer}
+   systemctl --user daemon-reload
+   ```
+
+   Then prove it, twice: nothing on the port, and nothing back a minute later.
+
+   ```sh
+   sudo ss -tlnp | grep :8787 || echo "8787 free"
+   sleep 30; sudo ss -tlnp | grep :8787 || echo "still free — Restart=always is gone"
+   pgrep -af /home/ubuntu/brain || echo "no process from the old tree"
+   ```
+
+   Re-sync anything the old copy captured in the meantime — see the note in
+   procedure 1 step 7 — then rename the tree and make it read-only, so that a
+   unit somebody re-enables by accident finds nothing it can write:
+
+   ```sh
+   mv ~/brain ~/brain.FROZEN-$(date -u +%F)
+   chmod -R a-w ~/brain.FROZEN-$(date -u +%F)
+   touch ~/brain.FROZEN-*/should-fail   # MUST fail
+   ```
 
 **11. Bring it up.**
 
@@ -1403,7 +1444,10 @@ known, recorded gap rather than a covered one.
 - Never put the age recovery identity on the VPS. `restore-drill.sh` refuses
   one stored under `/etc/brain`, `/srv/brain` or `/run/secrets`, and that
   refusal is load-bearing.
-- Never leave two writable copies of `knowledge/` in existence.
+- Never leave two writable copies of `knowledge/` in existence — and never
+  conclude the old one is retired on the strength of `kill` and a port check.
+  A `systemd --user` unit with `Restart=always` restarts in seconds and is
+  invisible to every system-level check.
 - Never make the current private data repository public in place. Publication
   is an allowlist export into fresh history — deleted files stay in git
   history forever.
