@@ -901,7 +901,7 @@ class NotificationTests(ProvisionTestCase):
         self.assertEqual(len(account.writes()), before,
                          "the second run rewrote a notification policy")
 
-    def test_the_tunnel_alert_is_bound_to_this_tunnel_and_to_real_statuses(self):
+    def test_the_tunnel_alert_is_bound_to_this_tunnel(self):
         """An unfiltered tunnel_health_event covers every tunnel in the
         account, which here would page the owner about an unrelated connector
         serving somebody's dev hostnames."""
@@ -911,9 +911,19 @@ class NotificationTests(ProvisionTestCase):
                   if p["alert_type"] == "tunnel_health_event"][0]
         self.assertEqual(policy["filters"]["tunnel_id"],
                          [account.tunnels[0]["id"]])
-        self.assertEqual(policy["filters"]["new_status"],
-                         list(provision.DEFAULT_TUNNEL_STATUSES))
-        self.assertNotIn("healthy", policy["filters"]["new_status"])
+
+    def test_no_status_filter_is_sent_because_the_api_rejects_every_value(self):
+        """`available_alerts` advertises new_status for this alert type and the
+        API refuses all four documented statuses with 17108 [verified
+        2026-08-23]. Defaulting it — which this file did first — made every
+        run fail against the real account while passing here. The fake cannot
+        catch that, so what is asserted is the narrower true thing: nothing
+        sends the filter unless a state file asks for it."""
+        account = self.account()
+        self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        policy = [p for p in account.notification_policies
+                  if p["alert_type"] == "tunnel_health_event"][0]
+        self.assertNotIn("new_status", policy["filters"])
 
     def test_the_owner_is_a_recipient_in_the_body_that_is_sent(self):
         account = self.account()

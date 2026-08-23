@@ -110,11 +110,21 @@ EXIT_DRIFT = 4           # --check only: the account no longer matches the decla
 
 PROFILES = ("read", "capture")
 
-# Cloudflare's four tunnel statuses [docs 2026-08-23]. Alerting on the three
-# that are not "healthy" is the whole point; "healthy" is included in the set
-# only so that a state file may ask for the recovery notification too.
+# Cloudflare's four tunnel statuses [docs 2026-08-23], used to catch a typo in
+# a state file before the API does.
+#
+# Nothing here SETS new_status, and that is a finding rather than an omission.
+# The account's own `available_alerts` advertises `new_status` as a filter
+# option for `tunnel_health_event` — and the API rejects every documented value
+# with "17108: invalid new_status input" [verified 2026-08-23, all four
+# statuses, each capitalisation, and `unhealthy` for good measure]. The
+# documentation agrees with the API rather than with the discovery endpoint:
+# the Tunnel Health Alert's "Other options / filters" is "None". So the alert
+# is bound to the tunnel and fires on every transition, which is noisier than
+# intended and is the only version of it that exists. The constant stays
+# because a state file may still declare the filter, and a value that is not
+# even a Cloudflare status should fail here rather than at the API.
 TUNNEL_STATUSES = ("healthy", "degraded", "down", "inactive")
-DEFAULT_TUNNEL_STATUSES = ("degraded", "down", "inactive")
 
 # Cloudflare returns the two grant lifetimes as Go duration strings ("15m",
 # "336h") and rejects anything else. Validating the shape here turns a silent
@@ -1572,7 +1582,6 @@ def _desired_notification(context: Context, spec: dict):
         # writing one into the state file would also make that file unusable
         # for rebuilding the edge anywhere else.
         filters["tunnel_id"] = [context.tunnel_id]
-        filters.setdefault("new_status", list(DEFAULT_TUNNEL_STATUSES))
     if filters:
         desired["filters"] = filters
     return desired

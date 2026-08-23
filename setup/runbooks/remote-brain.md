@@ -1201,6 +1201,32 @@ Exit 2 for a token is procedure 4. Exit 2 for a token that does not exist at
 all means the state file declares a credential nobody ever created; either
 create it, or drop it from the file.
 
+### How the Cloudflare alerts are addressed
+
+Email, to the account owner, and that is the only mechanism this account has:
+
+```sh
+# read-only, and the one call worth making before trusting any of it
+GET /accounts/<account>/alerting/v3/destinations/eligible
+#   email     eligible: true   ready: true
+#   pagerduty eligible: false
+#   webhooks  eligible: false        [verified 2026-08-23]
+```
+
+Two things to know before treating that as proof.
+
+**The `/policies/{id}/test` endpoint does not work here.** It answers
+`15000: An internal server error occurred` for both policies [verified
+2026-08-23]. So what is proven is that the policies exist, are enabled, are
+bound to the right tunnel, and that the account's email destination is ready.
+Actual delivery is *not* proven, and the first real delivery will be the proof.
+If a tunnel outage ever passes without an email, this is the first thing to
+suspect — not the policy.
+
+**Nothing is silenced.** `GET /alerting/v3/silences` should stay empty; a
+silence is invisible from the policy itself and is the one way a correctly
+configured alert reaches nobody.
+
 ### What watches what — the whole picture, in one table
 
 | Watcher | Runs on | Sees | Blind to |

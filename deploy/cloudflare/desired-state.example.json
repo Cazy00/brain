@@ -232,7 +232,11 @@
     "alerting on nothing.",
     "tunnel_id is NOT written here -- it is per-account, and provision.py fills",
     "it in from the tunnel it just reconciled. The owner must be a recipient;",
-    "add others freely."
+    "add others freely.",
+    "There is no new_status filter and that is a finding, not an omission: the",
+    "account's own available_alerts advertises one for tunnel_health_event and",
+    "the API rejects every documented status with 17108 [verified 2026-08-23].",
+    "The alert therefore fires on every transition, healthy included."
   ],
   "notifications": [
     {
