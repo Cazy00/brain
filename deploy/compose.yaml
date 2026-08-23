@@ -403,9 +403,9 @@ services:
 #                          no per-container egress ACL, so "full" is the honest
 #                          word — narrowing it to those two destinations is a
 #                          DOCKER-USER job on the host and belongs in the
-#                          firewall runbook, not in this file, and it is
-#                          recorded there as a residual rather than implied
-#                          away here.
+#                          runbook, not in this file. It is written out there as
+#                          procedure 11, together with the residual risk of not
+#                          applying it, rather than implied away here.
 #                inbound:  cloudflared, over `mcp`. Also the VPS host root, via
 #                          brain's address on the `egress` bridge — accepted,
 #                          because host root already owns the data mount and
@@ -458,6 +458,23 @@ networks:
     # `default` network, so that "which network gives this container a route to
     # the internet" is answerable by reading this file.
     driver: bridge
+    driver_opts:
+      # Docker's own name for a bridge is `br-<first 12 of the network id>`, and
+      # the id is regenerated every time the network is — `docker compose down`
+      # is enough. That makes the interface name unusable as a firewall anchor:
+      # a DOCKER-USER rule written against `br-d623f22f1ae7` simply stops
+      # matching after the next redeploy, and it fails OPEN, which is the worst
+      # direction for an egress rule to fail in. Pinning the name is what makes
+      # the allowlist in the runbook (procedure 11) survive a deployment.
+      com.docker.network.bridge.name: brain-egress
+    ipam:
+      config:
+        # Pinned for the same reason and chosen on the same grounds as `mcp`
+        # above: outside Docker's default 172.17.0.0/16 pool, so a future
+        # auto-assigned network cannot land on it, and outside the Oracle VCN's
+        # 10.0.0.0/16. Adjacent to the mcp subnet so the two read as one
+        # allocation.
+        - subnet: 10.77.1.0/24
 
 # ---------------------------------------------------------------------------
 # Secrets

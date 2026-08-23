@@ -35,6 +35,8 @@ Observed behaviour and deviations:
 | `backup.env` | S3-compatible endpoint, bucket, key id, secret |
 | `backup-recipients.txt` | age **public** recipients, `0644` — the identities are offline |
 | `deploy.env` | path overrides for the systemd units; optional |
+| `cf-api.env` | `CLOUDFLARE_API_TOKEN=…` — one line, for `provision.py` and the daily edge check. Scoped to this account's Access, Tunnel and DNS resources and to nothing else |
+| `cloudflare.json` | the declared edge state `provision.py` reconciles against — account, zone, team domain, owner address, applications, notifications |
 | `tunnel-token` | the brain tunnel's connector token |
 | `git-deploy-key` | write access to the private data repository, and to nothing else |
 
@@ -49,6 +51,7 @@ contains a value from it. `.env.example` documents names only.
 | `brain-maintenance.timer` | 03:20 +20m jitter | index, lint, doctor, in the pinned image |
 | `brain-consolidate.timer` | Sun 04:10 +45m | the weekly consolidation pass, onto a branch |
 | `brain-restore-drill.timer` | 2nd of the month 05:00 +1h | `restore-drill.sh --verify-only` |
+| `brain-edge-check.timer` | 06:40 +45m | `provision.py --check` — the Cloudflare side, read-only |
 
 Every one of them wires `OnFailure=brain-alert@%n.service`.
 
@@ -77,6 +80,13 @@ Exit codes, from the scripts' own headers:
 | 75 | transient: lock held too long, or no full drill in 60 days | procedure 10 |
 | 77 | refused: a credential was about to enter the archive | procedure 8 |
 | 78 | offsite storage was never configured | procedure 1 step 9 |
+
+`brain-edge-check` has its own two, from `provision.py`:
+
+| Code | Meaning | Go to |
+|---|---|---|
+| 2 | a human owes an action at the edge — usually a service token with seven days left | procedure 4 |
+| 4 | the account has DRIFTED from `/etc/brain/cloudflare.json`. Somebody edited the dashboard, or the state file changed and was never applied. Run the same command without `--check` to read the diff before deciding which side is right | procedure 13 |
 
 ---
 
@@ -390,7 +400,7 @@ sudo cp /srv/brain/engine/deploy/systemd/*.service /etc/systemd/system/
 sudo cp /srv/brain/engine/deploy/systemd/*.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now brain-backup.timer brain-maintenance.timer \
-     brain-restore-drill.timer
+     brain-restore-drill.timer brain-edge-check.timer
 systemctl list-timers 'brain-*'
 ```
 
@@ -855,6 +865,370 @@ drill older than 60 days turns the monthly verify-only run red.
 A failing drill means the backups are not proven. Fix it the same week: an
 untested backup is a belief, and the day you need it is the worst possible day
 to discover which one it was.
+
+---
+
+## 11. Egress allowlist for the containers
+
+The design limits outbound access "as practical" to the tunnel, the Cloudflare
+JWKS, the private git provider, backup storage, registries during controlled
+updates and the consolidator provider. Docker has no per-container egress ACL,
+so this is a host firewall job — `compose.yaml` says so and points here.
+
+**Which chain sees what.** This is the whole safety argument for trying it:
+
+| Traffic | Chain | Covered here |
+|---|---|---|
+| container → internet | `FORWARD` → `DOCKER-USER` | yes |
+| host → internet (`docker pull`, `apt`, the host connector) | `OUTPUT` | **no** — a different chain, deliberately out of scope |
+| internet → SSH | `INPUT` | no — **nothing here can lock you out** |
+| brain ↔ cloudflared, the MCP path itself | never leaves `brain_mcp` | nothing to do: the network is `internal: true` and has no gateway |
+
+Row three is why this is safe to attempt at all. A mistake breaks the tunnel —
+visible within seconds, one command to undo — and cannot cost you the way in.
+Row two is why "registries during controlled updates" needs no rule: `docker
+pull` is dockerd on the host, not a container.
+
+**The current state is no control at all**, and it is recorded here as a
+decision rather than left as an oversight:
+
+```sh
+sudo iptables -S DOCKER-USER
+# -N DOCKER-USER      <- empty. Container egress is unrestricted. [2026-08-23]
+```
+
+**What actually has to get out** [verified 2026-08-23]:
+
+| Service | Destination | Port |
+|---|---|---|
+| cloudflared | the Cloudflare edge | 7844/tcp **and** 7844/udp (QUIC) |
+| brain | `<team>.cloudflareaccess.com`, for the Access JWKS | 443/tcp |
+| brain | the private git remote, over SSH | 22/tcp |
+| maintenance | the S3-compatible backup endpoint | 443/tcp |
+
+DNS needs no rule. A container on a user-defined bridge resolves through
+Docker's embedded server at `127.0.0.11` inside its own namespace, and dockerd
+makes the upstream query from the HOST namespace — those packets are `OUTPUT`,
+never `FORWARD` [verified 2026-08-23: `/etc/resolv.conf` in `brain-brain-1` is
+`nameserver 127.0.0.11`]. Return traffic needs no rule either: replies arrive
+`-i <wan> -o brain-egress` and never match an `-i brain-egress` rule. Adding a
+conntrack ACCEPT "to be safe" is the usual way this ends up allowing more than
+intended.
+
+**Pin the interface name before writing a single rule.** Docker calls a bridge
+`br-<first 12 of the network id>` and regenerates the id whenever the network
+is recreated. `compose.yaml` therefore pins `com.docker.network.bridge.name:
+brain-egress` and the subnet `10.77.1.0/24`. Applying that pin recreates the
+network, so it lands on the next deploy:
+
+```sh
+cd /srv/brain/engine/deploy
+sudo docker compose down && sudo docker compose up -d
+ip -br link show brain-egress          # must exist before the rules mean anything
+```
+
+**One script owns every iptables rule this deployment adds.** Not
+`netfilter-persistent save` — saving while Docker is running captures Docker's
+generated chains and replays them at boot before Docker starts, which is
+already in the "never" list at the end of this file. Every rule is tagged with
+a comment so that clearing is exact and never touches anyone else's:
+
+```sh
+sudo tee /usr/local/sbin/brain-firewall >/dev/null <<'EOF'
+#!/bin/sh
+# Every iptables rule the brain deployment owns, in one place.
+#
+# Idempotent by construction: `apply` deletes its own rules before adding them,
+# so running it twice leaves one copy of each. Deletion is by RULE SPEC, never
+# by line number and never by parsing `iptables -S` -- Docker rewrites its
+# chains on every container start, so a line number read a second ago points at
+# something else by the time it is used, and `-S` output re-quotes arguments
+# (`--log-prefix "brain-egress-drop "`) in a way that does not survive being
+# split back into words.
+set -eu
+TAG=brain-fw
+EG=brain-egress            # the pinned bridge name from compose.yaml, not br-<id>
+
+# $1 is -A to add or -D to remove. Same specs both ways: that symmetry is the
+# only reason `clear` is exact.
+egress_rules() {
+    op=$1
+    iptables "$op" DOCKER-USER -i "$EG" -p tcp --dport 7844 -m comment --comment "$TAG" -j ACCEPT
+    iptables "$op" DOCKER-USER -i "$EG" -p udp --dport 7844 -m comment --comment "$TAG" -j ACCEPT
+    iptables "$op" DOCKER-USER -i "$EG" -p tcp --dport 443  -m comment --comment "$TAG" -j ACCEPT
+    iptables "$op" DOCKER-USER -i "$EG" -p tcp --dport 22   -m comment --comment "$TAG" -j ACCEPT
+    iptables "$op" DOCKER-USER -i "$EG" -m limit --limit 6/min \
+             -m comment --comment "$TAG" -j LOG --log-prefix "brain-egress-drop "
+    iptables "$op" DOCKER-USER -i "$EG" -m comment --comment "$TAG" -j DROP
+}
+
+apply() {
+    # Errexit is suspended for a function on the left of `||`, so every delete
+    # is attempted even though the first one usually fails on a clean chain.
+    { egress_rules -D; } >/dev/null 2>&1 || true
+    egress_rules -A          # -A, so the ACCEPTs precede LOG and DROP in order
+}
+
+case "${1:-}" in
+    apply) apply ;;
+    clear) { egress_rules -D; } >/dev/null 2>&1 || true ;;
+    *) echo "usage: $0 apply|clear" >&2; exit 64 ;;
+esac
+EOF
+sudo chmod 0755 /usr/local/sbin/brain-firewall
+```
+
+The delete loop is written against the rule text rather than line numbers on
+purpose: Docker rewrites its chains on every container start, and a rule number
+captured a second earlier is a rule number that now points at something else.
+
+```ini
+# /etc/systemd/system/brain-firewall.service
+[Unit]
+Description=iptables rules owned by the brain deployment
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/brain-firewall apply
+ExecStop=/usr/local/sbin/brain-firewall clear
+OnFailure=brain-alert@%n.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now brain-firewall.service
+```
+
+**Prove it both ways, and the negative half is the half that matters.** A rule
+set that allows everything passes the positive tests perfectly.
+
+```sh
+# still works: the JWKS fetch (443) and the data mount
+EG=$(sudo docker inspect -f '{{(index .NetworkSettings.Networks "brain_egress").IPAddress}}' brain-brain-1)
+curl -fsS "http://$EG:8787/readyz"
+
+# still works: git push over 22
+sudo docker compose --profile maintenance run --rm maintenance doctor
+
+# still works: the tunnel — four connections, from the Cloudflare side
+#   (Zero Trust > Networks > Tunnels, or provision.py's tunnel step)
+
+# MUST FAIL: anything else outbound
+sudo docker compose --profile maintenance run --rm --entrypoint python3 maintenance \
+     -c "import socket; socket.create_connection(('1.1.1.1', 53), 3)"
+# -> TimeoutError.  If this succeeds, the rules are not matching: check that
+#    `ip -br link show brain-egress` exists and that the container is on it.
+sudo iptables -L DOCKER-USER -v -n --line-numbers   # the DROP counter should move
+```
+
+**Rollback**, one line. `DOCKER-USER` is Docker's own hook chain and Docker
+never puts anything in it, so flushing it restores exactly the state above:
+
+```sh
+sudo systemctl disable --now brain-firewall.service   # ExecStop clears them
+sudo iptables -F DOCKER-USER                          # or, if in a hurry
+```
+
+**The stronger version, and why it is not the default.** Allowing 443 to
+anywhere still allows 443 to anywhere. An ipset refreshed from Cloudflare's
+published ranges (`https://www.cloudflare.com/ips-v4`) and GitHub's
+(`https://api.github.com/meta`) narrows 443 to Cloudflare and 22 to the git
+provider, which is most of the remaining value. It also adds a scheduled
+network fetch whose failure mode is a brain that stops pushing, or an edge that
+stops connecting, some hours later, for a reason that will not look like a
+firewall. Take it only with the refresh unit's `OnFailure=` wired to
+`brain-alert@` like every other timer, and with the last good ranges written to
+a file so a failed refresh keeps them rather than emptying the set.
+
+**If you do not apply any of this**, say what the residual is rather than
+letting it read as covered: the brain container can open a connection to any
+host on the internet. It runs no third-party dependency and no third-party
+code, its only inputs are Access-authenticated MCP calls, and everything it
+holds is already pushed to a private remote — so the realistic exposure is
+exfiltration *after* a compromise of the engine itself, which single-writer and
+append-only history do not defend against. That is a trade recorded, not a
+trade resolved.
+
+---
+
+## 12. SSH — the only way in
+
+**Before anything below: never close SSH until a second, tested way in already
+works.** On this instance that second way is Oracle's serial console. It is
+per-instance, it needs a key of its own, and it must be tested *before* it is
+needed. Every change here is applied with a second session already open, and
+reloaded rather than restarted.
+
+**Where the settings actually live, and the trap.** `sshd_config` `Include`s
+`/etc/ssh/sshd_config.d/*.conf` at the TOP of the file, and OpenSSH takes the
+**first** value it sees for a keyword. Drop-ins therefore beat the main file,
+and among drop-ins the **lowest-numbered** name wins — the opposite of what
+`99-hardening.conf` looks like it should do. Anything added here goes in
+`10-brain.conf` so it wins, and `sudo sshd -T` is the only reading that counts.
+
+Verified with `sudo sshd -T` on 2026-08-23:
+
+| Setting | Effective | Change to | Why |
+|---|---|---|---|
+| `PermitRootLogin` | `no` | keep | already right; stated in config, not inherited |
+| `PasswordAuthentication` | `no` | keep | key-only, and it is set — not assumed |
+| `KbdInteractiveAuthentication` | `no` | keep | leaving it on re-opens password auth through PAM |
+| `PubkeyAuthentication` | `yes` | keep | |
+| `MaxAuthTries` | `6` | `3` | halves the attempts a single connection buys |
+| `LoginGraceTime` | `120` | `30` | an unauthenticated connection holds a slot for two minutes today |
+| `ClientAliveInterval` | `0` | `300` (+ `ClientAliveCountMax 2`) | a dropped admin session otherwise holds its slot indefinitely |
+| `X11Forwarding` | `yes` | `no` | there is no X on this host |
+| `AllowAgentForwarding` | `yes` | `no` | forwarding your agent onto a shared host exposes every key it holds |
+| `AllowTcpForwarding` | `yes` | **keep `yes`** | it is how `ssh -L` reaches cloudflared's metrics and the container's health endpoints, neither of which publishes a port. Turning it off removes the only safe way to inspect them |
+| `AllowGroups` | unset | `sshadm` | three accounts on this box have a shell; one is used |
+
+Three accounts have login shells: `root` (`/bin/bash`, no authorized key,
+`PermitRootLogin no`), `ubuntu` (`/bin/bash`, one key — this is the admin
+account) and `opc` (`/bin/sh`, one key — Oracle's image ships it) [verified
+2026-08-23]. `opc` is the one to decide about deliberately: either add it to
+`sshadm` because you use it, or leave it out and let `AllowGroups` retire it.
+An account nobody has reviewed is not the same as an account nobody uses.
+
+```sh
+sudo groupadd -f sshadm
+sudo usermod -aG sshadm ubuntu
+
+sudo tee /etc/ssh/sshd_config.d/10-brain.conf >/dev/null <<'EOF'
+# Brain deployment hardening. Numbered 10 because drop-ins are first-wins and
+# the lowest number therefore wins; 99-hardening.conf does not.
+AllowGroups sshadm
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+AllowAgentForwarding no
+# Restated so they are asserted here rather than inherited from the cloud image.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+
+sudo sshd -t                       # syntax. A bad file here is how boxes are lost.
+sudo sshd -T | grep -E '^(allowgroups|maxauthtries|logingracetime|clientaliveinterval|x11forwarding|allowagentforwarding|permitrootlogin|passwordauthentication)'
+sudo systemctl reload ssh          # reload, never restart: open sessions survive
+```
+
+Then, **from a new terminal on the Mac and before closing anything**:
+
+```sh
+ssh workhorse true && echo "second way in still works"
+```
+
+**Rate limiting.** `INPUT` accepts 22 from anywhere and Oracle's security list
+is the only thing in front of it. Add the limit to the same script that owns
+every other rule here — `netfilter-persistent save` is still forbidden while
+Docker is running:
+
+```sh
+# Add to /usr/local/sbin/brain-firewall and call ssh_rules from apply/clear.
+# Insertion is positional (the order relative to the existing ACCEPT is the
+# whole point) but removal is by spec, so the two are still symmetric.
+ssh_rules() {
+    if [ "$1" = "-A" ]; then
+        iptables -I INPUT 4 -p tcp --dport 22 -m state --state NEW \
+                 -m recent --set --name SSH -m comment --comment "$TAG"
+        iptables -I INPUT 5 -p tcp --dport 22 -m state --state NEW \
+                 -m recent --update --seconds 60 --hitcount 6 --name SSH \
+                 -m comment --comment "$TAG" -j DROP
+    else
+        iptables -D INPUT -p tcp --dport 22 -m state --state NEW \
+                 -m recent --set --name SSH -m comment --comment "$TAG"
+        iptables -D INPUT -p tcp --dport 22 -m state --state NEW \
+                 -m recent --update --seconds 60 --hitcount 6 --name SSH \
+                 -m comment --comment "$TAG" -j DROP
+    fi
+}
+```
+
+Positions 4 and 5 put both rules immediately **above** the existing
+`--dport 22 -j ACCEPT` at position 4; check with `sudo iptables -L INPUT
+--line-numbers` first, because a DROP that lands below the ACCEPT is a rule
+that does nothing and a DROP that lands above the conntrack ACCEPT at position
+1 disconnects you.
+
+This rate-limits *you* as well — six new connections a minute is easy to exceed
+with a script that opens a session per command. Use `ControlMaster auto` +
+`ControlPersist` on the Mac so repeated commands share one connection, or use
+fail2ban's `sshd` jail instead (inactive on this host today) with your own
+address in `ignoreip`. **Never insert either rule without a second session
+open.**
+
+---
+
+## 13. Cloudflare drift, and what watches what
+
+`brain-edge-check.timer` has raised. It runs
+`provision.py --state /etc/brain/cloudflare.json --check` daily and, unlike a
+plain dry run, it is allowed to have an opinion:
+
+| Exit | Meaning |
+|---|---|
+| 0 | the account matches the declared state |
+| 2 | a human owes an action — a service token with seven days left, or one that was declared and never created |
+| 4 | **drift**: the live account no longer matches `/etc/brain/cloudflare.json` |
+
+**Read the diff before deciding which side is wrong.** Drift is not
+automatically the account's fault; the state file is edited by hand too.
+
+```sh
+# The token comes from the file, never from the command line: an argument is
+# visible in `ps` to every user on the box and stays in shell history.
+sudo sh -c 'set -a; . /etc/brain/cf-api.env; set +a; \
+    exec python3 /srv/brain/engine/deploy/cloudflare/provision.py \
+        --state /etc/brain/cloudflare.json'          # dry run: prints the diff
+```
+
+- The **account** is wrong (somebody edited the dashboard): re-run with
+  `--apply`. It creates and updates; it never deletes, so anything it cannot
+  fix is reported for you rather than removed.
+- The **state file** is wrong (a deliberate change was made at the edge and
+  never written down): edit `/etc/brain/cloudflare.json` to match, and say in
+  the commit-less way this file allows — a comment key — why.
+
+Exit 2 for a token is procedure 4. Exit 2 for a token that does not exist at
+all means the state file declares a credential nobody ever created; either
+create it, or drop it from the file.
+
+### What watches what — the whole picture, in one table
+
+| Watcher | Runs on | Sees | Blind to |
+|---|---|---|---|
+| `brain-maintenance` → `doctor` | the VPS | index, content, backup age, disk headroom, unpushed commits, inbox backlog | anything outside the box |
+| `brain-backup` | the VPS | archive built, encrypted, uploaded, pruned | whether it restores |
+| `brain-restore-drill` | the VPS | that it restores | the days between drills |
+| `brain-edge-check` | the VPS | the Cloudflare side: expiring credentials, drifted apps, policies, DNS | whether the brain is answering |
+| Cloudflare `tunnel_health_event` | **Cloudflare** | the connector stopped talking to the edge | whether the origin behind it is alive |
+| Cloudflare `expiring_service_token_alert` | **Cloudflare** | a headless credential lapses in 7 days | everything else |
+| the capture queue | the VPS | its own unpushed backlog | anything it is not asked to write |
+
+The first four go quiet in the one failure where silence is worst: the box
+being gone. The two Cloudflare policies are the only alerting that survives
+that, which is the entire reason they exist — and it is also why they are
+reconciled by `provision.py` rather than clicked in, so that "is the alerting
+still there" is a question the daily check answers instead of a thing somebody
+remembers.
+
+**Neither of them tells you the brain is up.** Cloudflare is explicit that
+tunnel status "only reflects the connection between `cloudflared` and the
+Cloudflare network... A tunnel can appear Healthy while users are unable to
+connect to an application" [docs 2026-08-23]. A healthy tunnel in front of a
+dead origin is a 502 that nothing alerts on. The gap is closed by the container
+healthcheck (which restarts a wedged process) and by `readyz` under
+maintenance — both of which run on the box. Closing it from OUTSIDE the box
+needs an external prober, and this deployment does not have one; that is a
+known, recorded gap rather than a covered one.
 
 ---
 

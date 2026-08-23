@@ -1,0 +1,72 @@
+# The daily read-only look at Cloudflare, from the VPS.
+#
+# Everything else this deployment watches, it watches from the inside: doctor
+# reads the backup stamp and the disk, the capture queue escalates its own
+# backlog, lint gates the content. None of that can see the edge — and the edge
+# is where the two things that expire live. An Access service token lapses on a
+# date nobody has written down anywhere else, and an application, a policy or a
+# DNS record can be edited in the dashboard by a hand that meant well.
+#
+# provision.py --check is exactly a dry run that is allowed to have an opinion:
+# it writes nothing, and it exits 2 when a human owes an action (a credential
+# with seven days left, a token that was never created) or 4 when the account
+# has drifted from the declared state. A plain --dry-run exits 0 on both,
+# because a plan is not a verdict — which is why scheduling THAT would have
+# produced a green timer on the morning a headless client stopped working.
+#
+# It runs on the HOST rather than in the pinned image on purpose. The image
+# holds the brain, not the deployment tooling, and this needs an API token that
+# the brain container must never be able to read.
+[Unit]
+Description=brain daily Cloudflare edge check (read-only)
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=brain-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=10min
+EnvironmentFile=-/etc/brain/deploy.env
+Environment=BRAIN_STATE_FILE=/etc/brain/cloudflare.json
+Environment=BRAIN_PROVISION=/srv/brain/engine/deploy/cloudflare/provision.py
+# provision.py reads the token from the environment and refuses to take it as
+# an argument, because an argument lands in shell history and in `ps` output
+# for every user on the box. EnvironmentFile is how it gets there: one
+# root-owned 0600 file in /etc/brain, in the same KEY=value form as backup.env,
+# holding CLOUDFLARE_API_TOKEN and nothing else. The unit therefore names the
+# file and never the value, which is also what keeps a credential out of this
+# repository — see the hard rule in AGENTS.md.
+#
+# The `-` prefix is deliberately ABSENT: a missing token file must stop the
+# unit, not let it run and report a clean edge it never looked at.
+EnvironmentFile=/etc/brain/cf-api.env
+ExecStart=/usr/bin/python3 ${BRAIN_PROVISION} --state ${BRAIN_STATE_FILE} --check
+
+# Hardening. This unit reads one config file, one credential and the Cloudflare
+# API. It never writes anything anywhere.
+User=root
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# AF_UNIX is here for glibc's name resolution, not for anything this script
+# does directly: NSS talks to the local resolver over a unix socket, and
+# without it the failure is a DNS error that looks like the API being down.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077

@@ -1013,6 +1013,252 @@ class EventLogVocabularyTests(unittest.TestCase):
         broken.record("server_started")        # must not raise
 
 
+def _compose_services(path: Path):
+    """The service names in compose.yaml, without a YAML parser.
+
+    This repository has no third-party dependency and this is not the place to
+    acquire one. The file is machine-written-shaped — two-space indentation, one
+    key per line — so a section-aware line scan is exact, and a scan that ever
+    stops being exact fails loudly here rather than quietly in production."""
+    services, section = [], None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line[:1].isalpha():                       # a top-level key
+            section = line.split(":", 1)[0]
+            continue
+        if section != "services":
+            continue
+        if (line.startswith("  ") and not line.startswith("   ")
+                and line.strip() and not line.lstrip().startswith("#")
+                and line.rstrip().endswith(":")):
+            services.append(line.strip().rstrip(":"))
+    return services
+
+
+def _compose_run_service(command: str):
+    """The compose SERVICE a `docker compose ... run` line targets, or None.
+
+    Parsed the way compose parses it — flags first, then the service — because
+    the whole point is to catch an ExecStart that names something compose will
+    not recognise."""
+    words = command.split()
+    # The unit spells docker by absolute path, so match the basename. Getting
+    # this wrong is silent: the parser returns None, the caller skips the line,
+    # and the test passes on a unit it never actually read.
+    if not any(word.rsplit("/", 1)[-1] == "docker" for word in words):
+        return None
+    if "compose" not in words or "run" not in words:
+        return None
+    rest = words[words.index("run") + 1:]
+    while rest and rest[0].startswith("-"):
+        rest.pop(0)                                  # --rm, --no-deps
+    return rest[0] if rest else None
+
+
+class DeploymentUnitTests(unittest.TestCase):
+    """Prevents: a scheduled unit that looks installed and never runs.
+
+    Both defects these units actually shipped with were of that shape. One
+    named the CONTAINER (`brain-maintenance`) where compose wanted the SERVICE
+    (`maintenance`), so every nightly run died with "no such service" — a
+    failure that reads as the maintenance work failing rather than as a name.
+    The other set `User=` to an account that did not exist and every start
+    ended in 217/USER. Neither is visible by reading the unit on its own; both
+    are visible by reading it against the file it refers to."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parent.parent
+        cls.systemd = root / "deploy" / "systemd"
+        cls.compose = root / "deploy" / "compose.yaml"
+        cls.services = sorted(cls.systemd.glob("*.service"))
+        cls.timers = sorted(cls.systemd.glob("*.timer"))
+
+    def directives(self, path, key):
+        return [line.split("=", 1)[1].strip()
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.startswith(key + "=")]
+
+    def test_every_timer_has_the_service_it_activates(self):
+        for timer in self.timers:
+            self.assertTrue(timer.with_suffix(".service").exists(),
+                            "%s activates a unit that is not in this directory"
+                            % timer.name)
+
+    def test_every_timer_survives_a_missed_window(self):
+        """An A1 instance that came back at 04:00 has already missed 03:20, and
+        a missed night is exactly the night the report mattered."""
+        for timer in self.timers:
+            self.assertIn("true", [v.lower() for v in self.directives(timer, "Persistent")],
+                          "%s does not catch up after a reboot" % timer.name)
+
+    def test_every_timer_is_installable(self):
+        for timer in self.timers:
+            self.assertIn("timers.target", self.directives(timer, "WantedBy"),
+                          "%s has no [Install] and enable would do nothing" % timer.name)
+
+    def test_every_calendar_is_pinned_to_utc(self):
+        """The scripts these drive reason in UTC. A local-time calendar crosses
+        the UTC date boundary twice a year and silently skips a run."""
+        for timer in self.timers:
+            for calendar in self.directives(timer, "OnCalendar"):
+                self.assertTrue(calendar.endswith("UTC"),
+                                "%s: %r is not pinned to UTC" % (timer.name, calendar))
+
+    def test_every_scheduled_service_raises_when_it_fails(self):
+        for service in self.services:
+            if service.name.startswith("brain-alert@"):
+                continue                     # it IS the handler
+            self.assertIn("brain-alert@%n.service", self.directives(service, "OnFailure"),
+                          "%s fails silently" % service.name)
+
+    def test_every_compose_service_a_unit_runs_exists_in_the_compose_file(self):
+        known = _compose_services(self.compose)
+        self.assertIn("maintenance", known, "the compose scan itself has stopped working")
+        checked = 0
+        for service in self.services:
+            for command in self.directives(service, "ExecStart"):
+                target = _compose_run_service(command)
+                if target is None:
+                    continue
+                checked += 1
+                self.assertIn(target, known,
+                              "%s runs compose service %r, which compose.yaml does "
+                              "not define" % (service.name, target))
+        # Without this the test passes just as happily when the parser has
+        # stopped recognising the lines it is supposed to be checking, which is
+        # how the first version of it missed the very bug it was written for.
+        self.assertGreaterEqual(checked, 3, "no compose `run` line was examined")
+
+    def test_the_edge_check_stops_rather_than_reporting_an_edge_it_never_read(self):
+        """`EnvironmentFile=-` makes a missing file non-fatal. For the token
+        that reaches Cloudflare that would mean a green daily check that never
+        authenticated — the exact failure the check exists to prevent."""
+        unit = self.systemd / "brain-edge-check.service"
+        token_files = [value for value in self.directives(unit, "EnvironmentFile")
+                       if "cf-api" in value]
+        self.assertEqual(len(token_files), 1)
+        self.assertFalse(token_files[0].startswith("-"),
+                         "a missing API token would be tolerated silently")
+
+
+
+class RunbookFirewallScriptTests(unittest.TestCase):
+    """The egress allowlist in the runbook is a shell script somebody will
+    paste onto a production host, so it is extracted from the runbook and run
+    here rather than trusted.
+
+    Two properties are worth a test and nothing else is. `apply` must be
+    idempotent, because it runs on every boot through a systemd unit and a
+    chain that grows a duplicate set of rules per reboot is a slow outage. And
+    `clear` must remove exactly the deployment's own rules, because
+    DOCKER-USER is a shared hook chain: a clear that took someone else's rule
+    with it would be discovered as a firewall hole, not as a bug here.
+
+    The first version of this script deleted rules by parsing `iptables -S`.
+    It passed inspection and failed this test: `-S` re-quotes
+    `--log-prefix "brain-egress-drop "` and the trailing space does not
+    survive being split back into words, so the LOG rule was never removed and
+    `apply` grew the chain every time."""
+
+    RULE_COUNT = 6
+
+    @classmethod
+    def setUpClass(cls):
+        runbook = (Path(__file__).resolve().parent.parent
+                   / "setup" / "runbooks" / "remote-brain.md")
+        text = runbook.read_text(encoding="utf-8")
+        start = "sudo tee /usr/local/sbin/brain-firewall >/dev/null <<'EOF'\n"
+        head = text.index(start) + len(start)
+        cls.script = text[head:text.index("\nEOF\n", head)] + "\n"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="brain-fw-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.store = self.dir / "chain"
+        self.store.write_text("", encoding="utf-8")
+        script = self.dir / "brain-firewall"
+        script.write_text(self.script, encoding="utf-8")
+        script.chmod(0o755)
+        self.script_path = script
+        stub_dir = self.dir / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "iptables"
+        # Models the only two behaviours the script relies on: -D removes the
+        # FIRST match, and exits non-zero when nothing matches.
+        stub.write_text(
+            "#!/bin/sh\n"
+            "STORE=${FAKE_IPT_STORE:?}\n"
+            "op=$1; shift\n"
+            'spec="$*"\n'
+            "case \"$op\" in\n"
+            "  -A) printf '%s\\n' \"$spec\" >> \"$STORE\" ;;\n"
+            "  -D) awk -v s=\"$spec\" 'BEGIN{d=0}{if(!d && $0==s){d=1;next}print}"
+            "END{exit d?0:1}' \"$STORE\" > \"$STORE.tmp\" || "
+            "{ rm -f \"$STORE.tmp\"; exit 1; }\n"
+            "      mv \"$STORE.tmp\" \"$STORE\" ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
+            encoding="utf-8")
+        stub.chmod(0o755)
+        self.env = dict(os.environ)
+        self.env["PATH"] = "%s:%s" % (stub_dir, self.env.get("PATH", ""))
+        self.env["FAKE_IPT_STORE"] = str(self.store)
+
+    def run_script(self, verb):
+        return subprocess.run(["/bin/sh", str(self.script_path), verb],
+                              env=self.env, capture_output=True, text=True)
+
+    def rules(self):
+        return [line for line in self.store.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
+    def test_the_script_is_valid_shell(self):
+        checked = subprocess.run(["/bin/sh", "-n", str(self.script_path)],
+                                 capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_apply_is_idempotent(self):
+        for attempt in range(3):
+            result = self.run_script("apply")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(self.rules()), self.RULE_COUNT,
+                             "apply #%d changed the rule count" % (attempt + 1))
+
+    def test_the_drop_is_last_and_the_accepts_precede_it(self):
+        """Order is the whole rule set. A DROP above the ACCEPTs blocks the
+        tunnel; a DROP that never gets appended allows everything."""
+        self.run_script("apply")
+        rules = self.rules()
+        self.assertTrue(rules[-1].endswith("-j DROP"), rules[-1])
+        self.assertEqual(sum(1 for r in rules if r.endswith("-j ACCEPT")), 4)
+        self.assertLess(max(i for i, r in enumerate(rules) if r.endswith("-j ACCEPT")),
+                        len(rules) - 1)
+
+    def test_clear_removes_everything_it_added(self):
+        self.run_script("apply")
+        result = self.run_script("clear")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rules(), [])
+
+    def test_clear_on_an_empty_chain_succeeds(self):
+        """It runs as a systemd ExecStop, so failing on an already-clean chain
+        would leave the unit in a failed state after a normal stop."""
+        result = self.run_script("clear")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_rule_belonging_to_somebody_else_survives_both(self):
+        foreign = "DOCKER-USER -i eth0 -j ACCEPT"
+        self.store.write_text(foreign + "\n", encoding="utf-8")
+        self.run_script("apply")
+        self.run_script("clear")
+        self.assertEqual(self.rules(), [foreign])
+
+    def test_an_unknown_verb_is_a_usage_error(self):
+        result = self.run_script("flush-everything")
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(self.rules(), [])
+
+
 def _note_line(text: str) -> str:
     for line in text.splitlines():
         if line.startswith("note:"):

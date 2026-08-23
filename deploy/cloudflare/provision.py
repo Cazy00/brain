@@ -98,6 +98,7 @@ STEPS = (
     "access applications",
     "access policies",
     "service tokens",
+    "notifications",
     "dns records",
 )
 
@@ -105,8 +106,15 @@ EXIT_OK = 0
 EXIT_FAILED = 1          # a reconciliation step failed outright
 EXIT_BLOCKED = 2         # everything the script may do is done; a human owes an action
 EXIT_REFUSED = 3         # refused to start: bad state file, missing token, secret found
+EXIT_DRIFT = 4           # --check only: the account no longer matches the declared state
 
 PROFILES = ("read", "capture")
+
+# Cloudflare's four tunnel statuses [docs 2026-08-23]. Alerting on the three
+# that are not "healthy" is the whole point; "healthy" is included in the set
+# only so that a state file may ask for the recovery notification too.
+TUNNEL_STATUSES = ("healthy", "degraded", "down", "inactive")
+DEFAULT_TUNNEL_STATUSES = ("degraded", "down", "inactive")
 
 # Cloudflare returns the two grant lifetimes as Go duration strings ("15m",
 # "336h") and rejects anything else. Validating the shape here turns a silent
@@ -312,7 +320,8 @@ def validate_state(state: dict) -> None:
     owner_email = _require(state, "owner_email", str, "state").strip().lower()
 
     unknown = sorted(set(state) - {"account_id", "zone_id", "team_domain", "owner_email",
-                                   "tunnel", "applications", "service_tokens", "dns"})
+                                   "tunnel", "applications", "service_tokens",
+                                   "notifications", "dns"})
     if unknown:
         raise Refusal("state has unknown keys: %s" % ", ".join(unknown))
 
@@ -471,6 +480,70 @@ def validate_state(state: dict) -> None:
         token_profile = _require(token, "profile", str, where)
         if token_profile not in PROFILES:
             raise Refusal("%s.profile must be one of %s" % (where, ", ".join(PROFILES)))
+
+    _validate_notifications(state.get("notifications", []) or [], owner_email)
+
+
+def _validate_notifications(declared, owner_email: str) -> None:
+    """Alerting nobody reads is worse than none, so two things are enforced.
+
+    The owner has to be a recipient. Cloudflare will happily accept a policy
+    addressed only to an alias, and an alias is a thing that gets forwarded,
+    filtered and eventually abandoned; the person who owns the brain is then
+    the last to know it is down. Adding other recipients is fine — removing
+    the owner is not.
+
+    And `tunnel_id` may not be written here. It is per-account, so a state file
+    carrying one cannot rebuild this edge in a different account, which is the
+    one job the file exists for; `_desired_notification` injects the id of the
+    tunnel it just reconciled instead."""
+    seen = set()
+    for position, policy in enumerate(declared):
+        where = "notifications[%d]" % position
+        if not isinstance(policy, dict):
+            raise Refusal("%s is not an object" % where)
+        unknown = sorted(set(policy) - {"name", "alert_type", "email", "enabled",
+                                        "description", "filters"})
+        if unknown:
+            raise Refusal("%s has unknown keys: %s" % (where, ", ".join(unknown)))
+        name = _require(policy, "name", str, where)
+        if name in seen:
+            # Policies are matched by name on every run. Two with one name and
+            # the second would overwrite the first every time, forever, and the
+            # run would still report "converged".
+            raise Refusal("%s duplicates the name %r" % (where, name))
+        seen.add(name)
+        _require(policy, "alert_type", str, where)
+        if "enabled" in policy and not isinstance(policy["enabled"], bool):
+            raise Refusal("%s.enabled must be true or false" % where)
+        recipients = _require(policy, "email", list, where)
+        if not recipients:
+            raise Refusal("%s.email is empty; the policy would notify nobody" % where)
+        for address in recipients:
+            if not isinstance(address, str) or "@" not in address:
+                raise Refusal("%s.email contains %r, which is not an address"
+                              % (where, address))
+        if owner_email not in [str(a).strip().lower() for a in recipients]:
+            raise Refusal("%s.email does not include the owner (state.owner_email). "
+                          "Add other recipients freely; the owner is not optional."
+                          % where)
+        filters = policy.get("filters")
+        if filters is not None:
+            if not isinstance(filters, dict):
+                raise Refusal("%s.filters must be an object" % where)
+            if "tunnel_id" in filters:
+                raise Refusal("%s.filters must not set tunnel_id — it is per-account "
+                              "and is filled in from the reconciled tunnel" % where)
+            for key, values in filters.items():
+                if not isinstance(values, list) or not values:
+                    raise Refusal("%s.filters.%s must be a non-empty list" % (where, key))
+                if any(not isinstance(v, str) or not v.strip() for v in values):
+                    raise Refusal("%s.filters.%s must hold strings" % (where, key))
+            for status in filters.get("new_status", []):
+                if status not in TUNNEL_STATUSES:
+                    raise Refusal("%s.filters.new_status has %r; Cloudflare's tunnel "
+                                  "statuses are %s" % (where, status,
+                                                       ", ".join(TUNNEL_STATUSES)))
 
 
 def _validate_oauth(oauth: dict, where: str) -> None:
@@ -766,11 +839,13 @@ class Report(object):
 # ---------------------------------------------------------------------------
 
 class Context(object):
-    def __init__(self, api: Api, state: dict, report: Report, apply_changes: bool):
+    def __init__(self, api: Api, state: dict, report: Report, apply_changes: bool,
+                 check: bool = False):
         self.api = api
         self.state = state
         self.report = report
         self.apply = apply_changes
+        self.check = check
         self.account = "/accounts/" + state["account_id"]
         self.zone = "/zones/" + state["zone_id"]
         self.tunnel_id = None
@@ -800,6 +875,7 @@ def reconcile(context: Context) -> int:
     step_applications(context)
     step_policies(context)
     step_service_tokens(context)
+    step_notifications(context)
     step_dns(context)
     # A dry run makes no claim about convergence — it reports a plan — so it
     # exits 0 whatever it found, with the blocked items printed all the same.
@@ -807,6 +883,17 @@ def reconcile(context: Context) -> int:
     # because only an --apply was supposed to finish it.
     if context.apply and context.report.blocked:
         return EXIT_BLOCKED
+    # --check is the third mode and it exists for one reason: a timer needs a
+    # verdict, and a plain dry run deliberately does not give one. Without it
+    # the expiring-service-token check in this file could be scheduled and
+    # would still never alert, because it would exit 0 on the morning the
+    # credential lapsed. Blocked outranks drift: an expiring token is a
+    # deadline, a changed application is a diff.
+    if context.check:
+        if context.report.blocked:
+            return EXIT_BLOCKED
+        if context.report.changes:
+            return EXIT_DRIFT
     return EXIT_OK
 
 
@@ -1384,6 +1471,113 @@ def _parse_timestamp(value):
     return parsed.replace(tzinfo=timezone.utc)
 
 
+def step_notifications(context: Context) -> None:
+    """Cloudflare's half of the alerting — and the half it cannot do.
+
+    Everything else this system watches, it watches from the inside: `doctor`
+    reads the backup stamp and the disk, the timers raise through
+    `brain-alert@`, the capture queue escalates its own backlog. All of it runs
+    ON the VPS, which means all of it goes quiet in exactly the failure where
+    silence is indistinguishable from health — the box being gone. These
+    policies are the only alerting that survives that, because Cloudflare is
+    the one observer that is not the thing being observed.
+
+    Two are worth having and the account offers little else [verified
+    2026-08-23 against `available_alerts`]:
+
+      `tunnel_health_event`      the connector stopped talking to the edge
+      `expiring_service_token_alert`  a headless credential lapses in 7 days
+
+    Read the first one for exactly what it says. Cloudflare's own
+    documentation is blunt about it: tunnel status "only reflects the
+    connection between cloudflared and the Cloudflare network... A tunnel can
+    appear Healthy while users are unable to connect to an application"
+    [docs 2026-08-23]. So this alert fires when the connector dies and stays
+    silent when the brain behind it dies — which is why it does not replace the
+    endpoint probe on the host, and why `brain-edge-check.timer` runs this
+    file with `--check` rather than treating a green tunnel as an answer.
+
+    There is deliberately no application-health policy. The account's only
+    HTTP-level notifier is `health_check_status_notification`, which needs a
+    standalone Health Check — a paid add-on this deployment does not have. An
+    empty policy pointed at nothing would look like coverage on the dashboard
+    and alert on nothing at all, which is worse than the gap it papers over.
+
+    Like every other step here: it creates and updates, and it never deletes.
+    A policy dropped from the state file is reported as drift for a human."""
+    report = context.report
+    report.begin("notifications")
+    declared = context.state.get("notifications", []) or []
+    if not declared:
+        report.ok("notifications", "none declared")
+        return
+    path = context.account + "/alerting/v3/policies"
+    by_name = dict((policy.get("name"), policy) for policy in context.api.paginate(path))
+
+    for spec in declared:
+        desired = _desired_notification(context, spec)
+        if desired is None:
+            continue                        # blocked; already reported
+        name = desired["name"]
+        live = by_name.get(name)
+        target = "notification %s" % name
+        if live is None:
+            if not context.apply:
+                report.change("create", target, _diff({}, desired))
+                continue
+            context.api.request("POST", path, desired)
+            report.change("create", target)
+            continue
+        owned_live = dict((key, live.get(key, _MISSING)) for key in desired)
+        diff = _diff(owned_live, desired)
+        if not diff:
+            report.ok(target)
+            continue
+        report.change("update", target, diff)
+        if context.apply:
+            body = dict(live)
+            for key in ("id", "created", "modified"):
+                body.pop(key, None)
+            body.update(desired)
+            context.api.request("PUT", "%s/%s" % (path, live["id"]), body)
+
+
+def _desired_notification(context: Context, spec: dict):
+    """Resolve a declared policy into the body the API wants, or None if blocked."""
+    alert_type = spec["alert_type"]
+    desired = {
+        "name": spec["name"],
+        "alert_type": alert_type,
+        "enabled": bool(spec.get("enabled", True)),
+        # The API's own wording: "IDs for email type will be the email address."
+        "mechanisms": {"email": [{"id": address} for address in spec["email"]]},
+    }
+    if spec.get("description"):
+        desired["description"] = spec["description"]
+
+    filters = dict(spec.get("filters") or {})
+    if alert_type == "tunnel_health_event":
+        if context.tunnel_id is None:
+            # Only reachable in a dry run against an account where the tunnel
+            # does not exist yet: --apply created it in the first step. Same
+            # shape as the policies step's unpreviewable case.
+            context.report.note(
+                "%s: cannot be previewed until the tunnel exists — its filter "
+                "binds to the tunnel's id" % spec["name"])
+            return None
+        # Bound to THIS tunnel, and the id is injected rather than declared.
+        # An unfiltered tunnel_health_event covers every tunnel in the account,
+        # which here would mean paging the owner about the unrelated host
+        # connector that serves their dev hostnames. Ids are per-account, so
+        # writing one into the state file would also make that file unusable
+        # for rebuilding the edge anywhere else.
+        filters["tunnel_id"] = [context.tunnel_id]
+        filters.setdefault("new_status", list(DEFAULT_TUNNEL_STATUSES))
+    if filters:
+        desired["filters"] = filters
+    return desired
+
+
 def step_dns(context: Context) -> None:
     """Last, because this is what makes the hostname reachable.
 
@@ -1484,6 +1678,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "is written and only the diff is printed.")
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="emit the plan or result as JSON instead of text")
+    parser.add_argument("--check", action="store_true",
+                        help="a dry run that FAILS on what it finds, for a timer: "
+                             "exit 2 if an operator action is owed (an expiring "
+                             "service token, a missing one), exit 4 if the account "
+                             "has drifted from the declared state. A plain dry run "
+                             "exits 0 either way, because a plan is not a verdict.")
     return parser
 
 
@@ -1512,6 +1712,11 @@ def _warn_on_loose_permissions(path: str, report_stream) -> None:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.apply and args.check:
+        # Checked before anything is read, because it is a contradiction in the
+        # command line rather than something the account or the state file did.
+        sys.stderr.write("refused: --check reports, --apply changes. Pick one.\n")
+        return EXIT_REFUSED
     try:
         credential = _read_token(args.token_env)
         state = load_state(args.state)
@@ -1523,8 +1728,10 @@ def main(argv=None) -> int:
     report = Report(args.apply, args.as_json)
     if not args.as_json:
         sys.stdout.write("brain cloudflare reconcile — %s\n\n"
-                         % ("APPLY" if args.apply else "DRY RUN (nothing will change)"))
-    context = Context(Api(credential), state, report, args.apply)
+                         % ("APPLY" if args.apply else
+                            "CHECK (nothing will change; drift and deadlines fail)"
+                            if args.check else "DRY RUN (nothing will change)"))
+    context = Context(Api(credential), state, report, args.apply, args.check)
     try:
         code = reconcile(context)
     except StepFailed as failure:

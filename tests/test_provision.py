@@ -19,6 +19,7 @@ fake account hands back is assembled at run time, because the point of the test
 it serves is that such a value must never appear in a tracked file OR in this
 script's output.
 """
+import contextlib
 import copy
 import io
 import json
@@ -59,7 +60,8 @@ def stamp(moment: datetime) -> str:
 
 
 def sample_state(config_src="cloudflare", create_if_missing=True,
-                 service_tokens=None, ingress=None, applications=None):
+                 service_tokens=None, ingress=None, applications=None,
+                 notifications=None):
     """The shape of desired-state.example.json with test values filled in.
 
     Defaults to `config_src: cloudflare` — the example file uses `local`, but
@@ -87,6 +89,12 @@ def sample_state(config_src="cloudflare", create_if_missing=True,
         "service_tokens": service_tokens if service_tokens is not None else [
             declared_client(CAPTURE_CLIENT_NAME, "capture"),
             declared_client(READ_CLIENT_NAME, "read"),
+        ],
+        "notifications": notifications if notifications is not None else [
+            {"name": "brain tunnel unhealthy", "alert_type": "tunnel_health_event",
+             "email": [OWNER]},
+            {"name": "brain service token expiring",
+             "alert_type": "expiring_service_token_alert", "email": [OWNER]},
         ],
         "dns": {"comment": "brain remote MCP — provision.py"},
     }
@@ -167,6 +175,7 @@ class FakeCloudflare(object):
         self.apps = []
         self.policies = {}
         self.service_clients = []
+        self.notification_policies = []
         self.dns_records = []
         self.requests = []
         self._counter = 0
@@ -247,6 +256,17 @@ class FakeCloudflare(object):
                 return {"tunnel_id": tunnel_id, "config": copy.deepcopy(body["config"])}
         if rest == ["access", "service_tokens"] and method == "GET":
             return self._page(self.service_clients, params)
+        if rest == ["alerting", "v3", "policies"]:
+            if method == "GET":
+                return self._page(self.notification_policies, params)
+            if method == "POST":
+                created = copy.deepcopy(body)
+                created["id"] = self.identifier("notification")
+                self.notification_policies.append(created)
+                return copy.deepcopy(created)
+        if len(rest) == 4 and rest[:3] == ["alerting", "v3", "policies"] and method == "PUT":
+            return copy.deepcopy(self._replace(self.notification_policies, rest[3],
+                                               body, ("id",)))
         if rest == ["access", "apps"]:
             if method == "GET":
                 return self._page(self.apps, params)
@@ -321,6 +341,9 @@ def phase_of(path: str) -> str:
         return "dns records"
     if "/access/service_tokens" in path:
         return "service tokens"
+    if "/alerting/" in path:
+        # Before the generic /policies rule below, which this path also matches.
+        return "notifications"
     if "/policies" in path:
         return "access policies"
     if "/access/apps" in path:
@@ -351,14 +374,15 @@ class ProvisionTestCase(unittest.TestCase):
             self.load(state)
         return str(caught.exception)
 
-    def context_for(self, state, account, apply_changes=False):
+    def context_for(self, state, account, apply_changes=False, check=False):
         stream = io.StringIO()
         report = provision.Report(apply_changes, False, stream=stream)
         api = provision.Api(BEARER, opener=account.open)
-        return provision.Context(api, state, report, apply_changes), report, stream
+        return (provision.Context(api, state, report, apply_changes, check),
+                report, stream)
 
-    def reconcile(self, state, account, apply_changes=False) -> Run:
-        context, report, stream = self.context_for(state, account, apply_changes)
+    def reconcile(self, state, account, apply_changes=False, check=False) -> Run:
+        context, report, stream = self.context_for(state, account, apply_changes, check)
         code = provision.reconcile(context)
         report.finish(code)              # what main() prints; part of the output
         return Run(code, report, stream.getvalue(), account)
@@ -849,3 +873,166 @@ class SecretHandlingTests(ProvisionTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotificationTests(ProvisionTestCase):
+    """Prevents: alerting that exists on the dashboard and reaches nobody.
+
+    Every failure this deployment can detect from the inside goes quiet in the
+    one case where silence is worst — the VPS being gone — so these policies
+    are the only signal that survives it. A policy addressed to the wrong
+    person, bound to the wrong tunnel, or duplicated under one name looks
+    identical to a working one until the morning it is needed."""
+
+    def account(self):
+        account = FakeCloudflare()
+        account.add_service_client(CAPTURE_CLIENT_NAME)
+        account.add_service_client(READ_CLIENT_NAME)
+        return account
+
+    def test_both_policies_are_created_and_the_second_run_writes_nothing(self):
+        account = self.account()
+        self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        created = [p["name"] for p in account.notification_policies]
+        self.assertEqual(sorted(created),
+                         ["brain service token expiring", "brain tunnel unhealthy"])
+        before = len(account.writes())
+        self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        self.assertEqual(len(account.writes()), before,
+                         "the second run rewrote a notification policy")
+
+    def test_the_tunnel_alert_is_bound_to_this_tunnel_and_to_real_statuses(self):
+        """An unfiltered tunnel_health_event covers every tunnel in the
+        account, which here would page the owner about an unrelated connector
+        serving somebody's dev hostnames."""
+        account = self.account()
+        self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        policy = [p for p in account.notification_policies
+                  if p["alert_type"] == "tunnel_health_event"][0]
+        self.assertEqual(policy["filters"]["tunnel_id"],
+                         [account.tunnels[0]["id"]])
+        self.assertEqual(policy["filters"]["new_status"],
+                         list(provision.DEFAULT_TUNNEL_STATUSES))
+        self.assertNotIn("healthy", policy["filters"]["new_status"])
+
+    def test_the_owner_is_a_recipient_in_the_body_that_is_sent(self):
+        account = self.account()
+        self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        for policy in account.notification_policies:
+            self.assertIn({"id": OWNER}, policy["mechanisms"]["email"])
+
+    def test_a_policy_the_owner_cannot_receive_is_refused(self):
+        state = sample_state(notifications=[
+            {"name": "brain tunnel unhealthy", "alert_type": "tunnel_health_event",
+             "email": ["oncall@example.invalid"]}])
+        self.assertIn("owner", self.refuse(state))
+
+    def test_a_policy_addressed_to_nobody_is_refused(self):
+        state = sample_state(notifications=[
+            {"name": "n", "alert_type": "tunnel_health_event", "email": []}])
+        self.assertIn("notify nobody", self.refuse(state))
+
+    def test_a_hand_written_tunnel_id_is_refused(self):
+        """Ids are per-account. One written down here makes the state file
+        unable to rebuild this edge anywhere else, which is its only job."""
+        state = sample_state(notifications=[
+            {"name": "n", "alert_type": "tunnel_health_event", "email": [OWNER],
+             "filters": {"tunnel_id": ["some-other-tunnel"]}}])
+        self.assertIn("tunnel_id", self.refuse(state))
+
+    def test_two_policies_with_one_name_are_refused(self):
+        """They are matched by name on every run, so the second would overwrite
+        the first forever while the run still reported convergence."""
+        entry = {"name": "same", "alert_type": "tunnel_health_event", "email": [OWNER]}
+        self.assertIn("duplicates", self.refuse(sample_state(notifications=[entry, dict(entry)])))
+
+    def test_a_status_cloudflare_does_not_have_is_refused(self):
+        state = sample_state(notifications=[
+            {"name": "n", "alert_type": "tunnel_health_event", "email": [OWNER],
+             "filters": {"new_status": ["unhealthy"]}}])
+        message = self.refuse(state)
+        self.assertIn("new_status", message)
+        self.assertIn("degraded", message)
+
+    def test_an_existing_policy_is_updated_rather_than_duplicated(self):
+        account = self.account()
+        account.notification_policies.append({
+            "id": "pre-existing", "name": "brain tunnel unhealthy",
+            "alert_type": "tunnel_health_event", "enabled": False,
+            "mechanisms": {"email": [{"id": "someone-else@example.invalid"}]}})
+        run = self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        self.assertEqual(len(account.notification_policies), 2)
+        fixed = [p for p in account.notification_policies if p["id"] == "pre-existing"][0]
+        self.assertTrue(fixed["enabled"])
+        self.assertEqual(fixed["mechanisms"]["email"], [{"id": OWNER}])
+        self.assertIn("enabled", run.output)
+
+    def test_nothing_is_ever_deleted(self):
+        account = self.account()
+        account.notification_policies.append({
+            "id": "someone-elses", "name": "billing", "alert_type": "billing_usage_alert",
+            "enabled": True, "mechanisms": {"email": [{"id": OWNER}]}})
+        self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        self.assertIn("someone-elses", [p["id"] for p in account.notification_policies])
+        self.assertEqual([r for r in account.requests if r.method == "DELETE"], [])
+
+
+class CheckModeTests(ProvisionTestCase):
+    """Prevents: a scheduled check that exits 0 on the morning a credential
+    lapses.
+
+    A dry run reports a plan and says so by exiting 0 whatever it finds. That
+    is right for a human reading a diff and useless for a timer, whose only
+    vocabulary is the exit code — which is why the expiring-service-token check
+    in this file could be scheduled, before --check existed, and would still
+    never have raised anything."""
+
+    def converged_account(self):
+        account = FakeCloudflare()
+        account.add_service_client(CAPTURE_CLIENT_NAME)
+        account.add_service_client(READ_CLIENT_NAME)
+        self.reconcile(self.load(sample_state()), account, apply_changes=True)
+        return account
+
+    def test_a_converged_account_passes(self):
+        account = self.converged_account()
+        run = self.reconcile(self.load(sample_state()), account, check=True)
+        self.assertEqual(run.code, provision.EXIT_OK)
+
+    def test_drift_fails_with_its_own_code(self):
+        account = self.converged_account()
+        account.dns_records[0]["content"] = "somewhere-else.cfargotunnel.com"
+        run = self.reconcile(self.load(sample_state()), account, check=True)
+        self.assertEqual(run.code, provision.EXIT_DRIFT)
+
+    def test_an_expiring_credential_outranks_drift(self):
+        """Both are true at once here. A deadline is not the same kind of
+        problem as a diff and must not be reported as one."""
+        account = self.converged_account()
+        account.dns_records[0]["content"] = "somewhere-else.cfargotunnel.com"
+        account.service_clients[0]["expires_at"] = stamp(
+            datetime.now(timezone.utc) + timedelta(days=2))
+        run = self.reconcile(self.load(sample_state()), account, check=True)
+        self.assertEqual(run.code, provision.EXIT_BLOCKED)
+
+    def test_a_plain_dry_run_still_reports_rather_than_judges(self):
+        account = self.converged_account()
+        account.dns_records[0]["content"] = "somewhere-else.cfargotunnel.com"
+        run = self.reconcile(self.load(sample_state()), account)
+        self.assertEqual(run.code, provision.EXIT_OK)
+
+    def test_check_writes_nothing(self):
+        account = self.converged_account()
+        before = len(account.writes())
+        self.reconcile(self.load(sample_state()), account, check=True)
+        self.assertEqual(len(account.writes()), before)
+
+    def test_apply_and_check_together_are_refused(self):
+        """And refused for THAT reason. Both refusals share an exit code, so
+        asserting the code alone would pass on the missing-token path and prove
+        nothing."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = provision.main(["--state", "/nonexistent", "--apply", "--check"])
+        self.assertEqual(code, provision.EXIT_REFUSED)
+        self.assertIn("Pick one", stderr.getvalue())

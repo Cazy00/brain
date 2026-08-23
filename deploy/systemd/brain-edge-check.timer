@@ -1,0 +1,25 @@
+# Daily, well before the backup and maintenance windows.
+#
+# Daily rather than weekly because the service-token warning is seven days
+# wide: a weekly check can consume most of that window before it first speaks,
+# and a rotation that has to happen today is not the same problem as one that
+# has to happen this week.
+[Unit]
+Description=brain daily Cloudflare edge check
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+
+[Timer]
+# UTC explicitly, for the same reason as every other timer here: the scripts
+# these drive reason in UTC, and a local-time calendar moves across the UTC
+# date boundary twice a year.
+OnCalendar=*-*-* 06:40:00 UTC
+# Wider than the others. Nothing downstream waits on this, and the Cloudflare
+# API is a shared service — a fleet of these all firing on the same minute is
+# the kind of thing rate limits exist for.
+RandomizedDelaySec=45min
+# A missed day is exactly the day the expiry warning mattered.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

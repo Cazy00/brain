@@ -10,6 +10,26 @@ Install and enable them per `setup/runbooks/remote-brain.md`. Nothing here is
 enabled by copying it: `systemctl enable --now <timer>` is a deliberate act, and
 the runbook says which ones to enable when.
 
+## What each unit watches, and the one blind spot they share
+
+| Unit | Sees | Cannot see |
+|---|---|---|
+| `brain-backup` | the archive built, encrypted, uploaded, pruned | whether it can be restored |
+| `brain-restore-drill` | that it can be restored | anything between drills |
+| `brain-maintenance` | index, content, backup age, disk, unpushed commits | anything outside the box |
+| `brain-edge-check` | the Cloudflare side: expiring service tokens, drifted applications, policies, DNS | whether the brain itself is answering |
+
+The blind spot is the same for the first three: they run ON the VPS, so they go
+quiet in exactly the failure where silence is worst — the box being gone. That
+is what `brain-edge-check` and the Cloudflare notification policies it
+reconciles are for. Between them, an outage is either reported by the host or
+reported by Cloudflare, and never by neither.
+
+`brain-edge-check` runs `provision.py --check`, which is a dry run that is
+allowed to have an opinion: it writes nothing and exits non-zero on what it
+finds. A plain dry run exits 0 whatever it sees, so scheduling that would have
+produced a green timer on the morning a headless credential lapsed.
+
 ## Why there is no consolidation timer
 
 There was one, and it was removed on 2026-08-23 rather than shipped.

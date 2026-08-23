@@ -216,6 +216,39 @@
     }
   ],
 
+  "_notifications_note": [
+    "Cloudflare's half of the alerting, and the only half that survives the VPS",
+    "being gone -- every other alarm in this system runs ON the box it is",
+    "watching. Two policies, because the account offers little else that is",
+    "honest [verified 2026-08-23 against available_alerts].",
+    "Read the tunnel one for exactly what it says: Cloudflare's own docs are",
+    "blunt that tunnel status 'only reflects the connection between cloudflared",
+    "and the Cloudflare network... A tunnel can appear Healthy while users are",
+    "unable to connect to an application' [docs 2026-08-23]. It fires when the",
+    "connector dies and stays silent when the brain behind it does.",
+    "There is deliberately no application-health policy: the only HTTP-level",
+    "notifier here needs a standalone Health Check, a paid add-on this",
+    "deployment does not have, and an empty one would look like coverage while",
+    "alerting on nothing.",
+    "tunnel_id is NOT written here -- it is per-account, and provision.py fills",
+    "it in from the tunnel it just reconciled. The owner must be a recipient;",
+    "add others freely."
+  ],
+  "notifications": [
+    {
+      "name": "brain tunnel unhealthy",
+      "alert_type": "tunnel_health_event",
+      "description": "The brain's connector stopped talking to the Cloudflare edge.",
+      "email": ["<OWNER_EMAIL>"]
+    },
+    {
+      "name": "brain access service token expiring",
+      "alert_type": "expiring_service_token_alert",
+      "description": "A headless credential lapses in 7 days.",
+      "email": ["<OWNER_EMAIL>"]
+    }
+  ],
+
   "_dns_note": [
     "One proxied CNAME per ingress hostname, pointing at",
     "<tunnel_id>.cfargotunnel.com. Proxied is not a preference: an unproxied",
