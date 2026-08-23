@@ -868,6 +868,117 @@ class ModernEraTests(RemoteTestCase):
         self.assertTrue(body["result"]["isError"])
 
 
+class FakeGit(object):
+    """Stands in for git so a push outage can be staged without one.
+
+    Records every invocation, so a test can assert what was ATTEMPTED and not
+    merely what was reported."""
+
+    class Done(object):
+        def __init__(self, returncode, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def __init__(self, unpushed=1, push_ok=True, upstream=True):
+        self.unpushed = unpushed
+        self.push_ok = push_ok
+        self.upstream = upstream
+        self.calls = []
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        if args[:2] == ["rev-list", "--count"]:
+            if not self.upstream:
+                return self.Done(128)
+            return self.Done(0, "%d\n" % self.unpushed)
+        if args[0] == "push":
+            if self.push_ok:
+                self.unpushed = 0
+                return self.Done(0)
+            return self.Done(1)
+        raise AssertionError("unexpected git call: %r" % (args,))
+
+
+class BackupQueueTests(unittest.TestCase):
+    """The third durability layer, and the contract that makes a capture
+    ACCEPTED before it is BACKED UP.
+
+    A push failure must never un-accept a committed capture: the spec says the
+    result reports backup_pending, the queue retries, and an alert fires after
+    fifteen minutes. None of that was covered — the mechanism existed and its
+    failure path had never been executed, which is the one path that only runs
+    on the day something is already wrong."""
+
+    def setUp(self):
+        self.now = 1_000_000.0
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = eventlog.EventLog(self.tmp.name, clock=lambda: self.now)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp.name, ignore_errors=True)
+
+    def queue(self, git, enabled=True):
+        return capture.BackupQueue(self.tmp.name, log=self.log, enabled=enabled,
+                                   clock=lambda: self.now, runner=git,
+                                   sleeper=lambda _s: None)
+
+    def test_a_successful_push_reports_pushed(self):
+        queue = self.queue(FakeGit(unpushed=2, push_ok=True))
+        self.assertTrue(queue.push_once())
+        self.assertEqual(queue.state(), "pushed")
+
+    def test_nothing_to_push_is_success_and_does_not_call_push(self):
+        git = FakeGit(unpushed=0)
+        queue = self.queue(git)
+        self.assertTrue(queue.push_once())
+        self.assertEqual([c for c in git.calls if c[0] == "push"], [],
+                         "pushed when there was nothing to push")
+
+    def test_a_failed_push_becomes_backup_pending_not_a_failure(self):
+        """The capture is already committed and is NOT at risk. Reporting this
+        as a failure would tell a caller to retry a note that is safely on
+        disk, which is how one dropped connection becomes two notes."""
+        queue = self.queue(FakeGit(unpushed=1, push_ok=False))
+        self.assertFalse(queue.push_once())
+        self.assertEqual(queue.state(), "backup_pending")
+
+    def test_it_escalates_to_push_failed_after_fifteen_minutes(self):
+        queue = self.queue(FakeGit(unpushed=1, push_ok=False))
+        queue.push_once()
+        self.assertEqual(queue.state(), "backup_pending")
+        self.now += capture.PUSH_ALERT_SECONDS + 1
+        self.assertEqual(queue.state(), "push_failed",
+                         "an outage past the alert threshold still read as merely pending")
+
+    def test_recovery_clears_the_pending_state(self):
+        git = FakeGit(unpushed=1, push_ok=False)
+        queue = self.queue(git)
+        queue.push_once()
+        self.now += capture.PUSH_ALERT_SECONDS + 1
+        self.assertEqual(queue.state(), "push_failed")
+        git.push_ok = True
+        self.assertTrue(queue.push_once())
+        self.assertEqual(queue.state(), "pushed", "state stayed red after recovery")
+
+    def test_a_repository_with_no_upstream_is_reported_not_guessed(self):
+        queue = self.queue(FakeGit(upstream=False))
+        self.assertEqual(queue.unpushed(), -1)
+
+    def test_a_brain_with_no_remote_says_backup_is_off(self):
+        """Honest, and not the same as 'pushed'. A brain with nowhere to push
+        has no third durability layer, and the caller is told so."""
+        queue = self.queue(FakeGit(), enabled=False)
+        self.assertEqual(queue.state(), "disabled")
+
+    def test_the_outage_is_recorded_without_any_note_content(self):
+        queue = self.queue(FakeGit(unpushed=3, push_ok=False))
+        queue.push_once()
+        written = (Path(self.tmp.name) / "mutations.jsonl").read_text(encoding="utf-8")
+        self.assertIn("push_failed", written)
+        self.assertIn('"count":3', written.replace(" ", ""))
+
+
 class EventLogVocabularyTests(unittest.TestCase):
     """The redaction control is a list of what MAY exist, not a list of what to hide."""
 
