@@ -254,7 +254,8 @@ remains; see "Remaining work" below.
 7. ~~Docker image, compose, systemd units.~~
 8. ~~Cloudflare provisioning script.~~
 9. ~~Backup, restore drill, runbooks.~~
-10. Deploy, probe, and the client qualification matrix. **In progress.**
+10. ~~Deploy, probe, and the cutover.~~ The client qualification matrix is
+    the one part still open — see R3.
 
 What each step produced, and the evidence for it, is in
 [`../handbacks/2026-08-23-remote-mcp-foundation-status.md`](../handbacks/2026-08-23-remote-mcp-foundation-status.md).
@@ -268,15 +269,18 @@ An independent audit of all 194 spec requirements on 2026-08-23 returned
 "partial" column has one cause: `brain.qodevia.com` is not cut over, so the
 capture endpoint has never been exercised over the network.
 
-**Closed since that audit:** ~~R0 the two credentials~~, ~~R2 Access service
-tokens and the revocation gate~~, ~~R4 Cloudflare alerting~~, ~~R5 the egress
-allowlist and SSH hardening~~, ~~R7 the release, its identity, bill of
-materials and vulnerability scan~~. What they produced, with the evidence, is
-in [`../handbacks/2026-08-23-remote-mcp-foundation-status.md`](../handbacks/2026-08-23-remote-mcp-foundation-status.md).
+**Closed since that audit:** ~~R0 the two credentials~~, ~~R1 the cutover~~,
+~~R2 Access service tokens and the revocation gate~~, ~~R4 Cloudflare
+alerting~~, ~~R5 the egress allowlist and SSH hardening~~, ~~R6 the live push
+outage~~, ~~R7 the release, its identity, bill of materials and vulnerability
+scan~~, ~~R8 the inherited consolidation branches~~. What each produced, with
+the evidence, is in
+[`../handbacks/2026-08-23-remote-mcp-foundation-status.md`](../handbacks/2026-08-23-remote-mcp-foundation-status.md).
 
-Everything below is ordered so that each item is safe to stop after. **R1 is
-still the hinge** — a dozen acceptance gates cannot be evaluated until it is
-done, and R6 and R9 are only meaningful afterwards.
+**R1 is done, so the hinge has turned.** Both hostnames are served by the
+container stack, there is exactly one writer, and `doctor` passes on the
+migrated data with no RED. What remains is R3 and two things waiting on the
+clock.
 
 ### ~~R0. Two credentials the owner has to make~~ — done
 
@@ -289,42 +293,21 @@ are minted, one year, secrets in `/etc/brain/service-tokens/`.
 only drift it would report today is the un-done cutover, so it would alert
 nightly for a planned reason. Enable it as the last step of R1.
 
-### R1. Cut `brain.qodevia.com` over to the new stack
+### ~~R1. Cut `brain.qodevia.com` over to the new stack~~ — done
 
-The single largest gap. Until this is done, `brain_capture` has never run over
-the real network, and the spec's read/capture endpoint does not exist.
+Done 2026-08-23 in the runbook's order: out of the old tunnel's ingress first,
+then the bypass policy deleted, then `provision.py --apply`, then DNS. The five
+other hostnames on that tunnel were untouched. Access now owns the challenge;
+before the cutover the same request was answered by the old server advertising
+`scope="brain:read brain:write"`.
 
-This is a live rewrite of a production tunnel's ingress and a DNS repoint on a
-zone that carries five other hostnames on that same tunnel. It needs an
-explicit go-ahead. The order matters and is not the obvious one — see
-`setup/runbooks/remote-brain.md` procedure 1 step 10c:
+Capture over the network works, is idempotent on `client_request_id`, comes
+back under `scope: all` tagged provisional, and pushes. `--check` reports the
+edge converged.
 
-1. `GET` the **workhorse** tunnel's ingress, remove *only* its
-   `brain.qodevia.com` entry, `PUT` the whole remaining list back with the
-   catch-all last. Doing this BEFORE repointing DNS means the hostname 502s for
-   a few seconds rather than being served by two origins at once.
-   A rollback copy of the current list (version 3, eight rules) is held in the
-   session's private notes.
-2. Convert the existing `brain` Access application from its `bypass`/Everyone
-   policy to Managed OAuth plus an owner-email Allow policy, and delete the
-   bypass. Its audience does not change, so `/etc/brain/brain-http.json` needs
-   no edit. `/etc/brain/cloudflare.json` already declares the desired end
-   state, so with R0a done this step is `provision.py --apply` and a diff to
-   read first.
-3. Wait out the Access propagation delay (~85s) and confirm an unauthenticated
-   request is challenged, not served.
-4. Repoint the `brain.qodevia.com` CNAME onto the brain tunnel, proxied.
-5. **Freeze and retire the old copy** — cutover steps 3 and 11. Stop the
-   orphaned `:8787` process, re-sync anything it captured since the migration,
-   and make the old tree non-writable. Two writable copies is the one failure
-   this whole design exists to prevent, and the window is open until this is
-   done.
-
-Then re-run these gates, which are currently unevaluable: owner OAuth on both
-endpoints; both tunnel routes reach the intended service; the read-only denial
-observed live; a canary capture over the network that commits, returns
-provisional, appears under `scope: all`, survives a restart, pushes, and enters
-the encrypted backup.
+The old copy is retired and read-only — and retiring it took more than `kill`:
+it was a `systemd --user` unit with `Restart=always` on a lingering account and
+came back in five seconds. Runbook step 10c now says where to look.
 
 ### ~~R2. Access service tokens, and prove revocation isolates~~ — done
 
@@ -344,21 +327,24 @@ The capture endpoint's Service Auth policy is declared in
 `/etc/brain/cloudflare.json` and lands with the cutover — there is no point
 binding a policy to an application still on `bypass`/Everyone.
 
-### R3. The client compatibility matrix
+### R3. The client compatibility matrix — the one open item
 
-The spec requires an **observed** matrix, not an assumption. One row per client
-per endpoint, recording client/version, endpoint, authentication result,
-advertised tools, a safe search/read probe, capture where permitted, and the
-exact limitation where it fails.
+Three rows observed: Claude Code (OAuth, `2026-07-28`, four tools on the read
+endpoint), and a headless service token against each endpoint. The rest need an
+interactive login each.
 
-Expect, from published defect reports: Claude Code works; Gemini CLI should
-work; ChatGPT connectors need developer mode; **Codex has open RFC 8707 defects**
-and may authenticate then fail at token expiry; **claude.ai web/mobile has a
-long-running unresolved failure against Access Managed OAuth**. A plan or
-account restriction is reported as such, never disguised as a server failure.
+Expect, from published defect reports: Gemini CLI should work; ChatGPT
+connectors need developer mode; **Codex has open RFC 8707 defects** and may
+authenticate then fail at token expiry — its supported path is the service
+token, which now exists; **claude.ai web/mobile has a long-running unresolved
+failure specifically against Access Managed OAuth** while Claude Code succeeds
+on the same URL. A plan or client restriction is reported as such, never
+disguised as a server failure.
 
-Every row needs an interactive login, so this is owner-driven. The service
-tokens from R2 are what make the headless rows possible at all.
+One trap is already recorded: a client whose User-Agent looks automated is
+refused by **Cloudflare error 1010** at the edge, before Access is consulted.
+The 403 body is a Cloudflare error page rather than an Access challenge, which
+is how to tell them apart.
 
 ### ~~R4. Cloudflare-side alerting~~ — done
 
@@ -379,15 +365,16 @@ states the effective configuration as read on the box rather than the intended
 one, and includes the drop-in ordering trap that makes `99-hardening.conf`
 lose.
 
-### R6. Finish the durability evidence
+### ~~R6. Finish the durability evidence~~ — done, bar the clock
 
-- Demonstrate a **live push outage and recovery**: break the remote, capture,
-  observe `backup_pending`, restore, observe the queue drain. Unit coverage
-  exists (`BackupQueueTests`); the gate asks for a demonstration, and the
-  demonstration needs a capture over the HTTP path — so this waits on R1.
-- Let the **nightly timer** produce an unattended backup and the **monthly
-  drill** run once on its own schedule, rather than by hand. Both are armed;
-  this is elapsed time, not work.
+The **live push outage** was demonstrated twice against the real remote: the
+capture was held with `backup: PENDING`, and the queue drained itself 45
+seconds after the remote came back. The first run is what found the defect that
+made the report untrue; the second was against the fixed build.
+
+What is left is elapsed time, not work: the nightly backup and the monthly
+restore drill are armed and both have been proven by hand, but neither has yet
+run **unattended**.
 
 ### ~~R7. Release tag and the deployment discipline~~ — done
 
@@ -397,23 +384,37 @@ version number now spans the git tag, the image tag, the OCI label and
 rather than reported. Scan: 73 HIGH/CRITICAL and **zero with a fix available**,
 which is the number that decides anything.
 
-### R8. Resolve the inherited consolidation branches
+### ~~R8. Resolve the inherited consolidation branches~~ — done
 
-`brain doctor` is RED on three unreviewed `consolidate/*` branches that came
-across in the migration. They predate this work. Until they are reviewed or
-dropped, the nightly maintenance timer alerts every night, and the acceptance
-gate "`brain lint` and `brain doctor` pass on the migrated private data" cannot
-pass. **Owner decision**, not an implementation task.
+Deleted, local and remote, at the owner's decision: start fresh. Merging was
+never an option — their merge-base predated the commit that stripped the engine
+out of the data repository, so a merge would have pushed ~32,000 lines of
+engine files back into `knowledge/`. Each branch held seven inbox notes and
+promoted nothing; two of the three overlapped heavily.
+
+The commits (`1c3df2c`, `90a5394`, `1b922d6`) remain inside every encrypted
+backup taken before the deletion, because the archive tars the whole data root
+including `.git`. Recoverable by restore for as long as those recovery points
+are kept.
+
+`doctor` now passes with no RED.
 
 ### R9. Declare cutover complete
 
-Cutover step 12: only after every applicable gate passes. Produce the final
-handback — branch/commit and tag, test commands and outputs, image digest and
-SBOM, sanitized service evidence, redacted Cloudflare evidence, the separation
-scan and export inventory, capture/concurrency/failure-injection results, git
-push and backup/restore reports, the completed client matrix, and the
-deviations. No credential, assertion, owner address, or note content in any of
-it.
+Cutover step 12, and it is close. Everything applicable passes except the
+client matrix. The final handback owes: branch/commit and tag, test commands
+and outputs, image digest and SBOM, sanitized service evidence, redacted
+Cloudflare evidence, the separation scan and export inventory,
+capture/concurrency/failure-injection results, git push and backup/restore
+reports, the completed client matrix, and the deviations. No credential,
+assertion, owner address, or note content in any of it.
+
+Two housekeeping items to clear first, neither a gate:
+
+- the object-storage keys pasted into a chat transcript are burned and live in
+  `/etc/brain/backup.env`;
+- the API token at `/etc/brain/cf-api.env` should carry a client-IP restriction
+  to the VPS.
 
 ### Not in scope, deliberately
 

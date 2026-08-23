@@ -1,7 +1,8 @@
 # Remote MCP Foundation — implementation status and evidence
 
-Status as of 2026-08-23. Branch `remote-mcp-foundation`, head `3226626`,
-released as **`v0.2.2`** and deployed.
+Status as of 2026-08-23. Branch `remote-mcp-foundation`, head `fcb3ae6`,
+released as **`v0.2.4`** and deployed. **The cutover is done**: both hostnames
+are served by the container stack, and there is exactly one writer.
 
 This is the spec's "Implementation handback", written while the work is still
 in flight rather than at the end. It exists to answer one question for every
@@ -16,8 +17,8 @@ insist on, and it is not pedantry:
 | **test** | it does what it says under controlled conditions |
 | **live** | it did it on the production VPS, against the real network |
 
-A gate that asks for a demonstration is not satisfied by a passing test. Ten
-defects in this work were found by running things and would not have been found
+A gate that asks for a demonstration is not satisfied by a passing test.
+Fourteen defects in this work were found by running things and would not have been found
 by reading them — they are listed at the end, because they are the argument for
 the distinction.
 
@@ -33,11 +34,13 @@ deployment notes, never here.
 | | |
 |---|---|
 | Branch | `remote-mcp-foundation` (public engine repo) |
-| Head | `3226626` |
-| Release | **`v0.2.2`**, and the VPS engine is checked out at that tag, detached — not a branch |
-| Image | `brain:0.2.2`, `org.opencontainers.image.version=0.2.2`, base `python:3.12-slim-bookworm`, arm64 |
-| Image id | `sha256:882a63fd…` — a **local** daemon digest; nothing is pushed, so no registry manifest digest exists |
-| Tests | **496 pass**, `python3 -m unittest discover -s tests`, exit 0 |
+| Head | `fcb3ae6` |
+| Release | **`v0.2.4`**, and the VPS engine is checked out at that tag, detached — not a branch |
+| Image | `brain:0.2.4`, `org.opencontainers.image.version=0.2.4`, base `python:3.12-slim-bookworm`, arm64 |
+| Image id | `sha256:f4f41caa…` — a **local** daemon digest; nothing is pushed, so no registry manifest digest exists |
+| SBOM | `/var/lib/brain/sbom-0.2.4.json` — 129 components, **0 third-party Python packages** |
+| Vulnerability scan | 73 HIGH/CRITICAL, **0 with a fix available** — all `affected`, `fix_deferred` or `will_not_fix` |
+| Tests | **510 pass**, `python3 -m unittest discover -s tests`, exit 0 |
 | Lint | `python3 bin/brain lint` → 0 errors, 0 warnings |
 
 Commits, oldest first:
@@ -65,7 +68,13 @@ Commits, oldest first:
 | `5f6129c` | a locked object and a lost permission were the same nothing |
 | `658a908` | release 0.2.1 |
 | `a0ffe40` | the local digest, called what it actually is on this daemon |
-| `3226626` | release 0.2.2 — deployed |
+| `3226626` | release 0.2.2 |
+| `7e73be4` | rotate a service token in the order Cloudflare actually allows |
+| `729eca1` | the headless path, proven over the network |
+| `81aef7d` | refuse an argument the tool does not declare |
+| `81bf647` | stop claiming a push that has not happened |
+| `fcb3ae6` | kill is not retirement |
+| `bb749af` | release 0.2.4 — **deployed** |
 
 New code, all Python standard library only:
 
@@ -81,8 +90,8 @@ New code, all Python standard library only:
 | `bin/brainlib/version.py` | 21 | the release number, in one place |
 | `deploy/sbom.sh` | 109 | the bill of materials, and the no-wheels assertion |
 
-Test modules: `test_rs256` 31, `test_remote` 113, `test_provision` 47, plus the
-pre-existing `test_brain` 213, `test_osbackend` 51, `test_setup` 41 — **496**.
+Test modules: `test_rs256` 31, `test_remote` 127, `test_provision` 47, plus the
+pre-existing `test_brain` 213, `test_osbackend` 51, `test_setup` 41 — **510**.
 
 ---
 
@@ -198,6 +207,48 @@ looks automated is refused by Cloudflare error 1010 before Access is
 consulted** — a 403 whose body is a Cloudflare error page rather than an Access
 challenge. `Python-urllib/3.12` was refused; any ordinary User-Agent was not.
 
+### The cutover
+
+Done on 2026-08-23, in the order the runbook insists on — the hostname was
+pulled from the old tunnel's ingress **before** DNS moved, so it fell to a
+catch-all for a few seconds rather than being served by two origins at once.
+
+| Step | Evidence |
+|---|---|
+| The other five hostnames on that tunnel were untouched | one rule removed of eight, asserted in code before the `PUT`; `dev8080` and `console` still answered 302/303 throughout |
+| The `bypass`/Everyone policy is gone | deleted; the application briefly had **no** policy, which fails closed |
+| Managed OAuth, owner policy, capture Service Auth policy, DNS | `provision.py --apply` → 6 changes, exit 0 |
+| Access owns the challenge now | `WWW-Authenticate: … resource_metadata="https://brain.qodevia.com/.well-known/cloudflare-access-protected-resource/mcp"`. Before the cutover the same request got the **old** server's own challenge, advertising `scope="brain:read brain:write"` — scopes this design deliberately does not have |
+| The capture endpoint advertises five tools | `brain_capture`, `brain_links`, `brain_read`, `brain_recent`, `brain_search` |
+| A read credential is refused there | 401 |
+| **A capture over the network** | committed, returned `PROVISIONAL`, pushed to the private remote — all four durability layers in one call |
+| Idempotency on a retry | same `client_request_id` → **the same note and the same commit**, and the server says so: *"this request id was captured before; returning the original note rather than writing a second one"* |
+| It comes back through the read endpoint | found under `scope: all`, tagged `[provisional — unconsolidated]` |
+| The edge matches the declared state | `provision.py --check` → **"converged: no changes"**, exit 0 |
+| `brain-edge-check.timer` armed | enabled once it had something true to say |
+| **One writer** | the old service retired, its `systemd --user` units moved aside, `~/brain` renamed to `brain.FROZEN-2026-08-23` and `chmod -R a-w`; a `touch` inside it is refused |
+| `doctor` on the migrated data | **no RED, exit 0** — the three inherited `consolidate/*` branches were deleted at the owner's decision |
+
+### The push outage, demonstrated rather than simulated
+
+The remote was pointed at an unroutable host, a capture was made over HTTPS,
+and the remote was restored — with the restore in a `finally` block, because a
+demonstration that can leave the brain unable to push is not a demonstration.
+
+```
+2. capturing over the network, with the remote down
+     backup: PENDING — the note is committed locally and safe, and
+             the push to the private remote is being retried.
+   unpushed now: 1
+5. waiting for the queue to drain on its own
+   + 45s  unpushed=0     the queue drained itself.
+```
+
+The first run of that drill is what found the defect below: it reported
+`backup: pushed to the private remote` while the commit sat unpushed. On the
+fixed build a healthy capture still reports `pushed` (3.3 s round trip, and
+`settle` caps its own wait at 2.5 s), so the word means something again.
+
 ### Durability — all four layers
 
 | Layer | Evidence |
@@ -245,7 +296,7 @@ Each is recorded in the plan with the evidence that forced it.
 
 ---
 
-## 4. Ten defects found by running, not reading
+## 4. Fourteen defects found by running, not reading
 
 The argument for finishing the cutover properly rather than declaring it done.
 
@@ -282,7 +333,28 @@ The argument for finishing the cutover properly rather than declaring it done.
    cannot do while containers are attached. Every nightly maintenance run
    would have failed after the engine was updated. Found by the upgrade
    procedure's own preflight step, which is what that step is for.
-10. **A retention lock and a lost permission reported as the same nothing.**
+10. **A capture claiming a push that had not happened.** The live outage drill
+    reported `backup: pushed to the private remote` while the commit sat
+    unpushed. `_pending_since` means "a push was TRIED and failed"; in the
+    moment after a commit nothing has been tried, so the flag was clear and
+    `state()` read that as success. Every capture this system ever served said
+    "pushed" the instant it committed. That line is the caller's only signal
+    about durability, and a wrong one is worse than none.
+11. **An undeclared argument silently dropped.** A probe sent `request_id`
+    where the tool declares `client_request_id`. The capture succeeded and the
+    retry-safety it asked for was off, with nothing said — the exact failure
+    that argument exists to prevent. It is not only capture: a dropped `scope`
+    turns an explicit search of the inbox into one that never looked at it.
+12. **`kill` is not retirement.** The old server was stopped, its port checked,
+    and it was back in five seconds under a new pid: a `systemd --user` unit
+    with `Restart=always` on an account with `Linger=yes`. Invisible to
+    `systemctl list-units`, to `crontab -l`, and to a grep of
+    `/etc/systemd/system` — all three of which had just been run and all three
+    of which said there was nothing.
+13. **Cloudflare refuses to delete a service token a policy still references**
+    (`12139`). The rotation procedure said "delete the old token and its
+    policy" with no order, and the order is the whole thing.
+14. **A retention lock and a lost permission reported as the same nothing.**
     The prune wrote `s3_delete "$key" && note "pruned $key"`, so a 409 from the
     bucket's object lock (expected, nightly, forever) and a 403 from a
     credential that had lost its delete permission were both silent. Found by
@@ -292,40 +364,27 @@ The argument for finishing the cutover properly rather than declaring it done.
 
 ## 5. What is not done
 
-The remaining work is a numbered, ordered plan in
-[`../plans/2026-08-23-remote-mcp-foundation.md`](../plans/2026-08-23-remote-mcp-foundation.md),
-under "Remaining work". Closed since the audit: Cloudflare alerting (R4), the
-egress and SSH runbook sections (R5), and the release discipline with its
-identity, bill of materials and scan (R7).
+The plan's remaining work is in
+[`../plans/2026-08-23-remote-mcp-foundation.md`](../plans/2026-08-23-remote-mcp-foundation.md).
+R0 through R8 are closed. What is left is genuinely small, and none of it is
+blocked on anything except other people's software and the passage of time:
 
-What is left divides cleanly into two kinds, and the distinction matters
-because only one of them is work:
+- **The client matrix (R3).** Three rows observed — Claude Code, and a headless
+  service token against each endpoint. Codex, ChatGPT connectors, Gemini CLI and
+  claude.ai web each need an interactive login, and the published defect
+  reports say at least two of them will fail in ways that are not this server's
+  doing. A plan or client restriction is to be reported as such, never
+  disguised as a server failure.
+- **Two timers have not yet fired on their own.** The nightly backup and the
+  monthly restore drill are armed and have both been proven by hand; what is
+  missing is one unattended run each, which is elapsed time rather than work.
+- **The egress allowlist is written and not applied.** Procedure 11, with the
+  residual risk stated rather than implied away. Applying it needs a
+  `compose down`/`up` for the pinned bridge name, and it is the one change here
+  whose failure mode is a dead tunnel, so it wants its own window.
+- **The final handback (R9).** Owed once the matrix is filled in.
 
-**Blocked on an owner action.**
-
-- **`brain.qodevia.com` is not cut over.** The change is a live rewrite of a
-  production tunnel's ingress and a DNS repoint on a domain carrying five other
-  hostnames; it needs an explicit go-ahead, not an inference from "finish the
-  plan". Until it happens `brain_capture` has never run over the network, and
-  that single fact accounts for most of the audit's "partial" column.
-- **`brain-edge-check.timer` is installed and not enabled.** Not for want of a
-  credential any more — it now has one, and `--check` runs green against the
-  live account. It is held back because the only drift it currently reports
-  *is* the un-done cutover, so enabling it would alert nightly for a known,
-  planned reason. That is precisely how an alert becomes one people skip. It
-  goes on the moment the cutover lands.
-- **Three unreviewed `consolidate/*` branches** inherited from the old brain.
-  `doctor` is RED on them and will stay RED. Reviewing or dropping them is a
-  judgement about the owner's own notes.
-
-**Waiting on the network path, or on the clock.**
-
-- The **client compatibility matrix** has two observed rows and needs the rest;
-  those need interactive logins, and the capture rows need the cutover.
-- The **live push outage demonstration** needs a capture over the HTTP path,
-  which needs the cutover.
-- The **unattended** nightly backup and monthly drill need the timers to fire on
-  their own; both are armed, and both have been proven by hand.
-
-Cutover must not be declared complete until every applicable gate passes. It
-does not yet.
+Two housekeeping items that are not gates but should not be forgotten: the R2
+storage keys pasted into a chat transcript are burned and live in
+`/etc/brain/backup.env`, and the API token now standing at
+`/etc/brain/cf-api.env` should carry a client-IP restriction to the VPS.
