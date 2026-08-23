@@ -177,7 +177,7 @@ Cloudflare edge, and came back through the tunnel to the container.
 | A credential authorized elsewhere is refused here | the capture token at `brain-read` → **401** from Access, because the policy names one token rather than `any_valid_service_token` |
 | **One headless credential can be revoked without affecting another** | before: both 200 / 4 tools. after revoking one: revoked → **401**, the other → **200, 4 tools**. Both sat on the same endpoint with the same profile, so the per-token policy is the only thing that separated them |
 | `service_auth_401_redirect` enabled only after a Service Auth policy exists | set on `brain-read` after its policy; the read credential still returns 200 and the unauthenticated `WWW-Authenticate` + `resource_metadata` challenge is unchanged |
-| The origin enforces the profile boundary itself | `access.py:335` — a credential mapped to one profile is refused at another with `wrong_profile`, independent of Access policy (unit-covered; Access blocks it first in production, which is the point) |
+| The origin enforces the profile boundary itself | `bin/brainlib/access.py:335` — a credential mapped to one profile is refused at another with `wrong_profile`, independent of Access policy (unit-covered; Access blocks it first in production, which is the point) |
 
 Secrets never left the box: the tokens were minted by a script running **on**
 the VPS that wrote `client_secret` straight to `/etc/brain/service-tokens/`
