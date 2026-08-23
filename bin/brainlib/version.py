@@ -18,4 +18,4 @@ told the number.
 Bump it in the same commit that cuts the release, never before: a version that
 is claimed on a branch and never tagged is worse than no version at all."""
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
