@@ -342,6 +342,21 @@ The argument for finishing the cutover properly rather than declaring it done.
 
 ---
 
+## 4b. What an independent audit found afterwards
+
+Everything above was written by the person who did the work. An audit of all
+404 spec requirements on 2026-08-23 overturned fourteen `done` verdicts, seven
+of which were then confirmed by hand — including a capture that can be filed on
+the consolidation branch while the caller is told it was not saved, a ledger
+that stores capture text while its docstring says it stores none, and a public
+export that ships the owner's live hostnames.
+
+**→ [`../plans/2026-08-23-audit-remediation.md`](../plans/2026-08-23-audit-remediation.md)**
+
+Read that before trusting any "done" in this file. The evidence tables above
+are accurate about what was observed; they are not proof that what was observed
+covered everything worth observing.
+
 ## 5. What is not done
 
 The plan's remaining work is in

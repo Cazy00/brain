@@ -262,6 +262,19 @@ What each step produced, and the evidence for it, is in
 
 ---
 
+## Audit findings — read this before calling anything finished
+
+An independent audit on 2026-08-23 graded all 404 spec requirements and found
+real defects in work recorded here as done, including three in the code path
+that mutates knowledge. They are written up separately, with evidence and a
+confidence tier per finding:
+
+**→ [`2026-08-23-audit-remediation.md`](2026-08-23-audit-remediation.md)**
+
+The remaining-work list below is still accurate about what was never started.
+It is **not** a complete picture of what is left, because it says nothing about
+the things that were finished incorrectly.
+
 ## Remaining work
 
 An independent audit of all 194 spec requirements on 2026-08-23 returned
