@@ -1049,9 +1049,32 @@ def _compose_run_service(command: str):
     if "compose" not in words or "run" not in words:
         return None
     rest = words[words.index("run") + 1:]
+    # `compose run` flags come in two kinds and getting the difference wrong is
+    # how this returns `python3` for `--entrypoint python3 maintenance` — a
+    # confident wrong answer rather than a miss.
+    takes_a_value = {"--entrypoint", "--env", "-e", "--label", "-l", "--name",
+                     "--publish", "-p", "--user", "-u", "--volume", "-v",
+                     "--workdir", "-w"}
     while rest and rest[0].startswith("-"):
-        rest.pop(0)                                  # --rm, --no-deps
+        flag = rest.pop(0)
+        if flag in takes_a_value and rest:
+            rest.pop(0)
     return rest[0] if rest else None
+
+
+def _shell_commands(markdown: str):
+    """Every command line in a fenced block, with `\` continuations joined."""
+    joined, buffer = [], ""
+    for line in markdown.splitlines():
+        line = line.rstrip()
+        if buffer:
+            line = buffer + " " + line.lstrip()
+            buffer = ""
+        if line.endswith("\\"):
+            buffer = line[:-1].rstrip()
+            continue
+        joined.append(line)
+    return joined
 
 
 class DeploymentUnitTests(unittest.TestCase):
@@ -1128,6 +1151,30 @@ class DeploymentUnitTests(unittest.TestCase):
         # stopped recognising the lines it is supposed to be checking, which is
         # how the first version of it missed the very bug it was written for.
         self.assertGreaterEqual(checked, 3, "no compose `run` line was examined")
+
+    def test_the_runbook_names_compose_services_that_exist(self):
+        """The same check, against the other place these names are written.
+
+        The unit files had this bug and so did the runbook, in four commands
+        across three procedures: they all said `brain-maintenance`, which is
+        the systemd unit and the container prefix, where compose wanted the
+        SERVICE `maintenance`. Every one of them would have failed with "no
+        such service" at the moment somebody reached for it — during an
+        upgrade, or while recovering corrupt data."""
+        known = _compose_services(self.compose)
+        runbook = (Path(__file__).resolve().parent.parent
+                   / "setup" / "runbooks" / "remote-brain.md")
+        checked = 0
+        for command in _shell_commands(runbook.read_text(encoding="utf-8")):
+            target = _compose_run_service(command)
+            if target is None:
+                continue
+            checked += 1
+            self.assertIn(target, known,
+                          "the runbook runs compose service %r, which "
+                          "compose.yaml does not define:\n  %s"
+                          % (target, command.strip()))
+        self.assertGreaterEqual(checked, 4, "no compose `run` command was examined")
 
     def test_the_edge_check_stops_rather_than_reporting_an_edge_it_never_read(self):
         """`EnvironmentFile=-` makes a missing file non-fatal. For the token

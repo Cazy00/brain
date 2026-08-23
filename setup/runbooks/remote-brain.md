@@ -450,20 +450,29 @@ sudo systemctl start brain-backup.service
 # 3. Record what is running now — this is the rollback target.
 sudo docker compose -p brain images --format '{{.Service}} {{.Repository}}@{{.ID}}'
 
-# 4. Fetch the new engine and the new image.
+# 4. Fetch the new engine and build the new image.
+#    `compose pull` is WRONG here and fails: the brain image is built on this
+#    box and never pushed anywhere, so there is no registry to pull it from.
+#    Only cloudflared comes from a registry, and it is pinned by tag in the
+#    compose file.
 sudo git -C /srv/brain/engine fetch --tags
 sudo git -C /srv/brain/engine checkout <NEW_TAG>
-sudo docker compose -p brain pull
+sudo docker build --pull -f /srv/brain/engine/deploy/Dockerfile \
+     -t brain:<NEW_TAG> /srv/brain/engine
+sudo docker compose -p brain pull cloudflared
 
 # 5. Preflight against the real data, without serving traffic.
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
-     brain-maintenance lint
+     maintenance lint
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
-     brain-maintenance doctor
+     maintenance doctor
 
-# 6. Restart, and prove it.
+# 6. Restart, and prove it. There is no host port -- that is the design -- so
+#    the probe goes to the container's address on the egress bridge, which is
+#    the same path the host-side monitoring uses.
 sudo docker compose -p brain up -d
-curl -fsS localhost:8787/readyz
+EG=$(sudo docker inspect -f '{{(index .NetworkSettings.Networks "brain_egress").IPAddress}}' brain-brain-1)
+curl -fsS "http://$EG:8787/readyz"
 sudo docker compose -p brain logs --since 5m brain
 ```
 
@@ -482,7 +491,8 @@ not the same operation.
 ```sh
 sudo git -C /srv/brain/engine checkout <PREVIOUS_TAG>
 sudo docker compose -p brain up -d
-curl -fsS localhost:8787/readyz
+EG=$(sudo docker inspect -f '{{(index .NetworkSettings.Networks "brain_egress").IPAddress}}' brain-brain-1)
+curl -fsS "http://$EG:8787/readyz"
 ```
 
 **Do not restore the data volume as part of a software rollback.** Notes
@@ -626,7 +636,7 @@ remedies. Identify which before touching anything.
 sudo -u brain git -C /srv/brain/data status --porcelain
 sudo -u brain git -C /srv/brain/data fsck --no-progress
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
-     brain-maintenance lint
+     maintenance lint
 ls -l /srv/brain/state
 ```
 
@@ -636,7 +646,7 @@ disposable, and it is never truth.
 ```sh
 sudo rm -f /srv/brain/state/index.db
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
-     brain-maintenance index
+     maintenance index
 ```
 
 **b. Lint fails on content.** The notes are readable but malformed — usually a
