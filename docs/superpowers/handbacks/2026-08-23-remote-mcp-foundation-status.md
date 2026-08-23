@@ -1,6 +1,7 @@
 # Remote MCP Foundation — implementation status and evidence
 
-Status as of 2026-08-23. Branch `remote-mcp-foundation`, head `a88d6e4`.
+Status as of 2026-08-23. Branch `remote-mcp-foundation`, head `3226626`,
+released as **`v0.2.2`** and deployed.
 
 This is the spec's "Implementation handback", written while the work is still
 in flight rather than at the end. It exists to answer one question for every
@@ -15,7 +16,7 @@ insist on, and it is not pedantry:
 | **test** | it does what it says under controlled conditions |
 | **live** | it did it on the production VPS, against the real network |
 
-A gate that asks for a demonstration is not satisfied by a passing test. Five
+A gate that asks for a demonstration is not satisfied by a passing test. Ten
 defects in this work were found by running things and would not have been found
 by reading them — they are listed at the end, because they are the argument for
 the distinction.
@@ -32,10 +33,12 @@ deployment notes, never here.
 | | |
 |---|---|
 | Branch | `remote-mcp-foundation` (public engine repo) |
-| Head | `a88d6e4` |
-| Tests | **453 pass**, `python3 -m unittest discover -s tests`, exit 0 |
+| Head | `3226626` |
+| Release | **`v0.2.2`**, and the VPS engine is checked out at that tag, detached — not a branch |
+| Image | `brain:0.2.2`, `org.opencontainers.image.version=0.2.2`, base `python:3.12-slim-bookworm`, arm64 |
+| Image id | `sha256:882a63fd…` — a **local** daemon digest; nothing is pushed, so no registry manifest digest exists |
+| Tests | **496 pass**, `python3 -m unittest discover -s tests`, exit 0 |
 | Lint | `python3 bin/brain lint` → 0 errors, 0 warnings |
-| Release tag | **none yet** — see Remaining, R7 |
 
 Commits, oldest first:
 
@@ -54,6 +57,15 @@ Commits, oldest first:
 | `bc29bab` | the timers, and the two things that only fail once installed |
 | `83edb5a` | doctor watches the backup age and the disk |
 | `a88d6e4` | CI scans the public export |
+| `559107c` | this document, and the plan's remaining work |
+| `bfd2466` | alerting: the two things only Cloudflare can see, and `--check` |
+| `ecb4d08` | the alert filter Cloudflare advertises and then refuses |
+| `bbb2ef0` | three runbook commands that would have failed when used |
+| `fd64b7c` | one version number instead of three; the SBOM generator |
+| `5f6129c` | a locked object and a lost permission were the same nothing |
+| `658a908` | release 0.2.1 |
+| `a0ffe40` | the local digest, called what it actually is on this daemon |
+| `3226626` | release 0.2.2 — deployed |
 
 New code, all Python standard library only:
 
@@ -66,9 +78,11 @@ New code, all Python standard library only:
 | `bin/brainlib/capture.py` | 357 | idempotency ledger and the backup queue |
 | `bin/brainlib/eventlog.py` | 216 | the log that cannot contain the brain |
 | `bin/brain-http` | 326 | the entrypoint |
+| `bin/brainlib/version.py` | 21 | the release number, in one place |
+| `deploy/sbom.sh` | 109 | the bill of materials, and the no-wheels assertion |
 
-Test modules: `test_rs256` 31, `test_remote` 87, `test_provision` 30, plus the
-pre-existing `test_brain` 213, `test_osbackend` 51, `test_setup` 41.
+Test modules: `test_rs256` 31, `test_remote` 113, `test_provision` 47, plus the
+pre-existing `test_brain` 213, `test_osbackend` 51, `test_setup` 41 — **496**.
 
 ---
 
@@ -129,6 +143,25 @@ pre-existing `test_brain` 213, `test_osbackend` 51, `test_setup` 41.
 | Owner OAuth works | **live** | **Claude Code authenticated end to end.** |
 | Timers installed and each unit executed | **live** | `brain-backup.service` exits 0; `brain-maintenance` runs index and lint clean; `OnFailure=` reached `brain-alert@` (proven by a real failure). |
 
+### Alerting, and the release
+
+| Requirement | Evidence | Where |
+|---|---|---|
+| Something outside the box notices the tunnel dying | **live** | Cloudflare notification policy `tunnel_health_event`, enabled, filtered to the brain's tunnel id — created through the API and confirmed by re-reading the account. |
+| Something notices a headless credential expiring | **live** | Cloudflare `expiring_service_token_alert`, enabled. It fires 7 days out and will have nothing to say until a service token exists. |
+| The alerts are addressed to somebody | **live** | `alerting/v3/destinations/eligible` → `email: eligible true, ready true`; pagerduty and webhooks are not eligible on this account. **Delivery itself is not proven**: `/policies/{id}/test` answers `15000` for both policies, so the first real delivery is the first proof. Recorded in the runbook rather than implied. |
+| Alerting is reconciled, not clicked in | code + test | `deploy/cloudflare/provision.py` `step_notifications` and `_desired_notification`; `tests/test_provision.py` `NotificationTests` — 9 tests including "the owner cannot be removed from their own alerting" and "two policies with one name are refused". |
+| The credential-expiry check is scheduled | code | `deploy/systemd/brain-edge-check.{service,timer}`, daily, `OnFailure=brain-alert@%n.service`. Installed on the VPS and **deliberately not enabled** — see Remaining. |
+| A scheduled check can actually fail | code + test | `provision.py --check`: writes nothing, exits **2** when a human owes an action and **4** on drift. A plain dry run exits 0 whatever it finds, so scheduling that would have produced a green timer on the morning a credential lapsed. `CheckModeTests` — 6 tests, including that blocked outranks drift. |
+| Production deploys a tag, never a moving branch | **live** | `git describe` on the VPS engine → `v0.2.2`, detached HEAD. `BRAIN_VERSION=0.2.2` in `deploy/.env`; compose refuses to start without it. |
+| One version number, not three | code + test | `bin/brainlib/version.py`; the git tag is `v` + it, the image tag **is** it, the Dockerfile stamps it into `org.opencontainers.image.version`, and `serverInfo.version` reports it. `ReleaseVersionTests` — 4 tests. |
+| Software bill of materials | **live** | `deploy/sbom.sh brain:0.2.2` → CycloneDX 1.5, **129 components**, `python.third_party_packages = 0`. Stored at `/var/lib/brain/sbom-0.2.2.json`. The generator **exits 77** if a third-party wheel ever appears, so that invariant is asserted rather than reported. |
+| Vulnerability scan | **live** | Trivy against a saved tarball (not by mounting the daemon socket into a scanner): **73 HIGH/CRITICAL, 0 with a fix available** — every one `affected`, `fix_deferred` or `will_not_fix`. Nothing to apply; rebuilding would change nothing. Stored at `/var/lib/brain/vulnscan-0.2.2.json`. |
+| Egress is a decision, not an oversight | code | Runbook procedure 11: the DOCKER-USER allowlist, the script that owns it, the systemd unit, the negative test, the rollback — and the residual risk written out for the case where it is not applied. `compose.yaml` pins the bridge name and subnet so the rules have an anchor that survives a redeploy. |
+| The firewall script is not just prose | test | `RunbookFirewallScriptTests` — 7 tests; the script is **extracted from the runbook** and run against a fake `iptables`. Apply is idempotent across three runs, clear is exact, a foreign rule survives both. |
+| SSH is stated rather than assumed | code | Runbook procedure 12: the effective `sshd -T` values as read on 2026-08-23, what to change and what each buys, the drop-in ordering trap (first-wins, so `99-` does **not** win), the three accounts with shells, and rate limiting — with the standing rule that SSH is never closed until a second, tested way in works. |
+| A retention lock is not a failure | code + test | `deploy/backup/lib-s3.sh` `s3_delete` returns 0/2/1; `S3DeleteTests` — 4 tests. |
+
 ### Durability — all four layers
 
 | Layer | Evidence |
@@ -176,7 +209,7 @@ Each is recorded in the plan with the evidence that forced it.
 
 ---
 
-## 4. Five defects found by running, not reading
+## 4. Ten defects found by running, not reading
 
 The argument for finishing the cutover properly rather than declaring it done.
 
@@ -192,6 +225,32 @@ The argument for finishing the cutover properly rather than declaring it done.
    systemd unit is actually started.
 5. **Inverted base64 padding** in the JWS decoder, which rejected most real
    input. Caught by the first test written against it.
+6. **A filter Cloudflare advertises and then refuses.** The account's own
+   `available_alerts` lists `new_status` for `tunnel_health_event`. The API
+   rejects every documented status, every capitalisation, with
+   `17108: invalid new_status input`. The provisioner defaulted it for exactly
+   one commit — the fake account accepted it happily, so only the real one
+   could have found this.
+7. **Four runbook commands naming a compose service that does not exist.**
+   `brain-maintenance` is the systemd unit and the container prefix; the
+   service is `maintenance`. They sat in the upgrade, rollback and
+   corrupt-data procedures, each correct-looking and each failing at the
+   moment somebody reached for it. The test written after the systemd version
+   of this bug only looked at the units.
+8. **Two runbook probes against a host port that does not exist.**
+   `curl localhost:8787/readyz` was the stated proof that an upgrade or a
+   rollback had worked. Nothing is published on the host — that absence is the
+   first control in the whole network design.
+9. **A network change that breaks `compose run` until a full `down`.** Pinning
+   the egress bridge name made compose want to recreate the network, which it
+   cannot do while containers are attached. Every nightly maintenance run
+   would have failed after the engine was updated. Found by the upgrade
+   procedure's own preflight step, which is what that step is for.
+10. **A retention lock and a lost permission reported as the same nothing.**
+    The prune wrote `s3_delete "$key" && note "pruned $key"`, so a 409 from the
+    bucket's object lock (expected, nightly, forever) and a 403 from a
+    credential that had lost its delete permission were both silent. Found by
+    reading a real backup run's log rather than the code.
 
 ---
 
@@ -199,20 +258,43 @@ The argument for finishing the cutover properly rather than declaring it done.
 
 The remaining work is a numbered, ordered plan in
 [`../plans/2026-08-23-remote-mcp-foundation.md`](../plans/2026-08-23-remote-mcp-foundation.md),
-under "Remaining work". In summary, from an independent audit of all 194 spec
-requirements — **69 done, 81 partial, 25 missing, 17 deliberate deviations**:
+under "Remaining work". Closed since the audit: Cloudflare alerting (R4), the
+egress and SSH runbook sections (R5), and the release discipline with its
+identity, bill of materials and scan (R7).
 
-- `brain.qodevia.com` is **not cut over**, so `brain_capture` has never been
-  exercised over the network. That single fact accounts for most of the
-  "partial" column.
-- No Access **service tokens**, so the headless fallback and its revocation gate
-  are unmet.
-- The **client compatibility matrix** has one row and it is half filled.
-- No Cloudflare **tunnel/app health alerting**.
-- No **release tag**; production runs a branch, which the spec forbids.
-- The runbook lacks the **egress allowlist** and **SSH hardening** sections.
-- `brain doctor` is RED on three **unreviewed consolidation branches** inherited
-  from the old brain — an owner decision.
+What is left divides cleanly into two kinds, and the distinction matters
+because only one of them is work:
+
+**Blocked on an owner action.**
+
+- **`brain.qodevia.com` is not cut over.** The change is a live rewrite of a
+  production tunnel's ingress and a DNS repoint on a domain carrying five other
+  hostnames; it needs an explicit go-ahead, not an inference from "finish the
+  plan". Until it happens `brain_capture` has never run over the network, and
+  that single fact accounts for most of the audit's "partial" column.
+- **No Access service tokens.** Minting one produces a client secret Cloudflare
+  shows exactly once. The design's answer is that a human creates it in a
+  session where the secret is shown to them and it goes straight into
+  `/etc/brain/service-tokens/` — `provision.py` deliberately does not mint one,
+  and that is the sharpest trade-off in the file. Until then the headless
+  fallback and the revocation gate are unmet.
+- **No Cloudflare API token with Access permissions.** The token on the box can
+  read service tokens and reach the tunnel API; it is refused (`1010
+  auth.forbidden`) on `access/apps`. `brain-edge-check.timer` is therefore
+  installed and **not enabled**: enabling it today would produce a nightly
+  failure that means "the token is wrong", not "the edge is wrong".
+- **Three unreviewed `consolidate/*` branches** inherited from the old brain.
+  `doctor` is RED on them and will stay RED. Reviewing or dropping them is a
+  judgement about the owner's own notes.
+
+**Waiting on the network path, or on the clock.**
+
+- The **client compatibility matrix** needs the other clients, and those need
+  interactive logins.
+- The **live push outage demonstration** needs a capture over the HTTP path,
+  which needs the cutover.
+- The **unattended** nightly backup and monthly drill need the timers to fire on
+  their own; both are armed, and both have been proven by hand.
 
 Cutover must not be declared complete until every applicable gate passes. It
 does not yet.

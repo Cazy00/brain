@@ -268,29 +268,65 @@ An independent audit of all 194 spec requirements on 2026-08-23 returned
 "partial" column has one cause: `brain.qodevia.com` is not cut over, so the
 capture endpoint has never been exercised over the network.
 
-The tasks below are ordered so that each one is safe to stop after. **R1 is the
-hinge** — a dozen acceptance gates cannot be evaluated until it is done, and
-several later tasks are only meaningful afterwards.
+**Closed since that audit:** ~~R4 Cloudflare alerting~~, ~~R5 the egress
+allowlist and SSH hardening~~, ~~R7 the release, its identity, bill of
+materials and vulnerability scan~~. What they produced, with the evidence, is
+in [`../handbacks/2026-08-23-remote-mcp-foundation-status.md`](../handbacks/2026-08-23-remote-mcp-foundation-status.md).
+
+Everything below is ordered so that each item is safe to stop after. **R1 is
+still the hinge** — a dozen acceptance gates cannot be evaluated until it is
+done, and R6 and R9 are only meaningful afterwards.
+
+### R0. Two credentials the owner has to make
+
+Neither is work; both block work, and R0 exists so they are not discovered
+half way through R1.
+
+**a. A Cloudflare API token that can see Access.** The token on the VPS
+(`/etc/brain/cf-api-token`) reaches the tunnel API and can list service tokens,
+and is refused with `1010 auth.forbidden` on `access/apps` — so
+`provision.py` cannot run at all, and `brain-edge-check.timer` is installed and
+**deliberately left disabled**: enabled today it would fail nightly in a way
+that means "the token is wrong", not "the edge is wrong". Create one scoped to:
+
+| Scope | Permission |
+|---|---|
+| Account | Cloudflare Tunnel : Edit |
+| Account | Access: Apps and Policies : Edit |
+| Account | Access: Service Tokens : Edit |
+| Account | Notifications : Edit |
+| Zone (`qodevia.com`) | DNS : Edit |
+
+Install it as `/etc/brain/cf-api.env`, root-owned `0600`, one line:
+`CLOUDFLARE_API_TOKEN=…`. Then
+`sudo systemctl enable --now brain-edge-check.timer` and confirm the first run
+is green.
+
+**b. The Access service tokens** — see R2. They cannot be minted by the
+provisioner by design.
 
 ### R1. Cut `brain.qodevia.com` over to the new stack
 
 The single largest gap. Until this is done, `brain_capture` has never run over
 the real network, and the spec's read/capture endpoint does not exist.
 
-Preconditions, both owner actions: a client has listed tools successfully
-against `brain-read.qodevia.com`, and the owner accepts a brief interruption of
-the old endpoint.
-
-The order matters and is not the obvious one — see `setup/runbooks/remote-brain.md`
-procedure 1 step 10c:
+This is a live rewrite of a production tunnel's ingress and a DNS repoint on a
+zone that carries five other hostnames on that same tunnel. It needs an
+explicit go-ahead. The order matters and is not the obvious one — see
+`setup/runbooks/remote-brain.md` procedure 1 step 10c:
 
 1. `GET` the **workhorse** tunnel's ingress, remove *only* its
    `brain.qodevia.com` entry, `PUT` the whole remaining list back with the
    catch-all last. Doing this BEFORE repointing DNS means the hostname 502s for
    a few seconds rather than being served by two origins at once.
+   A rollback copy of the current list (version 3, eight rules) is held in the
+   session's private notes.
 2. Convert the existing `brain` Access application from its `bypass`/Everyone
-   policy to Managed OAuth plus an owner-email Allow policy. Its audience does
-   not change, so `/etc/brain/brain-http.json` needs no edit.
+   policy to Managed OAuth plus an owner-email Allow policy, and delete the
+   bypass. Its audience does not change, so `/etc/brain/brain-http.json` needs
+   no edit. `/etc/brain/cloudflare.json` already declares the desired end
+   state, so with R0a done this step is `provision.py --apply` and a diff to
+   read first.
 3. Wait out the Access propagation delay (~85s) and confirm an unauthenticated
    request is challenged, not served.
 4. Repoint the `brain.qodevia.com` CNAME onto the brain tunnel, proxied.
@@ -309,19 +345,27 @@ the encrypted backup.
 ### R2. Access service tokens, and prove revocation isolates
 
 Unmet gate: *"One headless credential can be revoked without affecting
-another."* Owner action — the secret is shown once and cannot be retrieved.
+another."* Owner action, and it is a design decision rather than a limitation:
+Cloudflare shows a service token's client secret exactly once, and
+`provision.py` refuses to be a secret-handling tool — see `step_service_tokens`
+for the three options that were weighed.
 
-1. Create two named service tokens with explicit finite durations.
-2. Give each its own Service Auth policy using
-   `{"service_token": {"token_id": …}}` — **never** `any_valid_service_token`,
-   which admits every token in the account, including ones minted years later
-   for something unrelated.
-3. Add each `common_name` to `service_principals` in
+1. Create two named service tokens with explicit finite durations
+   (`brain-read-headless`, `brain-capture-headless`).
+2. Put each secret in `/etc/brain/service-tokens/<name>`, root-owned `0600`.
+3. Add each `client_id` to `service_principals` in
    `/etc/brain/brain-http.json`, mapped to exactly one profile.
-4. Authenticate a headless client with each, delete one, and show that client
-   blocked while the other still works.
-5. Only then set `service_auth_401_redirect: true` — it cannot be enabled until
-   a Service Auth policy exists.
+4. Add both to `service_tokens` in `/etc/brain/cloudflare.json`, add the
+   Service Auth policies, and run `provision.py --apply`. The policy names the
+   token — **never** `any_valid_service_token`, which admits every token in the
+   account including ones minted years later for something unrelated;
+   `provision.py` refuses that outright.
+5. Authenticate a headless client with each. Then create a third, disposable
+   token, authenticate with it, delete it, and show that client blocked while
+   the other two still work — a cleaner demonstration of the same gate than
+   destroying a credential you intend to keep.
+6. Only then set `service_auth_401_redirect: true`; it cannot be enabled until
+   a Service Auth policy exists, and the provisioner defers it until then.
 
 ### R3. The client compatibility matrix
 
@@ -336,47 +380,45 @@ and may authenticate then fail at token expiry; **claude.ai web/mobile has a
 long-running unresolved failure against Access Managed OAuth**. A plan or
 account restriction is reported as such, never disguised as a server failure.
 
-### R4. Cloudflare-side alerting
+Every row needs an interactive login, so this is owner-driven. The service
+tokens from R2 are what make the headless rows possible at all.
 
-Missing entirely: nothing notices the brain or the tunnel being down. A
-container restart loop is not an alert. Create Cloudflare notification policies
-for tunnel health and application health, and record how they are addressed.
+### ~~R4. Cloudflare-side alerting~~ — done
 
-The other alerts in the spec's list are now covered: backup age and disk
-headroom by `bin/brain doctor` (`bin/brain:5013`, `:5040`) under the nightly
-timer whose `OnFailure=` raises; push-pending by the queue's own escalation.
-Service-credential expiry is checked by `deploy/cloudflare/provision.py` but
-**nothing schedules it** — wire it to a timer as part of this task.
+Two policies are live and reconciled by `provision.py`; `--check` gives a timer
+something to fail on; `brain-edge-check.timer` is installed and waits on R0a.
+The gap that remains is deliberate and recorded: **nothing outside the box
+knows whether the brain is answering.** Cloudflare's tunnel alert is explicit
+that a tunnel can be healthy while the origin behind it is dead, and the
+account's only HTTP-level notifier needs a paid Health Check. Closing that
+needs an external prober this deployment does not have.
 
-### R5. Runbook: the egress allowlist and SSH hardening
+### ~~R5. Runbook: the egress allowlist and SSH hardening~~ — done
 
-Two sections the spec asks for and the runbook does not contain.
-
-- **Egress.** The spec limits outbound access "as practical" to the tunnel,
-  Cloudflare JWKS, the private git provider, backup storage, registries during
-  controlled updates, and the consolidator provider. Docker has no per-container
-  egress ACL, so this is a `DOCKER-USER` job on the host. Write the rules, or
-  record the residual risk explicitly — the compose file already says the honest
-  word is "full" and points here.
-- **SSH.** The only administrative path to the single production writer, and the
-  runbook says nothing about it. Key-only authentication, root-login policy,
-  rate limiting. Note the standing rule: **never close SSH until a second,
-  tested way in already works.**
+Procedures 11 and 12. The egress rules are written, scripted, unit-wrapped,
+tested against a fake `iptables`, and **not applied** — the residual risk of
+not applying them is written out rather than implied away. The SSH section
+states the effective configuration as read on the box rather than the intended
+one, and includes the drop-in ordering trap that makes `99-hardening.conf`
+lose.
 
 ### R6. Finish the durability evidence
 
 - Demonstrate a **live push outage and recovery**: break the remote, capture,
   observe `backup_pending`, restore, observe the queue drain. Unit coverage
-  exists (`BackupQueueTests`); the gate asks for a demonstration.
+  exists (`BackupQueueTests`); the gate asks for a demonstration, and the
+  demonstration needs a capture over the HTTP path — so this waits on R1.
 - Let the **nightly timer** produce an unattended backup and the **monthly
-  drill** run once on its own schedule, rather than by hand.
+  drill** run once on its own schedule, rather than by hand. Both are armed;
+  this is elapsed time, not work.
 
-### R7. Release tag and the deployment discipline
+### ~~R7. Release tag and the deployment discipline~~ — done
 
-The spec says production deploys tagged releases, never a moving branch. The
-VPS currently runs branch `remote-mcp-foundation`. Tag a release, retag the
-image to match, and record the image digest — which the handback also owes,
-along with a software bill of materials and a vulnerability scan.
+`v0.2.2`, deployed, engine checked out at the tag rather than a branch. One
+version number now spans the git tag, the image tag, the OCI label and
+`serverInfo.version`. SBOM: 129 components, zero third-party Python, asserted
+rather than reported. Scan: 73 HIGH/CRITICAL and **zero with a fix available**,
+which is the number that decides anything.
 
 ### R8. Resolve the inherited consolidation branches
 
