@@ -373,7 +373,11 @@ class DoctorSurfacesTheLogTests(unittest.TestCase):
 
     def log(self):
         where = osbackend.state_dir(ROOT, env=self.env, create=True)
-        return eventlog.EventLog(where / eventlog.FILENAME, clock=FakeClock())
+        # Stamped NOW, not at FakeClock's fixed date: doctor counts only the
+        # last DOCTOR_ERROR_WINDOW_DAYS, so a fixed date passes for a week after
+        # it was written and fails forever after (found 2026-10-14).
+        return eventlog.EventLog(where / eventlog.FILENAME,
+                                 clock=FakeClock(eventlog._utc_now()))
 
     def test_a_quiet_log_is_reported_as_quiet(self):
         done = self.run_doctor()
