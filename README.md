@@ -256,10 +256,10 @@ trusting.
 - **The privacy rule is instruction-enforced.** "Ask before recording anything
   about a person's private life" is followed by the model, not enforced by code,
   and commits auto-push. Weaker harnesses will eventually get this wrong.
-- **Windows is not verified today.** CI runs the suite on all three platforms,
-  but on Windows about 80 tests fail for platform reasons (path separators, file
-  locks, bash-only scripts, `os.statvfs`), so that job is informational until
-  they are fixed — see `docs/decisions/2026-10-14-windows-ci-informational.md`.
+- **Windows is not verified.** CI runs the suite on Linux and macOS only; on
+  Windows about 80 tests fail for platform reasons (path separators, file
+  locks, bash-only scripts, `os.statvfs`) — see
+  `docs/decisions/2026-10-14-windows-ci-informational.md`.
   Nobody on this project owns a Windows machine, so anything CI cannot reach
   there — how the path picker feels in a real terminal, Credential Manager
   prompts — is unverified rather than known to work.
