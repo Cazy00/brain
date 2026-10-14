@@ -145,6 +145,12 @@ jobs:
           fi
           exit $fail
       - name: the export lints and its own tests pass
+        env:
+          # Running the tests must not add to the tree the next step scans.
+          # Bytecode constant-folds the split-up fake tokens in the test
+          # fixtures back into whole strings, and gitleaks then reported three
+          # "leaks" in __pycache__ files that the export never contained.
+          PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -eu
           cd /tmp/export
