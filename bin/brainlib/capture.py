@@ -91,6 +91,31 @@ class Ledger(object):
             db.execute("CREATE TABLE IF NOT EXISTS seen ("
                        "fingerprint TEXT PRIMARY KEY, kind TEXT, at REAL, result TEXT)")
             db.execute("CREATE INDEX IF NOT EXISTS seen_at ON seen(at)")
+            self._scrub_legacy_rows(db)
+
+    @staticmethod
+    def _scrub_legacy_rows(db) -> None:
+        """Rows written before 0.2.5 hold the whole result, whose note path is
+        a slug of the capture text (audit A3). Rewrite them to LEDGER_FIELDS
+        once, then checkpoint and VACUUM, so the old bytes leave the WAL and
+        the free pages as well as the rows."""
+        changed = 0
+        for fingerprint, result in db.execute("SELECT fingerprint, result FROM seen").fetchall():
+            try:
+                stored = json.loads(result or "{}")
+            except ValueError:
+                stored = {}
+            if isinstance(stored, dict) and set(stored) <= set(LEDGER_FIELDS):
+                continue
+            stored = stored if isinstance(stored, dict) else {}
+            kept = {field: str(stored.get(field) or "") for field in LEDGER_FIELDS}
+            db.execute("UPDATE seen SET result = ? WHERE fingerprint = ?",
+                       (json.dumps(kept), fingerprint))
+            changed += 1
+        if changed:
+            db.commit()
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.execute("VACUUM")
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -130,6 +155,9 @@ class Ledger(object):
             db.execute("INSERT OR REPLACE INTO seen (fingerprint, kind, at, result) "
                        "VALUES (?,?,?,?)",
                        (digest, kind, self._clock(), json.dumps(kept)))
+        # The only writer is also the only pruner: rows past their TTL answer
+        # nothing, so keeping them is only keeping them.
+        self.prune()
 
     def prune(self) -> int:
         now = self._clock()

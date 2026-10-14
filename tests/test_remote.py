@@ -910,6 +910,57 @@ class FakeGit(object):
         raise AssertionError("unexpected git call: %r" % (args,))
 
 
+class LedgerUpgradeTests(unittest.TestCase):
+    """Prevents: a server upgraded past audit A3 keeping, forever, the rows an
+    older version wrote — their note path is a slug of the capture text — and
+    rows past their TTL that nothing ever deleted."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+
+    def _write_legacy_row(self, digest):
+        import sqlite3
+        db = sqlite3.connect(str(self.state / capture.LEDGER_FILE))
+        db.execute("CREATE TABLE IF NOT EXISTS seen ("
+                   "fingerprint TEXT PRIMARY KEY, kind TEXT, at REAL, result TEXT)")
+        db.execute("INSERT OR REPLACE INTO seen VALUES (?,?,?,?)", (digest, "content", time.time(), json.dumps(
+            {"ok": True, "status": "committed",
+             "note": "knowledge/inbox/2026-08-23-zanzibar-pineapple-canary.md",
+             "commit": "abc1234", "provisional": True, "backup": "pushed", "detail": ""})))
+        db.commit()
+        db.close()
+
+    def _disk(self):
+        return b"".join(p.read_bytes()
+                        for p in sorted(self.state.glob(capture.LEDGER_FILE + "*"))).lower()
+
+    def test_opening_an_old_ledger_scrubs_the_text_from_its_rows(self):
+        self._write_legacy_row("f" * 64)
+        capture.Ledger(self.state, PRINCIPAL_KEY)
+        self.assertNotIn(b"pineapple", self._disk())
+
+    def test_a_scrubbed_row_still_answers_its_lookup(self):
+        digest = capture.Ledger(self.state, PRINCIPAL_KEY).fingerprint(
+            "content", "capture", "Zanzibar pineapple canary")
+        self._write_legacy_row(digest)
+        ledger = capture.Ledger(self.state, PRINCIPAL_KEY)
+        self.assertEqual(ledger.lookup("content", "capture", "Zanzibar pineapple canary"),
+                         {"status": "committed", "commit": "abc1234"})
+
+    def test_rows_past_their_ttl_are_deleted_when_a_new_one_is_written(self):
+        import sqlite3
+        clock = [1000.0]
+        ledger = capture.Ledger(self.state, PRINCIPAL_KEY, clock=lambda: clock[0])
+        ledger.remember("content", "capture", "old", {"status": "committed", "commit": "abc1234"})
+        clock[0] += capture.REQUEST_TTL_SECONDS + capture.CONTENT_TTL_SECONDS + 1
+        ledger.remember("content", "capture", "new", {"status": "committed", "commit": "def5678"})
+        db = sqlite3.connect(str(self.state / capture.LEDGER_FILE))
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM seen").fetchone()[0], 1)
+
+
 class BackupQueueTests(unittest.TestCase):
     """The third durability layer, and the contract that makes a capture
     ACCEPTED before it is BACKED UP.
