@@ -142,6 +142,10 @@ jobs:
             echo "BRAIN_ZONE not set (a fork?): live-zone check skipped"
           elif grep -rnF "$BRAIN_ZONE" /tmp/export; then
             echo "^ the live zone reached the export"; fail=1
+          elif grep -rniF "${BRAIN_ZONE%%.*}" /tmp/export; then
+            # The zone's first label is usually the brand, and "for the
+            # <Brand> deployment" names the zone as surely as the zone does.
+            echo "^ the live zone's name reached the export"; fail=1
           fi
           exit $fail
       - name: the export lints and its own tests pass

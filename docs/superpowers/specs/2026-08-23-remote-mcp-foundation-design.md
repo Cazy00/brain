@@ -535,7 +535,7 @@ Four durability layers are required:
 2. a local Git commit for every accepted mutation;
 3. automatic push to the private Git remote;
 4. a nightly fully encrypted archive in S3-compatible object storage, with
-   Cloudflare R2 recommended for the Qodevia deployment.
+   Cloudflare R2 recommended for this deployment.
 
 Encrypted object retention defaults to seven daily, four weekly, and twelve
 monthly recovery points. Object versioning or retention protection is enabled
