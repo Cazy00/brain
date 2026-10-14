@@ -67,8 +67,8 @@ implementation.
 | Cloudflare Tunnel is the only network path | Publish a VPS port | The origin needs no public inbound application port. |
 | Cloudflare Access Managed OAuth performs interactive login | Implement and maintain an OAuth authorization server | Access now supplies MCP-compatible OAuth discovery and browser authorization; custom token machinery adds security risk. |
 | Two Access applications and endpoints | One authenticated endpoint with all tools | Separate audiences give a concrete, server-verifiable read-only boundary. |
-| `brain.qodevia.com/mcp` is read + capture | Put write capability on every connection implicitly | The endpoint is explicitly selected for clients allowed to capture. |
-| `brain-read.qodevia.com/mcp` is read-only | Depend only on instructions telling an agent not to capture | Tool discovery and handler authorization both enforce the boundary. |
+| `brain.<ZONE>/mcp` is read + capture | Put write capability on every connection implicitly | The endpoint is explicitly selected for clients allowed to capture. |
+| `brain-read.<ZONE>/mcp` is read-only | Depend only on instructions telling an agent not to capture | Tool discovery and handler authorization both enforce the boundary. |
 | Cloudflare service credentials are the headless fallback | Add Brain-specific personal tokens in v1 | Access already provides named, expiring, renewable, independently revocable machine credentials. |
 | Remote capture always commits | Expose local `commit: false` remotely | An uncommitted remote capture is neither durable nor auditable and can block consolidation. |
 | Private Git is server-pushed history and backup | Bidirectional Git synchronization with local clones | Only the VPS may change production state. |
@@ -85,8 +85,8 @@ Codex / ChatGPT / Claude / Gemini / future MCP clients
         +------------------------------------------+
         | Cloudflare                               |
         |                                          |
-        | brain.qodevia.com      read + capture    |
-        | brain-read.qodevia.com read-only         |
+        | brain.<ZONE>      read + capture    |
+        | brain-read.<ZONE> read-only         |
         |                                          |
         | Access Managed OAuth / Service Auth      |
         +--------------------+---------------------+
@@ -120,8 +120,8 @@ SSH is not a production Brain data interface.
 
 | Endpoint | Access application | MCP tools |
 |---|---|---|
-| `https://brain-read.qodevia.com/mcp` | distinct read-only audience | `brain_search`, `brain_read`, `brain_links`, `brain_recent` |
-| `https://brain.qodevia.com/mcp` | distinct read/capture audience | the four read tools plus `brain_capture` |
+| `https://brain-read.<ZONE>/mcp` | distinct read-only audience | `brain_search`, `brain_read`, `brain_links`, `brain_recent` |
+| `https://brain.<ZONE>/mcp` | distinct read/capture audience | the four read tools plus `brain_capture` |
 
 Both hostnames resolve through the same named tunnel to the same Brain service
 and private data. The hostnames do not represent replicas.
@@ -462,8 +462,8 @@ version. An irreversible data migration requires a separately approved design.
 
 The implementation creates:
 
-- proxied DNS/tunnel routes for `brain.qodevia.com` and
-  `brain-read.qodevia.com`;
+- proxied DNS/tunnel routes for `brain.<ZONE>` and
+  `brain-read.<ZONE>`;
 - two self-hosted Access applications with distinct audiences;
 - owner-email Allow policies for interactive OAuth;
 - Managed OAuth and dynamic client registration settings;
@@ -535,7 +535,7 @@ Four durability layers are required:
 2. a local Git commit for every accepted mutation;
 3. automatic push to the private Git remote;
 4. a nightly fully encrypted archive in S3-compatible object storage, with
-   Cloudflare R2 recommended for the Qodevia deployment.
+   Cloudflare R2 recommended for this deployment.
 
 Encrypted object retention defaults to seven daily, four weekly, and twelve
 monthly recovery points. Object versioning or retention protection is enabled
@@ -573,7 +573,7 @@ copy writable alongside the replacement VPS.
 5. Transfer it to the VPS over an authenticated encrypted channel and compare
    an inventory plus cryptographic hashes.
 6. Deploy the pinned public Brain image with private data/state/config mounts.
-7. Configure and verify both `qodevia.com` MCP endpoints.
+7. Configure and verify both `<ZONE>` MCP endpoints.
 8. Exercise OAuth, read-only denial, capture, Git push, backup, restart, and
    isolated restore.
 9. Replace every production client configuration with its chosen remote MCP

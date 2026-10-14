@@ -2336,16 +2336,43 @@ class ConnectTests(unittest.TestCase):
         server = str(self.repo / "bin" / "brain-mcp")
         for name, template in module.CONNECT_FORMATS.items():
             with self.subTest(fmt=name):
-                text = template.format(server=server)
+                text = module.render_connect_snippet(name, server)
                 if name == "toml":
                     self.assertIn("[mcp_servers.brain]", text)
-                    self.assertIn(f'command = "{server}"', text)
+                    self.assertIn("command = " + _json.dumps(server), text)
                 else:
                     parsed = _json.loads(text)
                     key = "servers" if name == "json-servers" else "mcpServers"
                     self.assertIn(key, parsed, f"{name} used the wrong top-level key")
                     self.assertEqual(parsed[key]["brain"]["command"], server)
                     self.assertEqual(parsed[key]["brain"]["args"], [])
+
+    def test_a_windows_path_renders_snippets_that_parse_back_to_it(self):
+        """Backslashes pasted raw into a JSON or TOML string are escapes. CI's
+        Windows runner proved it: every JSON snippet failed to parse."""
+        import json as _json
+        module = load_brain_module()
+        server = 'C:\\Users\\Ana "A" Ruiz\\brain\\bin\\brain-mcp'
+        for name in module.CONNECT_FORMATS:
+            with self.subTest(fmt=name):
+                text = module.render_connect_snippet(name, server)
+                if name == "toml":
+                    line = next(l for l in text.splitlines() if l.startswith("command = "))
+                    self.assertEqual(_json.loads(line[len("command = "):]), server)
+                else:
+                    parsed = _json.loads(text)
+                    key = "servers" if name == "json-servers" else "mcpServers"
+                    self.assertEqual(parsed[key]["brain"]["command"], server)
+
+    def test_the_vscode_command_line_carries_valid_json_for_a_windows_path(self):
+        """The same bug as the snippets, one line below them: VS Code's
+        `--add-mcp` takes a JSON literal, and a raw Windows path breaks it."""
+        import json as _json
+        module = load_brain_module()
+        server = 'C:\\Users\\Ana "A" Ruiz\\brain\\bin\\brain-mcp'
+        line = module.render_connect_cli(module.CONNECT_CLIENTS["vscode"], server)
+        payload = line[line.index("'") + 1:line.rindex("'")]
+        self.assertEqual(_json.loads(payload)["command"], server)
 
     def test_vscode_uses_servers_and_everyone_else_uses_mcpservers(self):
         """The single most common silent failure. VS Code's key is `servers`;
@@ -2426,7 +2453,7 @@ class ConnectTests(unittest.TestCase):
         for fmt, template in module.CONNECT_FORMATS.items():
             with self.subTest(fmt=fmt):
                 kind, container, entry = module.server_entry(fmt)
-                pasted = template.format(server=server)
+                pasted = module.render_connect_snippet(fmt, server)
                 if kind == "json":
                     self.assertEqual(json.loads(pasted), {container: {"brain": entry}})
                 else:
@@ -3071,7 +3098,7 @@ class ResetTests(unittest.TestCase):
         self.assertIsNotNone(found, out.stdout)
         stamp = found.group(1)
         happens, kept = self.module.retire_plan(
-            str(self.remote), Path(str(self.repo) + f".retired-{stamp}"),
+            str(self.remote), Path(str(self.repo.resolve()) + f".retired-{stamp}"),
             Path.home() / f"brain-backup-{stamp}.bundle")
         self.assertTrue(happens and kept, "the plan is empty")
 

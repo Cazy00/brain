@@ -107,13 +107,13 @@ ingress:
   # compose.yaml for why that pin exists.
 
   # Read + capture. The five v1 tools.
-  - hostname: brain.qodevia.com
+  - hostname: brain.<ZONE>
     service: http://brain:8787
 
   # Read-only. The four read tools; a hand-built brain_capture call here is
   # rejected by the origin's handler authorization, not merely hidden from
   # tools/list.
-  - hostname: brain-read.qodevia.com
+  - hostname: brain-read.<ZONE>
     service: http://brain:8787
 
   # The catch-all, and it MUST be last — cloudflared requires a final rule with

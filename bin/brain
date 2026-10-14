@@ -1721,7 +1721,7 @@ CONNECT_CLIENTS = {
         "path": {"macos": "~/Library/Application Support/Code/User/mcp.json",
                  "linux": "~/.config/Code/User/mcp.json",
                  "windows": "%APPDATA%/Code/User/mcp.json"},
-        "cli": 'code --add-mcp \'{{"name":"brain","type":"stdio","command":"{server}","args":[]}}\'',
+        "cli": 'code --add-mcp \'{{"name":"brain","type":"stdio","command":{server_json},"args":[]}}\'',
         "agents_md": "yes, on by default (chat.useAgentsMdFile), workspace-scoped",
         "routing": "~/.copilot/instructions/brain.instructions.md, with frontmatter "
                    "applyTo: \"**\"  (it also reads ~/.claude/CLAUDE.md by default)",
@@ -1787,17 +1787,34 @@ CONNECT_CLIENTS = {
 }
 
 CONNECT_FORMATS = {
-    "toml": '[mcp_servers.brain]\ncommand = "{server}"\nargs = []',
+    "toml": '[mcp_servers.brain]\ncommand = {server}\nargs = []',
     "json-mcpServers": ('{{\n  "mcpServers": {{\n    "brain": {{\n'
-                        '      "command": "{server}",\n      "args": []\n'
+                        '      "command": {server},\n      "args": []\n'
                         '    }}\n  }}\n}}'),
     "json-mcpServers-typed": ('{{\n  "mcpServers": {{\n    "brain": {{\n'
-                              '      "type": "stdio",\n      "command": "{server}",\n'
+                              '      "type": "stdio",\n      "command": {server},\n'
                               '      "args": []\n    }}\n  }}\n}}'),
     "json-servers": ('{{\n  "servers": {{\n    "brain": {{\n'
-                     '      "type": "stdio",\n      "command": "{server}",\n'
+                     '      "type": "stdio",\n      "command": {server},\n'
                      '      "args": []\n    }}\n  }}\n}}'),
 }
+
+
+def render_connect_snippet(fmt: str, server: str) -> str:
+    """The paste-ready snippet for one client format, with `server` quoted and
+    escaped here, once. A JSON string literal is also a valid TOML basic
+    string, so one escaping serves all four formats — and it is the same
+    escaping `--apply` writes, which keeps the pasted and applied files equal."""
+    import json as _json
+    return CONNECT_FORMATS[fmt].format(server=_json.dumps(server))
+
+
+def render_connect_cli(client: dict, server: str) -> str:
+    """A client's one-line registration command. `{server}` is the raw path,
+    for templates that quote it for a shell; `{server_json}` is a JSON string
+    literal, for a template whose argument is JSON (VS Code's --add-mcp)."""
+    import json as _json
+    return client["cli"].format(server=server, server_json=_json.dumps(server))
 
 
 # What `--apply` writes, per format: the container key and any fields beyond
@@ -1862,10 +1879,10 @@ def print_client(key: str) -> None:
     print(f"\n1. Register the server        {client['config']}")
     if client["format"]:
         print()
-        for line in CONNECT_FORMATS[client["format"]].format(server=server).splitlines():
+        for line in render_connect_snippet(client["format"], server).splitlines():
             print(f"     {line}")
     if client["cli"]:
-        print(f"\n   or, equivalently:\n     {client['cli'].format(server=server)}")
+        print(f"\n   or, equivalently:\n     {render_connect_cli(client, server)}")
     print(f"\n2. Global routing rule        {client['routing']}")
     print("   (print the block itself with: bin/brain connect --routing)")
     print(f"\n3. Restart                    {client['restart']}")
@@ -5089,7 +5106,7 @@ def cmd_retire(argv: list, alias: bool = False) -> int:
     def block(title: str, lines: list) -> None:
         print(f"\n{title}")
         for line in lines:
-            for i, wrapped in enumerate(textwrap.wrap(line, 72)):
+            for i, wrapped in enumerate(textwrap.wrap(line, 72, break_long_words=False, break_on_hyphens=False)):
                 print(("  - " if i == 0 else "    ") + wrapped)
 
     if "--explain" in argv:
@@ -5132,7 +5149,7 @@ def cmd_retire(argv: list, alias: bool = False) -> int:
     if blockers:
         print("\nREFUSING — this brain is not fully backed up:\n")
         for blocker in blockers:
-            for i, line in enumerate(textwrap.wrap(blocker, 72)):
+            for i, line in enumerate(textwrap.wrap(blocker, 72, break_long_words=False, break_on_hyphens=False)):
                 print(("  - " if i == 0 else "    ") + line)
         print("\nThere is no --force for this. Fix the above and run it again.")
         print("Nothing was changed.")

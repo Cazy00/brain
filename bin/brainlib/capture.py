@@ -21,7 +21,9 @@ The ledger stores **HMACs, never text**. It is derived state on a disk that also
 holds the brain, and a table of recent capture text would be a second copy of
 the most sensitive thing here, outside the notes, outside git, outside every
 rule that governs the notes. An HMAC answers "have I seen this exact text" and
-answers nothing else.
+answers nothing else. It keeps the commit id beside each HMAC, never the note
+path, because the path is a slug of the text; a replay rebuilds the path from
+the commit.
 
 **A push can fail without the capture having failed.** The spec is explicit: a
 capture is accepted once the LOCAL commit exists, and a failed push must not
@@ -40,13 +42,21 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 LEDGER_FILE = "capture-ledger.db"
+
+# What the ledger may keep about a capture. The commit id is a hash and says
+# nothing about the text. The note path is a slug OF the text, so it is rebuilt
+# from the commit on a hit instead of being stored.
+LEDGER_FIELDS = ("status", "commit")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
 
 # How long a request id and a content fingerprint stay deduplicable. A dropped
 # connection is retried in seconds; a person deliberately re-saying the same
@@ -81,6 +91,31 @@ class Ledger(object):
             db.execute("CREATE TABLE IF NOT EXISTS seen ("
                        "fingerprint TEXT PRIMARY KEY, kind TEXT, at REAL, result TEXT)")
             db.execute("CREATE INDEX IF NOT EXISTS seen_at ON seen(at)")
+            self._scrub_legacy_rows(db)
+
+    @staticmethod
+    def _scrub_legacy_rows(db) -> None:
+        """Rows written before 0.2.5 hold the whole result, whose note path is
+        a slug of the capture text (audit A3). Rewrite them to LEDGER_FIELDS
+        once, then checkpoint and VACUUM, so the old bytes leave the WAL and
+        the free pages as well as the rows."""
+        changed = 0
+        for fingerprint, result in db.execute("SELECT fingerprint, result FROM seen").fetchall():
+            try:
+                stored = json.loads(result or "{}")
+            except ValueError:
+                stored = {}
+            if isinstance(stored, dict) and set(stored) <= set(LEDGER_FIELDS):
+                continue
+            stored = stored if isinstance(stored, dict) else {}
+            kept = {field: str(stored.get(field) or "") for field in LEDGER_FIELDS}
+            db.execute("UPDATE seen SET result = ? WHERE fingerprint = ?",
+                       (json.dumps(kept), fingerprint))
+            changed += 1
+        if changed:
+            db.commit()
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.execute("VACUUM")
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -115,10 +150,14 @@ class Ledger(object):
 
     def remember(self, kind: str, profile: str, value: str, result: dict) -> None:
         digest = self.fingerprint(kind, profile, value)
+        kept = {field: str(result.get(field) or "") for field in LEDGER_FIELDS}
         with self._lock, self._connect() as db:
             db.execute("INSERT OR REPLACE INTO seen (fingerprint, kind, at, result) "
                        "VALUES (?,?,?,?)",
-                       (digest, kind, self._clock(), json.dumps(result)))
+                       (digest, kind, self._clock(), json.dumps(kept)))
+        # The only writer is also the only pruner: rows past their TTL answer
+        # nothing, so keeping them is only keeping them.
+        self.prune()
 
     def prune(self) -> int:
         now = self._clock()
@@ -297,21 +336,15 @@ class Capturer(object):
                 # note id has not been deduplicated; it has been renamed.
                 if self._log:
                     self._log.record("capture_deduplicated", cid=cid, profile=profile,
-                                     principal=principal, outcome="deduplicated",
-                                     note=previous.get("note") or None)
-                result = dict(previous)
-                result["deduplicated"] = "request"
-                return result
+                                     principal=principal, outcome="deduplicated")
+                return self._replay(previous, "request")
         if not allow_duplicate:
             previous = self.ledger.lookup("content", profile, text)
             if previous is not None:
                 if self._log:
                     self._log.record("capture_deduplicated", cid=cid, profile=profile,
-                                     principal=principal, outcome="deduplicated",
-                                     note=previous.get("note") or None)
-                result = dict(previous)
-                result["deduplicated"] = "content"
-                return result
+                                     principal=principal, outcome="deduplicated")
+                return self._replay(previous, "content")
 
         outcome = self._run(text)
         if outcome.get("status") != "committed":
@@ -338,11 +371,32 @@ class Capturer(object):
         if self._log:
             self._log.record("capture_accepted", cid=cid, profile=profile,
                              principal=principal, outcome="ok",
-                             note=result["note"], commit=result["commit"][:12],
+                             commit=result["commit"][:12],
                              backup=result["backup"],
                              mutation=hashlib.sha256(
                                  result["commit"].encode("utf-8")).hexdigest()[:16])
         return result
+
+    def _replay(self, previous: dict, how: str) -> dict:
+        commit = str(previous.get("commit") or "")
+        return {"ok": True, "status": previous.get("status") or "committed",
+                "note": self._note_for(commit), "commit": commit, "provisional": True,
+                "backup": self.queue.state(), "detail": "", "deduplicated": how}
+
+    def _note_for(self, commit: str) -> str:
+        """The inbox file that commit added, in the same form `brain capture`
+        reports it (relative to the data root, OS separators)."""
+        if not _COMMIT_RE.match(commit):
+            return ""
+        done = subprocess.run(
+            ["git", "show", "--name-only", "--diff-filter=A", "--format=", commit],
+            capture_output=True, text=True, cwd=self.data_root, timeout=30)
+        if done.returncode != 0:
+            return ""
+        for line in done.stdout.splitlines():
+            if line.startswith("knowledge/inbox/"):
+                return str(Path(line.strip()))
+        return ""
 
     def _invoke(self, text: str) -> dict:
         done = subprocess.run(

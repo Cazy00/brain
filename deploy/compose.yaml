@@ -6,8 +6,9 @@
 #     docker compose up -d
 #     docker compose --profile maintenance run --rm maintenance doctor
 #
-# Everything private lives outside this file. Hostnames appear because they are
-# already public in the design spec; the Cloudflare account id, the two Access
+# Everything private lives outside this file. Tracked files name hostnames only
+# as `<ZONE>` placeholders (CI fails if the live zone reaches the public
+# export); the live hostnames, the Cloudflare account id, the two Access
 # audiences, the application ids, the tunnel id, the owner's email and every
 # credential live in /etc/brain/ and in deploy/.env, neither of which is
 # tracked. Nothing here is a value that would matter if this file were pasted

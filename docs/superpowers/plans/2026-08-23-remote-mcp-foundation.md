@@ -115,8 +115,8 @@ capture endpoint. `[docs 2026-08-23]`
 
 ```text
                  Cloudflare edge
-                 ├── brain-read.qodevia.com   Access app RO   aud_ro
-                 └── brain.qodevia.com        Access app RW   aud_rw
+                 ├── brain-read.<ZONE>   Access app RO   aud_ro
+                 └── brain.<ZONE>        Access app RW   aud_rw
                         │  Managed OAuth (browser) │ Service Auth (headless)
                         │  Cf-Access-Jwt-Assertion │
                         ▼
@@ -279,7 +279,7 @@ the things that were finished incorrectly.
 
 An independent audit of all 194 spec requirements on 2026-08-23 returned
 **69 done, 81 partial, 25 missing, 17 deliberate deviations**. Almost the whole
-"partial" column has one cause: `brain.qodevia.com` is not cut over, so the
+"partial" column has one cause: `brain.<ZONE>` is not cut over, so the
 capture endpoint has never been exercised over the network.
 
 **Closed since that audit:** ~~R0 the two credentials~~, ~~R1 the cutover~~,
@@ -306,7 +306,7 @@ are minted, one year, secrets in `/etc/brain/service-tokens/`.
 only drift it would report today is the un-done cutover, so it would alert
 nightly for a planned reason. Enable it as the last step of R1.
 
-### ~~R1. Cut `brain.qodevia.com` over to the new stack~~ — done
+### ~~R1. Cut `brain.<ZONE>` over to the new stack~~ — done
 
 Done 2026-08-23 in the runbook's order: out of the old tunnel's ingress first,
 then the bypass policy deleted, then `provision.py --apply`, then DNS. The five
@@ -441,7 +441,7 @@ From published, reproducible defect reports. `[docs 2026-08-23]`
 
 | Client | Expectation |
 |---|---|
-| Claude Code | Implements RFC 8707 and enforces that PRM `resource` equals the configured URL exactly. Configure `https://brain.qodevia.com/mcp` with no trailing slash. Best-supported client. |
+| Claude Code | Implements RFC 8707 and enforces that PRM `resource` equals the configured URL exactly. Configure `https://brain.<ZONE>/mcp` with no trailing slash. Best-supported client. |
 | Gemini CLI | Implements RFC 8707 correctly, path preserved. Same trailing-slash caution. |
 | ChatGPT connectors | Send resource indicators as full URLs including the path. Expected to work; developer mode required. |
 | Codex CLI | Open defects: has omitted `resource` on authorize, token exchange and refresh. Expect first-login success then failure at token expiry. **Service token is its supported path.** |

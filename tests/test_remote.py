@@ -589,18 +589,27 @@ class CaptureTests(RemoteTestCase):
                                           "allow_duplicate": True})
         self.assertEqual(len(self.inbox()), 2)
 
+    def _state_text(self, pattern):
+        """Every file matching `pattern` under the state dir, lowercased: the
+        SQLite WAL and SHM hold rows the main file does not have yet, and note
+        filenames are lowercase slugs of the text."""
+        blob = b""
+        for path in sorted(self.brain.state_dir.rglob(pattern)):
+            blob += path.read_bytes()
+        return blob.lower()
+
     def test_the_ledger_never_stores_the_capture_text(self):
         secret_ish = "Zanzibar pineapple ledger canary 2026-08-23"
         self.brain.call("brain_capture", {"text": secret_ish})
-        blob = (self.brain.state_dir / "capture-ledger.db").read_bytes()
-        self.assertNotIn(b"Zanzibar", blob)
-        self.assertNotIn(b"pineapple", blob)
+        blob = self._state_text("capture-ledger.db*")
+        for word in (b"zanzibar", b"pineapple", b"canary"):
+            self.assertNotIn(word, blob)
 
     def test_the_event_log_records_the_mutation_and_no_content(self):
         self.brain.call("brain_capture", {"text": "Rutabaga is the log canary."})
         audit = (self.brain.state_dir / "mutations.jsonl").read_text(encoding="utf-8")
         self.assertIn("capture_accepted", audit)
-        self.assertNotIn("Rutabaga", audit)
+        self.assertNotIn(b"rutabaga", self._state_text("*.jsonl"))
         self.assertNotIn(OWNER, audit)
 
     def test_capture_reports_that_backup_is_off_when_there_is_no_remote(self):
@@ -899,6 +908,57 @@ class FakeGit(object):
                 return self.Done(0)
             return self.Done(1)
         raise AssertionError("unexpected git call: %r" % (args,))
+
+
+class LedgerUpgradeTests(unittest.TestCase):
+    """Prevents: a server upgraded past audit A3 keeping, forever, the rows an
+    older version wrote — their note path is a slug of the capture text — and
+    rows past their TTL that nothing ever deleted."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+
+    def _write_legacy_row(self, digest):
+        import sqlite3
+        db = sqlite3.connect(str(self.state / capture.LEDGER_FILE))
+        db.execute("CREATE TABLE IF NOT EXISTS seen ("
+                   "fingerprint TEXT PRIMARY KEY, kind TEXT, at REAL, result TEXT)")
+        db.execute("INSERT OR REPLACE INTO seen VALUES (?,?,?,?)", (digest, "content", time.time(), json.dumps(
+            {"ok": True, "status": "committed",
+             "note": "knowledge/inbox/2026-08-23-zanzibar-pineapple-canary.md",
+             "commit": "abc1234", "provisional": True, "backup": "pushed", "detail": ""})))
+        db.commit()
+        db.close()
+
+    def _disk(self):
+        return b"".join(p.read_bytes()
+                        for p in sorted(self.state.glob(capture.LEDGER_FILE + "*"))).lower()
+
+    def test_opening_an_old_ledger_scrubs_the_text_from_its_rows(self):
+        self._write_legacy_row("f" * 64)
+        capture.Ledger(self.state, PRINCIPAL_KEY)
+        self.assertNotIn(b"pineapple", self._disk())
+
+    def test_a_scrubbed_row_still_answers_its_lookup(self):
+        digest = capture.Ledger(self.state, PRINCIPAL_KEY).fingerprint(
+            "content", "capture", "Zanzibar pineapple canary")
+        self._write_legacy_row(digest)
+        ledger = capture.Ledger(self.state, PRINCIPAL_KEY)
+        self.assertEqual(ledger.lookup("content", "capture", "Zanzibar pineapple canary"),
+                         {"status": "committed", "commit": "abc1234"})
+
+    def test_rows_past_their_ttl_are_deleted_when_a_new_one_is_written(self):
+        import sqlite3
+        clock = [1000.0]
+        ledger = capture.Ledger(self.state, PRINCIPAL_KEY, clock=lambda: clock[0])
+        ledger.remember("content", "capture", "old", {"status": "committed", "commit": "abc1234"})
+        clock[0] += capture.REQUEST_TTL_SECONDS + capture.CONTENT_TTL_SECONDS + 1
+        ledger.remember("content", "capture", "new", {"status": "committed", "commit": "def5678"})
+        db = sqlite3.connect(str(self.state / capture.LEDGER_FILE))
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM seen").fetchone()[0], 1)
 
 
 class BackupQueueTests(unittest.TestCase):

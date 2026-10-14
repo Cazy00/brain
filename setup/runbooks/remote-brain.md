@@ -2,7 +2,7 @@
 
 The production brain is one always-on VPS behind Cloudflare Access. Every
 client — Claude, Codex, ChatGPT, Gemini — reaches it as a remote MCP server at
-`brain.qodevia.com/mcp` (read + capture) or `brain-read.qodevia.com/mcp`
+`brain.<ZONE>/mcp` (read + capture) or `brain-read.<ZONE>/mcp`
 (read-only). Nothing else writes to it.
 
 **The one rule everything below protects: there is exactly one writer.** The
@@ -227,8 +227,8 @@ sudo nano /etc/brain/brain-http.json
   "team_domain": "<TEAM_DOMAIN>.cloudflareaccess.com",
   "owner_email": "<OWNER_EMAIL>",
   "endpoints": [
-    {"hostname": "brain.qodevia.com",      "aud": "<AUD_RW>", "profile": "capture"},
-    {"hostname": "brain-read.qodevia.com", "aud": "<AUD_RO>", "profile": "read"}
+    {"hostname": "brain.<ZONE>",      "aud": "<AUD_RW>", "profile": "capture"},
+    {"hostname": "brain-read.<ZONE>", "aud": "<AUD_RO>", "profile": "read"}
   ],
   "service_principals": {"<SERVICE_TOKEN_COMMON_NAME>": "read"},
   "principal_key_file": "/run/secrets/principal-key",
@@ -347,22 +347,22 @@ world; this is the step that makes the hostnames reachable, so nothing that can
 fail should be left after it. Access needs its ~85 seconds *before* a record
 exists, not after.
 
-`brain.qodevia.com` is a special case: it is **already** routed, by the host
+`brain.<ZONE>` is a special case: it is **already** routed, by the host
 `workhorse` tunnel, to the old service on `localhost:8787`. Repointing it is the
 cutover, and it has an order:
 
-1. Bring the new stack up and prove it on `brain-read.qodevia.com` first — a
+1. Bring the new stack up and prove it on `brain-read.<ZONE>` first — a
    brand-new hostname with nothing depending on it. Create its proxied CNAME
    onto `<brain-tunnel-id>.cfargotunnel.com` and run the acceptance list below.
-2. Only then touch `brain.qodevia.com`. `GET` the **workhorse** tunnel's
-   ingress, remove *only* its `brain.qodevia.com` entry, and `PUT` the whole
+2. Only then touch `brain.<ZONE>`. `GET` the **workhorse** tunnel's
+   ingress, remove *only* its `brain.<ZONE>` entry, and `PUT` the whole
    remaining list back with the catch-all last. Removing it from the old tunnel
    before repointing DNS means the hostname 502s for a few seconds rather than
    being served by two origins at once.
 3. Convert the existing `brain` Access application from its `bypass` policy to
    Managed OAuth plus an owner-email Allow policy. Its audience does not change,
    so `/etc/brain/brain-http.json` needs no edit.
-4. Repoint the `brain.qodevia.com` CNAME onto the brain tunnel, proxied.
+4. Repoint the `brain.<ZONE>` CNAME onto the brain tunnel, proxied.
 5. Retire the old service, and **look for USER units before you believe it is
    stopped.** Two writable copies is the one failure this design exists to
    prevent, so this step is not optional and not deferrable.
@@ -456,7 +456,7 @@ consolidation is a manual step with an alarm on it.
 order, and stop at the first failure:
 
 ```sh
-curl -sS -o /dev/null -w '%{http_code}\n' https://brain.qodevia.com/mcp   # 302/401 from Access, never 200
+curl -sS -o /dev/null -w '%{http_code}\n' https://brain.<ZONE>/mcp   # 302/401 from Access, never 200
 ```
 
 - OAuth login works on both hostnames, as the owner and as nobody else.
