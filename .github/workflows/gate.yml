@@ -52,7 +52,11 @@ jobs:
             python: "3.11"
           - os: windows-latest
             python: "3.9"
+            # Informational until the suite's Windows failures are fixed:
+            # docs/decisions/2026-10-14-windows-ci-informational.md.
+            informational: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.informational == true }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

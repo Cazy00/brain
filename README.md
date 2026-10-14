@@ -256,10 +256,13 @@ trusting.
 - **The privacy rule is instruction-enforced.** "Ask before recording anything
   about a person's private life" is followed by the model, not enforced by code,
   and commits auto-push. Weaker harnesses will eventually get this wrong.
-- **Windows is verified by CI only.** The test suite runs on all three
-  platforms; nobody on this project owns a Windows machine, so anything CI
-  cannot reach there — how the path picker feels in a real terminal, Credential
-  Manager prompts — is unverified rather than known to work.
+- **Windows is not verified today.** CI runs the suite on all three platforms,
+  but on Windows about 80 tests fail for platform reasons (path separators, file
+  locks, bash-only scripts, `os.statvfs`), so that job is informational until
+  they are fixed — see `docs/decisions/2026-10-14-windows-ci-informational.md`.
+  Nobody on this project owns a Windows machine, so anything CI cannot reach
+  there — how the path picker feels in a real terminal, Credential Manager
+  prompts — is unverified rather than known to work.
 - **A published brain protects the notes you left out of it, and nothing
   else.** `brain publish` compiles a second brain (P) holding only notes a
   human approved, so an agent you do not trust can be pointed at P and there is
