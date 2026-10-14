@@ -2364,6 +2364,16 @@ class ConnectTests(unittest.TestCase):
                     key = "servers" if name == "json-servers" else "mcpServers"
                     self.assertEqual(parsed[key]["brain"]["command"], server)
 
+    def test_the_vscode_command_line_carries_valid_json_for_a_windows_path(self):
+        """The same bug as the snippets, one line below them: VS Code's
+        `--add-mcp` takes a JSON literal, and a raw Windows path breaks it."""
+        import json as _json
+        module = load_brain_module()
+        server = 'C:\\Users\\Ana "A" Ruiz\\brain\\bin\\brain-mcp'
+        line = module.render_connect_cli(module.CONNECT_CLIENTS["vscode"], server)
+        payload = line[line.index("'") + 1:line.rindex("'")]
+        self.assertEqual(_json.loads(payload)["command"], server)
+
     def test_vscode_uses_servers_and_everyone_else_uses_mcpservers(self):
         """The single most common silent failure. VS Code's key is `servers`;
         pasting a `mcpServers` snippet there registers nothing, with no error."""

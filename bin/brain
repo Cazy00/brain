@@ -1721,7 +1721,7 @@ CONNECT_CLIENTS = {
         "path": {"macos": "~/Library/Application Support/Code/User/mcp.json",
                  "linux": "~/.config/Code/User/mcp.json",
                  "windows": "%APPDATA%/Code/User/mcp.json"},
-        "cli": 'code --add-mcp \'{{"name":"brain","type":"stdio","command":"{server}","args":[]}}\'',
+        "cli": 'code --add-mcp \'{{"name":"brain","type":"stdio","command":{server_json},"args":[]}}\'',
         "agents_md": "yes, on by default (chat.useAgentsMdFile), workspace-scoped",
         "routing": "~/.copilot/instructions/brain.instructions.md, with frontmatter "
                    "applyTo: \"**\"  (it also reads ~/.claude/CLAUDE.md by default)",
@@ -1809,6 +1809,14 @@ def render_connect_snippet(fmt: str, server: str) -> str:
     return CONNECT_FORMATS[fmt].format(server=_json.dumps(server))
 
 
+def render_connect_cli(client: dict, server: str) -> str:
+    """A client's one-line registration command. `{server}` is the raw path,
+    for templates that quote it for a shell; `{server_json}` is a JSON string
+    literal, for a template whose argument is JSON (VS Code's --add-mcp)."""
+    import json as _json
+    return client["cli"].format(server=server, server_json=_json.dumps(server))
+
+
 # What `--apply` writes, per format: the container key and any fields beyond
 # command/args. Kept beside CONNECT_FORMATS rather than parsed back out of it —
 # those strings exist for a human to paste, and a machine reading its own output
@@ -1874,7 +1882,7 @@ def print_client(key: str) -> None:
         for line in render_connect_snippet(client["format"], server).splitlines():
             print(f"     {line}")
     if client["cli"]:
-        print(f"\n   or, equivalently:\n     {client['cli'].format(server=server)}")
+        print(f"\n   or, equivalently:\n     {render_connect_cli(client, server)}")
     print(f"\n2. Global routing rule        {client['routing']}")
     print("   (print the block itself with: bin/brain connect --routing)")
     print(f"\n3. Restart                    {client['restart']}")
