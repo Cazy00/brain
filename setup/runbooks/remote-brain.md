@@ -412,6 +412,7 @@ cutover, and it has an order:
 
 ```sh
 cd /srv/brain/engine/deploy
+sudo systemctl enable --now docker   # the stack's restart policies need dockerd at boot
 sudo docker compose up -d
 sudo docker compose ps
 
@@ -882,7 +883,8 @@ sudo -u brain git -C /srv/brain/data push --tags
 ```
 
 **4. New deploy key**, scoped to that repository and nothing else, written to
-`/etc/brain/git-deploy-key`, `0600`, root-owned. Restart the brain service so
+`/etc/brain/git-deploy-key`, `0600`, owned by uid `10001` (`deploy/compose.yaml:44-45`: the
+container runs as 10001 and cannot read a root-owned key). Restart the brain service so
 the push queue picks it up.
 
 **5. Drain the queue and confirm.** A capture accepted while the remote was
@@ -1411,6 +1413,7 @@ configured alert reaches nobody.
 | Cloudflare `tunnel_health_event` | **Cloudflare** | the connector stopped talking to the edge | whether the origin behind it is alive |
 | Cloudflare `expiring_service_token_alert` | **Cloudflare** | a headless credential lapses in 7 days | everything else |
 | the capture queue | the VPS | its own unpushed backlog | anything it is not asked to write |
+| `deploy/probe.py` | wherever it is run; a request that crosses the Cloudflare edge | that each endpoint answers, through Access, with the right tools | everything between runs: it is not scheduled yet |
 
 The first four go quiet in the one failure where silence is worst: the box
 being gone. The two Cloudflare policies are the only alerting that survives
@@ -1423,11 +1426,66 @@ remembers.
 tunnel status "only reflects the connection between `cloudflared` and the
 Cloudflare network... A tunnel can appear Healthy while users are unable to
 connect to an application" [docs 2026-08-23]. A healthy tunnel in front of a
-dead origin is a 502 that nothing alerts on. The gap is closed by the container
-healthcheck (which restarts a wedged process) and by `readyz` under
-maintenance — both of which run on the box. Closing it from OUTSIDE the box
-needs an external prober, and this deployment does not have one; that is a
-known, recorded gap rather than a covered one.
+dead origin is a 502 that nothing alerts on. On the box, the container
+healthcheck marks a wedged process unhealthy (plain compose does not restart
+it for that; it restarts only a process that exits) and `readyz` runs under
+maintenance. From OUTSIDE the box, `deploy/probe.py` (0.2.5) checks the real
+path, but nothing runs it on a schedule yet — so the stack stopping on
+2026-09-17 went unnoticed for four weeks. That remains a known, recorded gap.
+
+## 14. Start a fresh data repository
+
+For a brain that starts over: the engine and the deployment stay, the knowledge
+does not. First run 2026-10-14. Every value below is a placeholder.
+
+1. **Seed it on a workstation.** `brain template` gives the skeleton; take only
+   `knowledge/` and the ignore files, commit, lint against it, push to a new
+   PRIVATE repository:
+   ```sh
+   T=$(mktemp -d); bin/brain template "$T/t"
+   mkdir "$T/data" && cd "$T/data" && git init -b main
+   cp -R "$T/t/knowledge" . && cp "$T/t"/.{gitignore,rgignore,cursorignore,devinignore,geminiignore} .
+   git add -A && git commit -m "brain: start"
+   BRAIN_DATA_ROOT="$T/data" python3 <ENGINE>/bin/brain lint
+   gh repo create <OWNER>/<DATA_REPO> --private --source=. --remote=origin --push
+   ```
+2. **On the VPS, move the old data aside, never delete it**: stop the stack,
+   `mv /srv/brain/{data,state}` to `*.retired-<DATE>`, `chmod -R a-w` the old data,
+   recreate `state` as `10001:10001`.
+3. **New deploy key**, owned by `10001`, `0600`; pin GitHub's host key and check
+   its fingerprint against GitHub's published one before trusting it:
+   ```sh
+   sudo ssh-keygen -t ed25519 -N "" -f /etc/brain/git-deploy-key
+   sudo chown 10001:10001 /etc/brain/git-deploy-key{,.pub}
+   ssh-keyscan -t ed25519 github.com > /tmp/gh_kh && ssh-keygen -lf /tmp/gh_kh
+   sudo install -o 0 -g 10001 -m 640 /tmp/gh_kh /etc/brain/known_hosts
+   ```
+   Add the public key to the new repository as a deploy key **with write access**.
+4. **Clone as the container's user** into `/srv/brain/data`, using the same
+   `GIT_SSH_COMMAND` compose uses (`-i /etc/brain/git-deploy-key -o
+   IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o
+   UserKnownHostsFile=/etc/brain/known_hosts`).
+5. **New backup prefix** (`BRAIN_BACKUP_PREFIX=<PREFIX>` in `backup.env`), so old
+   archives stay untouched under the old one; empty `drill-canaries.txt`.
+6. **Bring it up** (procedure 1 step 11, or procedure 2 for a new engine tag),
+   enable the timers, run `brain-backup.service` once. The first verify-only drill
+   reports OVERDUE until procedure 10 runs once under the new prefix.
+7. **Prove it from outside**, with each service token's client id from
+   `brain-http.json` (`service_principals`):
+   ```sh
+   sudo python3 deploy/probe.py https://brain-read.<ZONE>/mcp \
+     --token-file /etc/brain/service-tokens/brain-read-headless --client-id <READ_ID>.access --expect 4
+   sudo python3 deploy/probe.py https://brain.<ZONE>/mcp \
+     --token-file /etc/brain/service-tokens/brain-capture-headless --client-id <CAPTURE_ID>.access --expect 5
+   ```
+   Then capture one canary through the capture endpoint and confirm GitHub's
+   `main` shows its commit — a capture accepted but never pushed is the failure
+   this step exists to catch.
+8. **Check every container's restart policy** before trusting a reboot:
+   `docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' $(docker ps -q)`.
+   A policy changed by hand (`docker update`) survives `docker compose up -d`,
+   because the config hash is unchanged; `up -d --force-recreate <service>`
+   restores the compose file's. Found 2026-10-14: the tunnel container was `no`.
 
 ---
 
