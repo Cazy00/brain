@@ -8,7 +8,8 @@ request that crosses the edge sees that. Prints tool NAMES only — never the
 token — and exits 0 when the count equals --expect.
 
     python3 deploy/probe.py https://brain-read.<ZONE>/mcp \
-        --token-file /etc/brain/service-tokens/brain-read-headless --expect 4
+        --token-file /etc/brain/service-tokens/brain-read-headless \
+        --client-id <READ_CLIENT_ID>.access --expect 4
 """
 import argparse
 import json
@@ -20,8 +21,15 @@ from pathlib import Path
 PAIRS = (("client_id", "client_secret"), ("cf_access_client_id", "cf_access_client_secret"))
 
 
-def read_token_file(path: Path) -> tuple:
+def read_token_file(path: Path, client_id: str = "") -> tuple:
     text = path.read_text(encoding="utf-8").strip()
+    lines = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if len(lines) == 1 and "=" not in lines[0] and not lines[0].lstrip().startswith("{"):
+        # How the minting script writes it: the secret alone. The client id is
+        # public and lives in brain-http.json's service_principals.
+        if client_id:
+            return client_id, lines[0].strip()
+        raise ValueError("%s holds a bare secret; pass its client id with --client-id" % path)
     if text.startswith("{"):
         data = json.loads(text)
         data = data.get("result", data)
@@ -66,9 +74,11 @@ def main(argv=None) -> int:
     parser.add_argument("url")
     parser.add_argument("--token-file", required=True, type=Path)
     parser.add_argument("--expect", required=True, type=int)
+    parser.add_argument("--client-id", default="",
+                        help="for a token file that holds only the secret")
     args = parser.parse_args(argv)
     try:
-        names = tools_list(args.url, *read_token_file(args.token_file))
+        names = tools_list(args.url, *read_token_file(args.token_file, args.client_id))
     except urllib.error.HTTPError as exc:
         print("probe: HTTP %d from %s" % (exc.code, args.url))
         return 1

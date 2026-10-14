@@ -40,6 +40,20 @@ class TokenFileTests(unittest.TestCase):
         self.assertIn("unrelated", str(caught.exception))
         self.assertNotIn("valuethatmustnotprint", str(caught.exception))
 
+    def test_a_bare_secret_file_takes_its_client_id_separately(self):
+        """How the minting script writes it: the secret alone, while the
+        public client id lives in brain-http.json's service_principals."""
+        path = self.write("onlythesecretvalue\n")
+        self.assertEqual(probe.read_token_file(path, client_id="abc.access"),
+                         ("abc.access", "onlythesecretvalue"))
+
+    def test_a_bare_secret_file_without_a_client_id_asks_for_one_and_never_prints_it(self):
+        path = self.write("onlythesecretvalue\n")
+        with self.assertRaises(ValueError) as caught:
+            probe.read_token_file(path)
+        self.assertIn("--client-id", str(caught.exception))
+        self.assertNotIn("onlythesecretvalue", str(caught.exception))
+
 
 class StreamParsingTests(unittest.TestCase):
     def test_an_sse_reply_yields_its_json(self):
