@@ -70,15 +70,15 @@
       "'brain:8787' is reachable only from inside the project network."
     ],
     "ingress": [
-      { "hostname": "brain.qodevia.com", "service": "http://brain:8787" },
-      { "hostname": "brain-read.qodevia.com", "service": "http://brain:8787" }
+      { "hostname": "brain.<ZONE>", "service": "http://brain:8787" },
+      { "hostname": "brain-read.<ZONE>", "service": "http://brain:8787" }
     ]
   },
 
   "applications": [
     {
       "name": "brain — read and capture",
-      "hostname": "brain.qodevia.com",
+      "hostname": "brain.<ZONE>",
       "profile": "capture",
       "_session_note": [
         "session_duration must equal oauth_configuration.grant.session_duration.",
@@ -148,7 +148,7 @@
     },
     {
       "name": "brain — read only",
-      "hostname": "brain-read.qodevia.com",
+      "hostname": "brain-read.<ZONE>",
       "profile": "read",
       "session_duration": "336h",
       "service_auth_401_redirect": true,

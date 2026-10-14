@@ -101,6 +101,11 @@ jobs:
                                     -o -name '.mcp.json' -o -name 'vault-recipient.txt' \) -print)
           if [ -n "$found" ]; then echo "must not ship:"; echo "$found"; exit 1; fi
       - name: no private deployment values
+        env:
+          # The owner's live zone, kept as a repository secret so this public
+          # checker never names it (audit A6: hardcoding the zone here would
+          # recreate the leak in the check). GitHub masks it in the log.
+          BRAIN_ZONE: ${{ secrets.BRAIN_ZONE }}
         run: |
           set -eu
           # Deployment identifiers are private even though they are not secrets:
@@ -132,6 +137,11 @@ jobs:
           fi
           if grep -rInE '(cfut_|cfat_)[A-Za-z0-9]{20,}' /tmp/export; then
             echo "^ a Cloudflare API token reached the export"; fail=1
+          fi
+          if [ -z "${BRAIN_ZONE:-}" ]; then
+            echo "BRAIN_ZONE not set (a fork?): live-zone check skipped"
+          elif grep -rnF "$BRAIN_ZONE" /tmp/export; then
+            echo "^ the live zone reached the export"; fail=1
           fi
           exit $fail
       - name: the export lints and its own tests pass

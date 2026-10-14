@@ -146,9 +146,9 @@ pre-existing `test_brain` 213, `test_osbackend` 51, `test_setup` 41 — **510**.
 | Dedicated tunnel, not the shared one | **live** | Tunnel `brain`, locally configured, **healthy with 4 edge connections**; the pre-existing `workhorse` tunnel untouched. |
 | Tunnel secret never travelled | **live** | Generated from `/dev/urandom` on the VPS and written straight into `/etc/brain/tunnel-credentials.json`; never fetched, never printed. |
 | Managed OAuth on the read-only endpoint | **live** | Access app configured: 15m access token, 336h grant, DCR with localhost+loopback, owner-email Allow. |
-| Unauthenticated request gets Cloudflare's OAuth 401 | **live** | `POST https://brain-read.qodevia.com/mcp` → `401` with `WWW-Authenticate: Bearer … resource_metadata=…`. |
+| Unauthenticated request gets Cloudflare's OAuth 401 | **live** | `POST https://brain-read.<ZONE>/mcp` → `401` with `WWW-Authenticate: Bearer … resource_metadata=…`. |
 | The origin emits no 401 and no challenge | test + **live** | `AssertionTests.test_the_origin_never_emits_a_401_or_a_challenge`; live the origin returns 403 with no such header. |
-| Discovery documents correct | **live** | PRM `resource` = `https://brain-read.qodevia.com/mcp` exactly; AS metadata advertises PKCE `S256` and a registration endpoint. |
+| Discovery documents correct | **live** | PRM `resource` = `https://brain-read.<ZONE>/mcp` exactly; AS metadata advertises PKCE `S256` and a registration endpoint. |
 | Owner OAuth works | **live** | **Claude Code authenticated end to end.** |
 | Timers installed and each unit executed | **live** | `brain-backup.service` exits 0; `brain-maintenance` runs index and lint clean; `OnFailure=` reached `brain-alert@` (proven by a real failure). |
 
