@@ -1,0 +1,125 @@
+# deploy/cloudflared/config.yml.example
+#
+# Copy to deploy/cloudflared/config.yml and fill in the tunnel id. The copy is
+# machine-local and must stay untracked: the id is not a credential, but it
+# names one specific tunnel in one specific account and there is no reason for
+# the public template to carry it.
+#
+# This is a LOCALLY configured tunnel. The ingress list below is authoritative
+# and the dashboard holds no configuration for it. Do not also give this tunnel
+# remote configuration: a tunnel can be one or the other, and a remotely
+# configured one ignores this file entirely while looking exactly like it is
+# working. Note also that a remote ingress PUT REPLACES the whole list — which
+# is one more reason the brain's routes are not sharing a tunnel with anything
+# else.
+#
+# The tunnel this belongs to is the brain's OWN second tunnel, created for this
+# compose project. It is not the host systemd connector that serves the dev
+# hostnames. All replicas of one tunnel share one ingress list and traffic is
+# spread over them with no affinity, so the two could not be merged even if
+# separate incident containment were not wanted.
+
+tunnel: <TUNNEL_ID>
+
+# Mounted read-only from the host by compose. The file is the tunnel's private
+# credential; it never enters this repository, an image layer, or a build
+# context, and it must be readable by uid 65532 — the nonroot uid the pinned
+# distroless image runs as.
+credentials-file: /etc/cloudflared/credentials.json
+
+# Pinned rather than left to the default range. In a container cloudflared
+# binds its metrics server to 0.0.0.0 and walks 20241-20245 looking for a free
+# port, which means the readiness endpoint moves between restarts and any
+# scrape target is a guess. Fixing it makes /ready and /healthcheck a stable
+# address on the egress bridge for host-side monitoring. No host port is
+# published for it: monitoring runs on the VPS, not across the internet.
+metrics: 0.0.0.0:20241
+
+loglevel: info
+# The connector's own transport chatter is noisy at info and says nothing about
+# whether the brain is serving. Application-level events belong to the brain's
+# event log, which is allowlisted and cannot contain knowledge.
+transport-loglevel: warn
+
+# --no-autoupdate is already in the image's ENTRYPOINT, so it is not repeated
+# here. It is what allows the container to run with a read-only root
+# filesystem: self-update is the only thing this binary writes to its own
+# filesystem.
+
+originRequest:
+  # NOTHING in this block may rewrite the Host header.
+  #
+  # `httpHostHeader` and `originServerName` are deliberately absent, and their
+  # absence is load-bearing. The origin pairs the request's hostname with the
+  # Access audience it expects for that hostname, and that pairing is the ONLY
+  # thing separating the read-only endpoint from the one that can capture —
+  # Cloudflare's authorization-server metadata advertises no scopes, so there
+  # is no scope to fall back on. Setting httpHostHeader would make both
+  # hostnames arrive at the origin looking identical and would collapse the
+  # read/write boundary into nothing, silently, with everything still
+  # apparently working.
+
+  # Default is 30s. The origin is one hop across a Docker bridge with no
+  # gateway in between; if it has not accepted a connection in five seconds it
+  # is not going to. Waiting the full thirty holds an edge connection open and
+  # delays the 502 that is the client's only signal that the brain is down.
+  connectTimeout: 5s
+
+  # Reuse connections aggressively — MCP clients are chatty (initialize,
+  # tools/list, then a burst of tools/call) and a fresh TCP handshake per call
+  # is pure latency on a path that already crosses the Cloudflare edge.
+  tcpKeepAlive: 30s
+  keepAliveTimeout: 90s
+  # Default is 100. This origin is a single-writer service on a container with
+  # a 256-process limit; a hundred idle connections to it is a hundred file
+  # descriptors held for a workload whose concurrency is one owner and a
+  # handful of clients. Eight is comfortably above the peak and bounded.
+  keepAliveConnections: 8
+
+  # The origin is one IPv4 address on a Docker bridge. Happy Eyeballs exists to
+  # race IPv4 against IPv6 on dual-stack origins; here it can only add a second
+  # dial that is guaranteed to fail.
+  noHappyEyeballs: true
+
+  # Left at defaults on purpose:
+  #   noTLSVerify        — the origin is plain http:// inside an internal
+  #                        Docker network with no gateway; there is no TLS to
+  #                        verify and setting this would be meaningless rather
+  #                        than dangerous, but it reads as a downgrade later.
+  #   disableChunkedEncoding — the MCP Streamable HTTP transport may stream a
+  #                        response; disabling chunked encoding would force it
+  #                        to buffer.
+  #
+  # NOT settable here, and worth knowing before someone spends an afternoon on
+  # it: cloudflare's EDGE applies its own ~100-second proxy timeout and answers
+  # with a 524. The spec's capture ceiling is 120 seconds, so a capture that
+  # actually runs that long surfaces at the client as an edge 524, not as a
+  # tunnel or origin error. No originRequest value raises that limit.
+
+ingress:
+  # Both hostnames reach the SAME service and the same private data. They are
+  # not replicas and there is no second brain behind the read-only name — the
+  # difference between them is entirely the Access audience the origin
+  # verifies, which is why the Host header must survive the hop above.
+  #
+  # `brain` resolves to this service's fixed address on the internal network,
+  # pinned in cloudflared's /etc/hosts by compose. See the networks section of
+  # compose.yaml for why that pin exists.
+
+  # Read + capture. The five v1 tools.
+  - hostname: brain.qodevia.com
+    service: http://brain:8787
+
+  # Read-only. The four read tools; a hand-built brain_capture call here is
+  # rejected by the origin's handler authorization, not merely hidden from
+  # tools/list.
+  - hostname: brain-read.qodevia.com
+    service: http://brain:8787
+
+  # The catch-all, and it MUST be last — cloudflared requires a final rule with
+  # no hostname and refuses to start without one. 404 rather than a service:
+  # any hostname that is not one of the two above has no business reaching the
+  # brain, and answering with a status rather than a connection means an
+  # unexpected route added at the edge fails visibly instead of quietly
+  # landing on the MCP endpoint.
+  - service: http_status:404

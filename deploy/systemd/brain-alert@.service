@@ -1,0 +1,42 @@
+# OnFailure handler for every unit in this deployment. %i is the unit that
+# failed, e.g. brain-backup.service.
+#
+# It deliberately does two separate things, in this order, and neither can
+# prevent the other:
+#
+#   1. Append one line to /var/lib/brain/alerts.log, carrying the failing
+#      unit's Result and exit status. Those exit codes are the documented
+#      interface of snapshot.sh and restore-drill.sh — 70 means the archive is
+#      local only, 78 means the bucket was never configured, 75 means retry —
+#      so this single line is usually the whole diagnosis.
+#   2. Invoke the optional delivery hook at /usr/local/lib/brain/alert, if one
+#      is installed.
+#
+# There is no notification transport here on purpose. Any channel worth having
+# (email, push, a webhook) needs a credential, and a credential in a tracked
+# unit file is exactly what this repo forbids. The hook is a root-owned
+# executable the operator writes; the `-` prefix on ExecStart means that even a
+# broken alert path still leaves the log line and the journal entry behind.
+[Unit]
+Description=Report the failure of %i
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+# Never let the alert path itself be rate-limited into silence.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2min
+ExecStart=-/srv/brain/engine/deploy/systemd/brain-alert.sh %i
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/brain
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077

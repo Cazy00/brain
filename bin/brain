@@ -6,11 +6,15 @@ Commands:
                                    install a brain and prove it works (run once)
   brain connect [<client>|--all]   wire it into any MCP-capable agent
   brain new <kind> "<title>" [--topics a,b] [--sensitivity normal|personal]
-  brain capture "<text>" [--commit] [--source <slug>]
+  brain capture "<text>" [--commit] [--source <slug>] [--atomic] [--json]
                                    quick note into knowledge/inbox/. --source
                                    records WHICH endpoint accepted it (default
                                    `local`, this machine); consolidation treats
-                                   anything else as an untrusted proposal
+                                   anything else as an untrusted proposal.
+                                   --atomic removes the note if the commit fails
+                                   instead of leaving it behind (what the remote
+                                   write path asks for); --json reports the
+                                   result as one object instead of prose.
   brain lint [--staged]            validate every note; exit 1 on errors
   brain search "<query>" [--scope all] [--limit N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
@@ -66,6 +70,7 @@ capture).
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 import subprocess
@@ -75,8 +80,61 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+# Three roots, not one, and the distinction only becomes visible in production.
+#
+# ENGINE is where this code, its templates, its skills and its hooks live. It is
+# always the checkout this file was run from and it is never configurable —
+# resolving executable code through an environment variable is how a config
+# change becomes arbitrary code execution.
+#
+# ROOT is where the KNOWLEDGE lives, and it is also the git repository every
+# git() call runs inside. Locally the two are the same directory and nothing
+# below can tell the difference, which is the point: the combined layout stays
+# the default and stays untouched. On the production VPS the owner's notes are a
+# separate private repository mounted at /srv/brain/data, and the public engine
+# image must be able to hold no knowledge at all.
+#
+# STATE is derived and disposable — index, locks, session digest, reports. It
+# lives inside ROOT by default because that is where .cache/ has always been;
+# split mode moves it out so the data mount can hold notes and history only.
+#
+# Environment rather than a flag, deliberately. bin/brain:main() already refuses
+# to honour --root for anything but `lint`, and the comment there says why: a
+# user searching for the literal text "--root" must not silently rebind the repo
+# and write a capture outside the brain. Argument-shaped configuration is
+# reachable from a tool call; environment is set once by whoever started the
+# process. `--root` still wins over both, because `lint --staged` depends on it.
+ENGINE = Path(__file__).resolve().parent.parent
+
+
+def _root_from_env(name: str, fallback, env=None):
+    """Resolve one configurable root, falling back to the combined layout.
+
+    A blank or whitespace-only value is treated as unset rather than as the
+    current directory: an unset variable and an empty one look identical in a
+    Docker env-file, and resolving "" would silently point the brain at the
+    process's cwd.
+    """
+    raw = (env if env is not None else os.environ).get(name, "")
+    if not raw or not raw.strip():
+        return fallback
+    return Path(raw.strip()).expanduser().resolve()
+
+
+ROOT = _root_from_env("BRAIN_DATA_ROOT", ENGINE)
 K = ROOT / "knowledge"
+_STATE_OVERRIDE = _root_from_env("BRAIN_STATE_DIR", None)
+
+
+def state_dir() -> Path:
+    """Where derived, disposable state lives: index, locks, digest, reports.
+
+    Computed rather than a module constant, for the reason digest_path() gives:
+    main() rebinds ROOT for --root and the tests rebind it to a sandbox, and a
+    constant captured at import would go on pointing at the previous brain's
+    index and, worse, at its lock — two brains sharing one lock file is not a
+    theoretical failure, it is the one this function prevents."""
+    return _STATE_OVERRIDE if _STATE_OVERRIDE is not None else ROOT / ".cache"
 
 # bin/ on sys.path is what makes brainlib importable without a package
 # install — see bin/brainlib/__init__.py. Explicit rather than relying on
@@ -198,8 +256,8 @@ class repo_lock:
     platforms fall back to no lock (best-effort), same as the index builder."""
 
     def __enter__(self):
-        (ROOT / ".cache").mkdir(exist_ok=True)
-        self._lf = open(ROOT / ".cache" / "git.lock", "w")
+        state_dir().mkdir(parents=True, exist_ok=True)
+        self._lf = open(state_dir() / "git.lock", "w")
         try:
             import fcntl
             fcntl.flock(self._lf, fcntl.LOCK_EX)
@@ -235,7 +293,25 @@ def is_local_remote(url: str) -> bool:
     return ":" not in url                 # scp-style git@host:owner/repo is remote
 
 
-def ensure_hooks() -> None:
+def hooks_path() -> str:
+    """Where git should look for this brain's hooks.
+
+    Relative in the combined layout, which is what every existing clone already
+    has configured and what keeps a published template portable. Absolute in
+    split mode, because there the git repository is the DATA repo and it holds
+    no `.githooks/` — a relative path there silently configures a hooks
+    directory that does not exist, and the content gate stops running with no
+    error anywhere."""
+    return ".githooks" if ROOT == ENGINE else str(ENGINE / ".githooks")
+
+
+def ensure_hooks(quiet: bool = False) -> None:
+    """Install the commit gate, and say so — unless the caller wants JSON.
+
+    The notice is genuinely useful to a person running their first command in a
+    fresh clone. It is actively harmful ahead of `--json`: it is printed to
+    stdout, so it lands in front of the object and the caller's parse fails on
+    the very first request a freshly-mounted container serves."""
     # A brain that is not a git checkout has no hooks to install, and saying so
     # is worse than saying nothing: `git config` prints "fatal: not in a git
     # directory" to the terminal and this function then claims it installed
@@ -245,11 +321,13 @@ def ensure_hooks() -> None:
     if not (ROOT / ".git").exists():
         return
     try:
-        if git("config", "core.hooksPath") != ".githooks":
+        want = hooks_path()
+        if git("config", "core.hooksPath") != want:
             subprocess.run(
-                ["git", "config", "core.hooksPath", ".githooks"], cwd=ROOT, check=False
+                ["git", "config", "core.hooksPath", want], cwd=ROOT, check=False
             )
-            print("brain: installed git hooks (core.hooksPath = .githooks)")
+            if not quiet:
+                print(f"brain: installed git hooks (core.hooksPath = {want})")
     except Exception:
         pass
 
@@ -1320,7 +1398,7 @@ def lint(staged_only: bool = False) -> int:
 
 
 def render_template(kind: str, values: dict) -> str:
-    template_path = ROOT / "setup" / "templates" / f"{kind}.md"
+    template_path = ENGINE / "setup" / "templates" / f"{kind}.md"
     text = template_path.read_text(encoding="utf-8")
     for key, value in values.items():
         text = text.replace("{{" + key + "}}", value)
@@ -1366,18 +1444,18 @@ def cmd_init(argv: list) -> int:
     print("brain init — re-wiring THIS clone into Claude Code. Installing a new "
           "brain is `brain setup`.\n")
 
-    mcp_server = ROOT / "bin" / "brain-mcp"
-    skill_dir = ROOT / "setup" / "skills" / "brain"
+    mcp_server = ENGINE / "bin" / "brain-mcp"
+    skill_dir = ENGINE / "setup" / "skills" / "brain"
     template = skill_dir / "SKILL.md.template"
     skill = skill_dir / "SKILL.md"
     failures = []
 
     # 1. git hooks — the commit gate. Report what git actually did: claiming
     # the gate is installed when it is not is worse than saying nothing.
-    hooks = subprocess.run(["git", "config", "core.hooksPath", ".githooks"],
+    hooks = subprocess.run(["git", "config", "core.hooksPath", hooks_path()],
                            cwd=ROOT, capture_output=True, text=True)
     if hooks.returncode == 0:
-        print("  [1/5] git hooks       core.hooksPath = .githooks")
+        print(f"  [1/5] git hooks       core.hooksPath = {hooks_path()}")
     else:
         failures.append(f"could not set core.hooksPath ({hooks.stderr.strip() or 'git failed'})"
                         " — is this a git clone? the commit gate is NOT active")
@@ -1386,7 +1464,7 @@ def cmd_init(argv: list) -> int:
     # 2. .mcp.json — brain tools for Claude Code sessions started INSIDE the repo.
     # MERGE rather than overwrite: this file is gitignored now, so clobbering
     # another server's entry here would destroy it with no way to get it back.
-    mcp_file = ROOT / ".mcp.json"
+    mcp_file = ENGINE / ".mcp.json"
     try:
         config = {}
         if mcp_file.exists():
@@ -1771,7 +1849,7 @@ def routing_block() -> str:
     makes it RETRIEVE, the second makes it OFFER TO CAPTURE. Ship only the
     first and you get a brain that answers but never grows.
     """
-    path = ROOT / "setup" / "templates" / "routing-block.md"
+    path = ENGINE / "setup" / "templates" / "routing-block.md"
     if not path.exists():
         return f"(missing {path.relative_to(ROOT)})"
     return path.read_text(encoding="utf-8").replace("{{REPO}}", str(ROOT)).rstrip()
@@ -1779,7 +1857,7 @@ def routing_block() -> str:
 
 def print_client(key: str) -> None:
     client = CONNECT_CLIENTS[key]
-    server = str(ROOT / "bin" / "brain-mcp")
+    server = str(ENGINE / "bin" / "brain-mcp")
     print(f"\n=== {client['name']}  ({key}) " + "=" * max(0, 46 - len(client['name'])))
     print(f"\n1. Register the server        {client['config']}")
     if client["format"]:
@@ -2280,8 +2358,59 @@ def cmd_new(argv: list) -> int:
     return 0
 
 
+def atomic_write(path: Path, body: str) -> None:
+    """Write a note so a reader never sees half of one.
+
+    Temp file on the SAME filesystem, fsync, rename. `Path.write_text` opens the
+    destination and streams into it, so a crash or a full disk mid-write leaves
+    a truncated note that lint then rejects and consolidation then has to
+    reason about. Rename is atomic within a filesystem, so the note either
+    exists complete or does not exist.
+
+    The directory is fsynced too. Without that the rename itself can be lost on
+    power failure while the file's contents are safely on disk — which produces
+    the one outcome the whole transaction exists to prevent: a commit that
+    references a note that is not there."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+        try:
+            fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            # Directory fsync is not available everywhere (and is a no-op on
+            # some filesystems). Losing the durability guarantee is acceptable;
+            # losing the note because we insisted on it is not.
+            pass
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def cmd_capture(argv: list) -> int:
     do_commit = "--commit" in argv
+    # --atomic is what the REMOTE write path asks for, and it changes exactly one
+    # thing: what happens when the commit fails. The CLI default is to leave the
+    # note on disk and say so, because a person at their own keyboard can see it
+    # and the text would otherwise be gone. A remote caller still has the text,
+    # cannot see the disk, and an uncommitted note there is strictly harmful —
+    # it is invisible to backup, it dirties the tree, and a dirty tree blocks the
+    # consolidation pass that is the inbox's only drain. So remotely the note is
+    # removed and the failure is reported, which is the honest answer to "did you
+    # save it": no.
+    atomic = "--atomic" in argv
+    as_json = "--json" in argv
     # --source and its value are lifted OUT of argv before the text is
     # assembled: capture's text is positional and swallows the rest of the
     # line, so a flag parsed by filtering alone leaves its value sitting in
@@ -2292,7 +2421,7 @@ def cmd_capture(argv: list) -> int:
         if skip:
             skip = False
             continue
-        if arg == "--commit":
+        if arg in ("--commit", "--atomic", "--json"):
             continue
         if arg == "--source" and i + 1 < len(argv):
             source, skip = argv[i + 1], True
@@ -2300,7 +2429,7 @@ def cmd_capture(argv: list) -> int:
         words.append(arg)
     text = " ".join(words).strip()
     if not text:
-        print("usage: brain capture \"<text>\" [--commit] [--source <slug>]")
+        print("usage: brain capture \"<text>\" [--commit] [--source <slug>] [--atomic] [--json]")
         return 2
     if not ID_RE.match(source):
         # Refused here rather than written and linted later: this value is how
@@ -2323,6 +2452,22 @@ def cmd_capture(argv: list) -> int:
     # guess. It guesses in the trusting direction, which is the failure this
     # field exists to prevent.
     body = f"---\ncreated: {today}\nsource: {source}\nstatus: draft\n---\n\n{text}\n"
+
+    def report(status: str, detail: str = "", commit_id: str = "") -> None:
+        if not as_json:
+            return
+        rel = ""
+        if status in ("committed", "written"):
+            # Only name a note that actually exists. A failed or rolled-back
+            # capture has no path to report, and reporting one invites a caller
+            # to tell its user the note was saved under a name nothing is at.
+            try:
+                rel = str(path.relative_to(ROOT))
+            except ValueError:                # pragma: no cover - path is under ROOT
+                rel = path.name
+        print(_json_dumps({"status": status, "note": rel, "commit": commit_id,
+                           "provisional": True, "detail": _safe_detail(detail)}))
+
     # Scan BEFORE the write, not after. Without this the only moment an inbox
     # note ever meets scan_secrets is --commit -> pre-commit -> lint --staged,
     # so a capture without --commit (the CLI default) reached disk unexamined
@@ -2332,15 +2477,18 @@ def cmd_capture(argv: list) -> int:
     problems = []
     scan_secrets(path, problems, raw=body.encode("utf-8"))
     if problems:
-        print("REFUSED — the text looks like it contains a credential:")
-        for _p, msg in problems:
-            print(f"  - {msg}")
-        print("Nothing was written. Put the value in Keychain and capture a note that "
-              "names it instead (see .env.example).")
+        if not as_json:
+            print("REFUSED — the text looks like it contains a credential:")
+            for _p, msg in problems:
+                print(f"  - {msg}")
+            print("Nothing was written. Put the value in Keychain and capture a note that "
+                  "names it instead (see .env.example).")
+        else:
+            report("refused", "; ".join(msg for _p, msg in problems))
         return 1
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    print(path)
+    atomic_write(path, body)
+    if not as_json:
+        print(path)
     if do_commit:
         # --commit was ASKED for, so failing to commit is a failure: the note
         # exists only on this machine, unvetted and unbacked. Returning 0 here
@@ -2355,12 +2503,22 @@ def cmd_capture(argv: list) -> int:
         # the gap, and the capture would commit onto it anyway — the exact
         # outcome this test exists to prevent. consolidate takes the same lock
         # around its own branch switches, so the two can no longer interleave.
+        commit_id = ""
         with repo_lock():
             branch = git("rev-parse", "--abbrev-ref", "HEAD")
             if branch.startswith("consolidate/"):
                 # A capture committed onto the consolidation branch gets carried
                 # off to a review branch and vanishes from main's working tree.
                 # Write to disk (never lost), skip the commit, tell the truth.
+                if atomic:
+                    _unstage_and_remove(path)
+                    if not as_json:
+                        print("NOT SAVED: a consolidation pass is running, so this brain "
+                              "cannot accept a write right now. Nothing was left behind. "
+                              "Retry shortly.")
+                    else:
+                        report("retry", "consolidation in progress")
+                    return 1
                 print(f"SAVED BUT NOT COMMITTED: currently on branch {branch!r} "
                       "(a consolidation pass is running). The note is on disk at the path "
                       "above and is NOT lost — commit it from main once consolidation lands.")
@@ -2371,19 +2529,72 @@ def cmd_capture(argv: list) -> int:
                 ["git", "commit", "-m", f"capture: {slug}", "--", str(path)],
                 cwd=ROOT, capture_output=True, text=True,
             )
+            if add.returncode == 0 and commit.returncode == 0:
+                commit_id = git("rev-parse", "HEAD")[:40]
+            elif atomic:
+                # Roll back ONLY the note this call created: unstage that one
+                # path and delete that one file. Never `git reset --hard`, never
+                # `git clean` — a broad reset here would destroy whatever else
+                # the working tree happened to be holding, which on a server is
+                # somebody else's half-finished consolidation.
+                _unstage_and_remove(path)
         if add.returncode != 0 or commit.returncode != 0:
             detail = (commit.stderr.strip() or commit.stdout.strip()
                       or add.stderr.strip() or "git failed")
+            if atomic:
+                if not as_json:
+                    print(f"NOT SAVED: {detail}. The attempted note was removed, so "
+                          "nothing was half-written. Retry.")
+                else:
+                    report("failed", detail)
+                return 1
             print(f"SAVED BUT NOT COMMITTED: {detail}")
             print("The note is on disk at the path above and is NOT lost — do not "
                   "capture it again. Commit it once the problem is fixed.")
             return 1
-        print("captured and committed — push runs in background "
-              "(bin/brain doctor verifies backup)")
+        if not as_json:
+            print("captured and committed — push runs in background "
+                  "(bin/brain doctor verifies backup)")
+        else:
+            report("committed", "", commit_id)
+        return 0
+    report("written", "not committed")
     return 0
 
 
-INDEX_DB = ROOT / ".cache" / "index.db"
+def _safe_detail(detail: str) -> str:
+    """A failure explanation with the filesystem taken out of it.
+
+    git reports errors by absolute path, and that path is the container's
+    internal layout. The remote contract forbids an absolute path in a
+    response, and it is right to: it is not actionable from the other end of a
+    tunnel and it describes the inside of the machine holding the brain."""
+    if not detail:
+        return ""
+    cleaned = str(detail).replace(str(ROOT), "<data>").replace(str(ENGINE), "<engine>")
+    # Anything still starting at / is a path this function did not know about.
+    cleaned = re.sub(r"(?<![\w<])/[\w./-]{4,}", "<path>", cleaned)
+    return " ".join(cleaned.split())[:300]
+
+
+def _unstage_and_remove(path: Path) -> None:
+    """Undo one attempted capture and nothing else.
+
+    Scoped to a single pathspec on purpose. The tempting one-liner —
+    `git reset --hard` — would also discard every other uncommitted change in
+    the tree, and on the production VPS the tree can legitimately be holding a
+    consolidation pass's work. Silence is deliberate: this runs on a path that
+    is already reporting a failure, and a second error message about the
+    cleanup would bury the first."""
+    subprocess.run(["git", "reset", "--quiet", "HEAD", "--", str(path)],
+                   cwd=ROOT, capture_output=True, text=True)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+INDEX_DB = state_dir() / "index.db"
 FOLDER_WEIGHTS = {"decisions": 1.2, "reference": 1.2, "topics": 1.0, "projects": 1.0,
                   "people": 1.0, "life": 1.0, "journal": 0.6, "inbox": 0.6}
 
@@ -3317,7 +3528,7 @@ _REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 def digest_path() -> Path:
     # Computed, not a module constant: main() rebinds ROOT for --root.
-    return ROOT / ".cache" / "session-digest.md"
+    return state_dir() / "session-digest.md"
 
 
 def _human_turns(path: Path, max_turn: int = 2000) -> tuple:
@@ -3496,7 +3707,7 @@ def load_consolidator() -> dict:
     one: the difference between the two invocations IS the audit boundary, and
     a boundary that repairs itself on the way past is not a boundary.
     """
-    path = ROOT / CONSOLIDATOR_CONF
+    path = ENGINE / CONSOLIDATOR_CONF
     conf, source = dict(CONSOLIDATOR_DEFAULTS), "built-in defaults"
     if path.exists():
         source = CONSOLIDATOR_CONF
@@ -3636,7 +3847,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     import tempfile
 
     timeout = runner["audit_timeout"] if timeout is None else timeout
-    prompt_path = ROOT / "setup" / "audit-prompt.md"
+    prompt_path = ENGINE / "setup" / "audit-prompt.md"
     if not prompt_path.exists():
         return "error", "missing setup/audit-prompt.md"
     diff, diff_error = staged_diff_vs_main()
@@ -3698,20 +3909,20 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     reason = body.split("—", 1)[-1].strip() if "—" in body else body
     # The findings themselves are the useful part; keep them with the branch.
     try:
-        (ROOT / ".cache").mkdir(exist_ok=True)
-        (ROOT / ".cache" / "audit-report.md").write_text(out, encoding="utf-8")
+        state_dir().mkdir(parents=True, exist_ok=True)
+        (state_dir() / "audit-report.md").write_text(out, encoding="utf-8")
     except OSError:
         pass
     return "block", (reason or "unspecified")[:300] + " (full report: .cache/audit-report.md)"
 
 
 def cmd_consolidate(argv: list) -> int:
-    prompt_path = ROOT / "setup" / "consolidate-prompt.md"
+    prompt_path = ENGINE / "setup" / "consolidate-prompt.md"
     if not prompt_path.exists():
         print("missing setup/consolidate-prompt.md")
         return 1
     inbox_items = [p for p in (K / "inbox").glob("*.md")]
-    audit_path = ROOT / "setup" / "audit-prompt.md"
+    audit_path = ENGINE / "setup" / "audit-prompt.md"
     # Resolve the runner BEFORE anything else, --dry-run included. A config that
     # would drop the audit boundary must fail here, on the ground, rather than
     # after a branch has been cut and a model has spent half an hour writing.
@@ -4060,6 +4271,20 @@ def cmd_template(argv: list) -> int:
     machine-local wiring.
     """
     import shutil
+    # Split mode publishes nothing. Everything below reasons about ONE tree —
+    # `git ls-files` for what is tracked, the identity scan for whose machine it
+    # came from, `bin/brain lint` inside the emitted copy — and in split mode
+    # that tree is the DATA repository: the owner's actual notes, with the
+    # engine's allowlist applied to a directory the allowlist was never written
+    # for. Refusing is the only safe reading. Publish from a plain clone of the
+    # engine, which is what the combined layout already is.
+    if ROOT != ENGINE:
+        print("refusing to publish: this brain is running in split mode "
+              f"(BRAIN_DATA_ROOT={ROOT}).\n"
+              "`brain template` publishes the ENGINE checkout, and here that is a "
+              f"different tree ({ENGINE}).\n"
+              "Run it from a clone with no BRAIN_DATA_ROOT set.")
+        return 1
     # --allow-identity accepts either spelling: `--allow-identity a,b` or
     # `--allow-identity=a,b`. Its value must not be mistaken for the
     # destination, so both the flag and a detached value are consumed here.
@@ -4472,8 +4697,8 @@ def schedule_serves_this_repo(name: str) -> bool:
 # rewrites is a trap for whoever edits that line next.
 
 
-PLUGIN_SKILL = ROOT / "plugins" / "brain" / "skills" / "brain" / "SKILL.md"
-SKILL_TEMPLATE = ROOT / "setup" / "skills" / "brain" / "SKILL.md.template"
+PLUGIN_SKILL = ENGINE / "plugins" / "brain" / "skills" / "brain" / "SKILL.md"
+SKILL_TEMPLATE = ENGINE / "setup" / "skills" / "brain" / "SKILL.md.template"
 # What {{REPO}} becomes in the PLUGIN copy. A plugin is installed once and used
 # against whatever brain the user configured, so there is no absolute path to
 # bake in — unlike the symlinked copy `init` renders, which belongs to exactly
@@ -4557,10 +4782,10 @@ def cmd_schedule(argv: list) -> int:
             print(f"removed schedule: {name}")
             continue
         spec = SCHEDULES[name]
-        job_argv = [sys.executable, str(ROOT / "bin" / "brain")] + spec["argv_tail"]
+        job_argv = [sys.executable, str(ENGINE / "bin" / "brain")] + spec["argv_tail"]
         outcome = backend.install(name, job_argv, spec["when"], cwd=str(ROOT),
                                   env=job_env,
-                                  log=str(ROOT / ".cache" / f"{name}-launchd.log"))
+                                  log=str(state_dir() / f"{name}-launchd.log"))
         if outcome.startswith("installed ("):
             # The backend's sentence already names exactly where it wrote the
             # job — splice the schedule name into that same sentence rather
@@ -4763,7 +4988,7 @@ def reset_dewire() -> tuple:
     if shutil.which("claude"):
         got = subprocess.run(["claude", "mcp", "get", "brain"], cwd=ROOT,
                              capture_output=True, text=True, timeout=60)
-        registered = str(ROOT / "bin" / "brain-mcp") in got.stdout
+        registered = str(ENGINE / "bin" / "brain-mcp") in got.stdout
         if registered:
             removed = subprocess.run(["claude", "mcp", "remove", "brain", "-s", "user"],
                                      cwd=ROOT, capture_output=True, text=True, timeout=60)
@@ -5293,9 +5518,9 @@ def cmd_doctor_notify() -> int:
     run = subprocess.run([sys.executable, str(Path(__file__).resolve()), "doctor"],
                          capture_output=True, text=True, cwd=ROOT)
     report = run.stdout + run.stderr
-    (ROOT / ".cache").mkdir(exist_ok=True)
+    state_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y-%m-%d %H:%M")
-    (ROOT / ".cache" / "doctor-report.txt").write_text(f"{stamp}\n\n{report}", encoding="utf-8")
+    (state_dir() / "doctor-report.txt").write_text(f"{stamp}\n\n{report}", encoding="utf-8")
     if run.returncode != 0:
         subprocess.run(["osascript", "-e",
                         'display notification "red state — see .cache/doctor-report.txt" '
@@ -5438,11 +5663,71 @@ def doctor_knowledge(ok: bool) -> bool:
     return ok
 
 
+# The spec asks for an alert when the encrypted backup is older than 24 hours and
+# when disk drops below 20%. Both live HERE rather than in a bespoke monitor, and
+# the reason is that doctor is already the thing that runs nightly under a timer
+# whose OnFailure= raises an alert. A second watcher would be a second thing to
+# install, schedule and forget; a check nobody runs is not an alert.
+#
+# Both degrade to an advisory rather than a failure where the feature is simply
+# not configured: a laptop clone has no offsite backup and should not be told it
+# is broken for that.
+BACKUP_STAMP = "backup-last-success.json"
+BACKUP_STALE_SECONDS = 24 * 3600
+DISK_FLOOR_FRACTION = 0.20
+
+
+def _report_offsite_backup() -> bool:
+    """Whether the nightly encrypted archive is fresh. Returns False on a RED."""
+    stamp = state_dir() / BACKUP_STAMP
+    if not stamp.exists():
+        print("  [-- ] no offsite backup configured (encrypted archive) — "
+              "see setup/runbooks/remote-brain.md")
+        return True
+    try:
+        import json as _j
+        completed = _j.loads(stamp.read_text(encoding="utf-8")).get("completed", "")
+        # The stamp is ISO-8601 UTC with a fixed shape, written by our own
+        # snapshot script — parsed strictly so a malformed one reads as a
+        # problem rather than as a very old backup or a very fresh one.
+        age = time.time() - time.mktime(time.strptime(completed, "%Y-%m-%dT%H:%M:%SZ")) \
+            + time.timezone
+    except Exception:
+        print(f"  [RED] {BACKUP_STAMP} is unreadable — the offsite backup cannot be "
+              "verified, which is not the same as it being fine")
+        return False
+    if age > BACKUP_STALE_SECONDS:
+        print(f"  [RED] encrypted backup is {int(age // 3600)}h old — the nightly "
+              "archive has not completed in over 24h; check brain-backup.service")
+        return False
+    print(f"  [ok ] encrypted backup {int(age // 3600)}h old")
+    return True
+
+
+def _report_disk_headroom() -> bool:
+    """Headroom where the KNOWLEDGE lives, which is the volume that matters."""
+    try:
+        stat = os.statvfs(str(ROOT))
+    except OSError:
+        return True
+    total = stat.f_blocks * stat.f_frsize
+    free = stat.f_bavail * stat.f_frsize
+    if total <= 0:
+        return True
+    fraction = free / total
+    if fraction < DISK_FLOOR_FRACTION:
+        print(f"  [RED] disk {fraction * 100:.0f}% free on the knowledge volume — "
+              "below the 20% floor; a capture that cannot write is a lost capture")
+        return False
+    print(f"  [ok ] disk {fraction * 100:.0f}% free")
+    return True
+
+
 def cmd_doctor() -> int:
     print("brain doctor\n")
     ok = True
 
-    hooks = git("config", "core.hooksPath") == ".githooks"
+    hooks = git("config", "core.hooksPath") == hooks_path()
     if hooks:
         print("  [ok ] git hooks installed")
     else:
@@ -5509,6 +5794,10 @@ def cmd_doctor() -> int:
     ok = doctor_supervision(ok)
     ok = doctor_serving(ok)
     ok = doctor_knowledge(ok)
+    if not _report_offsite_backup():
+        ok = False
+    if not _report_disk_headroom():
+        ok = False
 
     import shutil
     for tool, why in (("gitleaks", "second secret scanner at commit time"),
@@ -5584,7 +5873,7 @@ def cmd_doctor() -> int:
     if _runner_error:
         ok = False
         print(f"  [RED] consolidation runner misconfigured — {_runner_error}")
-    elif _runner["propose"][0] == "claude" and (ROOT / ".claude" / "settings.json").exists():
+    elif _runner["propose"][0] == "claude" and (ENGINE / ".claude" / "settings.json").exists():
         trusted = False
         try:
             import json as _json
@@ -5673,10 +5962,16 @@ def main() -> int:
     # capture, a write outside the brain). Gate it to the lint subcommand.
     if argv[:1] == ["lint"] and "--root" in argv:
         i = argv.index("--root")
-        global ROOT, K, INDEX_DB
+        global ROOT, K, _STATE_OVERRIDE, INDEX_DB
         ROOT = Path(argv[i + 1]).resolve()
         K = ROOT / "knowledge"
-        INDEX_DB = ROOT / ".cache" / "index.db"
+        # Clearing the override makes state follow the tree being linted, and it
+        # must beat BRAIN_STATE_DIR: the re-invocation inherits the parent's
+        # environment, so without this a split-mode `lint --staged` would point
+        # the throwaway checkout's index and lock at the LIVE state directory,
+        # and rebuild the real index from a temporary tree.
+        _STATE_OVERRIDE = None
+        INDEX_DB = state_dir() / "index.db"
         argv = argv[:i] + argv[i + 2:]
     elif argv[:1] != ["setup"]:
         # Skipped for setup, and only for setup. Setup runs out of a throwaway
@@ -5684,7 +5979,7 @@ def main() -> int:
         # which phase_create does. Here it would mutate a directory that is
         # about to be deleted, and announce it — "brain: installed git hooks"
         # about a temp clone, in the very first output a new user ever sees.
-        ensure_hooks()
+        ensure_hooks(quiet="--json" in argv)
     if not argv:
         print(__doc__)
         return 2

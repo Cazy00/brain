@@ -4,7 +4,14 @@
 # with a loud warning if the toolchain itself is broken, so a dead environment
 # never blocks capture. Never blocks on backlog or staleness.
 
-out=$(python3 bin/brain lint --staged 2>&1)
+# Where the engine is. The hooks directory is inside the engine checkout, so the
+# toolbelt is one level up from this script — true in the combined layout and
+# still true in split mode, where git's top-level is the DATA repository and
+# holds no bin/. `git rev-parse --show-toplevel` would give the wrong answer
+# there; $0 cannot, because git always invokes the hook by the path it found it.
+BRAIN="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/brain"
+
+out=$(python3 "$BRAIN" lint --staged 2>&1)
 code=$?
 if [ "$code" -eq 1 ]; then
   echo "$out"

@@ -1,0 +1,15 @@
+[Unit]
+Description=brain monthly restore drill
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+
+[Timer]
+# The 2nd, not the 1st: the monthly recovery point is created by the backup
+# timer on day 01, and a drill that ran the same morning would either race it
+# or verify last month's object while reporting this month's date.
+OnCalendar=*-*-02 05:00:00 UTC
+RandomizedDelaySec=1h
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
