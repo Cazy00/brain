@@ -589,18 +589,27 @@ class CaptureTests(RemoteTestCase):
                                           "allow_duplicate": True})
         self.assertEqual(len(self.inbox()), 2)
 
+    def _state_text(self, pattern):
+        """Every file matching `pattern` under the state dir, lowercased: the
+        SQLite WAL and SHM hold rows the main file does not have yet, and note
+        filenames are lowercase slugs of the text."""
+        blob = b""
+        for path in sorted(self.brain.state_dir.rglob(pattern)):
+            blob += path.read_bytes()
+        return blob.lower()
+
     def test_the_ledger_never_stores_the_capture_text(self):
         secret_ish = "Zanzibar pineapple ledger canary 2026-08-23"
         self.brain.call("brain_capture", {"text": secret_ish})
-        blob = (self.brain.state_dir / "capture-ledger.db").read_bytes()
-        self.assertNotIn(b"Zanzibar", blob)
-        self.assertNotIn(b"pineapple", blob)
+        blob = self._state_text("capture-ledger.db*")
+        for word in (b"zanzibar", b"pineapple", b"canary"):
+            self.assertNotIn(word, blob)
 
     def test_the_event_log_records_the_mutation_and_no_content(self):
         self.brain.call("brain_capture", {"text": "Rutabaga is the log canary."})
         audit = (self.brain.state_dir / "mutations.jsonl").read_text(encoding="utf-8")
         self.assertIn("capture_accepted", audit)
-        self.assertNotIn("Rutabaga", audit)
+        self.assertNotIn(b"rutabaga", self._state_text("*.jsonl"))
         self.assertNotIn(OWNER, audit)
 
     def test_capture_reports_that_backup_is_off_when_there_is_no_remote(self):
