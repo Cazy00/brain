@@ -356,7 +356,9 @@ age -d -i "$IDENTITY" "$WORK/archive.age" > "$WORK/archive.tar.gz" \
     || die 70 "DECRYPT FAILED — this identity cannot open the archive"
 ok "decrypted"
 
-tar -xzf "$WORK/archive.tar.gz" -C "$WORK/data" || die 70 "EXTRACT FAILED"
+# --no-same-owner: run as root (a recovery host's timer), tar would keep the brain
+# container's uid, and git refuses a repository another user owns ("dubious ownership").
+tar --no-same-owner -xzf "$WORK/archive.tar.gz" -C "$WORK/data" || die 70 "EXTRACT FAILED"
 rm -f "$WORK/archive.tar.gz" "$WORK/archive.age"
 
 # The metadata rides one level up, out of the restored data root, so that a

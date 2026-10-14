@@ -1,6 +1,9 @@
 # Windows CI is informational until its failures are fixed
 
 Status: decided 2026-10-14 (executor ruling during Phase 0, owner informed).
+**Superseded the same day:** the owner does not need Windows, so the Windows leg was
+removed from CI rather than kept informational. The failure list below is where to
+start if Windows support is wanted again.
 
 On `main` at 29bffcf the Windows job ran 1107 tests: 55 failures, 26 errors,
 9 skipped. Release 0.2.5 fixed the connect-snippet class (`ConnectTests`); the

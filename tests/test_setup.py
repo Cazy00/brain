@@ -914,11 +914,16 @@ class TestBootstraps(unittest.TestCase):
 
 
 class TestCiMatrix(unittest.TestCase):
-    def test_all_three_platforms_run_the_tests(self):
+    def test_linux_and_macos_run_the_tests_and_windows_is_declared_unverified(self):
+        # Windows left CI by the owner's decision (docs/decisions/
+        # 2026-10-14-windows-ci-informational.md). What CI does not run is not
+        # verified, so the README must say so in those words.
         text = (ROOT / ".github" / "workflows" / "gate.yml").read_text(encoding="utf-8")
-        for runner in ("ubuntu-latest", "macos-latest", "windows-latest"):
-            self.assertIn(runner, text,
-                          "Windows support is CI-verified or it is not verified")
+        for runner in ("ubuntu-latest", "macos-latest"):
+            self.assertIn(runner, text)
+        if "windows-latest" not in text:
+            readme = (ROOT / "README.md").read_text(encoding="utf-8")
+            self.assertIn("Windows is not verified", readme)
 
     def test_the_matrix_is_actually_wired_to_the_job(self):
         # Naming three runners in a `matrix:` block that no job reads is the

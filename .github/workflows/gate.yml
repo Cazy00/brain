@@ -31,11 +31,11 @@ jobs:
     # Lint proves the NOTES are well-formed; these prove the TOOLBELT works —
     # bootstrap on a clean clone, read containment, MCP survival.
     #
-    # Three platforms, because `brain setup` claims to work on all three and
-    # nobody on this project owns a Windows machine. CI is the only thing
-    # standing behind that claim; if it does not run here it is not verified.
+    # Linux and macOS. Windows left CI by the owner's decision, so Windows is
+    # not verified and the README says so (docs/decisions/
+    # 2026-10-14-windows-ci-informational.md).
     # The `gate` job above stays on ubuntu alone — lint and gitleaks are
-    # platform-independent and running them three times buys nothing.
+    # platform-independent and running them twice buys nothing.
     if: github.event_name == 'push'
     strategy:
       fail-fast: false
@@ -50,13 +50,8 @@ jobs:
             python: "3.9"
           - os: macos-latest
             python: "3.11"
-          - os: windows-latest
-            python: "3.9"
-            # Informational until the suite's Windows failures are fixed:
-            # docs/decisions/2026-10-14-windows-ci-informational.md.
-            informational: true
+          # No Windows leg: docs/decisions/2026-10-14-windows-ci-informational.md.
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.informational == true }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
