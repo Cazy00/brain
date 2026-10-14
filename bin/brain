@@ -5098,7 +5098,7 @@ def cmd_retire(argv: list, alias: bool = False) -> int:
     def block(title: str, lines: list) -> None:
         print(f"\n{title}")
         for line in lines:
-            for i, wrapped in enumerate(textwrap.wrap(line, 72)):
+            for i, wrapped in enumerate(textwrap.wrap(line, 72, break_long_words=False, break_on_hyphens=False)):
                 print(("  - " if i == 0 else "    ") + wrapped)
 
     if "--explain" in argv:
@@ -5141,7 +5141,7 @@ def cmd_retire(argv: list, alias: bool = False) -> int:
     if blockers:
         print("\nREFUSING — this brain is not fully backed up:\n")
         for blocker in blockers:
-            for i, line in enumerate(textwrap.wrap(blocker, 72)):
+            for i, line in enumerate(textwrap.wrap(blocker, 72, break_long_words=False, break_on_hyphens=False)):
                 print(("  - " if i == 0 else "    ") + line)
         print("\nThere is no --force for this. Fix the above and run it again.")
         print("Nothing was changed.")

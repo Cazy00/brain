@@ -3088,7 +3088,7 @@ class ResetTests(unittest.TestCase):
         self.assertIsNotNone(found, out.stdout)
         stamp = found.group(1)
         happens, kept = self.module.retire_plan(
-            str(self.remote), Path(str(self.repo) + f".retired-{stamp}"),
+            str(self.remote), Path(str(self.repo.resolve()) + f".retired-{stamp}"),
             Path.home() / f"brain-backup-{stamp}.bundle")
         self.assertTrue(happens and kept, "the plan is empty")
 
