@@ -961,6 +961,17 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("claude exited 3", result.stdout)
 
+    def test_the_proposer_reads_nothing_from_stdin(self):
+        log = Path(self.tmp.name) / "stdin-kind"
+        self.stub_claude('if [ -c /dev/stdin ]; then echo devnull > %s; else echo other > %s; fi\nexit 0'
+                         % (log, log))
+        git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+        env = {**os.environ, "PATH": f"{self.stub_bin}:{git_dir}:/usr/bin:/bin"}
+        subprocess.run([sys.executable, str(self.repo / "bin" / "brain"), "consolidate"],
+                       cwd=self.repo, input="held by the caller\n", capture_output=True,
+                       text=True, env=env, timeout=300)
+        self.assertEqual(log.read_text().strip(), "devnull")
+
     def test_clean_run_with_no_changes_reports_no_changes(self):
         self.stub_claude("exit 0")
         result = self.consolidate()
@@ -3948,6 +3959,22 @@ class ConsolidationAuditTests(unittest.TestCase):
         self.assertNotIn("push", calls,
                          "post-commit tried to push from a consolidate branch:\n" + calls)
 
+    def test_the_auditor_reads_nothing_from_stdin(self):
+        """`claude -p` reads stdin: inherited, it read whatever the caller held there (seen in a
+        by-hand run, 2026-10-15). Model runs get /dev/null."""
+        self.stage_a_change()
+        seen = {}
+        real_run = subprocess.run
+
+        def runner(cmd, *a, **kw):
+            if cmd and cmd[0] == "claude":
+                seen["stdin"] = kw.get("stdin")
+                return subprocess.CompletedProcess(cmd, 0, "VERDICT: PASS", "")
+            return real_run(cmd, *a, **kw)
+        self.module.subprocess.run = runner
+        self.module.audit_changes(self.runner)
+        self.assertIs(seen["stdin"], subprocess.DEVNULL)
+
     def test_auditor_gets_no_write_permission(self):
         """The proposer runs with --permission-mode acceptEdits. If the auditor
         did too, the separation would be prompt wording rather than a boundary."""
@@ -4052,6 +4079,23 @@ class AuditSnapshotPrivacyTests(unittest.TestCase):
         self.assertFalse(stale.exists(), "a crashed audit's private snapshot was left in /tmp")
 
 
+class SplitLayoutPromptTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_brain_module()
+
+    def test_split_layout_tells_the_proposer_where_the_engine_is(self):
+        self.module.ENGINE = Path("/opt/brain-engine")
+        self.module.ROOT = Path("/var/lib/harbor-curator/work/brain-data")
+        prompt = self.module.propose_prompt("BODY")
+        self.assertIn("/opt/brain-engine/AGENTS.md", prompt)
+        self.assertIn("/opt/brain-engine/bin/brain", prompt)
+        self.assertTrue(prompt.endswith("BODY"))
+
+    def test_combined_layout_prompt_is_unchanged(self):
+        self.module.ROOT = self.module.ENGINE
+        self.assertEqual(self.module.propose_prompt("BODY"), "BODY")
+
+
 class OpenPullRequestTests(unittest.TestCase):
     """--open-pr opens the consolidation's PR with gh, or prints the command."""
 
@@ -4139,9 +4183,16 @@ class ConsolidatorConfigTests(unittest.TestCase):
         """The whole point of moving the pin into config is that nothing else
         changes. If this drifts, an unattended weekly job changed silently."""
         runner = self.module.load_consolidator()
+        engine = str(self.module.ENGINE)
+        tools = ["lint", "lint *", "search *", "read *", "links *", "recent *", "new *",
+                 "supersede *", "index", "index *"]
         self.assertEqual(runner["propose"],
                          ["claude", "--model", "claude-opus-5-5",
-                          "--permission-mode", "acceptEdits", *ISOLATED_ARGV, "-p"])
+                          "--permission-mode", "acceptEdits", *ISOLATED_ARGV,
+                          "--add-dir", engine, "--allowedTools",
+                          *["Bash(%s/bin/brain %s)" % (engine, t) for t in tools],
+                          *["Bash(git %s *)" % g for g in ("status", "diff", "log", "rev-parse")],
+                          "-p"])
         self.assertEqual(runner["audit"],
                          ["claude", "--model", "claude-opus-5-5", "-p", *CONFINED_ARGV])
         self.assertEqual(runner["propose_timeout"], 1800)
@@ -4295,6 +4346,22 @@ class ConsolidatorConfigTests(unittest.TestCase):
         self.write_conf(propose="claude --model {model} --permission-mode acceptEdits "
                                 "--strict-mcp-config --mcp-config '{\"mcpServers\":{\"b\":{}}}' -p")
         self.assertIn("MCP", self.refusal())
+
+    def test_the_shipped_propose_line_reaches_the_engine_and_its_toolbelt(self):
+        """Split layout (seen live 2026-10-15): the proposer could not read AGENTS.md or run
+        bin/brain, both in the engine outside the data folder, and changed nothing."""
+        self.module.ENGINE = Path("/opt/brain-engine")
+        self.conf.unlink()  # the built-in defaults: the same line as the shipped conf (synced)
+        propose = self.module.load_consolidator()["propose"]
+        self.assertEqual(propose[propose.index("--add-dir") + 1], "/opt/brain-engine")
+        allowed = propose[propose.index("--allowedTools") + 1:propose.index("-p")]
+        for sub in ("lint", "search", "read", "links", "recent", "new", "supersede"):
+            self.assertTrue([a for a in allowed if a.startswith("Bash(/opt/brain-engine/bin/brain %s" % sub)],
+                            sub)
+        self.assertFalse([a for a in allowed if "rg" in a.split("(")[1].split()[0]])
+        for forbidden in ("capture", "serve", "setup", "init", "schedule", "publish", "consolidate"):
+            self.assertFalse([a for a in allowed if ("bin/brain %s" % forbidden) in a], forbidden)
+        self.assertEqual(propose[-1], "-p")
 
     def test_an_auditor_that_is_not_the_claude_cli_is_refused(self):
         """The confinement flags are facts about the Claude CLI; carried by another

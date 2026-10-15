@@ -1072,6 +1072,29 @@ class BackupQueueTests(unittest.TestCase):
         self.assertTrue(queue.push_once())
         self.assertEqual(queue.state(), "pushed")
 
+    def test_a_push_that_lands_four_seconds_later_is_reported_pushed(self):
+        """Measured on Oracle (2026-10-15): a no-op push to GitHub takes 2.1-2.3 s, so a real one
+        lands just past a 2.5 s window and every capture answered PENDING."""
+        clock = [0.0]
+
+        class SlowGit(FakeGit):
+            def __call__(inner, args):
+                if args[:2] == ["rev-list", "--count"]:
+                    return inner.Done(0, "0\n" if clock[0] >= 4.0 else "1\n")
+                return FakeGit.__call__(inner, args)
+
+        def sleep(seconds):
+            clock[0] += seconds
+        queue = capture.BackupQueue(self.tmp.name, log=self.log, clock=lambda: clock[0],
+                                    runner=SlowGit(unpushed=1), sleeper=sleep)
+        self.assertEqual(queue.settle(), "pushed")
+
+    def test_pending_says_the_push_may_still_be_in_flight(self):
+        """PENDING also covers a push still on its way, not only one being retried."""
+        text = capture.format_result({"ok": True, "note": "knowledge/inbox/x.md",
+                                      "commit": "abc1234", "backup": "backup_pending"})
+        self.assertIn("in flight", text)
+
     def test_the_queue_pushes_exactly_main_through_the_single_pusher(self):
         """2.4: one code path pushes, and it names main — never HEAD."""
         git = FakeGit(unpushed=1, push_ok=True)

@@ -3722,8 +3722,13 @@ CONSOLIDATOR_DEFAULTS = {
                      "a planted private item and a planted contradiction and passed a "
                      "clean note; claude-opus-5-5 is the newer model and answered 2-4x "
                      "faster."),
+    # --add-dir and the toolbelt rules let a split-layout pass (data apart from the engine) read
+    # AGENTS.md and run bin/brain, both in the engine (seen live 2026-10-15: without them it
+    # changed nothing). The same list a combined brain's .claude/settings.json allows, by
+    # absolute path, minus rg (it reads outside the brain; bin/brain search covers it).
     "propose": ("claude --model {model} --permission-mode acceptEdits --strict-mcp-config "
-                "--mcp-config '{\"mcpServers\":{}}' -p"),
+                "--mcp-config '{\"mcpServers\":{}}' --add-dir {engine} --allowedTools "
+                '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
     "audit": ("claude --model {model} -p --safe-mode --restricted --strict-mcp-config "
               "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
               "--no-session-persistence"),
@@ -3902,7 +3907,8 @@ def load_consolidator() -> dict:
             raise ConsolidatorConfigError(f"{source}: {field} does not parse: {exc}")
         # Per-token replace, so {model} can only ever expand WITHIN one argv
         # element — never spawn new arguments, whatever the model string holds.
-        parts = [p.replace("{model}", conf["model"]) for p in parts]
+        parts = [p.replace("{model}", conf["model"]).replace("{engine}", str(ENGINE))
+                 for p in parts]
         if not parts:
             raise ConsolidatorConfigError(f"{source}: {field} is empty")
         return parts
@@ -4129,6 +4135,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
             run = subprocess.run(
                 [*runner["audit"], prompt],
                 cwd=str(snap), text=True, capture_output=True, timeout=timeout,
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             return "error", f"auditor timed out after {timeout}s"
@@ -4191,6 +4198,18 @@ def open_pull_request(branch: str, trunk: str, title: str, body: str,
     print(f"PULL REQUEST NOT OPENED: {error}")
     print("  open it with: " + shlex.join(cmd))
     return 1
+
+
+def propose_prompt(text: str) -> str:
+    """In a split layout the working directory holds only the notes; the protocol (AGENTS.md)
+    and the toolbelt (bin/brain) live in the engine. Say where, so the pass can follow them."""
+    if ROOT == ENGINE:
+        return text
+    return (f"Where things are: the working directory holds this brain's notes. The engine is at "
+            f"{ENGINE}. Read {ENGINE}/AGENTS.md first: it is the AGENTS.md this prompt refers to. "
+            f"Wherever this prompt says `bin/brain`, run `{ENGINE}/bin/brain`, and use "
+            f"`{ENGINE}/bin/brain search` where it mentions rg. Never edit anything under "
+            f"{ENGINE}.\n\n" + text)
 
 
 def cmd_consolidate(argv: list) -> int:
@@ -4273,8 +4292,9 @@ def cmd_consolidate(argv: list) -> int:
     runner_name = runner["propose"][0]
     try:
         run = subprocess.run(
-            [*runner["propose"], prompt_path.read_text(encoding="utf-8")],
+            [*runner["propose"], propose_prompt(prompt_path.read_text(encoding="utf-8"))],
             cwd=ROOT, text=True, capture_output=True, timeout=runner["propose_timeout"],
+            stdin=subprocess.DEVNULL,
         )
         print(run.stdout[-2000:] if run.stdout else "(no output)")
         if run.returncode != 0:
