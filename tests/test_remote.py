@@ -14,6 +14,7 @@ that only checked the advertised list would pass against a server that ran
 whatever arrived.
 """
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -673,6 +674,48 @@ class RateLimitTests(RemoteTestCase):
         status, body = self.brain.call("brain_capture", {"text": "One allowed capture."})
         self.assertEqual(status, 200)
         self.assertFalse(body["result"]["isError"])
+
+
+class OneResponsePerRequestTests(RemoteTestCase):
+    """Audit A5: a rate-limited initialize sent a 429 AND a 200 on one connection, which
+    corrupts HTTP framing for every request after it on that keep-alive connection."""
+    LIMITS = {"read": (1, 60.0), "capture": (1, 60.0), "protocol": (1, 60.0)}
+
+    def raw(self, body):
+        import socket
+        payload = json.dumps(body).encode("utf-8")
+        head = ("POST /mcp HTTP/1.1\r\nHost: brain.test\r\nContent-Type: application/json\r\n"
+                "Content-Length: %d\r\nConnection: close\r\nCf-Access-Jwt-Assertion: %s\r\n%s\r\n"
+                % (len(payload), sign_assertion(owner_claims(AUD_WRITE)),
+                   "" if body.get("method") == "initialize" else "MCP-Protocol-Version: 2025-11-25\r\n"))
+        conn = socket.create_connection(("127.0.0.1", self.brain.port), timeout=10)
+        conn.sendall(head.encode("ascii") + payload)
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        conn.close()
+        return data
+
+    def test_an_over_budget_initialize_gets_exactly_one_response(self):
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "1"}}}
+        first = self.raw(init)
+        self.assertEqual(len(re.findall(rb"HTTP/1\.[01] \d{3} ", first)), 1)
+        second = self.raw(init)
+        statuses = re.findall(rb"HTTP/1\.[01] (\d{3}) ", second)
+        self.assertEqual(statuses, [b"429"], second[:300])
+
+    def test_every_tool_bucket_sends_exactly_one_response_when_over_budget(self):
+        for name, arguments in (("brain_search", {"query": "x"}), ("brain_capture", {"text": "One note."})):
+            call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}}
+            self.raw(call)
+            statuses = re.findall(rb"HTTP/1\.[01] (\d{3}) ", self.raw(call))
+            self.assertEqual(len(statuses), 1, (name, statuses))
 
 
 class ModernEraTests(RemoteTestCase):

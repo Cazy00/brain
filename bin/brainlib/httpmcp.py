@@ -445,7 +445,8 @@ class Handler(BaseHTTPRequestHandler):
             # not support the requested version responds with one it does
             # support, and lets the client decide whether it can live with it.
             agreed = asked if asked in LEGACY_VERSIONS else PREFERRED_LEGACY
-            self._allow_or_refuse(principal, "protocol", cid)
+            if not self._allow_or_refuse(principal, "protocol", cid):
+                return None  # the 429 is already sent: one response per request (audit A5)
             self.service.record("request", cid=cid, method="initialize",
                                 principal=principal.stable_id, profile=principal.profile,
                                 endpoint=principal.endpoint, mode=principal.mode,
