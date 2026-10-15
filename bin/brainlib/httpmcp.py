@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import secrets
 import threading
 import time
@@ -162,8 +163,21 @@ class Service(object):
             raise ValueError("origin_policy must be 'strict' or 'observe'")
         self.origin_policy = origin_policy
         self._readiness = readiness
-        self.maintenance = None               # a reason string disables mutation
+        self.maintenance = None               # a reason string disables mutation (by hand)
+        self.maintenance_check = None         # () -> reason | None, asked on every write
         self._clock = clock
+
+    def write_block(self):
+        """Why a write must wait right now, or None. The hand-set flag wins; otherwise the
+        live check runs (computed per write, so it clears by itself)."""
+        if self.maintenance:
+            return self.maintenance
+        if self.maintenance_check is None:
+            return None
+        try:
+            return self.maintenance_check()
+        except Exception as exc:              # a check that cannot run fails closed
+            return "check failed: %s" % type(exc).__name__
 
     def ready(self):
         """(ok, reason). Readiness is more than liveness and must say why not."""
@@ -445,7 +459,8 @@ class Handler(BaseHTTPRequestHandler):
             # not support the requested version responds with one it does
             # support, and lets the client decide whether it can live with it.
             agreed = asked if asked in LEGACY_VERSIONS else PREFERRED_LEGACY
-            self._allow_or_refuse(principal, "protocol", cid)
+            if not self._allow_or_refuse(principal, "protocol", cid):
+                return None  # the 429 is already sent: one response per request (audit A5)
             self.service.record("request", cid=cid, method="initialize",
                                 principal=principal.stable_id, profile=principal.profile,
                                 endpoint=principal.endpoint, mode=principal.mode,
@@ -608,11 +623,12 @@ class Handler(BaseHTTPRequestHandler):
         if not allowed:
             return self._rate_limited(cid, principal, retry, tool=str(name)[:64])
 
-        if writes and self.service.maintenance:
+        reason = self.service.write_block() if writes else None
+        if reason:
             # Fail closed on mutation while reads stay available, exactly as the
-            # spec's failure table requires.
+            # spec's failure table requires (audit A2: now reached in production).
             self.service.record("maintenance_mode", cid=cid, principal=principal.stable_id,
-                                outcome="error", reason=self.service.maintenance[:64])
+                                outcome="error", reason=reason[:64])
             return self._refuse(503, cid, "the brain is not accepting writes right now",
                                 "maintenance_mode", headers={"Retry-After": "60"})
 
@@ -621,12 +637,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             result = mcpcore.call(name, args, profile=principal.profile,
                                   transport="remote", timeout=READ_TIMEOUT_SECONDS)
+        extra = {}
+        if name == "brain_search" and not result.get("isError"):
+            extra["results"] = search_result_count(result)
         self.service.record("tool_call", cid=cid, tool=str(name)[:64],
                             principal=principal.stable_id, profile=principal.profile,
                             endpoint=principal.endpoint, mode=principal.mode,
                             client=client_name, client_version=client_version,
                             outcome="error" if result.get("isError") else "ok",
-                            ms=_ms(started))
+                            ms=_ms(started), **extra)
         return self._send(200, reply(msg_id, result), cid=cid)
 
     def _capture(self, args, principal, cid) -> dict:
@@ -656,6 +675,19 @@ class Handler(BaseHTTPRequestHandler):
         if not allowed:
             self._rate_limited(cid, principal, retry)
         return allowed
+
+
+_HIT_LINE = re.compile(r"^\d+\. ", re.M)
+_MORE_LINE = re.compile(r"^\((\d+) more hits below the cap", re.M)
+
+
+def search_result_count(result) -> int:
+    """How many hits a brain_search found: the numbered lines of `format_hits` plus the hits
+    below the cap. "no hits" is 0. Only the number leaves this function, never the text."""
+    text = "".join(block.get("text", "") for block in result.get("content", [])
+                   if isinstance(block, dict))
+    more = _MORE_LINE.search(text)
+    return len(_HIT_LINE.findall(text)) + (int(more.group(1)) if more else 0)
 
 
 def _instructions(profile: str) -> str:

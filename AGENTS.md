@@ -176,8 +176,9 @@ because on a second machine an uncloned repo is the normal case.
 3. Run `bin/brain lint` and fix EVERY error before committing. Warnings are
    advisory but usually worth fixing on the spot.
 4. Commit when done (small, frequent commits). The pre-commit hook re-runs
-   lint and blocks bad content; post-commit auto-pushes to the private remote
-   (never a consolidate/ branch — those wait for the audit).
+   lint and blocks bad content; post-commit pushes `main` to the private remote
+   through `brain sync --push`, the one pusher (never another branch, never a
+   consolidate/ branch — those wait for the audit). Commit on `main`.
 5. New topic needed? Add one line to `knowledge/topics.yaml` in the same
    commit — that is deliberate, not friction.
 
@@ -256,8 +257,8 @@ answer to "does using a different model make my brain worse":
   warning anywhere in this system.
 
 Two invocations, and the difference between them is a security boundary: the
-write-capable `propose` pass, and a `audit` pass that cannot write and cannot
-see the session digest. `bin/brain consolidate` REFUSES to start if the config
+write-capable `propose` pass, and a `audit` pass that cannot write, cannot
+see the session digest, and reads only a read-only snapshot of the staged tree. `bin/brain consolidate` REFUSES to start if the config
 does not distinguish them — read-only-ness is a property of the specific tool,
 not something a command string carries with it, so swapping runners means
 re-establishing it and writing down how.

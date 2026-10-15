@@ -89,6 +89,7 @@ from . import mcp
 from . import notes
 from . import oauth as oauthlib
 from . import osbackend
+from . import served
 
 ENDPOINT = "/mcp"
 # Re-exported so the startup banner can name it without importing the module
@@ -1185,7 +1186,8 @@ def startup_notes(host: str, port: int, read_only: bool = False,
     return notes, warnings
 
 
-def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None) -> int:
+def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None,
+              mark=None) -> int:
     """The `brain serve` command.
 
     `run` is injected so the wiring can be tested without a socket, the same
@@ -1203,6 +1205,16 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None) -> i
         return 0
 
     store = store or osbackend.keystore()
+    if mark is None and run is None:
+        def mark():
+            if not served.mark(mcp.ROOT, "brain serve"):
+                print(f"WARNING could not mark {mcp.ROOT} as served; consolidation would "
+                      "not refuse it", file=sys.stderr)
+    elif mark is None:
+        # An injected `run` is a test, and mcp.ROOT is then the developer's own
+        # checkout: never mark that served.
+        def mark():
+            return None
     run = run or (lambda server: server.serve_forever())
 
     if "--new-client" in argv:
@@ -1367,6 +1379,9 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None) -> i
     for line in warnings:
         print(line, file=sys.stderr)
     print("", file=sys.stderr)
+    # Before serving: `brain consolidate` refuses a served folder (2.2). Injected
+    # for the same reason `run` is: a test must not mark the developer's checkout.
+    mark()
     try:
         run(server)
     except KeyboardInterrupt:

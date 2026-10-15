@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,10 +56,11 @@ def cleanup_temp(tmp):
         pass
 
 
-def run_brain(*args, repo=None):
+def run_brain(*args, repo=None, env=None):
     root = repo or ROOT
     return subprocess.run([sys.executable, str(root / "bin" / "brain"), *args],
-                          cwd=root, capture_output=True, text=True, timeout=180)
+                          cwd=root, capture_output=True, text=True, timeout=180,
+                          env=dict(os.environ, **env) if env else None)
 
 
 def make_sandbox(tmp):
@@ -965,6 +967,114 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("no changes", result.stdout)
 
+    # -- 2.2: its own clone, and nothing reaches the remote before the audit --
+
+    def consolidate_with(self, *args, env_extra=None):
+        git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+        env = {**os.environ, "PATH": f"{self.stub_bin}:{git_dir}:/usr/bin:/bin",
+               **(env_extra or {})}
+        return subprocess.run([sys.executable, str(self.repo / "bin" / "brain"),
+                               "consolidate", *args],
+                              cwd=self.repo, capture_output=True, text=True,
+                              env=env, timeout=300)
+
+    def with_remote(self):
+        remote = Path(self.tmp.name) / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo,
+                       check=True, capture_output=True)
+        return remote
+
+    def remote_branches(self, remote):
+        out = subprocess.run(["git", "for-each-ref", "--format=%(refname)"],
+                             cwd=remote, capture_output=True, text=True).stdout
+        return [line for line in out.splitlines() if line.strip()]
+
+    def stub_runner(self, verdict):
+        """Propose adds one inbox note; audit (the only call carrying --tools)
+        answers with the given verdict line."""
+        self.stub_claude(
+            'case "$*" in\n'
+            f'  *--tools*) echo "checked"; echo "{verdict}"; exit 0 ;;\n'
+            'esac\n'
+            'printf -- "---\\ncreated: 2026-10-15\\nstatus: draft\\n---\\n\\n'
+            'A consolidated note.\\n" > knowledge/inbox/consolidated.md\n'
+            'exit 0')
+
+    def branches(self):
+        return subprocess.run(["git", "branch", "--list", "consolidate/*"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_consolidate_refuses_a_served_folder(self):
+        """The served folder is where captures land. Consolidation switches
+        branches and stages everything, so it runs in its own clone — and a
+        served folder refuses before a branch is cut, marker or environment."""
+        sys.path.insert(0, str(self.repo / "bin"))
+        try:
+            from brainlib import served
+        finally:
+            sys.path.pop(0)
+        self.stub_runner("VERDICT: PASS")
+        for label, env, marked in (("environment", {"BRAIN_SERVED": "1"}, False),
+                                   ("marker", {}, True)):
+            with self.subTest(label):
+                if marked:
+                    self.assertTrue(served.mark(self.repo, "brain-http"))
+                result = self.consolidate_with(env_extra=env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("served", result.stdout)
+                self.assertIn("own clone", result.stdout)
+                self.assertEqual(self.branches(), "",
+                                 "a branch was cut in a served folder")
+
+    def test_nothing_is_pushed_before_the_audit_passes(self):
+        remote = self.with_remote()
+        self.stub_runner("VERDICT: BLOCK — names a private detail")
+        result = self.consolidate_with()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("audit block", result.stdout)
+        self.assertEqual(self.remote_branches(remote), [],
+                         "a blocked consolidation reached the remote")
+
+    def test_a_passed_audit_pushes_its_own_branch_and_nothing_else(self):
+        remote = self.with_remote()
+        self.stub_runner("VERDICT: PASS")
+        result = self.consolidate_with()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        refs = self.remote_branches(remote)
+        self.assertEqual(len(refs), 1, refs)
+        self.assertTrue(refs[0].startswith("refs/heads/consolidate/"), refs)
+
+    def test_open_pr_opens_the_pull_request_with_gh(self):
+        self.with_remote()
+        trunk = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                               capture_output=True, text=True).stdout.strip()
+        log = Path(self.tmp.name) / "gh-calls.log"
+        gh = self.stub_bin / "gh"
+        gh.write_text(f'#!/bin/sh\necho "$@" >> {log}\necho https://example.invalid/pull/7\n',
+                      encoding="utf-8")
+        gh.chmod(0o755)
+        self.stub_runner("VERDICT: PASS")
+        result = self.consolidate_with("--open-pr")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = log.read_text(encoding="utf-8")
+        self.assertIn("pr create", calls)
+        self.assertIn("--head consolidate/", calls)
+        self.assertIn(f"--base {trunk}", calls)
+        self.assertIn("https://example.invalid/pull/7", result.stdout)
+
+    def test_open_pr_is_not_attempted_when_the_audit_blocks(self):
+        self.with_remote()
+        log = Path(self.tmp.name) / "gh-calls.log"
+        gh = self.stub_bin / "gh"
+        gh.write_text(f'#!/bin/sh\necho "$@" >> {log}\n', encoding="utf-8")
+        gh.chmod(0o755)
+        self.stub_runner("VERDICT: BLOCK — no")
+        result = self.consolidate_with("--open-pr")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(log.exists(), "a pull request was opened for blocked work")
+
 
 class SessionDigestTests(unittest.TestCase):
     """Session mining reads transcripts from OUTSIDE the repo and hands them to
@@ -1304,6 +1414,77 @@ class CaptureConcurrencyTests(unittest.TestCase):
         self.assertIn("consolidation", out.stdout)
         notes = list((self.repo / "knowledge/inbox").glob("*would-strand*.md"))
         self.assertTrue(notes, "the note was lost rather than kept on disk")
+
+
+    def test_a_capture_racing_consolidation_is_committed_on_main_or_not_written(self):
+        """Audit A1. A consolidation step that commits in the gap before the capture takes the
+        lock must not carry the capture's note off on its branch while the caller is told
+        NOT SAVED. The hook runs at exactly that gap, so no sleep decides the outcome."""
+        subprocess.run(["git", "checkout", "-q", "-b", "consolidate/2026-10-15"],
+                       cwd=self.repo, check=True, capture_output=True)
+        out = run_brain("capture", "racing note zebra", "--commit", "--atomic", "--json", repo=self.repo,
+                        env={"BRAIN_TEST_HOOKS": "1",
+                             "BRAIN_TEST_HOOK_CAPTURE_BEFORE_LOCK":
+                                 "git add -A && git commit -q --no-verify -m consolidation-step"})
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["status"], "retry", out.stdout)
+        swept = subprocess.run(["git", "log", "--name-only", "--format=", "consolidate/2026-10-15"],
+                               cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertNotIn("racing-note-zebra", swept, "the note was committed on the consolidation branch")
+        self.assertFalse(list((self.repo / "knowledge/inbox").glob("*racing-note-zebra*")))
+
+    def test_two_identical_captures_in_one_second_both_survive(self):
+        """Review I1. The path used to be chosen BEFORE the lock, so a duplicate fired
+        while the first waited picked the same file: it overwrote the committed note,
+        found nothing to commit, and its rollback deleted the first capture's file."""
+        inner = ("BRAIN_TEST_HOOKS=0 python3 bin/brain capture 'duplicate probe kangaroo' "
+                 "--commit --atomic --json")
+        out = run_brain("capture", "duplicate probe kangaroo", "--commit", "--atomic",
+                        "--json", repo=self.repo,
+                        env={"BRAIN_TEST_HOOKS": "1",
+                             "BRAIN_TEST_HOOK_CAPTURE_BEFORE_LOCK": inner})
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["status"],
+                         "committed", out.stdout)
+        notes = sorted((self.repo / "knowledge/inbox").glob("*duplicate-probe-kangaroo*"))
+        self.assertEqual(len(notes), 2, "an acknowledged capture is gone from disk")
+        tracked = subprocess.run(["git", "ls-files", "knowledge/inbox"], cwd=self.repo,
+                                 capture_output=True, text=True).stdout
+        for note in notes:
+            self.assertIn(note.name, tracked)
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo,
+                                capture_output=True, text=True).stdout
+        self.assertNotIn("duplicate-probe-kangaroo", status)
+
+    def test_an_atomic_capture_off_main_writes_nothing(self):
+        """Review (Astra 7): the one pusher pushes main only, so an atomic capture
+        committed on any other branch would be stranded there. Refused, nothing written."""
+        subprocess.run(["git", "checkout", "-q", "-b", "feature/elsewhere"],
+                       cwd=self.repo, check=True, capture_output=True)
+        out = run_brain("capture", "stranded note okapi", "--commit", "--atomic", "--json",
+                        repo=self.repo)
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["status"], "retry",
+                         out.stdout)
+        self.assertFalse(list((self.repo / "knowledge/inbox").glob("*stranded-note-okapi*")))
+
+
+class StatsExportTests(unittest.TestCase):
+    """stats --export feeds the workspace's weekly report; it must never write into the data
+    repository (spec Phase 2.5), where it would dirty the tree and block captures."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.repo = make_sandbox(self.tmp.name)
+
+    def test_stats_export_writes_json_outside_the_data_repo(self):
+        out_file = Path(self.tmp.name) / "stats.json"
+        done = run_brain("stats", "--export", str(out_file), repo=self.repo)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("corpus", json.loads(out_file.read_text()))
+
+    def test_stats_export_refuses_a_path_inside_the_data_repo(self):
+        inside = self.repo / "knowledge" / "stats.json"
+        done = run_brain("stats", "--export", str(inside), repo=self.repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(inside.exists())
 
 
 class RepoLockCoverageTests(unittest.TestCase):
@@ -1902,6 +2083,15 @@ class MergeBackupTests(unittest.TestCase):
         calls = self.run_hook_and_read_calls(".githooks/post-merge", env, log)
         self.assertIn("push", calls,
                       "post-merge never reached the push — the backup is inert:\n" + calls)
+
+    def test_the_hook_pushes_through_the_single_pusher_never_head(self):
+        """2.4: the hook names main explicitly via `brain sync --push`; pushing
+        HEAD would make the hook a second pusher with its own idea of the branch."""
+        log, env = self.git_shim()
+        calls = self.run_hook_and_read_calls(".githooks/post-commit", env, log)
+        pushes = [line for line in calls.splitlines() if line.startswith("push")]
+        self.assertEqual(pushes, ["push --porcelain origin refs/heads/main:refs/heads/main"],
+                         calls)
 
     def test_post_merge_never_pushes_a_consolidate_branch(self):
         """post-merge delegates to post-commit precisely so the audit gate keeps
@@ -3778,6 +3968,135 @@ class ConsolidationAuditTests(unittest.TestCase):
         self.assertIn("audit-fixture.md", prompt, "the staged diff was not in the prompt")
         self.assertIn("A staged change.", prompt)
 
+    def test_the_audit_runs_in_a_read_only_snapshot_without_symlinks(self):
+        """2.3: the auditor's working directory is a fresh copy of the staged tree,
+        not the repository. It cannot write there, a symlink in the tree is not
+        materialized (so it cannot be followed out), and the copy is gone after."""
+        outside = Path(self.tmp.name) / "outside.md"
+        outside.write_text("a file outside the snapshot\n", encoding="utf-8")
+        os.symlink(str(outside), str(self.repo / "knowledge" / "inbox" / "escape.md"))
+        self.stage_a_change()
+        seen = {}
+        real_run = subprocess.run
+        test = self
+
+        def runner(cmd, *a, **kw):
+            if cmd and cmd[0] == "claude":
+                test.calls.append(cmd)
+                cwd = Path(kw.get("cwd"))
+                seen["cwd"] = cwd
+                seen["fixture"] = (cwd / "knowledge" / "inbox" / "audit-fixture.md").is_file()
+                seen["escape"] = os.path.lexists(cwd / "knowledge" / "inbox" / "escape.md")
+                seen["links"] = [os.path.join(r, n) for r, ds, fs in os.walk(cwd)
+                                 for n in ds + fs if os.path.islink(os.path.join(r, n))]
+                for target in (cwd / "probe.md", cwd / "knowledge" / "inbox" / "audit-fixture.md"):
+                    try:
+                        with open(target, "a", encoding="utf-8") as handle:
+                            handle.write("written by the auditor\n")
+                        seen.setdefault("writable", []).append(str(target))
+                    except OSError:
+                        pass
+                return subprocess.CompletedProcess(cmd, 0, "VERDICT: PASS", "")
+            return real_run(cmd, *a, **kw)
+
+        self.module.subprocess.run = runner
+        verdict, detail = self.module.audit_changes(self.runner)
+        self.assertEqual(verdict, "pass", detail)
+        self.assertNotEqual(seen["cwd"].resolve(), self.repo.resolve(),
+                            "the auditor ran in the repository itself")
+        self.assertTrue(seen["fixture"], "the snapshot does not hold the staged tree")
+        self.assertFalse(seen["escape"], "a symlink was materialized in the snapshot")
+        self.assertEqual(seen["links"], [], "the snapshot holds symlinks")
+        self.assertNotIn("writable", seen, "the auditor could write into its snapshot")
+        self.assertFalse(seen["cwd"].exists(), "the snapshot was left behind")
+
+
+class AuditSnapshotPrivacyTests(unittest.TestCase):
+    """Review I2: the snapshot is the whole private brain in the system temp dir."""
+
+    setUp = ConsolidationAuditTests.setUp
+    tearDown = ConsolidationAuditTests.tearDown
+    stage_a_change = ConsolidationAuditTests.stage_a_change
+    fake_claude = ConsolidationAuditTests.fake_claude
+
+    def test_the_snapshot_is_readable_by_its_owner_only(self):
+        self.stage_a_change()
+        seen = {}
+        real_run = subprocess.run
+
+        def runner(cmd, *a, **kw):
+            if cmd and cmd[0] == "claude":
+                cwd = Path(kw["cwd"])
+                seen["dir"] = cwd.stat().st_mode & 0o777
+                seen["file"] = (cwd / "knowledge/inbox/audit-fixture.md").stat().st_mode & 0o777
+                return subprocess.CompletedProcess(cmd, 0, "VERDICT: PASS", "")
+            return real_run(cmd, *a, **kw)
+
+        self.module.subprocess.run = runner
+        self.module.audit_changes(self.runner)
+        self.assertEqual(seen["dir"] & 0o077, 0, oct(seen["dir"]))
+        self.assertEqual(seen["file"] & 0o077, 0, oct(seen["file"]))
+
+    def test_a_snapshot_a_crash_left_behind_is_swept(self):
+        stale = Path(tempfile.mkdtemp(prefix="brain-audit-snapshot-"))
+        (stale / "note.md").write_text("private\n", encoding="utf-8")
+        os.chmod(stale / "note.md", 0o400)
+        os.chmod(stale, 0o500)
+        old = time.time() - 3 * 86400
+        os.utime(stale, (old, old))
+        self.addCleanup(lambda: (os.chmod(stale, 0o700) if stale.exists() else None,
+                                 shutil.rmtree(stale, ignore_errors=True)))
+        self.stage_a_change()
+        self.module.subprocess.run = self.fake_claude("VERDICT: PASS")
+        self.module.audit_changes(self.runner)
+        self.assertFalse(stale.exists(), "a crashed audit's private snapshot was left in /tmp")
+
+
+class OpenPullRequestTests(unittest.TestCase):
+    """--open-pr opens the consolidation's PR with gh, or prints the command."""
+
+    def setUp(self):
+        self.module = load_brain_module()
+        self.calls = []
+
+    def run_fake(self, cmd, *a, **kw):
+        self.calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "https://example.invalid/pull/1\n", "")
+
+    def test_without_gh_the_command_is_printed_not_run(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.module.open_pull_request("consolidate/2026-10-15", "main",
+                                                 "consolidate: 2026-10-15", "body",
+                                                 which=lambda _name: None, run=self.run_fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [], "gh was run although it is not installed")
+        self.assertIn("gh pr create", out.getvalue())
+        self.assertIn("--head consolidate/2026-10-15", out.getvalue())
+
+    def test_with_gh_it_runs_once_and_reports_the_url(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = self.module.open_pull_request("consolidate/2026-10-15", "main",
+                                                 "consolidate: 2026-10-15", "body",
+                                                 which=lambda _name: "/usr/bin/gh",
+                                                 run=self.run_fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][:3], ["gh", "pr", "create"])
+        self.assertIn("https://example.invalid/pull/1", out.getvalue())
+
+
+# The auditor's confinement flags, as they appear in a template (2.3).
+CONFINED = ("--safe-mode --restricted --strict-mcp-config "
+            "--mcp-config '{\"mcpServers\":{}}' --tools Read "
+            "--permission-prompts none --no-session-persistence")
+ISOLATED = "--strict-mcp-config --mcp-config '{\"mcpServers\":{}}'"
+ISOLATED_ARGV = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+CONFINED_ARGV = ["--safe-mode", "--restricted", "--strict-mcp-config",
+                 "--mcp-config", '{"mcpServers":{}}', "--tools", "Read",
+                 "--permission-prompts", "none", "--no-session-persistence"]
+
 
 class ConsolidatorConfigTests(unittest.TestCase):
     """The runner is pinned in config so it can move off Claude without a code
@@ -3802,8 +4121,9 @@ class ConsolidatorConfigTests(unittest.TestCase):
 
     def write_conf(self, **fields):
         base = {"model": "test-model",
-                "propose": "runner --model {model} --write -p",
-                "audit": "runner --model {model} -p",
+                "propose": "claude --model {model} --permission-mode acceptEdits "
+                           + ISOLATED + " -p",
+                "audit": "claude --model {model} -p " + CONFINED,
                 "audit_cannot_write": "runner grants no write tools unless --write is passed"}
         base.update(fields)
         self.conf.write_text(
@@ -3820,12 +4140,31 @@ class ConsolidatorConfigTests(unittest.TestCase):
         changes. If this drifts, an unattended weekly job changed silently."""
         runner = self.module.load_consolidator()
         self.assertEqual(runner["propose"],
-                         ["claude", "--model", "claude-opus-5",
-                          "--permission-mode", "acceptEdits", "-p"])
-        self.assertEqual(runner["audit"], ["claude", "--model", "claude-opus-5", "-p"])
+                         ["claude", "--model", "claude-opus-5-5",
+                          "--permission-mode", "acceptEdits", *ISOLATED_ARGV, "-p"])
+        self.assertEqual(runner["audit"],
+                         ["claude", "--model", "claude-opus-5-5", "-p", *CONFINED_ARGV])
         self.assertEqual(runner["propose_timeout"], 1800)
         self.assertEqual(runner["audit_timeout"], 900)
         self.assertIn("consolidator.conf", runner["source"])
+
+    def test_the_pin_carries_its_reason_in_both_copies(self):
+        """2.6: the pin is a decision, so the reason travels with it — and the
+        conf and the built-in defaults agree on both, like every other field."""
+        runner = self.module.load_consolidator()
+        self.assertGreaterEqual(len(runner["model_reason"].split()), 8,
+                                "the pinned model has no recorded reason")
+        self.assertEqual(runner["model"], self.module.CONSOLIDATOR_DEFAULTS["model"])
+        self.assertEqual(runner["model_reason"],
+                         self.module.CONSOLIDATOR_DEFAULTS["model_reason"])
+
+    def test_dry_run_prints_the_pin_and_its_reason(self):
+        runner = self.module.load_consolidator()
+        out = run_brain("consolidate", "--dry-run", repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        line = next((l for l in out.stdout.splitlines() if l.startswith("model:")), "")
+        self.assertIn(runner["model"], line, out.stdout)
+        self.assertIn(runner["model_reason"][:40], line)
 
     def test_a_missing_config_falls_back_to_the_shipped_default(self):
         shipped = self.module.load_consolidator()
@@ -3873,7 +4212,8 @@ class ConsolidatorConfigTests(unittest.TestCase):
         self.write_conf(model="some-model-v2.5")
         runner = self.module.load_consolidator()
         self.assertEqual(runner["audit"].count("some-model-v2.5"), 1)
-        self.assertEqual(runner["audit"], ["runner", "--model", "some-model-v2.5", "-p"])
+        self.assertEqual(runner["audit"],
+                         ["claude", "--model", "some-model-v2.5", "-p", *CONFINED_ARGV])
         self.assertNotIn("--permission-mode", " ".join(runner["audit"]))
 
     def test_an_unexplained_read_only_claim_is_refused(self):
@@ -3896,7 +4236,8 @@ class ConsolidatorConfigTests(unittest.TestCase):
 
     def test_a_multiline_explanation_is_read_as_one_value(self):
         self.conf.write_text(
-            "model = m\npropose = runner --write -p\naudit = runner -p\n"
+            "model = m\npropose = claude --permission-mode acceptEdits " + ISOLATED
+            + " -p\naudit = claude -p " + CONFINED + "\n"
             "audit_cannot_write = the first line of the reason\n"
             "  continues on the second line and the third\n", encoding="utf-8")
         runner = self.module.load_consolidator()
@@ -3908,8 +4249,65 @@ class ConsolidatorConfigTests(unittest.TestCase):
         runner = self.module.load_consolidator()
         for template in (runner["propose"], runner["audit"]):
             self.assertNotIn("{prompt}", " ".join(template))
-            self.assertEqual(template[-1], "-p", "the prompt flag must come last, "
-                             "so the prompt itself is the next argument")
+            self.assertIn("-p", template)
+            self.assertIn(template[-1], ("-p", "--no-session-persistence"),
+                          "the template must end on a switch that takes no value, "
+                          "so the prompt itself is the next argument")
+
+    def test_an_audit_template_missing_a_confinement_flag_is_refused(self):
+        """2.3: the auditor reads one snapshot and nothing else. Every flag that
+        makes that true is required, with its exact value, and nothing that
+        widens it is allowed back in."""
+        for i, token in enumerate(CONFINED_ARGV):
+            if not token.startswith("--"):
+                continue
+            kept = CONFINED_ARGV[:i] + CONFINED_ARGV[i + 1:]
+            if i + 1 < len(CONFINED_ARGV) and not CONFINED_ARGV[i + 1].startswith("--"):
+                kept = CONFINED_ARGV[:i] + CONFINED_ARGV[i + 2:]
+            with self.subTest(missing=token):
+                self.write_conf(audit="claude --model {model} -p "
+                                + " ".join(shlex.quote(t) for t in kept))
+                self.assertIn(token, self.refusal())
+        widened = {
+            "--tools Read,Bash": CONFINED.replace("--tools Read", "--tools Read,Bash"),
+            "--tools Read Bash": CONFINED.replace("--tools Read", "--tools Read Bash"),
+            "--permission-prompts host": CONFINED.replace("none", "host"),
+            "an MCP server": CONFINED.replace("'{\"mcpServers\":{}}'",
+                                              "'{\"mcpServers\":{\"brain\":{}}}'"),
+            "unparseable MCP config": CONFINED.replace("'{\"mcpServers\":{}}'", "nope"),
+            "--add-dir": CONFINED + " --add-dir / --no-session-persistence",
+            "--permission-mode": CONFINED + " --permission-mode acceptEdits --safe-mode",
+            "--allowedTools": CONFINED + " --allowedTools Bash --safe-mode",
+            # Variadic: a template ending on --tools would swallow the prompt as
+            # a second tool name.
+            "a value-taking last flag": CONFINED.replace(" --tools Read", "") + " --tools Read",
+        }
+        for label, flags in widened.items():
+            with self.subTest(widened=label):
+                self.write_conf(audit="claude --model {model} -p " + flags)
+                self.refusal()
+
+    def test_the_proposer_loads_no_mcp_servers(self):
+        """Spec 5.2: the proposer reads untrusted transcripts, so it runs with no MCP
+        servers at all — no brain_capture straight into the brain, around the audit."""
+        self.write_conf(propose="claude --model {model} --permission-mode acceptEdits -p")
+        self.assertIn("MCP", self.refusal())
+        self.write_conf(propose="claude --model {model} --permission-mode acceptEdits "
+                                "--strict-mcp-config --mcp-config '{\"mcpServers\":{\"b\":{}}}' -p")
+        self.assertIn("MCP", self.refusal())
+
+    def test_an_auditor_that_is_not_the_claude_cli_is_refused(self):
+        """The confinement flags are facts about the Claude CLI; carried by another
+        program they establish nothing (review, Astra 9)."""
+        self.write_conf(audit="other-runner --model {model} -p " + CONFINED)
+        self.assertIn("claude", self.refusal())
+
+    def test_an_audit_flag_outside_the_allowlist_is_refused(self):
+        for extra in ("--agents x", "--append-system-prompt hello", "--setting-sources user"):
+            with self.subTest(extra=extra):
+                self.write_conf(audit="claude --model {model} -p " + CONFINED.replace(
+                    " --no-session-persistence", " " + extra + " --no-session-persistence"))
+                self.refusal()
 
     def test_consolidate_refuses_before_cutting_a_branch(self):
         """A bad runner config must fail on the ground — not after a branch is
@@ -4223,6 +4621,67 @@ class ScheduleOwnershipTests(unittest.TestCase):
     def test_no_plist_at_all_is_not_scheduled(self):
         self.assertFalse(
             self.module.schedule_serves_this_repo("consolidate"))
+
+
+class ServedScheduleTests(unittest.TestCase):
+    """Review I4: a served folder refuses consolidation, so a weekly consolidation scheduled
+    in one would fail every week into a log nobody reads. doctor says so, and the schedule
+    is refused up front."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.module = load_brain_module()
+        self.module.ROOT, self.module.K = self.repo, self.repo / "knowledge"
+        self.module.INDEX_DB = self.repo / ".cache" / "index.db"
+        self.assertTrue(self.module.served.mark(self.repo, "brain serve"))
+
+    def test_doctor_is_red_when_scheduled_consolidation_would_refuse(self):
+        self.module.schedule_serves_this_repo = lambda name: True
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.module.cmd_doctor()
+        line = next((l for l in buf.getvalue().splitlines() if "consolidation" in l
+                     and "scheduled" in l), "")
+        self.assertIn("[RED]", line, buf.getvalue())
+        self.assertIn("served", line)
+        self.assertNotEqual(code, 0)
+
+    def test_doctor_is_red_when_sync_has_not_succeeded_for_a_day(self):
+        status = self.repo / ".cache" / "sync-status.json"
+        status.parent.mkdir(parents=True, exist_ok=True)
+        status.write_text(json.dumps({"last_ok": time.time() - 2 * 86400,
+                                      "last_attempt": time.time(), "status": "pending",
+                                      "detail": "fetch failed: auth"}), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.module.cmd_doctor()
+        line = next((l for l in buf.getvalue().splitlines() if "brain sync" in l), "")
+        self.assertIn("[RED]", line, buf.getvalue())
+        self.assertIn("fetch failed", line)
+        self.assertNotEqual(code, 0)
+
+    def test_scheduling_consolidation_in_a_served_folder_is_refused(self):
+        installed = []
+
+        class FakeScheduler(object):
+            def install(self, name, *a, **kw):
+                installed.append(name)
+                return "installed (fake)"
+
+            def status(self, name):
+                return "not installed"
+
+        real = self.module.osbackend.scheduler
+        self.module.osbackend.scheduler = lambda: FakeScheduler()
+        self.addCleanup(setattr, self.module.osbackend, "scheduler", real)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.module.cmd_schedule(["install", "--with-consolidate"])
+        self.assertEqual(code, 1, buf.getvalue())
+        self.assertIn("served", buf.getvalue())
+        self.assertEqual(installed, [], "a schedule was installed anyway")
 
 
 class HelpDoesNotActTests(unittest.TestCase):

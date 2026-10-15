@@ -49,7 +49,7 @@ contains a value from it. `.env.example` documents names only.
 |---|---|---|
 | `brain-backup.timer` | 02:30 +30m jitter | `deploy/backup/snapshot.sh` — encrypted archive, upload, prune |
 | `brain-maintenance.timer` | 03:20 +20m jitter | index, lint, doctor, in the pinned image |
-| `brain-consolidate.timer` | Sun 04:10 +45m | the weekly consolidation pass, onto a branch |
+| `brain-sync.timer` | every 5 min | `brain sync` — merged PRs in, captures out; the one pusher of `main` |
 | `brain-restore-drill.timer` | 2nd of the month 05:00 +1h | `restore-drill.sh --verify-only` |
 | `brain-edge-check.timer` | 06:40 +45m | `provision.py --check` — the Cloudflare side, read-only |
 
@@ -442,7 +442,7 @@ sudo cp /srv/brain/engine/deploy/systemd/*.service /etc/systemd/system/
 sudo cp /srv/brain/engine/deploy/systemd/*.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now brain-backup.timer brain-maintenance.timer \
-     brain-restore-drill.timer brain-edge-check.timer
+     brain-restore-drill.timer brain-edge-check.timer brain-sync.timer
 systemctl list-timers 'brain-*'
 ```
 
@@ -814,8 +814,11 @@ sudo docker compose -p brain --profile maintenance run --rm --no-deps \
 ```
 
 **b. Lint fails on content.** The notes are readable but malformed — usually a
-dangling wikilink or a half-finished supersede. The system is already in
-fail-closed maintenance mode for mutations, and reads keep working. Fix it as
+dangling wikilink or a half-finished supersede. Captures keep being accepted —
+each only adds an inbox note, which cannot make the content worse — and reads keep
+working. Writes are refused (503, `Retry-After`) only by the live maintenance
+check: a dirty tree outside the inbox, HEAD off `main`, an unreadable index, or
+an unwritable data volume (`bin/brainlib/maintenance.py`). Fix lint failures as
 content, on a branch, with `bin/brain supersede` or an ordinary commit. Never
 delete an archived note to make lint pass; archived history is append-only.
 

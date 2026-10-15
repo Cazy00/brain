@@ -14,6 +14,7 @@ that only checked the advertised list would pass against a server that ran
 whatever arrived.
 """
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -675,6 +676,84 @@ class RateLimitTests(RemoteTestCase):
         self.assertFalse(body["result"]["isError"])
 
 
+class OneResponsePerRequestTests(RemoteTestCase):
+    """Audit A5: a rate-limited initialize sent a 429 AND a 200 on one connection, which
+    corrupts HTTP framing for every request after it on that keep-alive connection."""
+    LIMITS = {"read": (1, 60.0), "capture": (1, 60.0), "protocol": (1, 60.0)}
+
+    def raw(self, body):
+        import socket
+        payload = json.dumps(body).encode("utf-8")
+        head = ("POST /mcp HTTP/1.1\r\nHost: brain.test\r\nContent-Type: application/json\r\n"
+                "Content-Length: %d\r\nConnection: close\r\nCf-Access-Jwt-Assertion: %s\r\n%s\r\n"
+                % (len(payload), sign_assertion(owner_claims(AUD_WRITE)),
+                   "" if body.get("method") == "initialize" else "MCP-Protocol-Version: 2025-11-25\r\n"))
+        conn = socket.create_connection(("127.0.0.1", self.brain.port), timeout=10)
+        conn.sendall(head.encode("ascii") + payload)
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        conn.close()
+        return data
+
+    def test_an_over_budget_initialize_gets_exactly_one_response(self):
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "1"}}}
+        first = self.raw(init)
+        self.assertEqual(len(re.findall(rb"HTTP/1\.[01] \d{3} ", first)), 1)
+        second = self.raw(init)
+        statuses = re.findall(rb"HTTP/1\.[01] (\d{3}) ", second)
+        self.assertEqual(statuses, [b"429"], second[:300])
+
+    def test_every_tool_bucket_sends_exactly_one_response_when_over_budget(self):
+        for name, arguments in (("brain_search", {"query": "x"}), ("brain_capture", {"text": "One note."})):
+            call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}}
+            self.raw(call)
+            statuses = re.findall(rb"HTTP/1\.[01] (\d{3}) ", self.raw(call))
+            self.assertEqual(len(statuses), 1, (name, statuses))
+
+
+class MaintenanceModeTests(RemoteTestCase):
+    """Audit A2: the 503 gate is reached in production, because the write path asks a live
+    check on every capture; reads never consult it."""
+
+    def test_writes_are_refused_reads_keep_working_and_it_clears_by_itself(self):
+        reasons = ["dirty tree"]
+        self.brain.service.maintenance_check = lambda: reasons[0]
+        status, headers, _body = self.brain.rpc(
+            "tools/call", {"name": "brain_capture", "arguments": {"text": "Held back."}})
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("Retry-After"), "60")
+        self.assertEqual(self.brain.call("brain_search", {"query": "connector"})[0], 200)
+        reasons[0] = None
+        status, body = self.brain.call("brain_capture", {"text": "Accepted again."})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["result"]["isError"])
+
+
+class SearchResultCountTests(RemoteTestCase):
+    """Metric 7 needs zero-result searches counted: each brain_search event carries the
+    number of hits it found (a number, never the query or a title)."""
+
+    def search_events(self):
+        rows = [json.loads(line) for line in
+                (self.brain.state_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        return [r for r in rows if r.get("event") == "tool_call" and r.get("tool") == "brain_search"]
+
+    def test_a_search_event_carries_its_result_count(self):
+        self.assertEqual(self.brain.call("brain_search", {"query": "connector"})[0], 200)
+        self.assertEqual(self.brain.call("brain_search", {"query": "zzqqxxnothinghere"})[0], 200)
+        first, second = self.search_events()[-2:]
+        self.assertGreaterEqual(first["results"], 1)
+        self.assertEqual(second["results"], 0)
+        self.assertNotIn("zzqq", json.dumps(second))
+
+
 class ModernEraTests(RemoteTestCase):
     """The 2026-07-28 revision, served from the same endpoint as the old one."""
 
@@ -890,10 +969,11 @@ class FakeGit(object):
             self.stdout = stdout
             self.stderr = ""
 
-    def __init__(self, unpushed=1, push_ok=True, upstream=True):
+    def __init__(self, unpushed=1, push_ok=True, upstream=True, push_rejected=False):
         self.unpushed = unpushed
         self.push_ok = push_ok
         self.upstream = upstream
+        self.push_rejected = push_rejected
         self.calls = []
 
     def __call__(self, args):
@@ -903,6 +983,9 @@ class FakeGit(object):
                 return self.Done(128)
             return self.Done(0, "%d\n" % self.unpushed)
         if args[0] == "push":
+            if self.push_rejected:
+                return self.Done(1, "To origin\n!\trefs/heads/main:refs/heads/main\t"
+                                    "[rejected] (fetch first)\nDone\n")
             if self.push_ok:
                 self.unpushed = 0
                 return self.Done(0)
@@ -988,6 +1071,25 @@ class BackupQueueTests(unittest.TestCase):
         queue = self.queue(FakeGit(unpushed=2, push_ok=True))
         self.assertTrue(queue.push_once())
         self.assertEqual(queue.state(), "pushed")
+
+    def test_the_queue_pushes_exactly_main_through_the_single_pusher(self):
+        """2.4: one code path pushes, and it names main — never HEAD."""
+        git = FakeGit(unpushed=1, push_ok=True)
+        self.queue(git).push_once()
+        pushes = [c for c in git.calls if c[0] == "push"]
+        self.assertEqual(pushes, [["push", "--porcelain", "origin",
+                                   "refs/heads/main:refs/heads/main"]])
+
+    def test_a_rejected_push_triggers_one_sync_not_a_retry_loop(self):
+        git = FakeGit(unpushed=1, push_rejected=True)
+        synced = []
+        queue = capture.BackupQueue(self.tmp.name, log=self.log, clock=lambda: self.now,
+                                    runner=git, sleeper=lambda _s: None,
+                                    syncer=lambda: synced.append(1))
+        self.assertFalse(queue.push_once())
+        self.assertEqual(synced, [1], "a rejected push did not hand over to sync")
+        self.assertEqual(len([c for c in git.calls if c[0] == "push"]), 1,
+                         "the queue retried the push itself")
 
     def test_nothing_to_push_is_success_and_does_not_call_push(self):
         git = FakeGit(unpushed=0)
@@ -1689,6 +1791,99 @@ def _note_line(text: str) -> str:
         if line.startswith("note:"):
             return line.strip()
     return ""
+
+
+class ServedMarkerWiringTests(unittest.TestCase):
+    """2.2: brain-http marks the folder it serves, so consolidation refuses it."""
+
+    def test_brain_http_marks_the_data_folder_it_serves(self):
+        sys.path.insert(0, str(ENGINE / "bin"))
+        from brainlib import served
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        data_root = make_data_root(base)
+        state_dir = base / "state"
+        state_dir.mkdir()
+        key = base / "principal.key"
+        key.write_bytes(PRINCIPAL_KEY)
+        key.chmod(0o600)
+        config = base / "brain-http.json"
+        config.write_text(json.dumps({
+            "team_domain": TEAM, "owner_email": OWNER, "principal_key_file": str(key),
+            "endpoints": [{"hostname": "brain.test", "aud": AUD_WRITE,
+                           "profile": "capture"}]}), encoding="utf-8")
+        self.assertIsNone(served.check(data_root, env={}))
+        env = dict(os.environ, BRAIN_DATA_ROOT=str(data_root),
+                   BRAIN_STATE_DIR=str(state_dir))
+        env.pop("BRAIN_SERVED", None)
+        proc = subprocess.Popen([sys.executable, str(ENGINE / "bin" / "brain-http"),
+                                 "--config", str(config), "--bind", "127.0.0.1",
+                                 "--port", "0"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and proc.poll() is None:
+                if served.check(data_root, env={}):
+                    break
+                time.sleep(0.2)
+            reason = served.check(data_root, env={})
+        finally:
+            proc.terminate()
+            try:
+                _out, err = proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _out, err = proc.communicate()
+        self.assertIsNotNone(reason, "brain-http served the folder without marking it:\n"
+                             + err.decode("utf-8", "replace")[-1500:])
+        self.assertIn("brain-http", reason)
+
+    def test_brain_http_finishes_an_interrupted_install_before_serving(self):
+        """After a reboot mid-install, the server must not serve a half-checked-out tree
+        until the five-minute timer happens to come round."""
+        sys.path.insert(0, str(ENGINE / "bin"))
+        from brainlib import served, sync
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        data_root = make_data_root(base)
+        state_dir = base / "state"
+        state_dir.mkdir()
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=data_root,
+                              capture_output=True, text=True).stdout.strip()
+        (state_dir / sync.INSTALL_MARK).write_text(json.dumps({"from": head, "to": head}))
+        facts = data_root / "knowledge" / "reference" / "tunnel-facts.md"
+        facts.write_text("half of an interrupted checkout\n", encoding="utf-8")
+        key = base / "principal.key"
+        key.write_bytes(PRINCIPAL_KEY)
+        key.chmod(0o600)
+        config = base / "brain-http.json"
+        config.write_text(json.dumps({
+            "team_domain": TEAM, "owner_email": OWNER, "principal_key_file": str(key),
+            "endpoints": [{"hostname": "brain.test", "aud": AUD_WRITE,
+                           "profile": "capture"}]}), encoding="utf-8")
+        env = dict(os.environ, BRAIN_DATA_ROOT=str(data_root), BRAIN_STATE_DIR=str(state_dir))
+        env.pop("BRAIN_SERVED", None)
+        proc = subprocess.Popen([sys.executable, str(ENGINE / "bin" / "brain-http"),
+                                 "--config", str(config), "--bind", "127.0.0.1",
+                                 "--port", "0"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and proc.poll() is None:
+                if served.check(data_root, env={}):
+                    break
+                time.sleep(0.2)
+        finally:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        self.assertFalse((state_dir / sync.INSTALL_MARK).exists(), "the install was not finished")
+        self.assertNotIn("interrupted", facts.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

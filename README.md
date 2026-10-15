@@ -188,8 +188,10 @@ every tool call still succeeds — against nothing.
 That is the point: permanent, versioned, yours. Two consequences you have to
 accept:
 
-- **Every commit auto-pushes.** A hook pushes to your remote in the background.
-  That is the backup, and it makes a lost laptop a non-event.
+- **Every commit auto-pushes.** A hook pushes `main` to your remote in the
+  background, through `brain sync --push` — the one code path that pushes, and
+  it never pushes anything but `main`. That is the backup, and it makes a lost
+  laptop a non-event.
 - **So the remote holds everything you ever record — it must be private.**
 
 A brain in a public repo is every private thought you wrote down, world-readable,

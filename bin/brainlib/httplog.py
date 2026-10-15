@@ -104,7 +104,7 @@ FIELDS = frozenset((
     "ts", "event", "cid", "mode", "principal", "profile", "endpoint",
     "client", "client_version", "method", "tool", "outcome", "status",
     "ms", "reason", "protocol", "count", "retry_after", "note", "commit",
-    "backup", "mutation", "attempt", "days",
+    "backup", "mutation", "attempt", "days", "results",
 ))
 
 # Field values that are free-form strings would defeat the whole design, so the

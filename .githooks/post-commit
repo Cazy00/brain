@@ -1,8 +1,9 @@
 #!/bin/sh
 # brain post-commit — mechanical backup.
-# Pushes asynchronously after every commit so the brain never lives only on
-# this machine. Silent no-op when offline or when no remote is configured;
-# `bin/brain doctor` reports unpushed commits either way.
+# Pushes main asynchronously after every commit, through `brain sync --push`,
+# so the brain never lives only on this machine. Silent no-op when offline or
+# when no remote is configured; `bin/brain doctor` reports unpushed commits
+# either way.
 #
 # The redirects and </dev/null MUST be on the subshell itself, not on the
 # commands inside it. A programmatic caller (bin/brain capture, the MCP server)
@@ -62,7 +63,10 @@ backup() {
       *)             local_remote=yes ;;  # bare relative path
     esac
     [ -d "$path" ] && local_remote=yes
-    [ "$local_remote" = "no" ] && git push --quiet origin HEAD
+    # Through the single pusher (brainlib/sync.py): main, named explicitly,
+    # never HEAD and never forced. Push only: this runs inside the capture's
+    # lock, so a moved remote is left to `brain sync` (the timer, the server).
+    [ "$local_remote" = "no" ] && python3 "$BRAIN" sync --push --quiet
   fi
 }
 

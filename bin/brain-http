@@ -40,7 +40,8 @@ import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import access, capture, httplog, httpmcp, mcpcore  # noqa: E402
+from brainlib import (access, capture, httplog, httpmcp, maintenance, mcpcore,  # noqa: E402
+                      served, sync)
 
 ENGINE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = "/etc/brain/brain-http.json"
@@ -180,8 +181,11 @@ def build(config: dict, data_root, state_dir):
         principal_key=principal_key,
     )
     log = httplog.EventLog(state_dir)
+    # A push the remote rejects (an owner's PR merged meanwhile) becomes one
+    # `brain sync`, the same code path the brain-sync timer runs (2.4).
     queue = capture.BackupQueue(data_root, log=log,
-                                enabled=bool(config.get("git_push", True)))
+                                enabled=bool(config.get("git_push", True)),
+                                syncer=lambda: sync.run(data_root, state_dir))
     capturer = capture.Capturer(
         brain_bin=str(ENGINE / "bin" / "brain"), data_root=data_root,
         ledger=capture.Ledger(state_dir, principal_key), queue=queue, log=log,
@@ -212,6 +216,8 @@ def build(config: dict, data_root, state_dir):
         allowed_origins=config.get("allowed_origins") or [],
         origin_policy=config.get("origin_policy", "strict"),
         readiness=readiness)
+    # Fail-closed maintenance for writes, asked on every capture (audit A2).
+    service.maintenance_check = lambda: maintenance.check(data_root, state_dir)
     return service, queue, log
 
 
@@ -277,6 +283,16 @@ def main(argv) -> int:
         # which reads to an agent exactly like "the brain does not know that".
         sys.stderr.write("brain-http: refusing to start — %s\n" % reason)
         return 3
+    # A reboot in the middle of a sync's install leaves a half-checked-out tree; finish it
+    # before serving rather than waiting for the timer. Writes stay refused if it cannot.
+    problem = sync.repair(data_root, state_dir)
+    if problem:
+        sys.stderr.write("brain-http: WARNING %s — captures stay refused until it is "
+                         "resolved\n" % problem)
+    # Before the socket opens: `brain consolidate` refuses a served folder (2.2).
+    if not served.mark(data_root, "brain-http"):
+        sys.stderr.write("brain-http: WARNING could not mark %s as served; consolidation "
+                         "would not refuse it\n" % data_root)
 
     host = _flag(argv, "--bind") or config.get("bind") or "127.0.0.1"
     port = int(_flag(argv, "--port") or config.get("port") or 8787)

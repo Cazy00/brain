@@ -1,0 +1,62 @@
+# brain sync (2.4): merged PRs in, captures out — every five minutes.
+#
+# Runs `bin/brain sync` INSIDE the pinned image through the compose project's
+# `maintenance` service, so it uses the engine, the mounts and the state
+# directory the live server uses — and with them the server's own repository
+# lock and tree lock. The server's capture queue also runs one sync when a push
+# is rejected; this timer is what brings the owner's merged PRs in when nobody
+# is capturing. brainlib/sync.py is the protocol, and the one pusher of main.
+#
+# Exit 1 is "pending" (the network is down, or the remote moved twice during one
+# run): nothing is lost and the next run retries, so it counts as success here;
+# a push pending for fifteen minutes is the server queue's alert to raise. Exit 2
+# is "refused" — a conflict, a local change that is not a new inbox note, or a
+# merged tree that fails lint — where a person decides, so it alerts.
+[Unit]
+Description=brain sync (merged PRs in, captures out)
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+After=docker.service
+Requires=docker.service
+OnFailure=brain-alert@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=10min
+SuccessExitStatus=1
+EnvironmentFile=-/etc/brain/deploy.env
+Environment=BRAIN_COMPOSE=/srv/brain/engine/deploy/compose.yaml
+Environment=DOCKER_CONFIG=/tmp/docker
+Environment=DOCKER_CLI_HINTS=false
+
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance sync
+
+# Hardening. This unit is a docker CLI client and nothing else: it opens one
+# AF_UNIX socket, and the work happens in a container with its own, stricter
+# profile. Root is required only because /run/docker.sock is root-owned — as
+# the socket's owner it passes the permission check with no capabilities at
+# all, which is why the bounding set is empty rather than holding DAC_OVERRIDE.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# AF_UNIX only. The unit talks to the docker socket and nothing else; the fetch
+# and the push happen in the container, on its egress network. Image pulls are
+# an explicit step of the upgrade procedure, never something a timer does on its
+# own. If this ever starts failing on a DNS lookup, that is the finding.
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077

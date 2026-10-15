@@ -419,9 +419,13 @@ the inbox drain, which is the bulk of the value.
 
 The pass runs as two agents, not one. The first drains the inbox and writes
 notes. A second then audits the staged diff before anything is committed or
-pushed — it runs with no write permission, and the session digest is physically
-moved out of the repo while it works, so it judges the artifact rather than
-re-running the reasoning that produced it. It checks two things only: whether
+pushed — it runs in a fresh read-only snapshot of the staged tree (symlinks
+refused, deleted afterwards) with Read as its only tool, no MCP servers, hooks
+or plugins, and file access confined to that snapshot; the session digest is
+physically moved out of the repo while it works, so it judges the artifact
+rather than re-running the reasoning that produced it. `bin/brain consolidate`
+refuses an audit line in `setup/consolidator.conf` that drops any of those
+flags. It checks two things only: whether
 any content exposes a named person's private life, and whether a new note
 contradicts one that is already current. It is explicitly barred from judging
 whether something was *worth* keeping — that needs the conversation it cannot
@@ -431,6 +435,16 @@ findings land in `.cache/audit-report.md`.
 
 Running it by hand instead is fine: `bin/brain consolidate`. Doing neither is
 the one option that quietly breaks the system.
+
+Consolidation runs in its **own clone**, never in a folder that is being
+served: it switches branches and stages everything, and the served folder is
+where captures land. `brain serve` and `brain-http` mark the folder they serve
+(a `brain-served` file inside `.git/`, never committed), and
+`bin/brain consolidate` refuses a marked folder or one with `BRAIN_SERVED=1`
+set. Nothing is pushed until the audit passes, and then only the
+`consolidate/` branch; `--open-pr` opens its pull request with `gh` (or prints
+the command when `gh` is not installed). A folder that is no longer served
+stays refused until you delete its marker.
 
 ### Backup alarm (re-enabling the CI pulse)
 

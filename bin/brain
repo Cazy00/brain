@@ -24,8 +24,13 @@ Commands:
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
                                    Code sessions into .cache/ (never committed)
-  brain consolidate [--dry-run]    weekly tidy pass via the pinned runner in
-                                   setup/consolidator.conf; lands on a branch
+  brain consolidate [--dry-run] [--open-pr]   weekly tidy pass via the pinned
+                                   runner in setup/consolidator.conf; lands on a
+                                   branch, pushed only after the audit passes;
+                                   refuses a served folder (run it in its own clone)
+  brain sync [--push]              converge the served folder's main with
+                                   origin/main (2.4); --push only pushes main
+                                   (the post-commit hook's entry). The one pusher.
   brain schedule install|uninstall|status [--with-consolidate]
   brain template <dest> [--force]  emit a publishable copy: all tooling, none
                                    of your notes (the public template is DERIVED)
@@ -70,6 +75,7 @@ capture).
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -142,7 +148,7 @@ def state_dir() -> Path:
 # file is also exec'd directly by tests/test_brain.py's load_brain_module(),
 # where sys.path[0] belongs to the test runner, not to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import osbackend
+from brainlib import locks, osbackend, served
 # The note contract lives in brainlib/notes.py so that `brain publish` — which
 # decides what a customer may see — applies the SAME rules as lint, rather than
 # a second copy of them that drifts. Imported by name, so every call site in
@@ -245,7 +251,7 @@ def default_branch() -> str:
     return _DEFAULT_BRANCH
 
 
-class repo_lock:
+def repo_lock():
     """Serialize git-index mutations across concurrent brain processes.
 
     Every agent session runs its own MCP server, so two `capture --commit`
@@ -253,24 +259,9 @@ class repo_lock:
     commit swept in the other's staged file (committed under the wrong
     message) and left notes uncommitted while telling the caller they were
     saved. An exclusive advisory lock elects one writer at a time. Non-POSIX
-    platforms fall back to no lock (best-effort), same as the index builder."""
-
-    def __enter__(self):
-        state_dir().mkdir(parents=True, exist_ok=True)
-        self._lf = open(state_dir() / "git.lock", "w")
-        try:
-            import fcntl
-            fcntl.flock(self._lf, fcntl.LOCK_EX)
-        except ImportError:
-            pass
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            self._lf.close()
-        except Exception:
-            pass
-        return False
+    platforms fall back to no lock (best-effort), same as the index builder.
+    The lock itself lives in brainlib/locks.py, shared with `brain sync`."""
+    return locks.repo_lock(state_dir())
 
 
 def is_local_remote(url: str) -> bool:
@@ -2458,11 +2449,18 @@ def cmd_capture(argv: list) -> int:
     today = date.today().isoformat()
     stamp = time.strftime("%H%M%S")
     slug = slugify(text)[:40]
-    path = K / "inbox" / f"{today}-{stamp}-{slug}.md"
-    n = 2
-    while path.exists():
-        path = K / "inbox" / f"{today}-{stamp}-{slug}-{n}.md"
-        n += 1
+
+    def fresh_path() -> Path:
+        # Chosen again inside the lock for a committed capture: chosen only before it,
+        # a duplicate fired while the first waited picked the same file, overwrote the
+        # committed note and, finding nothing to commit, rolled it back off the disk.
+        candidate, n = K / "inbox" / f"{today}-{stamp}-{slug}.md", 2
+        while candidate.exists():
+            candidate = K / "inbox" / f"{today}-{stamp}-{slug}-{n}.md"
+            n += 1
+        return candidate
+
+    path = fresh_path()
     # `source` is written on EVERY capture, including the owner's own. Absent
     # would mean "no idea" — a note from before this field existed, or one
     # written by something that never said — and the consolidator would have to
@@ -2503,80 +2501,102 @@ def cmd_capture(argv: list) -> int:
         else:
             report("refused", "; ".join(msg for _p, msg in problems))
         return 1
-    atomic_write(path, body)
-    if not as_json:
-        print(path)
-    if do_commit:
-        # --commit was ASKED for, so failing to commit is a failure: the note
-        # exists only on this machine, unvetted and unbacked. Returning 0 here
-        # made the MCP layer report isError:false and every caller believe the
-        # note was safely in git.
-        # Commit ONLY this note's path (git commit -- <path>), under a lock:
-        #  - the pathspec keeps unrelated staged work-in-progress out of the
-        #    capture commit, and
-        #  - the lock removes the concurrent-capture index race.
-        # The branch test lives INSIDE the lock with the commit it guards.
-        # Read outside it, it was a TOCTOU: consolidate could cut its branch in
-        # the gap, and the capture would commit onto it anyway — the exact
-        # outcome this test exists to prevent. consolidate takes the same lock
-        # around its own branch switches, so the two can no longer interleave.
-        commit_id = ""
-        with repo_lock():
-            branch = git("rev-parse", "--abbrev-ref", "HEAD")
-            if branch.startswith("consolidate/"):
-                # A capture committed onto the consolidation branch gets carried
-                # off to a review branch and vanishes from main's working tree.
-                # Write to disk (never lost), skip the commit, tell the truth.
-                if atomic:
-                    _unstage_and_remove(path)
-                    if not as_json:
-                        print("NOT SAVED: a consolidation pass is running, so this brain "
-                              "cannot accept a write right now. Nothing was left behind. "
-                              "Retry shortly.")
-                    else:
-                        report("retry", "consolidation in progress")
-                    return 1
-                print(f"SAVED BUT NOT COMMITTED: currently on branch {branch!r} "
-                      "(a consolidation pass is running). The note is on disk at the path "
-                      "above and is NOT lost — commit it from main once consolidation lands.")
-                return 1
-            add = subprocess.run(["git", "add", str(path)], cwd=ROOT,
-                                 capture_output=True, text=True)
-            commit = subprocess.run(
-                ["git", "commit", "-m", f"capture: {slug}", "--", str(path)],
-                cwd=ROOT, capture_output=True, text=True,
-            )
-            if add.returncode == 0 and commit.returncode == 0:
-                commit_id = git("rev-parse", "HEAD")[:40]
-            elif atomic:
-                # Roll back ONLY the note this call created: unstage that one
-                # path and delete that one file. Never `git reset --hard`, never
-                # `git clean` — a broad reset here would destroy whatever else
-                # the working tree happened to be holding, which on a server is
-                # somebody else's half-finished consolidation.
-                _unstage_and_remove(path)
-        if add.returncode != 0 or commit.returncode != 0:
-            detail = (commit.stderr.strip() or commit.stdout.strip()
-                      or add.stderr.strip() or "git failed")
-            if atomic:
-                if not as_json:
-                    print(f"NOT SAVED: {detail}. The attempted note was removed, so "
-                          "nothing was half-written. Retry.")
-                else:
-                    report("failed", detail)
-                return 1
-            print(f"SAVED BUT NOT COMMITTED: {detail}")
-            print("The note is on disk at the path above and is NOT lost — do not "
-                  "capture it again. Commit it once the problem is fixed.")
-            return 1
+    if not do_commit:
+        atomic_write(path, body)
         if not as_json:
-            print("captured and committed — push runs in background "
-                  "(bin/brain doctor verifies backup)")
-        else:
-            report("committed", "", commit_id)
+            print(path)
+        report("written", "not committed")
         return 0
-    report("written", "not committed")
+    # --commit was ASKED for, so failing to commit is a failure: the note exists only on this
+    # machine, unvetted and unbacked. Returning 0 here made the MCP layer report isError:false
+    # and every caller believe the note was safely in git.
+    # ONE lock region covers branch check -> write -> index -> commit (audit A1). The write
+    # used to come first, outside the lock: a consolidation step committing in that gap took
+    # the note onto its branch while this call told its caller "NOT SAVED". The commit names
+    # only this note's path, so unrelated staged work stays out of it.
+    _test_hook("CAPTURE_BEFORE_LOCK")
+    commit_id = ""
+    with repo_lock():
+        path = fresh_path()
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        trunk = default_branch()
+        if atomic and branch != trunk and not branch.startswith("consolidate/"):
+            # The one pusher pushes main only, so a note committed on any other branch
+            # would be stranded there while its caller was told it was saved.
+            if not as_json:
+                print(f"NOT SAVED: this brain is on {branch!r}, not {trunk!r}. "
+                      "Nothing was written. Retry once it is back on its trunk.")
+            else:
+                report("retry", f"not on {trunk}")
+            return 1
+        if branch.startswith("consolidate/"):
+            # A capture committed onto the consolidation branch gets carried off to a
+            # review branch and vanishes from main's working tree.
+            if atomic:
+                # Nothing is written at all, so nothing can be swept into that branch.
+                if not as_json:
+                    print("NOT SAVED: a consolidation pass is running, so this brain "
+                          "cannot accept a write right now. Nothing was written. "
+                          "Retry shortly.")
+                else:
+                    report("retry", "consolidation in progress")
+                return 1
+            atomic_write(path, body)
+            print(path)
+            print(f"SAVED BUT NOT COMMITTED: currently on branch {branch!r} "
+                  "(a consolidation pass is running). The note is on disk at the path "
+                  "above and is NOT lost — commit it from main once consolidation lands.")
+            return 1
+        atomic_write(path, body)
+        if not as_json:
+            print(path)
+        add = subprocess.run(["git", "add", str(path)], cwd=ROOT,
+                             capture_output=True, text=True)
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"capture: {slug}", "--", str(path)],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if add.returncode == 0 and commit.returncode == 0:
+            commit_id = git("rev-parse", "HEAD")[:40]
+        elif atomic:
+            # Roll back ONLY the note this call created: unstage that one
+            # path and delete that one file. Never `git reset --hard`, never
+            # `git clean` — a broad reset here would destroy whatever else
+            # the working tree happened to be holding, which on a server is
+            # somebody else's half-finished consolidation.
+            _unstage_and_remove(path)
+    if add.returncode != 0 or commit.returncode != 0:
+        detail = (commit.stderr.strip() or commit.stdout.strip()
+                  or add.stderr.strip() or "git failed")
+        if atomic:
+            if not as_json:
+                print(f"NOT SAVED: {detail}. The attempted note was removed, so "
+                      "nothing was half-written. Retry.")
+            else:
+                report("failed", detail)
+            return 1
+        print(f"SAVED BUT NOT COMMITTED: {detail}")
+        print("The note is on disk at the path above and is NOT lost — do not "
+              "capture it again. Commit it once the problem is fixed.")
+        return 1
+    if not as_json:
+        print("captured and committed — push runs in background "
+              "(bin/brain doctor verifies backup)")
+    else:
+        report("committed", "", commit_id)
     return 0
+
+
+def _test_hook(name: str) -> None:
+    """Run the shell command in BRAIN_TEST_HOOK_<NAME>, only when BRAIN_TEST_HOOKS=1.
+
+    Tests use it to make a race happen at an exact point instead of hoping a sleep lands
+    there (audit A1). Production never sets BRAIN_TEST_HOOKS, so this is a no-op there."""
+    if os.environ.get("BRAIN_TEST_HOOKS") != "1":
+        return
+    command = os.environ.get("BRAIN_TEST_HOOK_" + name)
+    if command:
+        subprocess.run(command, shell=True, cwd=ROOT, capture_output=True)
 
 
 def _safe_detail(detail: str) -> str:
@@ -3696,12 +3716,22 @@ CONSOLIDATOR_DEFAULTS = {
     # a different model from every other clone. That is precisely the drift
     # test_the_shipped_config_reproduces_todays_behaviour_exactly exists for,
     # and it caught this within a minute of the edit.
-    "model": "claude-opus-5",
-    "propose": "claude --model {model} --permission-mode acceptEdits -p",
-    "audit": "claude --model {model} -p",
-    "audit_cannot_write": ("The Claude CLI grants no write tools in its default "
-                           "headless mode; propose opts in with --permission-mode "
-                           "acceptEdits and audit omits it."),
+    "model": "claude-opus-5-5",
+    "model_reason": ("2026-10-15 live check: with the confined audit line and the "
+                     "shipped audit prompt, claude-opus-5 and claude-opus-5-5 both blocked "
+                     "a planted private item and a planted contradiction and passed a "
+                     "clean note; claude-opus-5-5 is the newer model and answered 2-4x "
+                     "faster."),
+    "propose": ("claude --model {model} --permission-mode acceptEdits --strict-mcp-config "
+                "--mcp-config '{\"mcpServers\":{}}' -p"),
+    "audit": ("claude --model {model} -p --safe-mode --restricted --strict-mcp-config "
+              "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
+              "--no-session-persistence"),
+    "audit_cannot_write": ("The auditor's only tool is Read, confined by --restricted to "
+                           "its working directory, which is a read-only snapshot of the "
+                           "staged tree; it loads no MCP servers, hooks, skills or "
+                           "plugins, and anything that would prompt is denied. Propose "
+                           "alone opts into writes with --permission-mode acceptEdits."),
     "propose_timeout": "1800",
     "audit_timeout": "900",
 }
@@ -3711,11 +3741,115 @@ class ConsolidatorConfigError(Exception):
     """A consolidator config that would silently weaken the audit boundary."""
 
 
+# The auditor's confinement (2.3), as Claude CLI flags, each required with its exact value.
+# Together they leave one tool (Read), confined by --restricted to the working directory —
+# which audit_changes makes a read-only snapshot — with no MCP servers (so no brain_capture),
+# no hooks, skills or plugins, and no permission prompt that anyone could approve.
+AUDIT_SWITCHES = ("--safe-mode", "--restricted", "--strict-mcp-config",
+                  "--no-session-persistence")
+AUDIT_VALUES = {"--mcp-config": [{"mcpServers": {}}], "--tools": ["Read"],
+                "--permission-prompts": ["none"]}
+# An allowlist, not a denylist: a flag nobody thought of (or a future one) cannot widen
+# the auditor, because anything not named here is refused.
+AUDIT_ALLOWED = {"--model", "-p", "--print", *AUDIT_SWITCHES, *AUDIT_VALUES}
+EMPTY_MCP = {"mcpServers": {}}
+# The one runner whose flags these are. Carried by another program they establish nothing,
+# so swapping the runner means teaching this file that program's confinement first.
+RUNNER = "claude"
+
+
+def _runner_flags(argv: list):
+    """(tokens, flags, problem): argv after the program, read the way the CLI reads it —
+    a flag's values are every token up to the next flag (`--tools` and `--mcp-config` are
+    variadic). flags maps each flag to one list of values per occurrence."""
+    tokens = []
+    for token in argv[1:]:
+        tokens.extend(token.split("=", 1) if token.startswith("--") and "=" in token
+                      else [token])
+    flags, i = {}, 0
+    while i < len(tokens):
+        j = i + 1
+        while j < len(tokens) and not tokens[j].startswith("-"):
+            j += 1
+        if not tokens[i].startswith("-"):
+            return tokens, flags, f"unexpected argument {tokens[i]!r}"
+        flags.setdefault(tokens[i], []).append(tokens[i + 1:j])
+        i = j
+    if Path(argv[0]).name != RUNNER:
+        return tokens, flags, (f"the runner is {argv[0]!r}, and these flags are facts about "
+                               f"the {RUNNER} CLI only")
+    return tokens, flags, None
+
+
+def _empty_mcp_problem(flags: dict):
+    if "--strict-mcp-config" not in flags:
+        return "missing --strict-mcp-config"
+    given = flags.get("--mcp-config")
+    if not given:
+        return "missing --mcp-config"
+    if len(given) != 1:
+        return "--mcp-config is given more than once"
+    try:
+        values = [json.loads(v) for v in given[0]]
+    except ValueError:
+        return "--mcp-config is not the empty MCP config"
+    if values != [EMPTY_MCP]:
+        return f"--mcp-config must be exactly {EMPTY_MCP!r}, got {given[0]!r}"
+    return None
+
+
+def audit_confinement_problem(argv: list):
+    """The first way this audit argv falls short of confinement, or None.
+
+    The template must END on a switch: `--tools` is variadic, and a template ending on
+    `--tools Read` would take the appended prompt as a second tool name."""
+    tokens, flags, problem = _runner_flags(argv)
+    if problem:
+        return problem
+    switches = AUDIT_SWITCHES + ("-p", "--print")
+    for switch in AUDIT_SWITCHES:
+        if switch not in flags:
+            return f"missing {switch}"
+    if "-p" not in flags and "--print" not in flags:
+        return "missing -p"
+    for flag in flags:
+        if flag not in AUDIT_ALLOWED:
+            return f"{flag} is not one of the flags the auditor may carry"
+    problem = _empty_mcp_problem(flags)
+    if problem:
+        return problem
+    for flag, expected in AUDIT_VALUES.items():
+        if flag == "--mcp-config":
+            continue
+        given = flags.get(flag)
+        if not given:
+            return f"missing {flag}"
+        if len(given) != 1:
+            return f"{flag} is given more than once"
+        if given[0] != expected:
+            return f"{flag} must be exactly {expected!r}, got {given[0]!r}"
+    for switch in switches:
+        for values in flags.get(switch, []):
+            if values:
+                return f"{switch} takes no value, but is followed by {values[0]!r}"
+    if tokens[-1] not in switches:
+        return (f"the template must end on a switch that takes no value; it ends on "
+                f"{tokens[-1]!r}, which would take the prompt as its own value")
+    return None
+
+
+def propose_isolation_problem(argv: list):
+    """Spec 5.2: the proposer reads untrusted transcripts, so it loads no MCP servers —
+    nothing that could write into the brain around the audit."""
+    _tokens, flags, problem = _runner_flags(argv)
+    return problem or _empty_mcp_problem(flags)
+
+
 def load_consolidator() -> dict:
     """The one pinned runner: two argv templates, a model, and a timeout each.
 
-    Returns {'model', 'propose' (list), 'audit' (list), 'propose_timeout',
-    'audit_timeout', 'audit_cannot_write', 'source'}. The prompt is NOT in the
+    Returns {'model', 'model_reason', 'propose' (list), 'audit' (list),
+    'propose_timeout', 'audit_timeout', 'audit_cannot_write', 'source'}. The prompt is NOT in the
     argv — callers append it as the final argument, so no prompt text is ever
     interpolated into a shell string.
 
@@ -3785,6 +3919,17 @@ def load_consolidator() -> dict:
             "has exactly the write access the proposer does. The audit is a "
             "security boundary, not a second opinion — express the read-only "
             "invocation separately (see the comments in that file).")
+    problem = audit_confinement_problem(audit)
+    if problem:
+        raise ConsolidatorConfigError(
+            f"{source}: the audit invocation is not confined — {problem}. The auditor "
+            "reads one snapshot and nothing else; every flag in the shipped audit line "
+            "is what makes that true.")
+    problem = propose_isolation_problem(propose)
+    if problem:
+        raise ConsolidatorConfigError(
+            f"{source}: the propose invocation is not isolated from MCP — {problem}. It "
+            "reads untrusted transcripts, so it loads no MCP servers (spec 5.2).")
     if len(conf["audit_cannot_write"].split()) < 8:
         raise ConsolidatorConfigError(
             f"{source}: audit_cannot_write must say HOW this runner is prevented "
@@ -3803,6 +3948,8 @@ def load_consolidator() -> dict:
 
     return {
         "model": conf["model"], "propose": propose, "audit": audit,
+        "model_reason": (conf.get("model_reason") or "").strip()
+                        or f"(no reason recorded in {source})",
         "propose_timeout": seconds("propose_timeout", CONSOLIDATOR_DEFAULTS["propose_timeout"]),
         "audit_timeout": seconds("audit_timeout", CONSOLIDATOR_DEFAULTS["audit_timeout"]),
         "audit_cannot_write": conf["audit_cannot_write"], "source": source,
@@ -3833,6 +3980,77 @@ def staged_diff_vs_main() -> tuple:
     return result.stdout, None
 
 
+SNAPSHOT_PREFIX = "brain-audit-snapshot-"
+
+
+def audit_snapshot(stale_after: int = 3600) -> tuple:
+    """(path, omitted, error): a fresh, read-only copy of the staged tree (2.3).
+
+    Exported from the index rather than copied from the working tree, so what is audited is
+    what would be committed, and gitignored state (.cache/, the digest, the index) is simply
+    not there. Symlinks and submodules are refused rather than copied: named in `omitted`,
+    never materialized, so no path inside the snapshot leads out of it.
+
+    It is the whole private brain in the system temp dir, so it is readable by its owner
+    alone (0400 files, 0500 directories), and a snapshot older than `stale_after` that a
+    crash left behind is swept before a new one is made."""
+    import tempfile
+
+    for leftover in Path(tempfile.gettempdir()).glob(SNAPSHOT_PREFIX + "*"):
+        try:
+            if leftover.is_dir() and not leftover.is_symlink() \
+                    and leftover.stat().st_uid == getattr(os, "getuid", lambda: 0)() \
+                    and time.time() - leftover.stat().st_mtime > stale_after:
+                remove_snapshot(leftover)
+        except OSError:
+            pass
+    snap = Path(tempfile.mkdtemp(prefix=SNAPSHOT_PREFIX))
+
+    def fail(why):
+        remove_snapshot(snap)
+        return None, [], why
+
+    listing = subprocess.run(["git", "ls-files", "--stage", "-z"], cwd=ROOT,
+                             capture_output=True)
+    if listing.returncode != 0:
+        return fail("could not list the staged tree")
+    keep, omitted = [], []
+    for entry in listing.stdout.split(b"\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition(b"\t")
+        if meta.split(b" ", 1)[0] in (b"120000", b"160000"):
+            omitted.append(path.decode("utf-8", "replace"))
+        else:
+            keep.append(path)
+    if keep:
+        export = subprocess.run(["git", "checkout-index", "-z", "--stdin", f"--prefix={snap}/"],
+                                cwd=ROOT, input=b"\0".join(keep) + b"\0", capture_output=True)
+        if export.returncode != 0:
+            return fail("could not export the staged tree: "
+                        + export.stderr.decode("utf-8", "replace").strip()[-200:])
+    for root, dirs, files in os.walk(snap):
+        for name in dirs + files:
+            if os.path.islink(os.path.join(root, name)):
+                return fail(f"a symlink appeared in the snapshot at {name}")
+    for root, _dirs, files in os.walk(snap, topdown=False):
+        for name in files:
+            os.chmod(os.path.join(root, name), 0o400)
+        os.chmod(root, 0o500)
+    return snap, omitted, None
+
+
+def remove_snapshot(snap: Path) -> None:
+    import shutil
+
+    for root, _dirs, _files in os.walk(snap):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+    shutil.rmtree(snap, ignore_errors=True)
+
+
 def audit_changes(runner: dict, timeout: int = None) -> tuple:
     """Independently audit the staged consolidation diff. Returns (verdict, detail)
     where verdict is 'pass', 'block' or 'error'.
@@ -3854,6 +4072,10 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     - The auditor CANNOT READ THE DIGEST. The file is moved out of the repo for
       the duration, not merely left unmentioned. Blindness has to be a fact of
       the filesystem; a prompt asking it not to look is not a control.
+    - The auditor CANNOT REACH THE REPOSITORY. It runs in a fresh read-only
+      snapshot of the staged tree (audit_snapshot), and its runner flags confine
+      it to that directory with Read as its only tool (load_consolidator refuses
+      an audit line without them). The snapshot is deleted afterwards.
 
     Fails CLOSED: a missing or unparseable verdict blocks. The work is preserved
     on the branch and `bin/brain doctor` reports unreviewed consolidation
@@ -3886,8 +4108,17 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
                    f"{AUDIT_MAX_DIFF_CHARS} characters — it exceeds what a pass "
                    "respecting its own caps can produce. Block on that alone.\n")
 
-    # Move the digest OUT OF THE REPO for the duration. The auditor runs with
-    # cwd=ROOT and can glob .cache/, so renaming in place would not blind it.
+    snap, omitted, snap_error = audit_snapshot(stale_after=max(2 * timeout, 3600))
+    if snap_error:
+        return "error", f"could not build the read-only audit snapshot: {snap_error}"
+    if omitted:
+        prompt += ("\nNOTE: your working directory is a read-only snapshot of the staged "
+                   "tree. These symlinks or submodules were refused, not copied: "
+                   + ", ".join(omitted[:50]) + "\n")
+
+    # Move the digest OUT OF THE REPO for the duration. The snapshot never holds it,
+    # but a runner that could reach outside its working directory would find it in
+    # .cache/, and blindness has to hold whatever the runner's flags turn out to do.
     stash_dir = tempfile.mkdtemp(prefix="brain-audit-")
     digest, hidden = digest_path(), None
     try:
@@ -3897,7 +4128,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
         try:
             run = subprocess.run(
                 [*runner["audit"], prompt],
-                cwd=ROOT, text=True, capture_output=True, timeout=timeout,
+                cwd=str(snap), text=True, capture_output=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             return "error", f"auditor timed out after {timeout}s"
@@ -3910,6 +4141,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
             except OSError:
                 pass
         shutil.rmtree(stash_dir, ignore_errors=True)
+        remove_snapshot(snap)
 
     out = (run.stdout or "").strip()
     if run.returncode != 0:
@@ -3933,6 +4165,34 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     return "block", (reason or "unspecified")[:300] + " (full report: .cache/audit-report.md)"
 
 
+def open_pull_request(branch: str, trunk: str, title: str, body: str,
+                      which=None, run=None) -> int:
+    """`consolidate --open-pr`: open the audited branch's pull request with gh, or print
+    the command when gh is not installed. The merge itself stays a person's tap."""
+    import shutil
+
+    which = which or shutil.which
+    run = run or subprocess.run
+    cmd = ["gh", "pr", "create", "--base", trunk, "--head", branch,
+           "--title", title, "--body", body]
+    if not which("gh"):
+        print("gh is not installed — open the pull request with:")
+        print("  " + shlex.join(cmd))
+        return 0
+    try:
+        pr = run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
+        error = None if pr.returncode == 0 else (
+            (pr.stderr or pr.stdout or "").strip()[-300:] or f"gh exited {pr.returncode}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = repr(exc)
+    if error is None:
+        print(f"pull request: {(pr.stdout or '').strip()}")
+        return 0
+    print(f"PULL REQUEST NOT OPENED: {error}")
+    print("  open it with: " + shlex.join(cmd))
+    return 1
+
+
 def cmd_consolidate(argv: list) -> int:
     prompt_path = ENGINE / "setup" / "consolidate-prompt.md"
     if not prompt_path.exists():
@@ -3948,10 +4208,19 @@ def cmd_consolidate(argv: list) -> int:
     except ConsolidatorConfigError as exc:
         print(f"consolidation refused — {exc}")
         return 1
+    # 2.2: never in the folder captures land in. Consolidation switches branches and
+    # stages everything, so it runs in its own clone — refused here, before a branch.
+    served_reason = served.check(ROOT)
+    if served_reason:
+        print(f"consolidation refused — this folder is served: {served_reason}")
+        print("  Consolidation runs in its own clone: git clone <remote> <dir>, then run "
+              "<dir>/bin/brain consolidate there.")
+        return 1
     if "--dry-run" in argv:
         print(f"would consolidate: {len(inbox_items)} inbox item(s)")
         _, sessions = session_digest()
         print(f"would mine: {sessions} recent session(s)")
+        print(f"model:  {runner['model']} — {runner['model_reason']}")
         print(f"prompt: {prompt_path}")
         print(f"audit:  {audit_path}"
               + ("" if audit_path.exists() else "  [MISSING — the pass would block]"))
@@ -4040,8 +4309,10 @@ def cmd_consolidate(argv: list) -> int:
         failure = f"could not diff the branch against main: {staged_error}"
     changed = bool(staged.strip())
 
+    audit_detail = ""
     if failure is None and changed:
         verdict, detail = audit_changes(runner)
+        audit_detail = detail
         print(f"  audit: {detail}")
         if verdict != "pass":
             failure = f"audit {verdict}: {detail}"
@@ -4093,8 +4364,40 @@ def cmd_consolidate(argv: list) -> int:
     print(f"consolidation committed on {branch} (never on main)"
           + ("" if pushed else " — PUSH FAILED, run: git push -u origin " + branch))
     print(f"review:  git diff main...{branch}")
+    if "--open-pr" in argv:
+        if not pushed:
+            print("pull request not opened — the branch is not on the remote")
+            return 1
+        trunk = default_branch()
+        return open_pull_request(
+            branch, trunk, f"consolidate: {today}",
+            f"Consolidation pass of {today}, audited before it was pushed "
+            f"({audit_detail}).\n\nReview: `git diff {trunk}...{branch}`")
     print(f"merge:   git merge {branch} && git push")
     return 0
+
+
+def cmd_sync(argv: list) -> int:
+    """`brain sync`: see brainlib/sync.py. `--push` is the post-commit hook's entry, and
+    it only pushes. The hook runs inside a capture's lock region, so a sync from there
+    would wait on the lock its own parent holds; converging a moved remote is left to
+    the timer and the server queue, which never run inside that lock."""
+    from brainlib import sync
+
+    quiet = "--quiet" in argv
+    if "--push" in argv:
+        ok, detail, rejected = sync.push_main(ROOT)
+        if ok:
+            if not quiet:
+                print("brain sync: main pushed")
+            return 0
+        print("brain sync: push pending — "
+              + ("the remote moved; `brain sync` converges it" if rejected else detail))
+        return 1
+    result = sync.run(ROOT, state_dir())
+    if result.status != "in_sync" or not quiet:
+        print(f"brain sync: {result.status}" + (f" — {result.detail}" if result.detail else ""))
+    return result.exit_code
 
 
 # Paths relative to knowledge/ — the scaffolding a brain needs to exist, as
@@ -4783,6 +5086,12 @@ def cmd_schedule(argv: list) -> int:
         return 2
     targets = ["doctor"]
     if "--with-consolidate" in argv:
+        served_reason = served.check(ROOT)
+        if action == "install" and served_reason:
+            print(f"refused — this folder is served ({served_reason}), and consolidation "
+                  "refuses a served folder, so a weekly pass here would fail every week. "
+                  "Schedule it in the brain's own clone. Nothing was installed.")
+            return 1
         targets.append("consolidate")
     if action == "uninstall":
         targets = list(SCHEDULES)
@@ -5399,6 +5708,23 @@ def cmd_stats(argv: list) -> int:
     exactly why they need a number rather than a vibe.
     """
     import json
+    if "--export" in argv:
+        # For the workspace's weekly report: JSON to a file OUTSIDE the data repository.
+        # Inside it the file would dirty the tree, which refuses captures (maintenance).
+        i = argv.index("--export")
+        if i + 1 >= len(argv):
+            print("usage: brain stats --export FILE   (FILE outside the data repository)")
+            return 2
+        target = Path(argv[i + 1]).expanduser().resolve()
+        root = ROOT.resolve()
+        if target == root or root in target.parents:
+            print("refused: --export must name a file outside the data repository")
+            return 2
+        snap = stats_snapshot()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(target, json.dumps(snap, indent=2) + "\n")
+        print(f"stats exported to {target}")
+        return 0
     snap = stats_snapshot()
     if "--json" in argv:
         print(json.dumps(snap, indent=2))
@@ -5863,7 +6189,35 @@ def cmd_doctor() -> int:
     # The inbox only drains if consolidation actually runs. Worth its own line
     # because a missing consolidate job is otherwise invisible: every other
     # check stays green while captures pile up with nowhere to go.
-    if schedule_serves_this_repo("consolidate"):
+    # brain sync records every run; exit 1 (pending) never alerts on its own, so a sync
+    # that has not succeeded for a day is this report's to raise: merged PRs stopped arriving.
+    sync_status = state_dir() / "sync-status.json"
+    if sync_status.exists():
+        try:
+            record = json.loads(sync_status.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            record = {}
+        last_ok = record.get("last_ok")
+        if not last_ok or time.time() - float(last_ok) > 86400:
+            since = (f"has not succeeded for "
+                     f"{int((time.time() - float(last_ok)) // 3600)} h" if last_ok
+                     else "has never succeeded")
+            print(f"  [RED] brain sync {since} — merged PRs are not "
+                  f"arriving (latest: {record.get('status', '?')}: "
+                  f"{record.get('detail') or 'no detail'})")
+            ok = False
+        else:
+            print(f"  [ok ] brain sync last succeeded "
+                  f"{int((time.time() - float(last_ok)) // 60)} min ago")
+
+    served_reason = served.check(ROOT)
+    if schedule_serves_this_repo("consolidate") and served_reason:
+        # Consolidation refuses a served folder (2.2), so this schedule fails every week.
+        print(f"  [RED] weekly consolidation is scheduled here, but this folder is served "
+              f"({served_reason}) and every pass will refuse — run it in its own clone, "
+              "or delete the marker if this folder is no longer served")
+        ok = False
+    elif schedule_serves_this_repo("consolidate"):
         print("  [ok ] weekly consolidation scheduled")
     elif osbackend.scheduler().status("consolidate") == "installed":
         print("  [RED] weekly consolidation is scheduled for a DIFFERENT brain — "
@@ -6058,15 +6412,19 @@ def main() -> int:
     if cmd == "doctor-notify":
         return cmd_doctor_notify()
     if cmd == "index":
-        return cmd_index(quiet="--quiet" in rest)
-    if cmd == "search":
-        return cmd_search(rest)
-    if cmd == "read":
-        return cmd_read(rest)
-    if cmd == "links":
-        return cmd_links(rest)
-    if cmd == "recent":
-        return cmd_recent(rest)
+        # Shared, like the reads below: an index built from a half-installed tree would
+        # look fresh afterwards and serve the mix until the next rebuild.
+        with locks.tree_lock(state_dir()):
+            return cmd_index(quiet="--quiet" in rest)
+    if cmd in ("search", "read", "links", "recent"):
+        # Readers take the tree shared; `brain sync` installs a new revision with
+        # it exclusive, so a read sees the old tree or the new one, never half.
+        reads = {"search": cmd_search, "read": cmd_read, "links": cmd_links,
+                 "recent": cmd_recent}
+        with locks.tree_lock(state_dir()):
+            return reads[cmd](rest)
+    if cmd == "sync":
+        return cmd_sync(rest)
     if cmd == "supersede":
         return cmd_supersede(rest)
     if cmd == "sessions":

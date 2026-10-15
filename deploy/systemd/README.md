@@ -17,6 +17,7 @@ the runbook says which ones to enable when.
 | `brain-backup` | the archive built, encrypted, uploaded, pruned | whether it can be restored |
 | `brain-restore-drill` | that it can be restored | anything between drills |
 | `brain-maintenance` | index, content, backup age, disk, unpushed commits | anything outside the box |
+| `brain-sync` | merged PRs arriving, captures leaving, refusals (exit 2 alerts) | a push pending for minutes (the server queue alerts on that) |
 | `brain-edge-check` | the Cloudflare side: expiring service tokens, drifted applications, policies, DNS | whether the brain itself is answering |
 
 The blind spot is the same for the first three: they run ON the VPS, so they go

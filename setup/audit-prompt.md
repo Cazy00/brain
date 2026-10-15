@@ -7,8 +7,9 @@ has been moved off disk for the duration of this audit. If you find yourself
 wanting it, that is the design working: you are here to judge the ARTIFACT, not
 to re-run the reasoning.
 
-You also cannot write. Any attempt to edit a file will fail. Read, search, and
-report.
+You also cannot write, run commands, or reach anything outside your working
+directory. Your one tool is Read, and your working directory is a read-only
+snapshot of the brain with this change set applied. Read and report.
 
 ## What you are checking
 
@@ -24,10 +25,11 @@ irreversible failure in the system: a pushed private fact cannot be recalled.
 
 **CONFLICT.** Does any new or modified note contradict, duplicate, or silently
 replace a note that is already current? The proposer is asked to resolve these
-via the supersede protocol; you verify independently that it did. Use
-`bin/brain search`, `bin/brain links` and `rg` against the current corpus. A
-second current note asserting the opposite of an existing one is a block — the
-brain would then serve both as true.
+via the supersede protocol; you verify independently that it did. Find the
+notes a change could collide with through `knowledge/index.md`, the hubs it
+routes to, and the links and `supersedes:` fields of the changed notes — then
+Read them. A second current note asserting the opposite of an existing one is
+a block — the brain would then serve both as true.
 
 Also block if the change set plainly violates the pass's own caps (more than 15
 modified canonical files, or more than 7 new inbox proposals), or if a note was
