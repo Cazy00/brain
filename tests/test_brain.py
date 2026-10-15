@@ -55,10 +55,11 @@ def cleanup_temp(tmp):
         pass
 
 
-def run_brain(*args, repo=None):
+def run_brain(*args, repo=None, env=None):
     root = repo or ROOT
     return subprocess.run([sys.executable, str(root / "bin" / "brain"), *args],
-                          cwd=root, capture_output=True, text=True, timeout=180)
+                          cwd=root, capture_output=True, text=True, timeout=180,
+                          env=dict(os.environ, **env) if env else None)
 
 
 def make_sandbox(tmp):
@@ -1304,6 +1305,23 @@ class CaptureConcurrencyTests(unittest.TestCase):
         self.assertIn("consolidation", out.stdout)
         notes = list((self.repo / "knowledge/inbox").glob("*would-strand*.md"))
         self.assertTrue(notes, "the note was lost rather than kept on disk")
+
+
+    def test_a_capture_racing_consolidation_is_committed_on_main_or_not_written(self):
+        """Audit A1. A consolidation step that commits in the gap before the capture takes the
+        lock must not carry the capture's note off on its branch while the caller is told
+        NOT SAVED. The hook runs at exactly that gap, so no sleep decides the outcome."""
+        subprocess.run(["git", "checkout", "-q", "-b", "consolidate/2026-10-15"],
+                       cwd=self.repo, check=True, capture_output=True)
+        out = run_brain("capture", "racing note zebra", "--commit", "--atomic", "--json", repo=self.repo,
+                        env={"BRAIN_TEST_HOOKS": "1",
+                             "BRAIN_TEST_HOOK_CAPTURE_BEFORE_LOCK":
+                                 "git add -A && git commit -q --no-verify -m consolidation-step"})
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["status"], "retry", out.stdout)
+        swept = subprocess.run(["git", "log", "--name-only", "--format=", "consolidate/2026-10-15"],
+                               cwd=self.repo, capture_output=True, text=True).stdout
+        self.assertNotIn("racing-note-zebra", swept, "the note was committed on the consolidation branch")
+        self.assertFalse(list((self.repo / "knowledge/inbox").glob("*racing-note-zebra*")))
 
 
 class RepoLockCoverageTests(unittest.TestCase):

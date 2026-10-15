@@ -2503,80 +2503,91 @@ def cmd_capture(argv: list) -> int:
         else:
             report("refused", "; ".join(msg for _p, msg in problems))
         return 1
-    atomic_write(path, body)
-    if not as_json:
-        print(path)
-    if do_commit:
-        # --commit was ASKED for, so failing to commit is a failure: the note
-        # exists only on this machine, unvetted and unbacked. Returning 0 here
-        # made the MCP layer report isError:false and every caller believe the
-        # note was safely in git.
-        # Commit ONLY this note's path (git commit -- <path>), under a lock:
-        #  - the pathspec keeps unrelated staged work-in-progress out of the
-        #    capture commit, and
-        #  - the lock removes the concurrent-capture index race.
-        # The branch test lives INSIDE the lock with the commit it guards.
-        # Read outside it, it was a TOCTOU: consolidate could cut its branch in
-        # the gap, and the capture would commit onto it anyway — the exact
-        # outcome this test exists to prevent. consolidate takes the same lock
-        # around its own branch switches, so the two can no longer interleave.
-        commit_id = ""
-        with repo_lock():
-            branch = git("rev-parse", "--abbrev-ref", "HEAD")
-            if branch.startswith("consolidate/"):
-                # A capture committed onto the consolidation branch gets carried
-                # off to a review branch and vanishes from main's working tree.
-                # Write to disk (never lost), skip the commit, tell the truth.
-                if atomic:
-                    _unstage_and_remove(path)
-                    if not as_json:
-                        print("NOT SAVED: a consolidation pass is running, so this brain "
-                              "cannot accept a write right now. Nothing was left behind. "
-                              "Retry shortly.")
-                    else:
-                        report("retry", "consolidation in progress")
-                    return 1
-                print(f"SAVED BUT NOT COMMITTED: currently on branch {branch!r} "
-                      "(a consolidation pass is running). The note is on disk at the path "
-                      "above and is NOT lost — commit it from main once consolidation lands.")
-                return 1
-            add = subprocess.run(["git", "add", str(path)], cwd=ROOT,
-                                 capture_output=True, text=True)
-            commit = subprocess.run(
-                ["git", "commit", "-m", f"capture: {slug}", "--", str(path)],
-                cwd=ROOT, capture_output=True, text=True,
-            )
-            if add.returncode == 0 and commit.returncode == 0:
-                commit_id = git("rev-parse", "HEAD")[:40]
-            elif atomic:
-                # Roll back ONLY the note this call created: unstage that one
-                # path and delete that one file. Never `git reset --hard`, never
-                # `git clean` — a broad reset here would destroy whatever else
-                # the working tree happened to be holding, which on a server is
-                # somebody else's half-finished consolidation.
-                _unstage_and_remove(path)
-        if add.returncode != 0 or commit.returncode != 0:
-            detail = (commit.stderr.strip() or commit.stdout.strip()
-                      or add.stderr.strip() or "git failed")
-            if atomic:
-                if not as_json:
-                    print(f"NOT SAVED: {detail}. The attempted note was removed, so "
-                          "nothing was half-written. Retry.")
-                else:
-                    report("failed", detail)
-                return 1
-            print(f"SAVED BUT NOT COMMITTED: {detail}")
-            print("The note is on disk at the path above and is NOT lost — do not "
-                  "capture it again. Commit it once the problem is fixed.")
-            return 1
+    if not do_commit:
+        atomic_write(path, body)
         if not as_json:
-            print("captured and committed — push runs in background "
-                  "(bin/brain doctor verifies backup)")
-        else:
-            report("committed", "", commit_id)
+            print(path)
+        report("written", "not committed")
         return 0
-    report("written", "not committed")
+    # --commit was ASKED for, so failing to commit is a failure: the note exists only on this
+    # machine, unvetted and unbacked. Returning 0 here made the MCP layer report isError:false
+    # and every caller believe the note was safely in git.
+    # ONE lock region covers branch check -> write -> index -> commit (audit A1). The write
+    # used to come first, outside the lock: a consolidation step committing in that gap took
+    # the note onto its branch while this call told its caller "NOT SAVED". The commit names
+    # only this note's path, so unrelated staged work stays out of it.
+    _test_hook("CAPTURE_BEFORE_LOCK")
+    commit_id = ""
+    with repo_lock():
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        if branch.startswith("consolidate/"):
+            # A capture committed onto the consolidation branch gets carried off to a
+            # review branch and vanishes from main's working tree.
+            if atomic:
+                # Nothing is written at all, so nothing can be swept into that branch.
+                if not as_json:
+                    print("NOT SAVED: a consolidation pass is running, so this brain "
+                          "cannot accept a write right now. Nothing was written. "
+                          "Retry shortly.")
+                else:
+                    report("retry", "consolidation in progress")
+                return 1
+            atomic_write(path, body)
+            print(path)
+            print(f"SAVED BUT NOT COMMITTED: currently on branch {branch!r} "
+                  "(a consolidation pass is running). The note is on disk at the path "
+                  "above and is NOT lost — commit it from main once consolidation lands.")
+            return 1
+        atomic_write(path, body)
+        if not as_json:
+            print(path)
+        add = subprocess.run(["git", "add", str(path)], cwd=ROOT,
+                             capture_output=True, text=True)
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"capture: {slug}", "--", str(path)],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        if add.returncode == 0 and commit.returncode == 0:
+            commit_id = git("rev-parse", "HEAD")[:40]
+        elif atomic:
+            # Roll back ONLY the note this call created: unstage that one
+            # path and delete that one file. Never `git reset --hard`, never
+            # `git clean` — a broad reset here would destroy whatever else
+            # the working tree happened to be holding, which on a server is
+            # somebody else's half-finished consolidation.
+            _unstage_and_remove(path)
+    if add.returncode != 0 or commit.returncode != 0:
+        detail = (commit.stderr.strip() or commit.stdout.strip()
+                  or add.stderr.strip() or "git failed")
+        if atomic:
+            if not as_json:
+                print(f"NOT SAVED: {detail}. The attempted note was removed, so "
+                      "nothing was half-written. Retry.")
+            else:
+                report("failed", detail)
+            return 1
+        print(f"SAVED BUT NOT COMMITTED: {detail}")
+        print("The note is on disk at the path above and is NOT lost — do not "
+              "capture it again. Commit it once the problem is fixed.")
+        return 1
+    if not as_json:
+        print("captured and committed — push runs in background "
+              "(bin/brain doctor verifies backup)")
+    else:
+        report("committed", "", commit_id)
     return 0
+
+
+def _test_hook(name: str) -> None:
+    """Run the shell command in BRAIN_TEST_HOOK_<NAME>, only when BRAIN_TEST_HOOKS=1.
+
+    Tests use it to make a race happen at an exact point instead of hoping a sleep lands
+    there (audit A1). Production never sets BRAIN_TEST_HOOKS, so this is a no-op there."""
+    if os.environ.get("BRAIN_TEST_HOOKS") != "1":
+        return
+    command = os.environ.get("BRAIN_TEST_HOOK_" + name)
+    if command:
+        subprocess.run(command, shell=True, cwd=ROOT, capture_output=True)
 
 
 def _safe_detail(detail: str) -> str:
