@@ -50,7 +50,6 @@ contains a value from it. `.env.example` documents names only.
 | `brain-backup.timer` | 02:30 +30m jitter | `deploy/backup/snapshot.sh` — encrypted archive, upload, prune |
 | `brain-maintenance.timer` | 03:20 +20m jitter | index, lint, doctor, in the pinned image |
 | `brain-sync.timer` | every 5 min | `brain sync` — merged PRs in, captures out; the one pusher of `main` |
-| `brain-consolidate.timer` | Sun 04:10 +45m | the weekly consolidation pass, onto a branch |
 | `brain-restore-drill.timer` | 2nd of the month 05:00 +1h | `restore-drill.sh --verify-only` |
 | `brain-edge-check.timer` | 06:40 +45m | `provision.py --check` — the Cloudflare side, read-only |
 

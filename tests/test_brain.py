@@ -1432,6 +1432,39 @@ class CaptureConcurrencyTests(unittest.TestCase):
         self.assertNotIn("racing-note-zebra", swept, "the note was committed on the consolidation branch")
         self.assertFalse(list((self.repo / "knowledge/inbox").glob("*racing-note-zebra*")))
 
+    def test_two_identical_captures_in_one_second_both_survive(self):
+        """Review I1. The path used to be chosen BEFORE the lock, so a duplicate fired
+        while the first waited picked the same file: it overwrote the committed note,
+        found nothing to commit, and its rollback deleted the first capture's file."""
+        inner = ("BRAIN_TEST_HOOKS=0 python3 bin/brain capture 'duplicate probe kangaroo' "
+                 "--commit --atomic --json")
+        out = run_brain("capture", "duplicate probe kangaroo", "--commit", "--atomic",
+                        "--json", repo=self.repo,
+                        env={"BRAIN_TEST_HOOKS": "1",
+                             "BRAIN_TEST_HOOK_CAPTURE_BEFORE_LOCK": inner})
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["status"],
+                         "committed", out.stdout)
+        notes = sorted((self.repo / "knowledge/inbox").glob("*duplicate-probe-kangaroo*"))
+        self.assertEqual(len(notes), 2, "an acknowledged capture is gone from disk")
+        tracked = subprocess.run(["git", "ls-files", "knowledge/inbox"], cwd=self.repo,
+                                 capture_output=True, text=True).stdout
+        for note in notes:
+            self.assertIn(note.name, tracked)
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo,
+                                capture_output=True, text=True).stdout
+        self.assertNotIn("duplicate-probe-kangaroo", status)
+
+    def test_an_atomic_capture_off_main_writes_nothing(self):
+        """Review (Astra 7): the one pusher pushes main only, so an atomic capture
+        committed on any other branch would be stranded there. Refused, nothing written."""
+        subprocess.run(["git", "checkout", "-q", "-b", "feature/elsewhere"],
+                       cwd=self.repo, check=True, capture_output=True)
+        out = run_brain("capture", "stranded note okapi", "--commit", "--atomic", "--json",
+                        repo=self.repo)
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1])["status"], "retry",
+                         out.stdout)
+        self.assertFalse(list((self.repo / "knowledge/inbox").glob("*stranded-note-okapi*")))
+
 
 class StatsExportTests(unittest.TestCase):
     """stats --export feeds the workspace's weekly report; it must never write into the data
@@ -3978,6 +4011,47 @@ class ConsolidationAuditTests(unittest.TestCase):
         self.assertFalse(seen["cwd"].exists(), "the snapshot was left behind")
 
 
+class AuditSnapshotPrivacyTests(unittest.TestCase):
+    """Review I2: the snapshot is the whole private brain in the system temp dir."""
+
+    setUp = ConsolidationAuditTests.setUp
+    tearDown = ConsolidationAuditTests.tearDown
+    stage_a_change = ConsolidationAuditTests.stage_a_change
+    fake_claude = ConsolidationAuditTests.fake_claude
+
+    def test_the_snapshot_is_readable_by_its_owner_only(self):
+        self.stage_a_change()
+        seen = {}
+        real_run = subprocess.run
+
+        def runner(cmd, *a, **kw):
+            if cmd and cmd[0] == "claude":
+                cwd = Path(kw["cwd"])
+                seen["dir"] = cwd.stat().st_mode & 0o777
+                seen["file"] = (cwd / "knowledge/inbox/audit-fixture.md").stat().st_mode & 0o777
+                return subprocess.CompletedProcess(cmd, 0, "VERDICT: PASS", "")
+            return real_run(cmd, *a, **kw)
+
+        self.module.subprocess.run = runner
+        self.module.audit_changes(self.runner)
+        self.assertEqual(seen["dir"] & 0o077, 0, oct(seen["dir"]))
+        self.assertEqual(seen["file"] & 0o077, 0, oct(seen["file"]))
+
+    def test_a_snapshot_a_crash_left_behind_is_swept(self):
+        stale = Path(tempfile.mkdtemp(prefix="brain-audit-snapshot-"))
+        (stale / "note.md").write_text("private\n", encoding="utf-8")
+        os.chmod(stale / "note.md", 0o400)
+        os.chmod(stale, 0o500)
+        old = time.time() - 3 * 86400
+        os.utime(stale, (old, old))
+        self.addCleanup(lambda: (os.chmod(stale, 0o700) if stale.exists() else None,
+                                 shutil.rmtree(stale, ignore_errors=True)))
+        self.stage_a_change()
+        self.module.subprocess.run = self.fake_claude("VERDICT: PASS")
+        self.module.audit_changes(self.runner)
+        self.assertFalse(stale.exists(), "a crashed audit's private snapshot was left in /tmp")
+
+
 class OpenPullRequestTests(unittest.TestCase):
     """--open-pr opens the consolidation's PR with gh, or prints the command."""
 
@@ -4017,6 +4091,8 @@ class OpenPullRequestTests(unittest.TestCase):
 CONFINED = ("--safe-mode --restricted --strict-mcp-config "
             "--mcp-config '{\"mcpServers\":{}}' --tools Read "
             "--permission-prompts none --no-session-persistence")
+ISOLATED = "--strict-mcp-config --mcp-config '{\"mcpServers\":{}}'"
+ISOLATED_ARGV = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 CONFINED_ARGV = ["--safe-mode", "--restricted", "--strict-mcp-config",
                  "--mcp-config", '{"mcpServers":{}}', "--tools", "Read",
                  "--permission-prompts", "none", "--no-session-persistence"]
@@ -4045,8 +4121,9 @@ class ConsolidatorConfigTests(unittest.TestCase):
 
     def write_conf(self, **fields):
         base = {"model": "test-model",
-                "propose": "runner --model {model} --write -p",
-                "audit": "runner --model {model} -p " + CONFINED,
+                "propose": "claude --model {model} --permission-mode acceptEdits "
+                           + ISOLATED + " -p",
+                "audit": "claude --model {model} -p " + CONFINED,
                 "audit_cannot_write": "runner grants no write tools unless --write is passed"}
         base.update(fields)
         self.conf.write_text(
@@ -4064,7 +4141,7 @@ class ConsolidatorConfigTests(unittest.TestCase):
         runner = self.module.load_consolidator()
         self.assertEqual(runner["propose"],
                          ["claude", "--model", "claude-opus-5-5",
-                          "--permission-mode", "acceptEdits", "-p"])
+                          "--permission-mode", "acceptEdits", *ISOLATED_ARGV, "-p"])
         self.assertEqual(runner["audit"],
                          ["claude", "--model", "claude-opus-5-5", "-p", *CONFINED_ARGV])
         self.assertEqual(runner["propose_timeout"], 1800)
@@ -4136,7 +4213,7 @@ class ConsolidatorConfigTests(unittest.TestCase):
         runner = self.module.load_consolidator()
         self.assertEqual(runner["audit"].count("some-model-v2.5"), 1)
         self.assertEqual(runner["audit"],
-                         ["runner", "--model", "some-model-v2.5", "-p", *CONFINED_ARGV])
+                         ["claude", "--model", "some-model-v2.5", "-p", *CONFINED_ARGV])
         self.assertNotIn("--permission-mode", " ".join(runner["audit"]))
 
     def test_an_unexplained_read_only_claim_is_refused(self):
@@ -4159,7 +4236,8 @@ class ConsolidatorConfigTests(unittest.TestCase):
 
     def test_a_multiline_explanation_is_read_as_one_value(self):
         self.conf.write_text(
-            "model = m\npropose = runner --write -p\naudit = runner -p " + CONFINED + "\n"
+            "model = m\npropose = claude --permission-mode acceptEdits " + ISOLATED
+            + " -p\naudit = claude -p " + CONFINED + "\n"
             "audit_cannot_write = the first line of the reason\n"
             "  continues on the second line and the third\n", encoding="utf-8")
         runner = self.module.load_consolidator()
@@ -4187,7 +4265,7 @@ class ConsolidatorConfigTests(unittest.TestCase):
             if i + 1 < len(CONFINED_ARGV) and not CONFINED_ARGV[i + 1].startswith("--"):
                 kept = CONFINED_ARGV[:i] + CONFINED_ARGV[i + 2:]
             with self.subTest(missing=token):
-                self.write_conf(audit="runner --model {model} -p "
+                self.write_conf(audit="claude --model {model} -p "
                                 + " ".join(shlex.quote(t) for t in kept))
                 self.assertIn(token, self.refusal())
         widened = {
@@ -4206,7 +4284,29 @@ class ConsolidatorConfigTests(unittest.TestCase):
         }
         for label, flags in widened.items():
             with self.subTest(widened=label):
-                self.write_conf(audit="runner --model {model} -p " + flags)
+                self.write_conf(audit="claude --model {model} -p " + flags)
+                self.refusal()
+
+    def test_the_proposer_loads_no_mcp_servers(self):
+        """Spec 5.2: the proposer reads untrusted transcripts, so it runs with no MCP
+        servers at all — no brain_capture straight into the brain, around the audit."""
+        self.write_conf(propose="claude --model {model} --permission-mode acceptEdits -p")
+        self.assertIn("MCP", self.refusal())
+        self.write_conf(propose="claude --model {model} --permission-mode acceptEdits "
+                                "--strict-mcp-config --mcp-config '{\"mcpServers\":{\"b\":{}}}' -p")
+        self.assertIn("MCP", self.refusal())
+
+    def test_an_auditor_that_is_not_the_claude_cli_is_refused(self):
+        """The confinement flags are facts about the Claude CLI; carried by another
+        program they establish nothing (review, Astra 9)."""
+        self.write_conf(audit="other-runner --model {model} -p " + CONFINED)
+        self.assertIn("claude", self.refusal())
+
+    def test_an_audit_flag_outside_the_allowlist_is_refused(self):
+        for extra in ("--agents x", "--append-system-prompt hello", "--setting-sources user"):
+            with self.subTest(extra=extra):
+                self.write_conf(audit="claude --model {model} -p " + CONFINED.replace(
+                    " --no-session-persistence", " " + extra + " --no-session-persistence"))
                 self.refusal()
 
     def test_consolidate_refuses_before_cutting_a_branch(self):
@@ -4521,6 +4621,67 @@ class ScheduleOwnershipTests(unittest.TestCase):
     def test_no_plist_at_all_is_not_scheduled(self):
         self.assertFalse(
             self.module.schedule_serves_this_repo("consolidate"))
+
+
+class ServedScheduleTests(unittest.TestCase):
+    """Review I4: a served folder refuses consolidation, so a weekly consolidation scheduled
+    in one would fail every week into a log nobody reads. doctor says so, and the schedule
+    is refused up front."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.module = load_brain_module()
+        self.module.ROOT, self.module.K = self.repo, self.repo / "knowledge"
+        self.module.INDEX_DB = self.repo / ".cache" / "index.db"
+        self.assertTrue(self.module.served.mark(self.repo, "brain serve"))
+
+    def test_doctor_is_red_when_scheduled_consolidation_would_refuse(self):
+        self.module.schedule_serves_this_repo = lambda name: True
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.module.cmd_doctor()
+        line = next((l for l in buf.getvalue().splitlines() if "consolidation" in l
+                     and "scheduled" in l), "")
+        self.assertIn("[RED]", line, buf.getvalue())
+        self.assertIn("served", line)
+        self.assertNotEqual(code, 0)
+
+    def test_doctor_is_red_when_sync_has_not_succeeded_for_a_day(self):
+        status = self.repo / ".cache" / "sync-status.json"
+        status.parent.mkdir(parents=True, exist_ok=True)
+        status.write_text(json.dumps({"last_ok": time.time() - 2 * 86400,
+                                      "last_attempt": time.time(), "status": "pending",
+                                      "detail": "fetch failed: auth"}), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.module.cmd_doctor()
+        line = next((l for l in buf.getvalue().splitlines() if "brain sync" in l), "")
+        self.assertIn("[RED]", line, buf.getvalue())
+        self.assertIn("fetch failed", line)
+        self.assertNotEqual(code, 0)
+
+    def test_scheduling_consolidation_in_a_served_folder_is_refused(self):
+        installed = []
+
+        class FakeScheduler(object):
+            def install(self, name, *a, **kw):
+                installed.append(name)
+                return "installed (fake)"
+
+            def status(self, name):
+                return "not installed"
+
+        real = self.module.osbackend.scheduler
+        self.module.osbackend.scheduler = lambda: FakeScheduler()
+        self.addCleanup(setattr, self.module.osbackend, "scheduler", real)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.module.cmd_schedule(["install", "--with-consolidate"])
+        self.assertEqual(code, 1, buf.getvalue())
+        self.assertIn("served", buf.getvalue())
+        self.assertEqual(installed, [], "a schedule was installed anyway")
 
 
 class HelpDoesNotActTests(unittest.TestCase):

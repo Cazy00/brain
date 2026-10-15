@@ -5,11 +5,13 @@ second clone that stands in for the owner merging curator PRs there. Each case c
 one property that matters most: every capture the served folder accepted survives.
 """
 import errno
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -243,6 +245,90 @@ class RefusalTests(SyncCase):
         self.assert_untouched(before, remote_before)
 
 
+class ServedLocalChangesTests(SyncCase):
+    """Spec 5.2: the served folder's own divergence is accepted only as pure inbox additions.
+    Anything else reaches GitHub through a PR, never through the pusher (review, Astra)."""
+
+    def hand_edit(self):
+        facts = self.served / "knowledge/reference/tunnel-facts.md"
+        facts.write_text(facts.read_text() + "\nedited on the served folder\n")
+        git(self.served, "-c", "core.hooksPath=/dev/null", "commit", "-qam", "a hand edit")
+
+    def test_a_served_folder_does_not_push_a_local_edit(self):
+        from brainlib import served
+        served.mark(self.served, "brain-http")
+        self.hand_edit()
+        remote_before = self.head(self.remote)
+        result = self.sync()
+        self.assertEqual(result.status, "refused", result.detail)
+        self.assertIn("tunnel-facts.md", result.detail)
+        ok, detail, rejected = sync.push_main(self.served)
+        self.assertFalse(ok)
+        self.assertFalse(rejected)
+        self.assertIn("tunnel-facts.md", detail)
+        self.assertEqual(self.head(self.remote), remote_before)
+
+    def test_a_served_folder_still_pushes_its_captures(self):
+        from brainlib import served
+        served.mark(self.served, "brain-http")
+        self.capture("served-capture")
+        self.assertEqual(self.sync().status, "pushed")
+        self.assert_captures_survive(on_remote=True)
+
+    def test_an_unserved_clone_pushes_its_own_edits(self):
+        """A personal clone is not a served folder: every commit is still its backup."""
+        self.hand_edit()
+        self.assertEqual(self.sync().status, "pushed")
+
+
+class SyncStatusTests(SyncCase):
+    """Review M2 (re-graded): exit 1 is not an alert, so a sync that never succeeds again
+    (a revoked key, DNS) must surface somewhere — doctor reads this record nightly."""
+
+    def status_record(self):
+        return json.loads((self.state / sync.STATUS_FILE).read_text())
+
+    def test_a_success_records_when(self):
+        self.sync()
+        record = self.status_record()
+        self.assertIsNotNone(record["last_ok"])
+        self.assertEqual(record["status"], "in_sync")
+
+    def test_a_pending_run_does_not_move_the_last_success(self):
+        self.sync()
+        first = self.status_record()["last_ok"]
+        git(self.served, "remote", "set-url", "origin", str(Path(self.tmp.name) / "gone.git"))
+        self.sync()
+        record = self.status_record()
+        self.assertEqual(record["last_ok"], first)
+        self.assertEqual(record["status"], "pending")
+
+
+class OverlapTests(SyncCase):
+    def test_a_second_sync_never_tears_down_the_first_ones_worktree(self):
+        """Review I3: the timer and the server queue both run syncs. One starting while the
+        other is mid-merge must wait for the lock, not delete the merge out from under it."""
+        import threading
+        import time
+        self.capture("overlapping")
+        self.merge_pr("knowledge/reference/overlap-note.md", "x\n")
+        second = {}
+
+        def start_another(step):
+            if step == "merged" and "thread" not in second:
+                second["thread"] = threading.Thread(
+                    target=lambda: second.update(result=self.sync()))
+                second["thread"].start()
+                time.sleep(1.5)
+
+        first = self.sync(fault=start_another)
+        second["thread"].join(timeout=120)
+        self.assertEqual(first.status, "merged", first.detail)
+        self.assertIn(second["result"].status, ("in_sync", "pushed"), second["result"].detail)
+        self.assert_captures_survive(on_remote=True)
+        self.assert_no_worktrees_left()
+
+
 class PendingTests(SyncCase):
     def test_a_network_or_auth_failure_is_pending_and_loses_nothing(self):
         self.capture("offline")
@@ -317,6 +403,71 @@ class CrashTests(SyncCase):
                 self.assert_no_worktrees_left()
 
 
+class Crash(BaseException):
+    """A process dying: not an Exception, so nothing in sync catches it."""
+
+
+class InterruptedInstallTests(SyncCase):
+    """Review (Astra 5): a crash INSIDE git's checkout leaves some files new and some old.
+    The next run must finish the install, and writes are refused until it has."""
+
+    def crash_halfway(self):
+        self.capture("before-the-crash")
+        self.merge_pr("knowledge/reference/half-one.md", "one\n")
+        self.merge_pr("knowledge/reference/half-two.md", "two\n")
+
+        def die_mid_checkout(step):
+            if step == "installing":
+                marker = json.loads((self.state / sync.INSTALL_MARK).read_text())
+                target = marker["to"]
+                # Half the checkout: one new file on disk, the index locked, HEAD old.
+                content = git(self.served, "show", target + ":knowledge/reference/half-one.md")
+                (self.served / "knowledge/reference/half-one.md").write_text(content.stdout)
+                lock = self.served / ".git" / "index.lock"
+                lock.write_text("")
+                old = time.time() - 600
+                os.utime(lock, (old, old))
+                raise Crash()
+
+        with self.assertRaises(Crash):
+            self.sync(fault=die_mid_checkout)
+
+    def test_writes_are_refused_until_the_install_is_finished(self):
+        from brainlib import maintenance
+        self.crash_halfway()
+        self.assertEqual(maintenance.check(self.served, self.state), "interrupted update")
+
+    def test_the_next_run_finishes_the_install(self):
+        self.crash_halfway()
+        result = self.sync()
+        self.assertEqual(result.exit_code, 0, result.detail)
+        self.assertEqual(self.head(self.served), self.head(self.remote))
+        self.assertEqual(self.status(), "")
+        self.assertFalse((self.state / sync.INSTALL_MARK).exists())
+        self.assertFalse((self.served / ".git" / "index.lock").exists())
+        for name in ("half-one", "half-two"):
+            self.assertTrue((self.served / ("knowledge/reference/%s.md" % name)).is_file())
+        self.assert_captures_survive(on_remote=True)
+
+    def test_a_folder_moved_since_the_crash_is_refused_not_reset(self):
+        self.crash_halfway()
+        (self.served / ".git" / "index.lock").unlink()
+        git(self.served, "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty",
+            "-m", "someone committed on top of the half-installed tree")
+        before = self.head(self.served)
+        result = self.sync()
+        self.assertEqual(result.status, "refused", result.detail)
+        self.assertEqual(self.head(self.served), before)
+
+    def test_tracked_changes_on_the_served_folder_are_never_overwritten(self):
+        self.merge_pr("knowledge/reference/incoming.md", "x\n")
+        facts = self.served / "knowledge/reference/tunnel-facts.md"
+        facts.write_text(facts.read_text() + "\nan uncommitted hand edit\n")
+        result = self.sync()
+        self.assertEqual(result.status, "refused", result.detail)
+        self.assertIn("an uncommitted hand edit", facts.read_text())
+
+
 class ReaderExclusionTests(SyncCase):
     """Readers take the tree lock shared; the install takes it exclusive."""
 
@@ -327,8 +478,10 @@ class ReaderExclusionTests(SyncCase):
             self.skipTest("no fcntl on this platform")
         env = dict(os.environ, BRAIN_DATA_ROOT=str(self.served),
                    BRAIN_STATE_DIR=str(self.state))
+        # `index` too: it reads every note, and an index built from a half-installed tree
+        # would look fresh afterwards (review, Astra 4).
         for args in (["read", "tunnel-facts"], ["search", "cloudflared"],
-                     ["links", "tunnel-facts"], ["recent"]):
+                     ["links", "tunnel-facts"], ["recent"], ["index", "--quiet"]):
             with self.subTest(command=args[0]):
                 with locks.tree_lock(self.state, exclusive=True):
                     proc = subprocess.Popen([sys.executable, str(ENGINE / "bin" / "brain"),
@@ -357,6 +510,23 @@ class ReaderExclusionTests(SyncCase):
         self.assertEqual(result.status, "fast_forwarded", result.detail)
         self.assertIs(seen.get("reader_got_in"), False,
                       "a reader could take the tree while the install held it")
+
+
+class HookPushTests(SyncCase):
+    def test_push_only_never_waits_on_the_repo_lock(self):
+        """The post-commit hook runs `brain sync --push` INSIDE a capture's lock region
+        (synchronously under BRAIN_SYNC_PUSH). A rejected push that then ran a sync would
+        wait on the lock its own parent holds, forever. It must report pending instead."""
+        self.capture("behind")
+        self.merge_pr("knowledge/reference/ahead-note.md", "x\n")
+        env = dict(os.environ, BRAIN_DATA_ROOT=str(self.served),
+                   BRAIN_STATE_DIR=str(self.state))
+        with locks.repo_lock(self.state):
+            done = subprocess.run([sys.executable, str(ENGINE / "bin" / "brain"), "sync",
+                                   "--push"], cwd=str(self.served), env=env,
+                                  capture_output=True, text=True, timeout=20)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("pending", done.stdout)
 
 
 class SinglePusherTests(SyncCase):

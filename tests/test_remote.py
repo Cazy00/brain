@@ -1839,6 +1839,52 @@ class ServedMarkerWiringTests(unittest.TestCase):
                              + err.decode("utf-8", "replace")[-1500:])
         self.assertIn("brain-http", reason)
 
+    def test_brain_http_finishes_an_interrupted_install_before_serving(self):
+        """After a reboot mid-install, the server must not serve a half-checked-out tree
+        until the five-minute timer happens to come round."""
+        sys.path.insert(0, str(ENGINE / "bin"))
+        from brainlib import served, sync
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        data_root = make_data_root(base)
+        state_dir = base / "state"
+        state_dir.mkdir()
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=data_root,
+                              capture_output=True, text=True).stdout.strip()
+        (state_dir / sync.INSTALL_MARK).write_text(json.dumps({"from": head, "to": head}))
+        facts = data_root / "knowledge" / "reference" / "tunnel-facts.md"
+        facts.write_text("half of an interrupted checkout\n", encoding="utf-8")
+        key = base / "principal.key"
+        key.write_bytes(PRINCIPAL_KEY)
+        key.chmod(0o600)
+        config = base / "brain-http.json"
+        config.write_text(json.dumps({
+            "team_domain": TEAM, "owner_email": OWNER, "principal_key_file": str(key),
+            "endpoints": [{"hostname": "brain.test", "aud": AUD_WRITE,
+                           "profile": "capture"}]}), encoding="utf-8")
+        env = dict(os.environ, BRAIN_DATA_ROOT=str(data_root), BRAIN_STATE_DIR=str(state_dir))
+        env.pop("BRAIN_SERVED", None)
+        proc = subprocess.Popen([sys.executable, str(ENGINE / "bin" / "brain-http"),
+                                 "--config", str(config), "--bind", "127.0.0.1",
+                                 "--port", "0"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and proc.poll() is None:
+                if served.check(data_root, env={}):
+                    break
+                time.sleep(0.2)
+        finally:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        self.assertFalse((state_dir / sync.INSTALL_MARK).exists(), "the install was not finished")
+        self.assertNotIn("interrupted", facts.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -283,6 +283,12 @@ def main(argv) -> int:
         # which reads to an agent exactly like "the brain does not know that".
         sys.stderr.write("brain-http: refusing to start — %s\n" % reason)
         return 3
+    # A reboot in the middle of a sync's install leaves a half-checked-out tree; finish it
+    # before serving rather than waiting for the timer. Writes stay refused if it cannot.
+    problem = sync.repair(data_root, state_dir)
+    if problem:
+        sys.stderr.write("brain-http: WARNING %s — captures stay refused until it is "
+                         "resolved\n" % problem)
     # Before the socket opens: `brain consolidate` refuses a served folder (2.2).
     if not served.mark(data_root, "brain-http"):
         sys.stderr.write("brain-http: WARNING could not mark %s as served; consolidation "

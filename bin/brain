@@ -29,8 +29,8 @@ Commands:
                                    branch, pushed only after the audit passes;
                                    refuses a served folder (run it in its own clone)
   brain sync [--push]              converge the served folder's main with
-                                   origin/main (2.4); --push pushes main only, and
-                                   a rejected push becomes a sync. The one pusher.
+                                   origin/main (2.4); --push only pushes main
+                                   (the post-commit hook's entry). The one pusher.
   brain schedule install|uninstall|status [--with-consolidate]
   brain template <dest> [--force]  emit a publishable copy: all tooling, none
                                    of your notes (the public template is DERIVED)
@@ -2449,11 +2449,18 @@ def cmd_capture(argv: list) -> int:
     today = date.today().isoformat()
     stamp = time.strftime("%H%M%S")
     slug = slugify(text)[:40]
-    path = K / "inbox" / f"{today}-{stamp}-{slug}.md"
-    n = 2
-    while path.exists():
-        path = K / "inbox" / f"{today}-{stamp}-{slug}-{n}.md"
-        n += 1
+
+    def fresh_path() -> Path:
+        # Chosen again inside the lock for a committed capture: chosen only before it,
+        # a duplicate fired while the first waited picked the same file, overwrote the
+        # committed note and, finding nothing to commit, rolled it back off the disk.
+        candidate, n = K / "inbox" / f"{today}-{stamp}-{slug}.md", 2
+        while candidate.exists():
+            candidate = K / "inbox" / f"{today}-{stamp}-{slug}-{n}.md"
+            n += 1
+        return candidate
+
+    path = fresh_path()
     # `source` is written on EVERY capture, including the owner's own. Absent
     # would mean "no idea" — a note from before this field existed, or one
     # written by something that never said — and the consolidator would have to
@@ -2510,7 +2517,18 @@ def cmd_capture(argv: list) -> int:
     _test_hook("CAPTURE_BEFORE_LOCK")
     commit_id = ""
     with repo_lock():
+        path = fresh_path()
         branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        trunk = default_branch()
+        if atomic and branch != trunk and not branch.startswith("consolidate/"):
+            # The one pusher pushes main only, so a note committed on any other branch
+            # would be stranded there while its caller was told it was saved.
+            if not as_json:
+                print(f"NOT SAVED: this brain is on {branch!r}, not {trunk!r}. "
+                      "Nothing was written. Retry once it is back on its trunk.")
+            else:
+                report("retry", f"not on {trunk}")
+            return 1
         if branch.startswith("consolidate/"):
             # A capture committed onto the consolidation branch gets carried off to a
             # review branch and vanishes from main's working tree.
@@ -3704,7 +3722,8 @@ CONSOLIDATOR_DEFAULTS = {
                      "a planted private item and a planted contradiction and passed a "
                      "clean note; claude-opus-5-5 is the newer model and answered 2-4x "
                      "faster."),
-    "propose": "claude --model {model} --permission-mode acceptEdits -p",
+    "propose": ("claude --model {model} --permission-mode acceptEdits --strict-mcp-config "
+                "--mcp-config '{\"mcpServers\":{}}' -p"),
     "audit": ("claude --model {model} -p --safe-mode --restricted --strict-mcp-config "
               "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
               "--no-session-persistence"),
@@ -3730,18 +3749,19 @@ AUDIT_SWITCHES = ("--safe-mode", "--restricted", "--strict-mcp-config",
                   "--no-session-persistence")
 AUDIT_VALUES = {"--mcp-config": [{"mcpServers": {}}], "--tools": ["Read"],
                 "--permission-prompts": ["none"]}
-# Flags that would widen what the auditor reaches, refused even beside the required ones.
-AUDIT_FORBIDDEN = ("--add-dir", "--allowedTools", "--allowed-tools", "--permission-mode",
-                   "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
-                   "--settings", "--permission-prompt-tool", "--plugin-dir")
+# An allowlist, not a denylist: a flag nobody thought of (or a future one) cannot widen
+# the auditor, because anything not named here is refused.
+AUDIT_ALLOWED = {"--model", "-p", "--print", *AUDIT_SWITCHES, *AUDIT_VALUES}
+EMPTY_MCP = {"mcpServers": {}}
+# The one runner whose flags these are. Carried by another program they establish nothing,
+# so swapping the runner means teaching this file that program's confinement first.
+RUNNER = "claude"
 
 
-def audit_confinement_problem(argv: list):
-    """The first way this audit argv falls short of confinement, or None.
-
-    Values are read the way the CLI reads them: every token up to the next flag. That is
-    why the template must END on a switch — `--tools` is variadic, and a template ending on
-    `--tools Read` would take the appended prompt as a second tool name."""
+def _runner_flags(argv: list):
+    """(tokens, flags, problem): argv after the program, read the way the CLI reads it —
+    a flag's values are every token up to the next flag (`--tools` and `--mcp-config` are
+    variadic). flags maps each flag to one list of values per occurrence."""
     tokens = []
     for token in argv[1:]:
         tokens.extend(token.split("=", 1) if token.startswith("--") and "=" in token
@@ -3752,32 +3772,62 @@ def audit_confinement_problem(argv: list):
         while j < len(tokens) and not tokens[j].startswith("-"):
             j += 1
         if not tokens[i].startswith("-"):
-            return f"unexpected argument {tokens[i]!r}"
+            return tokens, flags, f"unexpected argument {tokens[i]!r}"
         flags.setdefault(tokens[i], []).append(tokens[i + 1:j])
         i = j
+    if Path(argv[0]).name != RUNNER:
+        return tokens, flags, (f"the runner is {argv[0]!r}, and these flags are facts about "
+                               f"the {RUNNER} CLI only")
+    return tokens, flags, None
+
+
+def _empty_mcp_problem(flags: dict):
+    if "--strict-mcp-config" not in flags:
+        return "missing --strict-mcp-config"
+    given = flags.get("--mcp-config")
+    if not given:
+        return "missing --mcp-config"
+    if len(given) != 1:
+        return "--mcp-config is given more than once"
+    try:
+        values = [json.loads(v) for v in given[0]]
+    except ValueError:
+        return "--mcp-config is not the empty MCP config"
+    if values != [EMPTY_MCP]:
+        return f"--mcp-config must be exactly {EMPTY_MCP!r}, got {given[0]!r}"
+    return None
+
+
+def audit_confinement_problem(argv: list):
+    """The first way this audit argv falls short of confinement, or None.
+
+    The template must END on a switch: `--tools` is variadic, and a template ending on
+    `--tools Read` would take the appended prompt as a second tool name."""
+    tokens, flags, problem = _runner_flags(argv)
+    if problem:
+        return problem
     switches = AUDIT_SWITCHES + ("-p", "--print")
     for switch in AUDIT_SWITCHES:
         if switch not in flags:
             return f"missing {switch}"
     if "-p" not in flags and "--print" not in flags:
         return "missing -p"
+    for flag in flags:
+        if flag not in AUDIT_ALLOWED:
+            return f"{flag} is not one of the flags the auditor may carry"
+    problem = _empty_mcp_problem(flags)
+    if problem:
+        return problem
     for flag, expected in AUDIT_VALUES.items():
+        if flag == "--mcp-config":
+            continue
         given = flags.get(flag)
         if not given:
             return f"missing {flag}"
         if len(given) != 1:
             return f"{flag} is given more than once"
-        values = given[0]
-        if flag == "--mcp-config":
-            try:
-                values = [json.loads(v) for v in values]
-            except ValueError:
-                return f"{flag} is not the empty MCP config"
-        if values != expected:
+        if given[0] != expected:
             return f"{flag} must be exactly {expected!r}, got {given[0]!r}"
-    for flag in AUDIT_FORBIDDEN:
-        if flag in flags:
-            return f"{flag} widens what the auditor can reach"
     for switch in switches:
         for values in flags.get(switch, []):
             if values:
@@ -3786,6 +3836,13 @@ def audit_confinement_problem(argv: list):
         return (f"the template must end on a switch that takes no value; it ends on "
                 f"{tokens[-1]!r}, which would take the prompt as its own value")
     return None
+
+
+def propose_isolation_problem(argv: list):
+    """Spec 5.2: the proposer reads untrusted transcripts, so it loads no MCP servers —
+    nothing that could write into the brain around the audit."""
+    _tokens, flags, problem = _runner_flags(argv)
+    return problem or _empty_mcp_problem(flags)
 
 
 def load_consolidator() -> dict:
@@ -3868,6 +3925,11 @@ def load_consolidator() -> dict:
             f"{source}: the audit invocation is not confined — {problem}. The auditor "
             "reads one snapshot and nothing else; every flag in the shipped audit line "
             "is what makes that true.")
+    problem = propose_isolation_problem(propose)
+    if problem:
+        raise ConsolidatorConfigError(
+            f"{source}: the propose invocation is not isolated from MCP — {problem}. It "
+            "reads untrusted transcripts, so it loads no MCP servers (spec 5.2).")
     if len(conf["audit_cannot_write"].split()) < 8:
         raise ConsolidatorConfigError(
             f"{source}: audit_cannot_write must say HOW this runner is prevented "
@@ -3918,16 +3980,31 @@ def staged_diff_vs_main() -> tuple:
     return result.stdout, None
 
 
-def audit_snapshot() -> tuple:
+SNAPSHOT_PREFIX = "brain-audit-snapshot-"
+
+
+def audit_snapshot(stale_after: int = 3600) -> tuple:
     """(path, omitted, error): a fresh, read-only copy of the staged tree (2.3).
 
     Exported from the index rather than copied from the working tree, so what is audited is
     what would be committed, and gitignored state (.cache/, the digest, the index) is simply
     not there. Symlinks and submodules are refused rather than copied: named in `omitted`,
-    never materialized, so no path inside the snapshot leads out of it."""
+    never materialized, so no path inside the snapshot leads out of it.
+
+    It is the whole private brain in the system temp dir, so it is readable by its owner
+    alone (0400 files, 0500 directories), and a snapshot older than `stale_after` that a
+    crash left behind is swept before a new one is made."""
     import tempfile
 
-    snap = Path(tempfile.mkdtemp(prefix="brain-audit-snapshot-"))
+    for leftover in Path(tempfile.gettempdir()).glob(SNAPSHOT_PREFIX + "*"):
+        try:
+            if leftover.is_dir() and not leftover.is_symlink() \
+                    and leftover.stat().st_uid == getattr(os, "getuid", lambda: 0)() \
+                    and time.time() - leftover.stat().st_mtime > stale_after:
+                remove_snapshot(leftover)
+        except OSError:
+            pass
+    snap = Path(tempfile.mkdtemp(prefix=SNAPSHOT_PREFIX))
 
     def fail(why):
         remove_snapshot(snap)
@@ -3958,8 +4035,8 @@ def audit_snapshot() -> tuple:
                 return fail(f"a symlink appeared in the snapshot at {name}")
     for root, _dirs, files in os.walk(snap, topdown=False):
         for name in files:
-            os.chmod(os.path.join(root, name), 0o444)
-        os.chmod(root, 0o555)
+            os.chmod(os.path.join(root, name), 0o400)
+        os.chmod(root, 0o500)
     return snap, omitted, None
 
 
@@ -4031,7 +4108,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
                    f"{AUDIT_MAX_DIFF_CHARS} characters — it exceeds what a pass "
                    "respecting its own caps can produce. Block on that alone.\n")
 
-    snap, omitted, snap_error = audit_snapshot()
+    snap, omitted, snap_error = audit_snapshot(stale_after=max(2 * timeout, 3600))
     if snap_error:
         return "error", f"could not build the read-only audit snapshot: {snap_error}"
     if omitted:
@@ -4301,8 +4378,10 @@ def cmd_consolidate(argv: list) -> int:
 
 
 def cmd_sync(argv: list) -> int:
-    """`brain sync`: see brainlib/sync.py. `--push` is the post-commit hook's entry:
-    push main, and only when the remote has moved, sync."""
+    """`brain sync`: see brainlib/sync.py. `--push` is the post-commit hook's entry, and
+    it only pushes. The hook runs inside a capture's lock region, so a sync from there
+    would wait on the lock its own parent holds; converging a moved remote is left to
+    the timer and the server queue, which never run inside that lock."""
     from brainlib import sync
 
     quiet = "--quiet" in argv
@@ -4312,9 +4391,9 @@ def cmd_sync(argv: list) -> int:
             if not quiet:
                 print("brain sync: main pushed")
             return 0
-        if not rejected:
-            print(f"brain sync: push pending — {detail}")
-            return 1
+        print("brain sync: push pending — "
+              + ("the remote moved; `brain sync` converges it" if rejected else detail))
+        return 1
     result = sync.run(ROOT, state_dir())
     if result.status != "in_sync" or not quiet:
         print(f"brain sync: {result.status}" + (f" — {result.detail}" if result.detail else ""))
@@ -5007,6 +5086,12 @@ def cmd_schedule(argv: list) -> int:
         return 2
     targets = ["doctor"]
     if "--with-consolidate" in argv:
+        served_reason = served.check(ROOT)
+        if action == "install" and served_reason:
+            print(f"refused — this folder is served ({served_reason}), and consolidation "
+                  "refuses a served folder, so a weekly pass here would fail every week. "
+                  "Schedule it in the brain's own clone. Nothing was installed.")
+            return 1
         targets.append("consolidate")
     if action == "uninstall":
         targets = list(SCHEDULES)
@@ -6104,7 +6189,35 @@ def cmd_doctor() -> int:
     # The inbox only drains if consolidation actually runs. Worth its own line
     # because a missing consolidate job is otherwise invisible: every other
     # check stays green while captures pile up with nowhere to go.
-    if schedule_serves_this_repo("consolidate"):
+    # brain sync records every run; exit 1 (pending) never alerts on its own, so a sync
+    # that has not succeeded for a day is this report's to raise: merged PRs stopped arriving.
+    sync_status = state_dir() / "sync-status.json"
+    if sync_status.exists():
+        try:
+            record = json.loads(sync_status.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            record = {}
+        last_ok = record.get("last_ok")
+        if not last_ok or time.time() - float(last_ok) > 86400:
+            since = (f"has not succeeded for "
+                     f"{int((time.time() - float(last_ok)) // 3600)} h" if last_ok
+                     else "has never succeeded")
+            print(f"  [RED] brain sync {since} — merged PRs are not "
+                  f"arriving (latest: {record.get('status', '?')}: "
+                  f"{record.get('detail') or 'no detail'})")
+            ok = False
+        else:
+            print(f"  [ok ] brain sync last succeeded "
+                  f"{int((time.time() - float(last_ok)) // 60)} min ago")
+
+    served_reason = served.check(ROOT)
+    if schedule_serves_this_repo("consolidate") and served_reason:
+        # Consolidation refuses a served folder (2.2), so this schedule fails every week.
+        print(f"  [RED] weekly consolidation is scheduled here, but this folder is served "
+              f"({served_reason}) and every pass will refuse — run it in its own clone, "
+              "or delete the marker if this folder is no longer served")
+        ok = False
+    elif schedule_serves_this_repo("consolidate"):
         print("  [ok ] weekly consolidation scheduled")
     elif osbackend.scheduler().status("consolidate") == "installed":
         print("  [RED] weekly consolidation is scheduled for a DIFFERENT brain — "
@@ -6299,7 +6412,10 @@ def main() -> int:
     if cmd == "doctor-notify":
         return cmd_doctor_notify()
     if cmd == "index":
-        return cmd_index(quiet="--quiet" in rest)
+        # Shared, like the reads below: an index built from a half-installed tree would
+        # look fresh afterwards and serve the mix until the next rebuild.
+        with locks.tree_lock(state_dir()):
+            return cmd_index(quiet="--quiet" in rest)
     if cmd in ("search", "read", "links", "recent"):
         # Readers take the tree shared; `brain sync` installs a new revision with
         # it exclusive, so a read sees the old tree or the new one, never half.

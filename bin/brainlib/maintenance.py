@@ -9,6 +9,7 @@ Conditions (the spec's failure table):
   - HEAD not on the default branch (a consolidation or a hand checkout left it elsewhere)
   - an index that cannot be read
   - a data volume that cannot be written
+  - an update `brain sync` was installing when it was interrupted (until it is finished)
 """
 import os
 import sqlite3
@@ -16,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 INBOX = "knowledge/inbox/"
+INSTALL_MARK = "sync-installing.json"   # brainlib/sync.py's marker; the contract between them
 
 
 def _git(data_root, *args):
@@ -27,6 +29,8 @@ def check(data_root, state_dir, branch="main"):
     data_root, state_dir = Path(data_root), Path(state_dir)
     if not (os.access(str(data_root), os.W_OK) and os.access(str(data_root / ".git"), os.W_OK)):
         return "data not writable"
+    if (state_dir / INSTALL_MARK).exists():
+        return "interrupted update"
     head = _git(data_root, "rev-parse", "--abbrev-ref", "HEAD")
     if head.returncode != 0 or head.stdout.strip() != branch:
         return "not on %s" % branch

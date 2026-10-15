@@ -64,7 +64,8 @@ backup() {
     esac
     [ -d "$path" ] && local_remote=yes
     # Through the single pusher (brainlib/sync.py): main, named explicitly,
-    # never HEAD and never forced; a push the remote rejects becomes a sync.
+    # never HEAD and never forced. Push only: this runs inside the capture's
+    # lock, so a moved remote is left to `brain sync` (the timer, the server).
     [ "$local_remote" = "no" ] && python3 "$BRAIN" sync --push --quiet
   fi
 }

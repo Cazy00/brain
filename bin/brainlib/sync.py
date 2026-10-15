@@ -19,22 +19,36 @@
 `HEAD`, never forced. The capture queue, the post-commit hook (`brain sync --push`) and
 `brain sync` itself all come through it.
 
+An install is a fast-forward of the served folder, under the tree lock, of a folder whose
+tracked files are clean. Before it starts, `<state>/sync-installing.json` records the revision
+before and after. A crash inside git's checkout leaves that marker behind: writes are refused
+while it exists (maintenance.check), and `repair` — the first thing every run does, and what
+brain-http does at startup — finishes the install, provided the folder is still at one of the
+two revisions; anything else is refused for a person.
+
 Results: in_sync, fast_forwarded, pushed, merged (exit 0); pending (1: try again later, nothing
 lost); refused (2: a person decides).
 """
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-from . import locks
+from . import locks, served
 
 BRANCH = "main"
 REFSPEC = "refs/heads/%s:refs/heads/%s" % (BRANCH, BRANCH)
 INBOX = "knowledge/inbox/"
 WORKTREES = "sync-worktrees"
+INSTALL_MARK = "sync-installing.json"
+# Every run's outcome and when one last succeeded: exit 1 is not an alert, so a sync that
+# never succeeds again (a revoked key, DNS) has to surface somewhere — `brain doctor`.
+STATUS_FILE = "sync-status.json"
+STALE_INDEX_LOCK_SECONDS = 30
 STEPS = ("fetched", "classified", "worktree", "merged", "linted", "installing", "installed",
          "pushing")
 CRASH_EXIT = 70
@@ -64,7 +78,19 @@ def push_argv() -> list:
 
 
 def push_main(data_root, run=None) -> tuple:
-    """(ok, detail, rejected). `rejected` means the remote moved: sync, then push again."""
+    """(ok, detail, rejected). `rejected` means the remote moved: sync, then push again.
+
+    In a served folder, what main brings over the last-fetched origin/main must be new inbox
+    notes and nothing else (spec 5.2); anything more is refused here, so no path around
+    `brain sync` can push it."""
+    if served.check(data_root):
+        known = _rev(data_root, "refs/remotes/origin/" + BRANCH)
+        local = _rev(data_root, "refs/heads/" + BRANCH)
+        if known and local and known != local:
+            problem = _local_changes_problem(Path(data_root), known, local)
+            if problem:
+                return False, "refused: " + problem, False
+
     def default(args):
         return subprocess.run(["git", *args], cwd=str(data_root), capture_output=True,
                               text=True, timeout=PUSH_TIMEOUT)
@@ -86,8 +112,30 @@ def default_lint(tree: Path) -> tuple:
     return done.returncode == 0, (done.stdout or done.stderr or "").strip()[-300:]
 
 
-def run(data_root, state_dir, lint=None, fault=None, before_push=None, retry: bool = True):
-    data_root, state_dir = Path(data_root), Path(state_dir)
+def run(data_root, state_dir, lint=None, fault=None, before_push=None):
+    result = _run(Path(data_root), Path(state_dir), lint, fault, before_push, retry=True)
+    _record(Path(state_dir), result)
+    return result
+
+
+def _record(state_dir: Path, result) -> None:
+    path = state_dir / STATUS_FILE
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = {}
+    now = time.time()
+    record.update(last_attempt=now, status=result.status, detail=result.detail[:300])
+    if result.exit_code == 0:
+        record["last_ok"] = now
+    record.setdefault("last_ok", None)
+    try:
+        _write_json(path, record)
+    except OSError:                            # pragma: no cover - full disk, read-only
+        pass
+
+
+def _run(data_root: Path, state_dir: Path, lint, fault, before_push, retry: bool):
     lint = lint or default_lint
 
     def step(name):
@@ -97,7 +145,6 @@ def run(data_root, state_dir, lint=None, fault=None, before_push=None, retry: bo
         if fault is not None:
             fault(name)
 
-    _clear_worktrees(data_root, state_dir)
     fetch = _git(data_root, "fetch", "--quiet", "origin",
                  "+refs/heads/%s:refs/remotes/origin/%s" % (BRANCH, BRANCH),
                  timeout=FETCH_TIMEOUT)
@@ -106,6 +153,12 @@ def run(data_root, state_dir, lint=None, fault=None, before_push=None, retry: bo
     step("fetched")
 
     with locks.repo_lock(state_dir):
+        # Under the lock: outside it, a second sync would delete the worktree a first
+        # one is merging in (the timer and the server queue can overlap).
+        _clear_worktrees(data_root, state_dir)
+        problem = _repair_locked(data_root, state_dir)
+        if problem:
+            return Result("refused", problem)
         head = _git(data_root, "symbolic-ref", "--quiet", "HEAD").stdout.strip()
         if head != "refs/heads/" + BRANCH:
             return Result("refused", "the served folder is on %s, not %s"
@@ -123,6 +176,10 @@ def run(data_root, state_dir, lint=None, fault=None, before_push=None, retry: bo
             step("installed")
             return Result("fast_forwarded", "now at %s" % remote[:12])
         merged = False
+        if base == remote and served.check(data_root):
+            problem = _local_changes_problem(data_root, base, local)
+            if problem:
+                return Result("refused", problem)
         if base != remote:
             problem = _local_changes_problem(data_root, base, local)
             if problem:
@@ -144,8 +201,7 @@ def run(data_root, state_dir, lint=None, fault=None, before_push=None, retry: bo
     if ok:
         return Result("merged" if merged else "pushed")
     if rejected and retry:
-        return run(data_root, state_dir, lint=lint, fault=fault, before_push=before_push,
-                   retry=False)
+        return _run(data_root, state_dir, lint, fault, before_push, retry=False)
     return Result("pending", "the push did not land: %s" % detail)
 
 
@@ -202,12 +258,86 @@ def _merge_in_worktree(data_root: Path, state_dir: Path, local: str, remote: str
 
 
 def _install(data_root: Path, state_dir: Path, target: str, step):
+    tracked = _git(data_root, "status", "--porcelain", "--untracked-files=no")
+    if tracked.returncode != 0 or tracked.stdout.strip():
+        return ("the served folder has uncommitted changes to tracked files, and an "
+                "install never overwrites them; a person decides: %s"
+                % (tracked.stdout.strip()[:200] or _tail(tracked)))
+    before = _rev(data_root, "HEAD")
+    mark = state_dir / INSTALL_MARK
     with locks.tree_lock(state_dir, exclusive=True):
+        _write_json(mark, {"from": before, "to": target})
         step("installing")
         done = _git(data_root, "merge", "--ff-only", "--quiet", target)
-        if done.returncode != 0:
+        if done.returncode == 0:
+            mark.unlink()
+            return None
+        untouched = _rev(data_root, "HEAD") == before and not _git(
+            data_root, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+        if untouched:                          # git refused before writing anything
+            mark.unlink()
             return "could not fast-forward the served folder: %s" % _tail(done)
+        return _finish_install(data_root, mark) or None
+
+
+def repair(data_root, state_dir):
+    """Finish an install a crash interrupted. None when there was nothing to do or it is
+    done; otherwise the reason a person has to decide. Takes the repo lock."""
+    with locks.repo_lock(Path(state_dir)):
+        return _repair_locked(Path(data_root), Path(state_dir))
+
+
+def _repair_locked(data_root: Path, state_dir: Path):
+    mark = state_dir / INSTALL_MARK
+    if not mark.exists():
+        return None
+    with locks.tree_lock(state_dir, exclusive=True):
+        return _finish_install(data_root, mark)
+
+
+def _finish_install(data_root: Path, mark: Path):
+    """Move the folder to the install's target. Only from the two revisions the marker names:
+    the target descends from the start, so nothing committed is lost, and the tracked tree
+    was clean when the install began, so every tracked change is the install's own."""
+    try:
+        record = json.loads(mark.read_text(encoding="utf-8"))
+        before, target = record["from"], record["to"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "an interrupted install left an unreadable marker at %s; a person decides" % mark
+    head = _rev(data_root, "HEAD")
+    if head not in (before, target):
+        return ("an interrupted install left the served folder at %s, neither %s nor %s; a "
+                "person decides (marker: %s)" % (head[:12], before[:12], target[:12], mark))
+    lock = Path(_git(data_root, "rev-parse", "--git-path", "index.lock").stdout.strip())
+    if not lock.is_absolute():
+        lock = data_root / lock
+    try:
+        if lock.exists():
+            if time.time() - lock.stat().st_mtime < STALE_INDEX_LOCK_SECONDS:
+                return "git is still busy in the served folder; the next run finishes the install"
+            lock.unlink()
+    except OSError as exc:
+        return "could not clear the interrupted install's index lock: %s" % exc
+    done = _git(data_root, "reset", "--hard", "--quiet", target)
+    if done.returncode != 0:
+        return "could not finish the interrupted install: %s" % _tail(done)
+    mark.unlink()
     return None
+
+
+def _write_json(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".sync-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _clear_worktrees(data_root: Path, state_dir: Path) -> None:
