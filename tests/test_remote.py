@@ -1770,5 +1770,52 @@ def _note_line(text: str) -> str:
     return ""
 
 
+class ServedMarkerWiringTests(unittest.TestCase):
+    """2.2: brain-http marks the folder it serves, so consolidation refuses it."""
+
+    def test_brain_http_marks_the_data_folder_it_serves(self):
+        sys.path.insert(0, str(ENGINE / "bin"))
+        from brainlib import served
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        data_root = make_data_root(base)
+        state_dir = base / "state"
+        state_dir.mkdir()
+        key = base / "principal.key"
+        key.write_bytes(PRINCIPAL_KEY)
+        key.chmod(0o600)
+        config = base / "brain-http.json"
+        config.write_text(json.dumps({
+            "team_domain": TEAM, "owner_email": OWNER, "principal_key_file": str(key),
+            "endpoints": [{"hostname": "brain.test", "aud": AUD_WRITE,
+                           "profile": "capture"}]}), encoding="utf-8")
+        self.assertIsNone(served.check(data_root, env={}))
+        env = dict(os.environ, BRAIN_DATA_ROOT=str(data_root),
+                   BRAIN_STATE_DIR=str(state_dir))
+        env.pop("BRAIN_SERVED", None)
+        proc = subprocess.Popen([sys.executable, str(ENGINE / "bin" / "brain-http"),
+                                 "--config", str(config), "--bind", "127.0.0.1",
+                                 "--port", "0"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and proc.poll() is None:
+                if served.check(data_root, env={}):
+                    break
+                time.sleep(0.2)
+            reason = served.check(data_root, env={})
+        finally:
+            proc.terminate()
+            try:
+                _out, err = proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _out, err = proc.communicate()
+        self.assertIsNotNone(reason, "brain-http served the folder without marking it:\n"
+                             + err.decode("utf-8", "replace")[-1500:])
+        self.assertIn("brain-http", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,8 +24,10 @@ Commands:
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
                                    Code sessions into .cache/ (never committed)
-  brain consolidate [--dry-run]    weekly tidy pass via the pinned runner in
-                                   setup/consolidator.conf; lands on a branch
+  brain consolidate [--dry-run] [--open-pr]   weekly tidy pass via the pinned
+                                   runner in setup/consolidator.conf; lands on a
+                                   branch, pushed only after the audit passes;
+                                   refuses a served folder (run it in its own clone)
   brain schedule install|uninstall|status [--with-consolidate]
   brain template <dest> [--force]  emit a publishable copy: all tooling, none
                                    of your notes (the public template is DERIVED)
@@ -70,6 +72,7 @@ capture).
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -142,7 +145,7 @@ def state_dir() -> Path:
 # file is also exec'd directly by tests/test_brain.py's load_brain_module(),
 # where sys.path[0] belongs to the test runner, not to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import osbackend
+from brainlib import osbackend, served
 # The note contract lives in brainlib/notes.py so that `brain publish` — which
 # decides what a customer may see — applies the SAME rules as lint, rather than
 # a second copy of them that drifts. Imported by name, so every call site in
@@ -3709,10 +3712,14 @@ CONSOLIDATOR_DEFAULTS = {
     # and it caught this within a minute of the edit.
     "model": "claude-opus-5",
     "propose": "claude --model {model} --permission-mode acceptEdits -p",
-    "audit": "claude --model {model} -p",
-    "audit_cannot_write": ("The Claude CLI grants no write tools in its default "
-                           "headless mode; propose opts in with --permission-mode "
-                           "acceptEdits and audit omits it."),
+    "audit": ("claude --model {model} -p --safe-mode --restricted --strict-mcp-config "
+              "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
+              "--no-session-persistence"),
+    "audit_cannot_write": ("The auditor's only tool is Read, confined by --restricted to "
+                           "its working directory, which is a read-only snapshot of the "
+                           "staged tree; it loads no MCP servers, hooks, skills or "
+                           "plugins, and anything that would prompt is denied. Propose "
+                           "alone opts into writes with --permission-mode acceptEdits."),
     "propose_timeout": "1800",
     "audit_timeout": "900",
 }
@@ -3720,6 +3727,72 @@ CONSOLIDATOR_DEFAULTS = {
 
 class ConsolidatorConfigError(Exception):
     """A consolidator config that would silently weaken the audit boundary."""
+
+
+# The auditor's confinement (2.3), as Claude CLI flags, each required with its exact value.
+# Together they leave one tool (Read), confined by --restricted to the working directory —
+# which audit_changes makes a read-only snapshot — with no MCP servers (so no brain_capture),
+# no hooks, skills or plugins, and no permission prompt that anyone could approve.
+AUDIT_SWITCHES = ("--safe-mode", "--restricted", "--strict-mcp-config",
+                  "--no-session-persistence")
+AUDIT_VALUES = {"--mcp-config": [{"mcpServers": {}}], "--tools": ["Read"],
+                "--permission-prompts": ["none"]}
+# Flags that would widen what the auditor reaches, refused even beside the required ones.
+AUDIT_FORBIDDEN = ("--add-dir", "--allowedTools", "--allowed-tools", "--permission-mode",
+                   "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                   "--settings", "--permission-prompt-tool", "--plugin-dir")
+
+
+def audit_confinement_problem(argv: list):
+    """The first way this audit argv falls short of confinement, or None.
+
+    Values are read the way the CLI reads them: every token up to the next flag. That is
+    why the template must END on a switch — `--tools` is variadic, and a template ending on
+    `--tools Read` would take the appended prompt as a second tool name."""
+    tokens = []
+    for token in argv[1:]:
+        tokens.extend(token.split("=", 1) if token.startswith("--") and "=" in token
+                      else [token])
+    flags, i = {}, 0
+    while i < len(tokens):
+        j = i + 1
+        while j < len(tokens) and not tokens[j].startswith("-"):
+            j += 1
+        if not tokens[i].startswith("-"):
+            return f"unexpected argument {tokens[i]!r}"
+        flags.setdefault(tokens[i], []).append(tokens[i + 1:j])
+        i = j
+    switches = AUDIT_SWITCHES + ("-p", "--print")
+    for switch in AUDIT_SWITCHES:
+        if switch not in flags:
+            return f"missing {switch}"
+    if "-p" not in flags and "--print" not in flags:
+        return "missing -p"
+    for flag, expected in AUDIT_VALUES.items():
+        given = flags.get(flag)
+        if not given:
+            return f"missing {flag}"
+        if len(given) != 1:
+            return f"{flag} is given more than once"
+        values = given[0]
+        if flag == "--mcp-config":
+            try:
+                values = [json.loads(v) for v in values]
+            except ValueError:
+                return f"{flag} is not the empty MCP config"
+        if values != expected:
+            return f"{flag} must be exactly {expected!r}, got {given[0]!r}"
+    for flag in AUDIT_FORBIDDEN:
+        if flag in flags:
+            return f"{flag} widens what the auditor can reach"
+    for switch in switches:
+        for values in flags.get(switch, []):
+            if values:
+                return f"{switch} takes no value, but is followed by {values[0]!r}"
+    if tokens[-1] not in switches:
+        return (f"the template must end on a switch that takes no value; it ends on "
+                f"{tokens[-1]!r}, which would take the prompt as its own value")
+    return None
 
 
 def load_consolidator() -> dict:
@@ -3796,6 +3869,12 @@ def load_consolidator() -> dict:
             "has exactly the write access the proposer does. The audit is a "
             "security boundary, not a second opinion — express the read-only "
             "invocation separately (see the comments in that file).")
+    problem = audit_confinement_problem(audit)
+    if problem:
+        raise ConsolidatorConfigError(
+            f"{source}: the audit invocation is not confined — {problem}. The auditor "
+            "reads one snapshot and nothing else; every flag in the shipped audit line "
+            "is what makes that true.")
     if len(conf["audit_cannot_write"].split()) < 8:
         raise ConsolidatorConfigError(
             f"{source}: audit_cannot_write must say HOW this runner is prevented "
@@ -3844,6 +3923,62 @@ def staged_diff_vs_main() -> tuple:
     return result.stdout, None
 
 
+def audit_snapshot() -> tuple:
+    """(path, omitted, error): a fresh, read-only copy of the staged tree (2.3).
+
+    Exported from the index rather than copied from the working tree, so what is audited is
+    what would be committed, and gitignored state (.cache/, the digest, the index) is simply
+    not there. Symlinks and submodules are refused rather than copied: named in `omitted`,
+    never materialized, so no path inside the snapshot leads out of it."""
+    import tempfile
+
+    snap = Path(tempfile.mkdtemp(prefix="brain-audit-snapshot-"))
+
+    def fail(why):
+        remove_snapshot(snap)
+        return None, [], why
+
+    listing = subprocess.run(["git", "ls-files", "--stage", "-z"], cwd=ROOT,
+                             capture_output=True)
+    if listing.returncode != 0:
+        return fail("could not list the staged tree")
+    keep, omitted = [], []
+    for entry in listing.stdout.split(b"\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition(b"\t")
+        if meta.split(b" ", 1)[0] in (b"120000", b"160000"):
+            omitted.append(path.decode("utf-8", "replace"))
+        else:
+            keep.append(path)
+    if keep:
+        export = subprocess.run(["git", "checkout-index", "-z", "--stdin", f"--prefix={snap}/"],
+                                cwd=ROOT, input=b"\0".join(keep) + b"\0", capture_output=True)
+        if export.returncode != 0:
+            return fail("could not export the staged tree: "
+                        + export.stderr.decode("utf-8", "replace").strip()[-200:])
+    for root, dirs, files in os.walk(snap):
+        for name in dirs + files:
+            if os.path.islink(os.path.join(root, name)):
+                return fail(f"a symlink appeared in the snapshot at {name}")
+    for root, _dirs, files in os.walk(snap, topdown=False):
+        for name in files:
+            os.chmod(os.path.join(root, name), 0o444)
+        os.chmod(root, 0o555)
+    return snap, omitted, None
+
+
+def remove_snapshot(snap: Path) -> None:
+    import shutil
+
+    for root, _dirs, _files in os.walk(snap):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass
+    shutil.rmtree(snap, ignore_errors=True)
+
+
 def audit_changes(runner: dict, timeout: int = None) -> tuple:
     """Independently audit the staged consolidation diff. Returns (verdict, detail)
     where verdict is 'pass', 'block' or 'error'.
@@ -3865,6 +4000,10 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     - The auditor CANNOT READ THE DIGEST. The file is moved out of the repo for
       the duration, not merely left unmentioned. Blindness has to be a fact of
       the filesystem; a prompt asking it not to look is not a control.
+    - The auditor CANNOT REACH THE REPOSITORY. It runs in a fresh read-only
+      snapshot of the staged tree (audit_snapshot), and its runner flags confine
+      it to that directory with Read as its only tool (load_consolidator refuses
+      an audit line without them). The snapshot is deleted afterwards.
 
     Fails CLOSED: a missing or unparseable verdict blocks. The work is preserved
     on the branch and `bin/brain doctor` reports unreviewed consolidation
@@ -3897,8 +4036,17 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
                    f"{AUDIT_MAX_DIFF_CHARS} characters — it exceeds what a pass "
                    "respecting its own caps can produce. Block on that alone.\n")
 
-    # Move the digest OUT OF THE REPO for the duration. The auditor runs with
-    # cwd=ROOT and can glob .cache/, so renaming in place would not blind it.
+    snap, omitted, snap_error = audit_snapshot()
+    if snap_error:
+        return "error", f"could not build the read-only audit snapshot: {snap_error}"
+    if omitted:
+        prompt += ("\nNOTE: your working directory is a read-only snapshot of the staged "
+                   "tree. These symlinks or submodules were refused, not copied: "
+                   + ", ".join(omitted[:50]) + "\n")
+
+    # Move the digest OUT OF THE REPO for the duration. The snapshot never holds it,
+    # but a runner that could reach outside its working directory would find it in
+    # .cache/, and blindness has to hold whatever the runner's flags turn out to do.
     stash_dir = tempfile.mkdtemp(prefix="brain-audit-")
     digest, hidden = digest_path(), None
     try:
@@ -3908,7 +4056,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
         try:
             run = subprocess.run(
                 [*runner["audit"], prompt],
-                cwd=ROOT, text=True, capture_output=True, timeout=timeout,
+                cwd=str(snap), text=True, capture_output=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             return "error", f"auditor timed out after {timeout}s"
@@ -3921,6 +4069,7 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
             except OSError:
                 pass
         shutil.rmtree(stash_dir, ignore_errors=True)
+        remove_snapshot(snap)
 
     out = (run.stdout or "").strip()
     if run.returncode != 0:
@@ -3944,6 +4093,34 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
     return "block", (reason or "unspecified")[:300] + " (full report: .cache/audit-report.md)"
 
 
+def open_pull_request(branch: str, trunk: str, title: str, body: str,
+                      which=None, run=None) -> int:
+    """`consolidate --open-pr`: open the audited branch's pull request with gh, or print
+    the command when gh is not installed. The merge itself stays a person's tap."""
+    import shutil
+
+    which = which or shutil.which
+    run = run or subprocess.run
+    cmd = ["gh", "pr", "create", "--base", trunk, "--head", branch,
+           "--title", title, "--body", body]
+    if not which("gh"):
+        print("gh is not installed — open the pull request with:")
+        print("  " + shlex.join(cmd))
+        return 0
+    try:
+        pr = run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=120)
+        error = None if pr.returncode == 0 else (
+            (pr.stderr or pr.stdout or "").strip()[-300:] or f"gh exited {pr.returncode}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = repr(exc)
+    if error is None:
+        print(f"pull request: {(pr.stdout or '').strip()}")
+        return 0
+    print(f"PULL REQUEST NOT OPENED: {error}")
+    print("  open it with: " + shlex.join(cmd))
+    return 1
+
+
 def cmd_consolidate(argv: list) -> int:
     prompt_path = ENGINE / "setup" / "consolidate-prompt.md"
     if not prompt_path.exists():
@@ -3958,6 +4135,14 @@ def cmd_consolidate(argv: list) -> int:
         runner = load_consolidator()
     except ConsolidatorConfigError as exc:
         print(f"consolidation refused — {exc}")
+        return 1
+    # 2.2: never in the folder captures land in. Consolidation switches branches and
+    # stages everything, so it runs in its own clone — refused here, before a branch.
+    served_reason = served.check(ROOT)
+    if served_reason:
+        print(f"consolidation refused — this folder is served: {served_reason}")
+        print("  Consolidation runs in its own clone: git clone <remote> <dir>, then run "
+              "<dir>/bin/brain consolidate there.")
         return 1
     if "--dry-run" in argv:
         print(f"would consolidate: {len(inbox_items)} inbox item(s)")
@@ -4051,8 +4236,10 @@ def cmd_consolidate(argv: list) -> int:
         failure = f"could not diff the branch against main: {staged_error}"
     changed = bool(staged.strip())
 
+    audit_detail = ""
     if failure is None and changed:
         verdict, detail = audit_changes(runner)
+        audit_detail = detail
         print(f"  audit: {detail}")
         if verdict != "pass":
             failure = f"audit {verdict}: {detail}"
@@ -4104,6 +4291,15 @@ def cmd_consolidate(argv: list) -> int:
     print(f"consolidation committed on {branch} (never on main)"
           + ("" if pushed else " — PUSH FAILED, run: git push -u origin " + branch))
     print(f"review:  git diff main...{branch}")
+    if "--open-pr" in argv:
+        if not pushed:
+            print("pull request not opened — the branch is not on the remote")
+            return 1
+        trunk = default_branch()
+        return open_pull_request(
+            branch, trunk, f"consolidate: {today}",
+            f"Consolidation pass of {today}, audited before it was pushed "
+            f"({audit_detail}).\n\nReview: `git diff {trunk}...{branch}`")
     print(f"merge:   git merge {branch} && git push")
     return 0
 

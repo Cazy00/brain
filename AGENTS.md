@@ -256,8 +256,8 @@ answer to "does using a different model make my brain worse":
   warning anywhere in this system.
 
 Two invocations, and the difference between them is a security boundary: the
-write-capable `propose` pass, and a `audit` pass that cannot write and cannot
-see the session digest. `bin/brain consolidate` REFUSES to start if the config
+write-capable `propose` pass, and a `audit` pass that cannot write, cannot
+see the session digest, and reads only a read-only snapshot of the staged tree. `bin/brain consolidate` REFUSES to start if the config
 does not distinguish them — read-only-ness is a property of the specific tool,
 not something a command string carries with it, so swapping runners means
 re-establishing it and writing down how.

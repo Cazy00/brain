@@ -40,7 +40,7 @@ import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import access, capture, httplog, httpmcp, maintenance, mcpcore  # noqa: E402
+from brainlib import access, capture, httplog, httpmcp, maintenance, mcpcore, served  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = "/etc/brain/brain-http.json"
@@ -279,6 +279,10 @@ def main(argv) -> int:
         # which reads to an agent exactly like "the brain does not know that".
         sys.stderr.write("brain-http: refusing to start — %s\n" % reason)
         return 3
+    # Before the socket opens: `brain consolidate` refuses a served folder (2.2).
+    if not served.mark(data_root, "brain-http"):
+        sys.stderr.write("brain-http: WARNING could not mark %s as served; consolidation "
+                         "would not refuse it\n" % data_root)
 
     host = _flag(argv, "--bind") or config.get("bind") or "127.0.0.1"
     port = int(_flag(argv, "--port") or config.get("port") or 8787)

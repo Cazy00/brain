@@ -1140,6 +1140,7 @@ class TestTheCli(unittest.TestCase):
         self.oauth_store = oauth.Store(Path(self.tmp.name) / "oauth.db")
         self.log = eventlog.EventLog(Path(self.tmp.name) / "events.jsonl")
         self.started = []
+        self.marked = []
         self.out = io.StringIO()
         self.err = io.StringIO()
 
@@ -1147,7 +1148,29 @@ class TestTheCli(unittest.TestCase):
         with contextlib.redirect_stdout(self.out), contextlib.redirect_stderr(self.err):
             return serve.run_serve(list(argv), store=self.store,
                                    oauth_store=self.oauth_store, log=self.log,
-                                   run=self.started.append)
+                                   run=self.started.append,
+                                   mark=lambda: self.marked.append(len(self.started)))
+
+    def test_serving_marks_the_folder_before_it_listens(self):
+        """2.2: a served folder says so, so `brain consolidate` refuses to run in it."""
+        self.run_serve("--new-token")
+        self.assertEqual(self.marked, [], "--new-token marked the folder served")
+        self.run_serve("--port", "0")
+        self.addCleanup(self.started[0].server_close)
+        self.assertEqual(self.marked, [0], "the folder was not marked before serving")
+
+    def test_an_injected_run_never_marks_the_real_checkout(self):
+        """A caller that injects `run` is a test, and mcp.ROOT is then the developer's
+        own checkout: the default must not mark it served."""
+        self.run_serve("--new-token")
+        with mock.patch.object(serve.served, "mark") as marked:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                serve.run_serve(["--port", "0"], store=self.store,
+                                oauth_store=self.oauth_store, log=self.log,
+                                run=self.started.append)
+        self.addCleanup(self.started[-1].server_close)
+        marked.assert_not_called()
 
     def test_it_refuses_to_start_without_one_and_names_the_fix(self):
         """A refusal, not a warning, and not a silent mint.
