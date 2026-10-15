@@ -40,7 +40,8 @@ import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import access, capture, httplog, httpmcp, maintenance, mcpcore, served  # noqa: E402
+from brainlib import (access, capture, httplog, httpmcp, maintenance, mcpcore,  # noqa: E402
+                      served, sync)
 
 ENGINE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = "/etc/brain/brain-http.json"
@@ -180,8 +181,11 @@ def build(config: dict, data_root, state_dir):
         principal_key=principal_key,
     )
     log = httplog.EventLog(state_dir)
+    # A push the remote rejects (an owner's PR merged meanwhile) becomes one
+    # `brain sync`, the same code path the brain-sync timer runs (2.4).
     queue = capture.BackupQueue(data_root, log=log,
-                                enabled=bool(config.get("git_push", True)))
+                                enabled=bool(config.get("git_push", True)),
+                                syncer=lambda: sync.run(data_root, state_dir))
     capturer = capture.Capturer(
         brain_bin=str(ENGINE / "bin" / "brain"), data_root=data_root,
         ledger=capture.Ledger(state_dir, principal_key), queue=queue, log=log,

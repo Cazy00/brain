@@ -28,6 +28,9 @@ Commands:
                                    runner in setup/consolidator.conf; lands on a
                                    branch, pushed only after the audit passes;
                                    refuses a served folder (run it in its own clone)
+  brain sync [--push]              converge the served folder's main with
+                                   origin/main (2.4); --push pushes main only, and
+                                   a rejected push becomes a sync. The one pusher.
   brain schedule install|uninstall|status [--with-consolidate]
   brain template <dest> [--force]  emit a publishable copy: all tooling, none
                                    of your notes (the public template is DERIVED)
@@ -145,7 +148,7 @@ def state_dir() -> Path:
 # file is also exec'd directly by tests/test_brain.py's load_brain_module(),
 # where sys.path[0] belongs to the test runner, not to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import osbackend, served
+from brainlib import locks, osbackend, served
 # The note contract lives in brainlib/notes.py so that `brain publish` — which
 # decides what a customer may see — applies the SAME rules as lint, rather than
 # a second copy of them that drifts. Imported by name, so every call site in
@@ -248,7 +251,7 @@ def default_branch() -> str:
     return _DEFAULT_BRANCH
 
 
-class repo_lock:
+def repo_lock():
     """Serialize git-index mutations across concurrent brain processes.
 
     Every agent session runs its own MCP server, so two `capture --commit`
@@ -256,24 +259,9 @@ class repo_lock:
     commit swept in the other's staged file (committed under the wrong
     message) and left notes uncommitted while telling the caller they were
     saved. An exclusive advisory lock elects one writer at a time. Non-POSIX
-    platforms fall back to no lock (best-effort), same as the index builder."""
-
-    def __enter__(self):
-        state_dir().mkdir(parents=True, exist_ok=True)
-        self._lf = open(state_dir() / "git.lock", "w")
-        try:
-            import fcntl
-            fcntl.flock(self._lf, fcntl.LOCK_EX)
-        except ImportError:
-            pass
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            self._lf.close()
-        except Exception:
-            pass
-        return False
+    platforms fall back to no lock (best-effort), same as the index builder.
+    The lock itself lives in brainlib/locks.py, shared with `brain sync`."""
+    return locks.repo_lock(state_dir())
 
 
 def is_local_remote(url: str) -> bool:
@@ -4304,6 +4292,27 @@ def cmd_consolidate(argv: list) -> int:
     return 0
 
 
+def cmd_sync(argv: list) -> int:
+    """`brain sync`: see brainlib/sync.py. `--push` is the post-commit hook's entry:
+    push main, and only when the remote has moved, sync."""
+    from brainlib import sync
+
+    quiet = "--quiet" in argv
+    if "--push" in argv:
+        ok, detail, rejected = sync.push_main(ROOT)
+        if ok:
+            if not quiet:
+                print("brain sync: main pushed")
+            return 0
+        if not rejected:
+            print(f"brain sync: push pending — {detail}")
+            return 1
+    result = sync.run(ROOT, state_dir())
+    if result.status != "in_sync" or not quiet:
+        print(f"brain sync: {result.status}" + (f" — {result.detail}" if result.detail else ""))
+    return result.exit_code
+
+
 # Paths relative to knowledge/ — the scaffolding a brain needs to exist, as
 # opposed to anything the owner has actually written down. note-conventions is
 # documentation of the system rather than knowledge about its owner, and an
@@ -6283,14 +6292,15 @@ def main() -> int:
         return cmd_doctor_notify()
     if cmd == "index":
         return cmd_index(quiet="--quiet" in rest)
-    if cmd == "search":
-        return cmd_search(rest)
-    if cmd == "read":
-        return cmd_read(rest)
-    if cmd == "links":
-        return cmd_links(rest)
-    if cmd == "recent":
-        return cmd_recent(rest)
+    if cmd in ("search", "read", "links", "recent"):
+        # Readers take the tree shared; `brain sync` installs a new revision with
+        # it exclusive, so a read sees the old tree or the new one, never half.
+        reads = {"search": cmd_search, "read": cmd_read, "links": cmd_links,
+                 "recent": cmd_recent}
+        with locks.tree_lock(state_dir()):
+            return reads[cmd](rest)
+    if cmd == "sync":
+        return cmd_sync(rest)
     if cmd == "supersede":
         return cmd_supersede(rest)
     if cmd == "sessions":

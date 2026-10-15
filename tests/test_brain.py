@@ -2051,6 +2051,15 @@ class MergeBackupTests(unittest.TestCase):
         self.assertIn("push", calls,
                       "post-merge never reached the push — the backup is inert:\n" + calls)
 
+    def test_the_hook_pushes_through_the_single_pusher_never_head(self):
+        """2.4: the hook names main explicitly via `brain sync --push`; pushing
+        HEAD would make the hook a second pusher with its own idea of the branch."""
+        log, env = self.git_shim()
+        calls = self.run_hook_and_read_calls(".githooks/post-commit", env, log)
+        pushes = [line for line in calls.splitlines() if line.startswith("push")]
+        self.assertEqual(pushes, ["push --porcelain origin refs/heads/main:refs/heads/main"],
+                         calls)
+
     def test_post_merge_never_pushes_a_consolidate_branch(self):
         """post-merge delegates to post-commit precisely so the audit gate keeps
         applying at the merge entry point too. If it ever grows its own copy of

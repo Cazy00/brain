@@ -50,6 +50,8 @@ import threading
 import time
 from pathlib import Path
 
+from . import sync
+
 LEDGER_FILE = "capture-ledger.db"
 
 # What the ledger may keep about a capture. The commit id is a hash and says
@@ -175,11 +177,16 @@ class BackupQueue(object):
     A single worker thread, because the repository has a single writer and two
     concurrent pushes to one branch would simply make one of them fail. It is
     woken by a capture and otherwise sleeps; there is no polling loop burning a
-    timer on a box that is idle most of the day."""
+    timer on a box that is idle most of the day.
+
+    It pushes through sync.push_main, the one pusher: main, named explicitly.
+    When the remote has moved, `syncer` (brain sync) runs once instead of a
+    retry loop hammering a push that cannot fast-forward."""
 
     def __init__(self, data_root, log=None, clock=time.time, runner=None,
-                 sleeper=None, enabled: bool = True):
+                 sleeper=None, enabled: bool = True, syncer=None):
         self.data_root = str(data_root)
+        self._syncer = syncer
         self._log = log
         self._clock = clock
         self._run = runner or self._git
@@ -266,8 +273,14 @@ class BackupQueue(object):
         if outstanding == 0:
             self._clear()
             return True
-        done = self._run(["push", "--quiet", "origin", "HEAD"])
-        if done.returncode == 0 and self.unpushed() == 0:
+        ok, _detail, rejected = sync.push_main(self.data_root, run=self._run)
+        if not ok and rejected and self._syncer is not None:
+            try:
+                self._syncer()
+            except Exception:                  # pragma: no cover - logged by the caller
+                pass
+            ok = self.unpushed() == 0
+        if ok and self.unpushed() == 0:
             self._clear()
             if self._log:
                 self._log.record("push_succeeded", count=outstanding, backup="pushed")

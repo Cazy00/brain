@@ -969,10 +969,11 @@ class FakeGit(object):
             self.stdout = stdout
             self.stderr = ""
 
-    def __init__(self, unpushed=1, push_ok=True, upstream=True):
+    def __init__(self, unpushed=1, push_ok=True, upstream=True, push_rejected=False):
         self.unpushed = unpushed
         self.push_ok = push_ok
         self.upstream = upstream
+        self.push_rejected = push_rejected
         self.calls = []
 
     def __call__(self, args):
@@ -982,6 +983,9 @@ class FakeGit(object):
                 return self.Done(128)
             return self.Done(0, "%d\n" % self.unpushed)
         if args[0] == "push":
+            if self.push_rejected:
+                return self.Done(1, "To origin\n!\trefs/heads/main:refs/heads/main\t"
+                                    "[rejected] (fetch first)\nDone\n")
             if self.push_ok:
                 self.unpushed = 0
                 return self.Done(0)
@@ -1067,6 +1071,25 @@ class BackupQueueTests(unittest.TestCase):
         queue = self.queue(FakeGit(unpushed=2, push_ok=True))
         self.assertTrue(queue.push_once())
         self.assertEqual(queue.state(), "pushed")
+
+    def test_the_queue_pushes_exactly_main_through_the_single_pusher(self):
+        """2.4: one code path pushes, and it names main — never HEAD."""
+        git = FakeGit(unpushed=1, push_ok=True)
+        self.queue(git).push_once()
+        pushes = [c for c in git.calls if c[0] == "push"]
+        self.assertEqual(pushes, [["push", "--porcelain", "origin",
+                                   "refs/heads/main:refs/heads/main"]])
+
+    def test_a_rejected_push_triggers_one_sync_not_a_retry_loop(self):
+        git = FakeGit(unpushed=1, push_rejected=True)
+        synced = []
+        queue = capture.BackupQueue(self.tmp.name, log=self.log, clock=lambda: self.now,
+                                    runner=git, sleeper=lambda _s: None,
+                                    syncer=lambda: synced.append(1))
+        self.assertFalse(queue.push_once())
+        self.assertEqual(synced, [1], "a rejected push did not hand over to sync")
+        self.assertEqual(len([c for c in git.calls if c[0] == "push"]), 1,
+                         "the queue retried the push itself")
 
     def test_nothing_to_push_is_success_and_does_not_call_push(self):
         git = FakeGit(unpushed=0)

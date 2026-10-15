@@ -1,0 +1,16 @@
+# Every five minutes, so a PR the owner merges on the phone is served within
+# minutes. A calendar rather than a monotonic interval so it follows the house
+# rule every timer here follows: UTC, and Persistent=true, so the first run after
+# a reboot is immediate instead of waiting out a fresh interval.
+[Unit]
+Description=brain sync every five minutes
+Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00 UTC
+Persistent=true
+RandomizedDelaySec=30s
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
