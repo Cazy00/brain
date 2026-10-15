@@ -4063,13 +4063,31 @@ class ConsolidatorConfigTests(unittest.TestCase):
         changes. If this drifts, an unattended weekly job changed silently."""
         runner = self.module.load_consolidator()
         self.assertEqual(runner["propose"],
-                         ["claude", "--model", "claude-opus-5",
+                         ["claude", "--model", "claude-opus-5-5",
                           "--permission-mode", "acceptEdits", "-p"])
         self.assertEqual(runner["audit"],
-                         ["claude", "--model", "claude-opus-5", "-p", *CONFINED_ARGV])
+                         ["claude", "--model", "claude-opus-5-5", "-p", *CONFINED_ARGV])
         self.assertEqual(runner["propose_timeout"], 1800)
         self.assertEqual(runner["audit_timeout"], 900)
         self.assertIn("consolidator.conf", runner["source"])
+
+    def test_the_pin_carries_its_reason_in_both_copies(self):
+        """2.6: the pin is a decision, so the reason travels with it — and the
+        conf and the built-in defaults agree on both, like every other field."""
+        runner = self.module.load_consolidator()
+        self.assertGreaterEqual(len(runner["model_reason"].split()), 8,
+                                "the pinned model has no recorded reason")
+        self.assertEqual(runner["model"], self.module.CONSOLIDATOR_DEFAULTS["model"])
+        self.assertEqual(runner["model_reason"],
+                         self.module.CONSOLIDATOR_DEFAULTS["model_reason"])
+
+    def test_dry_run_prints_the_pin_and_its_reason(self):
+        runner = self.module.load_consolidator()
+        out = run_brain("consolidate", "--dry-run", repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        line = next((l for l in out.stdout.splitlines() if l.startswith("model:")), "")
+        self.assertIn(runner["model"], line, out.stdout)
+        self.assertIn(runner["model_reason"][:40], line)
 
     def test_a_missing_config_falls_back_to_the_shipped_default(self):
         shipped = self.module.load_consolidator()
