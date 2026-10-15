@@ -1017,6 +1017,30 @@ class ConsolidateTests(unittest.TestCase):
         return subprocess.run(["git", "branch", "--list", "consolidate/*"], cwd=self.repo,
                               capture_output=True, text=True).stdout.strip()
 
+    def test_a_proposer_that_touches_git_control_files_lands_nothing_and_runs_nothing(self):
+        """Harbor Phase 3 final review: a prompt-injected proposer with acceptEdits could write
+        .git/config or a hook, and the engine's own git calls after it (status, add, commit)
+        would run that code as the engine's user, after the audit. The engine restores the
+        files it snapshotted before the proposer ran, and refuses the pass, before any git."""
+        mark = Path(self.tmp.name) / "ran"
+        self.stub_runner("VERDICT: PASS")
+        stub = self.stub_bin / "claude"
+        body = stub.read_text().rstrip()
+        assert body.endswith("exit 0"), body
+        stub.write_text(body[:-len("exit 0")] +
+                        'printf "[core]\\n\\tfsmonitor = touch %s\\n\\thooksPath = .git/hooks\\n" >> .git/config\n'
+                        'printf "#!/bin/sh\\ntouch %s\\n" > .git/hooks/pre-commit\n'
+                        'chmod +x .git/hooks/pre-commit\n'
+                        'exit 0\n' % (mark, mark))
+        before = (self.repo / ".git" / "config").read_text()
+        result = self.consolidate_with()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("git control files", result.stdout)
+        self.assertEqual(self.commits_on_branch(), [])
+        self.assertFalse(mark.exists(), "code the proposer planted ran")
+        self.assertEqual((self.repo / ".git" / "config").read_text(), before)
+        self.assertFalse((self.repo / ".git" / "hooks" / "pre-commit").exists())
+
     def test_consolidate_refuses_a_served_folder(self):
         """The served folder is where captures land. Consolidation switches
         branches and stages everything, so it runs in its own clone — and a

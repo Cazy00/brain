@@ -3962,6 +3962,42 @@ def load_consolidator() -> dict:
     }
 
 
+GIT_CONTROL = ("config", "hooks", "info")
+
+
+def git_control_snapshot(git_dir: Path) -> dict:
+    """Every file under the repository's own config, hooks and info, by path: what git reads
+    settings and runnable code from inside a checkout (Harbor Phase 3 final review)."""
+    snap = {}
+    for name in GIT_CONTROL:
+        top = git_dir / name
+        paths = [top] if (top.is_file() or top.is_symlink()) else (
+            sorted(p for p in top.rglob("*") if p.is_file() or p.is_symlink())
+            if top.is_dir() else [])
+        for path in paths:
+            snap[path] = (("link", os.readlink(path)) if path.is_symlink()
+                          else ("file", path.read_bytes(), path.stat().st_mode & 0o777))
+    return snap
+
+
+def restore_git_control(git_dir: Path, before: dict) -> list:
+    """Put config, hooks and info back as they were before the proposer ran, without running
+    git. Returns what had changed, relative to the git directory."""
+    now = git_control_snapshot(git_dir)
+    changed = sorted(p for p in set(before) | set(now) if before.get(p) != now.get(p))
+    for path in changed:
+        if path.is_symlink() or path.exists():
+            path.unlink()
+        if path in before:
+            kind = before[path]
+            if kind[0] == "link":
+                os.symlink(kind[1], path)
+            else:
+                path.write_bytes(kind[1])
+                path.chmod(kind[2])
+    return [str(p.relative_to(git_dir)) for p in changed]
+
+
 def staged_diff_vs_main() -> tuple:
     """(diff_text, error). The plain git() helper returns '' on failure, which a
     caller cannot tell from 'nothing changed' — and reading a failed diff as an
@@ -4290,6 +4326,11 @@ def cmd_consolidate(argv: list) -> int:
     # message claimed the consolidation had landed either way.
     failure = None
     runner_name = runner["propose"][0]
+    # The proposer can write files in the checkout, the git directory included. Its config,
+    # hooks and info are put back before the engine runs git again, and a pass that touched
+    # them lands nothing: that code would run as this user, after the audit.
+    git_dir = Path(git("rev-parse", "--absolute-git-dir", check=True))
+    control = git_control_snapshot(git_dir)
     try:
         run = subprocess.run(
             [*runner["propose"], propose_prompt(prompt_path.read_text(encoding="utf-8"))],
@@ -4304,6 +4345,10 @@ def cmd_consolidate(argv: list) -> int:
         failure = f"{runner_name} timed out after {runner['propose_timeout']}s"
     except (OSError, subprocess.SubprocessError) as exc:
         failure = f"could not run {runner_name}: {exc!r}"
+    touched = restore_git_control(git_dir, control)
+    if touched:
+        failure = (f"the proposer changed git control files ({', '.join(touched)}); "
+                   f"they are restored and nothing lands")
 
     dirty = bool(git("status", "--porcelain").strip())
     try:
