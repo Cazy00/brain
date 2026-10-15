@@ -4248,6 +4248,49 @@ def propose_prompt(text: str) -> str:
             f"{ENGINE}.\n\n" + text)
 
 
+def cmd_audit_branch(argv: list) -> int:
+    """`brain audit-branch --branch NAME`: audit a committed branch against the trunk with the
+    engine's confined auditor, without writing to the checkout.
+
+    Harbor's curator-audit user (Phase 5, 5.4) reads a checkout it cannot change, made from the
+    exact commit that will be pushed. The branch's tree goes into a private index
+    (GIT_INDEX_FILE), so the staged diff and the read-only snapshot audit_changes builds are the
+    branch's, and the checkout's own index, working tree and .cache stay untouched (state goes
+    to BRAIN_STATE_DIR). Exit 0 on pass, 1 on block, error or an unknown branch, 2 on usage."""
+    import shutil
+    import tempfile
+
+    if len(argv) != 2 or argv[0] != "--branch" or not re.fullmatch(r"[A-Za-z0-9._/-]+", argv[1]):
+        print("usage: brain audit-branch --branch NAME")
+        return 2
+    ref = "refs/heads/" + argv[1]
+    if not git("rev-parse", "--verify", "--quiet", ref):
+        print(f"  audit: no branch {argv[1]!r} in this checkout")
+        return 1
+    try:
+        runner = load_consolidator()
+    except ConsolidatorConfigError as exc:
+        print(f"  audit: refused — {exc}")
+        return 1
+    scratch = tempfile.mkdtemp(prefix="brain-audit-index-")
+    previous = os.environ.get("GIT_INDEX_FILE")
+    os.environ["GIT_INDEX_FILE"] = str(Path(scratch) / "index")
+    try:
+        loaded = subprocess.run(["git", "read-tree", ref], cwd=ROOT, capture_output=True, text=True)
+        if loaded.returncode != 0:
+            print(f"  audit: could not read {argv[1]!r}: {(loaded.stderr or '').strip()[-200:]}")
+            return 1
+        verdict, detail = audit_changes(runner)
+    finally:
+        if previous is None:
+            os.environ.pop("GIT_INDEX_FILE", None)
+        else:
+            os.environ["GIT_INDEX_FILE"] = previous
+        shutil.rmtree(scratch, ignore_errors=True)
+    print(f"  audit: {detail}")
+    return 0 if verdict == "pass" else 1
+
+
 def cmd_consolidate(argv: list) -> int:
     prompt_path = ENGINE / "setup" / "consolidate-prompt.md"
     if not prompt_path.exists():
@@ -6496,6 +6539,8 @@ def main() -> int:
         return cmd_sessions(rest)
     if cmd == "consolidate":
         return cmd_consolidate(rest)
+    if cmd == "audit-branch":
+        return cmd_audit_branch(rest)
     if cmd == "schedule":
         return cmd_schedule(rest)
     if cmd == "template":

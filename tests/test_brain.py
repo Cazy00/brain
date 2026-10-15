@@ -1041,6 +1041,52 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual((self.repo / ".git" / "config").read_text(), before)
         self.assertFalse((self.repo / ".git" / "hooks" / "pre-commit").exists())
 
+    # -- Harbor Phase 5 (5.4): `audit-branch`, for an auditor that may not write the checkout --
+
+    def audit_branch(self, *args, env_extra=None):
+        git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
+        env = {**os.environ, "PATH": f"{self.stub_bin}:{git_dir}:/usr/bin:/bin",
+               "BRAIN_STATE_DIR": str(Path(self.tmp.name) / "auditor-state"), **(env_extra or {})}
+        return subprocess.run([sys.executable, str(self.repo / "bin" / "brain"), "audit-branch",
+                               *args], cwd=self.repo, capture_output=True, text=True, env=env,
+                              timeout=300)
+
+    def branch_with(self, name, rel, text):
+        subprocess.run(["git", "checkout", "-q", "-b", name], cwd=self.repo, check=True)
+        (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / rel).write_text(text, encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "--no-verify", "-m", "consolidate: x"],
+                       cwd=self.repo, check=True)
+
+    def test_audit_branch_audits_the_branch_tree_not_the_working_tree(self):
+        seen = Path(self.tmp.name) / "seen.txt"
+        self.stub_claude('case "$*" in *--tools*) find . -type f > %s; echo "VERDICT: PASS"; '
+                         'exit 0;; esac\nexit 3' % seen)
+        self.branch_with("consolidate/2026-10-18", "knowledge/inbox/audited.md",
+                         "---\ncreated: 2026-10-18\nstatus: draft\n---\n\nAudited.\n")
+        (self.repo / "knowledge" / "inbox" / "working-only.md").write_text("not committed\n")
+        index = self.repo / ".git" / "index"
+        before = index.read_bytes()
+        result = self.audit_branch("--branch", "consolidate/2026-10-18")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("audit: no safety or conflict findings", result.stdout)
+        files = seen.read_text()
+        self.assertIn("audited.md", files)
+        self.assertNotIn("working-only.md", files)
+        self.assertEqual(index.read_bytes(), before, "the checkout's index was written")
+
+    def test_audit_branch_exits_1_on_block_or_an_unknown_branch(self):
+        self.stub_claude('case "$*" in *--tools*) echo "VERDICT: BLOCK — names a private detail"; '
+                         'exit 0;; esac\nexit 3')
+        self.branch_with("consolidate/2026-10-18", "knowledge/inbox/x.md",
+                         "---\ncreated: 2026-10-18\nstatus: draft\n---\n\nX.\n")
+        blocked = self.audit_branch("--branch", "consolidate/2026-10-18")
+        self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+        self.assertIn("audit: names a private detail", blocked.stdout)
+        self.assertEqual(self.audit_branch("--branch", "consolidate/nope").returncode, 1)
+        self.assertEqual(self.audit_branch().returncode, 2)
+
     def test_consolidate_refuses_a_served_folder(self):
         """The served folder is where captures land. Consolidation switches
         branches and stages everything, so it runs in its own clone — and a
