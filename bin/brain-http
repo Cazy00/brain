@@ -40,7 +40,7 @@ import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import access, capture, httplog, httpmcp, mcpcore  # noqa: E402
+from brainlib import access, capture, httplog, httpmcp, maintenance, mcpcore  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = "/etc/brain/brain-http.json"
@@ -212,6 +212,8 @@ def build(config: dict, data_root, state_dir):
         allowed_origins=config.get("allowed_origins") or [],
         origin_policy=config.get("origin_policy", "strict"),
         readiness=readiness)
+    # Fail-closed maintenance for writes, asked on every capture (audit A2).
+    service.maintenance_check = lambda: maintenance.check(data_root, state_dir)
     return service, queue, log
 
 

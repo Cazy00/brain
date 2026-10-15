@@ -718,6 +718,24 @@ class OneResponsePerRequestTests(RemoteTestCase):
             self.assertEqual(len(statuses), 1, (name, statuses))
 
 
+class MaintenanceModeTests(RemoteTestCase):
+    """Audit A2: the 503 gate is reached in production, because the write path asks a live
+    check on every capture; reads never consult it."""
+
+    def test_writes_are_refused_reads_keep_working_and_it_clears_by_itself(self):
+        reasons = ["dirty tree"]
+        self.brain.service.maintenance_check = lambda: reasons[0]
+        status, headers, _body = self.brain.rpc(
+            "tools/call", {"name": "brain_capture", "arguments": {"text": "Held back."}})
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("Retry-After"), "60")
+        self.assertEqual(self.brain.call("brain_search", {"query": "connector"})[0], 200)
+        reasons[0] = None
+        status, body = self.brain.call("brain_capture", {"text": "Accepted again."})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["result"]["isError"])
+
+
 class ModernEraTests(RemoteTestCase):
     """The 2026-07-28 revision, served from the same endpoint as the old one."""
 

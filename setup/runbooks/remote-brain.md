@@ -814,8 +814,11 @@ sudo docker compose -p brain --profile maintenance run --rm --no-deps \
 ```
 
 **b. Lint fails on content.** The notes are readable but malformed — usually a
-dangling wikilink or a half-finished supersede. The system is already in
-fail-closed maintenance mode for mutations, and reads keep working. Fix it as
+dangling wikilink or a half-finished supersede. Captures keep being accepted —
+each only adds an inbox note, which cannot make the content worse — and reads keep
+working. Writes are refused (503, `Retry-After`) only by the live maintenance
+check: a dirty tree outside the inbox, HEAD off `main`, an unreadable index, or
+an unwritable data volume (`bin/brainlib/maintenance.py`). Fix lint failures as
 content, on a branch, with `bin/brain supersede` or an ordinary commit. Never
 delete an archived note to make lint pass; archived history is append-only.
 

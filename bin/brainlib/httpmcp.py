@@ -162,8 +162,21 @@ class Service(object):
             raise ValueError("origin_policy must be 'strict' or 'observe'")
         self.origin_policy = origin_policy
         self._readiness = readiness
-        self.maintenance = None               # a reason string disables mutation
+        self.maintenance = None               # a reason string disables mutation (by hand)
+        self.maintenance_check = None         # () -> reason | None, asked on every write
         self._clock = clock
+
+    def write_block(self):
+        """Why a write must wait right now, or None. The hand-set flag wins; otherwise the
+        live check runs (computed per write, so it clears by itself)."""
+        if self.maintenance:
+            return self.maintenance
+        if self.maintenance_check is None:
+            return None
+        try:
+            return self.maintenance_check()
+        except Exception as exc:              # a check that cannot run fails closed
+            return "check failed: %s" % type(exc).__name__
 
     def ready(self):
         """(ok, reason). Readiness is more than liveness and must say why not."""
@@ -609,11 +622,12 @@ class Handler(BaseHTTPRequestHandler):
         if not allowed:
             return self._rate_limited(cid, principal, retry, tool=str(name)[:64])
 
-        if writes and self.service.maintenance:
+        reason = self.service.write_block() if writes else None
+        if reason:
             # Fail closed on mutation while reads stay available, exactly as the
-            # spec's failure table requires.
+            # spec's failure table requires (audit A2: now reached in production).
             self.service.record("maintenance_mode", cid=cid, principal=principal.stable_id,
-                                outcome="error", reason=self.service.maintenance[:64])
+                                outcome="error", reason=reason[:64])
             return self._refuse(503, cid, "the brain is not accepting writes right now",
                                 "maintenance_mode", headers={"Retry-After": "60"})
 
