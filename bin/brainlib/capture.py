@@ -74,7 +74,7 @@ PUSH_BACKOFF_SECONDS = (5, 15, 45, 120, 300, 600)
 # How long a capture will wait for its push to land before answering. Not a
 # retry budget — the queue keeps retrying long after this — just long enough
 # that a healthy push is reported as what it is. See `settle`.
-PUSH_SETTLE_SECONDS = 2.5
+PUSH_SETTLE_SECONDS = 6.0  # a push from Oracle to GitHub takes 2.1-2.3 s doing nothing (2026-10-15)
 PUSH_TIMEOUT_SECONDS = 120
 
 
@@ -459,8 +459,9 @@ def format_result(result: dict) -> str:
     backup = result.get("backup", "")
     lines.append({
         "pushed": "backup: pushed to the private remote.",
-        "backup_pending": "backup: PENDING — the note is committed locally and safe, and "
-                          "the push to the private remote is being retried.",
+        "backup_pending": "backup: PENDING — the note is committed locally and safe; its "
+                          "push to the private remote has not landed yet (still in flight, "
+                          "or being retried).",
         "push_failed": "backup: FAILING — the note is committed locally, but the private "
                        "remote has been unreachable for over fifteen minutes. The brain's "
                        "operator has been alerted.",
