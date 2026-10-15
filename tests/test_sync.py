@@ -40,15 +40,22 @@ class SyncCase(unittest.TestCase):
         base = Path(self.tmp.name)
         self.remote = base / "origin.git"
         git(base, "init", "-q", "--bare", "-b", "main", str(self.remote))
+        # No background gc: receive-pack's detached auto-gc was still writing packs when
+        # the temp dir was removed (Linux CI).
+        for key, value in (("receive.autogc", "false"), ("gc.auto", "0"),
+                           ("maintenance.auto", "false")):
+            git(self.remote, "config", key, value)
         # The owner's side: a clone where curator PRs get merged and pushed.
         self.github = make_data_root(base / "gh")
         git(self.github, "remote", "add", "origin", str(self.remote))
+        git(self.github, "config", "gc.auto", "0")
         git(self.github, "push", "-q", "origin", "main")
         # The served folder: the data repository the server writes captures into.
         self.served = base / "served"
         git(base, "clone", "-q", str(self.remote), str(self.served))
         for key, value in (("user.email", "served@example.invalid"), ("user.name", "Served"),
-                           ("core.hooksPath", "")):
+                           ("core.hooksPath", ""), ("gc.auto", "0"),
+                           ("maintenance.auto", "false")):
             git(self.served, "config", key, value)
         self.state = base / "state"
         self.state.mkdir()
@@ -554,6 +561,20 @@ class SinglePusherTests(SyncCase):
         self.capture("behind")
         self.merge_pr("knowledge/reference/ahead.md", "x\n")
         ok, _detail, rejected = sync.push_main(self.served)
+        self.assertFalse(ok)
+        self.assertTrue(rejected)
+
+    def test_a_concurrent_update_of_main_counts_as_the_remote_moving(self):
+        """Two syncs pushing at once: the loser gets `[remote rejected] (incorrect old
+        value provided)`, not a non-fast-forward. It is the same news — the remote moved —
+        and must be retried, not parked as pending (seen on Linux CI)."""
+        class Done(object):
+            returncode = 1
+            stdout = ("To origin\n!\trefs/heads/main:refs/heads/main\t[remote rejected] "
+                      "(incorrect old value provided)\nDone\n")
+            stderr = "remote: error: cannot lock ref 'refs/heads/main': is at a but expected b\n"
+
+        ok, _detail, rejected = sync.push_main(self.served, run=lambda args: Done())
         self.assertFalse(ok)
         self.assertTrue(rejected)
 

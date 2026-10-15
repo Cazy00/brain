@@ -101,7 +101,10 @@ def push_main(data_root, run=None) -> tuple:
     if done.returncode == 0:
         return True, "", False
     out = "%s\n%s" % (done.stdout or "", done.stderr or "")
-    rejected = any(sign in out for sign in ("[rejected]", "non-fast-forward", "fetch first"))
+    # The remote moved: a non-fast-forward, or another push of main landing at the same
+    # moment (the loser's ref update fails as "incorrect old value" / "cannot lock ref").
+    rejected = any(sign in out for sign in ("[rejected]", "non-fast-forward", "fetch first",
+                                            "incorrect old value", "cannot lock ref"))
     return False, out.strip()[-300:] or "git push exited %d" % done.returncode, rejected
 
 
