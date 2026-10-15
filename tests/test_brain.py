@@ -1324,6 +1324,27 @@ class CaptureConcurrencyTests(unittest.TestCase):
         self.assertFalse(list((self.repo / "knowledge/inbox").glob("*racing-note-zebra*")))
 
 
+class StatsExportTests(unittest.TestCase):
+    """stats --export feeds the workspace's weekly report; it must never write into the data
+    repository (spec Phase 2.5), where it would dirty the tree and block captures."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.repo = make_sandbox(self.tmp.name)
+
+    def test_stats_export_writes_json_outside_the_data_repo(self):
+        out_file = Path(self.tmp.name) / "stats.json"
+        done = run_brain("stats", "--export", str(out_file), repo=self.repo)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("corpus", json.loads(out_file.read_text()))
+
+    def test_stats_export_refuses_a_path_inside_the_data_repo(self):
+        inside = self.repo / "knowledge" / "stats.json"
+        done = run_brain("stats", "--export", str(inside), repo=self.repo)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(inside.exists())
+
+
 class RepoLockCoverageTests(unittest.TestCase):
     """Every command that mutates the git index must take repo_lock.
 

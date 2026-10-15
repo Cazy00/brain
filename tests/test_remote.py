@@ -736,6 +736,24 @@ class MaintenanceModeTests(RemoteTestCase):
         self.assertFalse(body["result"]["isError"])
 
 
+class SearchResultCountTests(RemoteTestCase):
+    """Metric 7 needs zero-result searches counted: each brain_search event carries the
+    number of hits it found (a number, never the query or a title)."""
+
+    def search_events(self):
+        rows = [json.loads(line) for line in
+                (self.brain.state_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        return [r for r in rows if r.get("event") == "tool_call" and r.get("tool") == "brain_search"]
+
+    def test_a_search_event_carries_its_result_count(self):
+        self.assertEqual(self.brain.call("brain_search", {"query": "connector"})[0], 200)
+        self.assertEqual(self.brain.call("brain_search", {"query": "zzqqxxnothinghere"})[0], 200)
+        first, second = self.search_events()[-2:]
+        self.assertGreaterEqual(first["results"], 1)
+        self.assertEqual(second["results"], 0)
+        self.assertNotIn("zzqq", json.dumps(second))
+
+
 class ModernEraTests(RemoteTestCase):
     """The 2026-07-28 revision, served from the same endpoint as the old one."""
 

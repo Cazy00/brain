@@ -5410,6 +5410,23 @@ def cmd_stats(argv: list) -> int:
     exactly why they need a number rather than a vibe.
     """
     import json
+    if "--export" in argv:
+        # For the workspace's weekly report: JSON to a file OUTSIDE the data repository.
+        # Inside it the file would dirty the tree, which refuses captures (maintenance).
+        i = argv.index("--export")
+        if i + 1 >= len(argv):
+            print("usage: brain stats --export FILE   (FILE outside the data repository)")
+            return 2
+        target = Path(argv[i + 1]).expanduser().resolve()
+        root = ROOT.resolve()
+        if target == root or root in target.parents:
+            print("refused: --export must name a file outside the data repository")
+            return 2
+        snap = stats_snapshot()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(target, json.dumps(snap, indent=2) + "\n")
+        print(f"stats exported to {target}")
+        return 0
     snap = stats_snapshot()
     if "--json" in argv:
         print(json.dumps(snap, indent=2))
