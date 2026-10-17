@@ -305,7 +305,9 @@ another tool follows it, and nothing in consolidation changes.
   characters of text at most, the oldest dropped first.
 - The file is replaced atomically and created mode 0640, so its owner and
   group are the only readers; give the group to the consolidating account.
-  `brain sessions --jsonl --out FILE [--days N]` is the Claude Code producer.
+  `brain sessions --jsonl --out FILE [--days N]` is the Claude Code producer;
+  it needs no brain, so the transcripts' owner can run it from an engine it
+  cannot write, and it writes FILE (and a temporary file beside it) only.
 - The reader skips a line that breaks the contract and counts it; unknown
   keys are ignored. It reads regular files under 2 MB and refuses symlinks.
 
