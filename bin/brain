@@ -61,6 +61,10 @@ Commands:
                                    and no note content by construction
   brain stats [--json] [--record]  is the KNOWLEDGE still healthy: findability,
                                    capture rate, staleness, curation, link graph
+  brain stats --captures [--since ISO] [--until ISO] [--json]
+                                   inbox notes first added on the trunk in
+                                   (since, until], default the last 7 days,
+                                   by source, via, client, kind and basis
   brain retire [--dry-run] [--explain]   retire this brain and start clean.
                                    Interactive, TTY-only, never exposed over
                                    MCP. Moves the repo aside; deletes nothing,
@@ -6226,6 +6230,103 @@ def stats_snapshot() -> dict:
     }
 
 
+CAPTURE_GROUP_KEYS = ("source", "via", "client", "kind", "basis")
+
+
+def _git_blobs(specs: list) -> dict:
+    """{"<commit>:<path>": text} for each spec git can resolve, in one `git cat-file`."""
+    if not specs:
+        return {}
+    run = subprocess.run(["git", "cat-file", "--batch"], cwd=ROOT, capture_output=True,
+                         input=("\n".join(specs) + "\n").encode("utf-8"))
+    out, blobs, pos = run.stdout, {}, 0
+    for spec in specs:
+        end = out.find(b"\n", pos)
+        if end < 0:
+            break
+        header = out[pos:end].split()
+        pos = end + 1
+        if len(header) != 3 or header[1] != b"blob":
+            continue                      # "<spec> missing", or not a file
+        size = int(header[2])
+        blobs[spec] = out[pos:pos + size].decode("utf-8", "replace")
+        pos += size + 1
+    return blobs
+
+
+def capture_counts(since: str, until: str) -> dict:
+    """E8: inbox notes whose FIRST add on the trunk was committed in (since, until], grouped
+    by their provenance fields as the adding commit wrote them.
+
+    From git rather than the folder, so a capture the curator has since drained still
+    counts, and from the trunk only, so a branch that never landed does not. `client` is
+    grouped by its name (before the first `/`), so a client's versions are one group; a
+    field the note does not carry is null."""
+    trunk = default_branch()
+    ref = f"refs/heads/{trunk}"
+    if not git("rev-parse", "--verify", "--quiet", ref):
+        ref = "HEAD"
+    out = git("-c", "core.quotePath=false", "log", "--diff-filter=A", "--name-only",
+              "--format=%x00%H %cI", ref, "--", "knowledge/inbox")
+    first_add, current = {}, None
+    for line in out.splitlines():
+        if line.startswith("\0"):
+            commit, _, when = line[1:].partition(" ")
+            current = (commit, utc_instant(when))
+        elif current and re.fullmatch(r"knowledge/inbox/[^/]+\.md", line.strip()):
+            # Newest first, so a later sighting is an EARLIER add: the oldest one wins.
+            first_add[line.strip()] = current
+    chosen = sorted(f"{commit}:{rel}" for rel, (commit, at) in first_add.items()
+                    if since < at <= until)
+    blobs = _git_blobs(chosen)
+    groups = {}
+    for spec in chosen:
+        fm, _err = parse_frontmatter(blobs.get(spec, ""))
+        values = []
+        for key in CAPTURE_GROUP_KEYS:
+            value = (fm or {}).get(key)
+            value = (", ".join(map(str, value)) if isinstance(value, list) else
+                     str(value) if value is not None else "").strip()
+            if key == "client":
+                value = value.split("/", 1)[0].strip()
+            values.append(value or None)
+        groups[tuple(values)] = groups.get(tuple(values), 0) + 1
+    ordered = sorted(groups.items(), key=lambda kv: (-kv[1], [v or "" for v in kv[0]]))
+    return {"v": 1, "since": since, "until": until, "total": len(chosen),
+            "groups": [dict(zip(CAPTURE_GROUP_KEYS, key), count=count)
+                       for key, count in ordered]}
+
+
+def cmd_stats_captures(argv: list) -> int:
+    import json
+    usage = "usage: brain stats --captures [--since ISO] [--until ISO] [--json]"
+    until = utc_instant(_arg_after(argv, "--until")) if "--until" in argv else utc_now_minus(0)
+    if "--since" in argv:
+        since = utc_instant(_arg_after(argv, "--since"))
+    else:
+        since = until and time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        time.gmtime(_utc_epoch(until) - 7 * 86400))
+    if not since or not until:
+        print(usage + "\n  ISO is a date (YYYY-MM-DD) or an instant (2026-10-18T05:12:09Z)")
+        return 2
+    counts = capture_counts(since, until)
+    if "--json" in argv:
+        print(json.dumps(counts, indent=2))
+        return 0
+    print(f"\nbrain stats — captures in ({since}, {until}]: {counts['total']}\n")
+    for group in counts["groups"]:
+        label = "  ".join(f"{k}={group[k] if group[k] is not None else '-'}"
+                          for k in CAPTURE_GROUP_KEYS)
+        print(f"  {group['count']:>5}  {label}")
+    print()
+    return 0
+
+
+def _utc_epoch(instant: str) -> int:
+    import calendar
+    return calendar.timegm(time.strptime(instant, "%Y-%m-%dT%H:%M:%SZ"))
+
+
 def cmd_stats(argv: list) -> int:
     """Trend and trust signals — the answer to 'is this thing still working?'
 
@@ -6235,6 +6336,8 @@ def cmd_stats(argv: list) -> int:
     exactly why they need a number rather than a vibe.
     """
     import json
+    if "--captures" in argv:
+        return cmd_stats_captures(argv)
     if "--export" in argv:
         # For the workspace's weekly report: JSON to a file OUTSIDE the data repository.
         # Inside it the file would dirty the tree, which refuses captures (maintenance).
