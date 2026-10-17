@@ -3833,9 +3833,26 @@ class SessionMiningTests(unittest.TestCase):
         path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
         return path
 
-    def user_turn(self, text, ts="2026-07-24T10:00:00Z"):
+    def user_turn(self, text, ts="2026-07-24T10:00:00Z", **extra):
         return {"type": "user", "timestamp": ts, "cwd": "/x",
-                "message": {"role": "user", "content": text}}
+                "message": {"role": "user", "content": text}, **extra}
+
+    def test_only_turns_a_person_typed_are_mined(self):
+        """E4: automation, peers and notifications type into the same transcript. Where the
+        record says who typed the turn, only `human` is the user's own word; older records
+        carry no such field and are read as before."""
+        path = self.transcript("origin.jsonl", [
+            self.user_turn("HUMANTYPED", turnOrigin="human"),
+            self.user_turn("LEGACYNOFIELD"),
+            self.user_turn("SDKTYPED", turnOrigin="sdk"),
+            self.user_turn("PEERTYPED", turnOrigin="peer"),
+            self.user_turn("NOTIFICATIONTYPED", turnOrigin="task_notification"),
+            self.user_turn("SYSTEMTYPED", turnOrigin="system"),
+            self.user_turn("NULLORIGIN", turnOrigin=None),
+            self.user_turn('<agent-message from="session_x">PEERWRAPPED</agent-message>'),
+        ])
+        turns, _cwd = self.module.__dict__["_human_turns"](path)
+        self.assertEqual([t for _ts, t in turns], ["HUMANTYPED", "LEGACYNOFIELD"])
 
     def test_orchestrator_payloads_are_not_mined_as_user_prompts(self):
         """Workflow/subagent returns pasted back by an orchestrator arrive as

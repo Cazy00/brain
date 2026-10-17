@@ -3559,7 +3559,10 @@ _NOISE_PREFIXES = ("<local-command", "<command-name>", "<command-message>",
                    # Mining them laundered assistant prose into the user's
                    # recorded fact — under a header that promises the opposite.
                    "<result>", "<task-notification>", "<system-reminder>",
-                   "[SYSTEM NOTIFICATION", "{\"final\":", "{'final':")
+                   "[SYSTEM NOTIFICATION", "{\"final\":", "{'final':",
+                   # A message another agent session sent into this one: a peer's
+                   # words, delivered as a user turn, never the user's own.
+                   "<agent-message")
 _REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 
@@ -3592,6 +3595,12 @@ def _human_turns(path: Path, max_turn: int = 2000) -> tuple:
             continue
         if rec.get("isSidechain"):
             continue                       # subagent traffic, not the user
+        # Who typed the turn, where the record says. Automation, peer sessions and
+        # notifications all arrive as user turns; only `human` is the user's own
+        # word. Records written before the field existed carry no key at all and
+        # are read as before; a key with any other value (null included) is not.
+        if "turnOrigin" in rec and rec.get("turnOrigin") != "human":
+            continue
         msg = rec.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, str):
