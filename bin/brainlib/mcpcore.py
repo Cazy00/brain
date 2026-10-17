@@ -38,6 +38,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import provenance
+
 ENGINE = Path(__file__).resolve().parent.parent.parent
 BRAIN = str(ENGINE / "bin" / "brain")
 
@@ -78,29 +80,58 @@ LINKS_DESCRIPTION = (
 RECENT_DESCRIPTION = (
     "List notes recently added or touched in the brain (default: last 7 days)."
 )
-# The capture policy travels WITH the tool, because the model reading this
-# description is the only thing that applies it. Shortening it to fit a UI is
-# how "ask before capturing somebody else's private life" stops happening.
-CAPTURE_POLICY = (
-    "Capture the WHY, not the what — the what is recoverable from git, files and "
-    "calendars; the reasoning evaporates within a week. Never capture credentials "
-    "of any kind. ALWAYS ask first before capturing anything about a named "
-    "person's private life, health, finances or relationships. Text should be "
-    "self-contained and use absolute dates (2026-08-23), never 'today'."
+# What every client is told about reading, whatever its profile.
+READ_POLICY = (
+    "This is the user's permanent second brain. Search it before answering anything "
+    "about their decisions, preferences, projects, people or history. Its trust "
+    "markers ([provisional — unconsolidated], [journal], an ARCHIVED banner, a passed "
+    "review_by) are part of the answer: never present a provisional or archived note "
+    "as settled fact. If a query misses, try 2-3 lexical variants before concluding "
+    "there is nothing."
 )
+# The capture policy, ONE text for every client of every vendor: the server's
+# instructions and the brain_capture description are the only things every MCP
+# client receives, so this is where the rule has to live. It travels with the
+# tool as well as in `initialize`, because a client may drop one of the two.
+#
+# It is short on purpose, and a test holds it to a budget: clients truncate
+# long instructions, and the sentence a truncation cuts is the last one —
+# which is how "ask before capturing somebody else's private life" would stop
+# happening. Vendor-neutral on purpose too: "your client's built-in memory"
+# is every vendor's, and naming one would make the rule read as theirs.
+CAPTURE_POLICY = (
+    "Capture without asking: a decision with its why and the alternatives rejected; "
+    "a stated preference or constraint; a fact about the user's world that could not "
+    "be inferred; a lesson or answer that cost real effort. When a search found "
+    "nothing and the user then gives the answer, capture it. When a note proves "
+    "wrong, capture a correction (kind: correction) that names its id. Offer in one "
+    "line and carry on; \"remember this\" captures at once. Anything about the user "
+    "another agent may need belongs here, not in your client's built-in memory. "
+    "Never capture credentials, transient state, or what the repo, git or files "
+    "already record. Ask first about a named person's private life, health, finances "
+    "or relationships. Write self-contained text with absolute dates (2026-08-23, "
+    "never \"today\"). Fill kind and basis: owner-said when the user said it, "
+    "agent-found when you verified it, agent-inferred when it is your conclusion. "
+    "Add project, job and model when known."
+)
+READ_ONLY_SENTENCE = "This endpoint is read-only; it cannot save anything."
 LOCAL_CAPTURE_DESCRIPTION = (
-    "Save a thought, fact, or decision into the brain's inbox, committed and "
-    "auto-backed-up to GitHub immediately. Use when the user says 'remember this' "
-    "or states something durable worth keeping. " + CAPTURE_POLICY
+    "Save a note to the brain's inbox, committed and backed up at once (pass commit: "
+    "false to keep it on this machine). It stays PROVISIONAL until the brain's "
+    "consolidation pass promotes it. " + CAPTURE_POLICY
 )
 REMOTE_CAPTURE_DESCRIPTION = (
-    "Save a thought, fact, or decision into the brain's inbox. The note is "
-    "scanned for credentials, written atomically, committed, and queued for "
-    "backup — always, with no option to hold it back. It lands as PROVISIONAL "
-    "and is not canonical knowledge until the brain's own consolidation pass "
-    "promotes it. Use when the user says 'remember this' or states something "
-    "durable worth keeping. " + CAPTURE_POLICY
+    "Save a note to the brain's inbox. It is scanned for credentials, committed and "
+    "backed up, with no way to hold it back, and it stays PROVISIONAL until the "
+    "brain's consolidation pass promotes it. " + CAPTURE_POLICY
 )
+
+
+def instructions(profile: str) -> str:
+    """The `initialize` instructions for one profile, on every transport."""
+    if profile == "capture":
+        return READ_POLICY + " " + CAPTURE_POLICY
+    return READ_POLICY + " " + READ_ONLY_SENTENCE
 
 
 def tool_table(transport: str = "local") -> list:
@@ -168,6 +199,10 @@ def tool_table(transport: str = "local") -> list:
         "text": {"type": "string", "description": "The content to save.",
                  "minLength": 1, "maxLength": caps["text"]},
     }
+    # What the caller may declare about the note — the same on every front end
+    # (provenance.py). What the ENDPOINT stamps (via, client, source) is never
+    # offered: a caller that could set it could claim to be anyone.
+    capture_properties.update(provenance.declared_schema())
     if transport == "local":
         capture_properties["commit"] = {
             "type": "boolean",
@@ -300,8 +335,9 @@ def validate_args(tool: dict, args):
     return clean, None
 
 
-def cli_for(name: str, args: dict, transport: str = "local") -> list:
-    """The bin/brain argv one validated tool call becomes."""
+def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> list:
+    """The bin/brain argv one validated tool call becomes. `declared` is a
+    capture's cleaned declared fields (provenance.take_declared)."""
     if name == "brain_search":
         cli = ["search", "--limit", str(args.get("limit", 8))]
         if args.get("scope") == "all":
@@ -319,10 +355,12 @@ def cli_for(name: str, args: dict, transport: str = "local") -> list:
         # to ask for anything else: committing is what backs the note up, and
         # an uncommitted note dirties the tree, which blocks the consolidation
         # pass that is the inbox's only drain.
-        cli = ["capture", args["text"]]
+        cli = ["capture"]
         if transport == "remote" or args.get("commit", True):
             cli.append("--commit")
-        return cli
+        # The text goes LAST: capture lifts its flags out of argv by name, so a
+        # note whose whole text is "--kind" must not find a value after it.
+        return cli + provenance.cli_flags(declared or {}) + [args["text"]]
     raise KeyError(name)
 
 
@@ -346,16 +384,24 @@ def call(name, args, profile: str = "capture", transport: str = "local",
             "tool %r is not available on this endpoint (profile %r is read-only)"
             % (name, profile))
     table = {tool["name"]: tool for tool in tool_table(transport)}
-    args, problem = validate_args(table[name], args if args is not None else {})
+    args = args if args is not None else {}
+    declared, ignored = {}, []
+    if name == "brain_capture":
+        # Declared fields are dropped when bad, never refused: see provenance.
+        args, declared, ignored = provenance.take_declared(args)
+    args, problem = validate_args(table[name], args)
     if problem:
         return error_result("invalid arguments for %s: %s" % (name, problem))
     try:
-        run = (runner or _run_cli)(cli_for(name, args, transport), timeout)
+        run = (runner or _run_cli)(cli_for(name, args, transport, declared), timeout)
     except Exception as exc:
         return error_result(_failure_hint(exc, transport))
     text = (run.stdout + ("\n" + run.stderr if run.stderr.strip() else "")).strip()
+    if ignored:
+        text = provenance.ignored_line(ignored) + "\n" + text
     return {"content": [{"type": "text", "text": text or "(no output)"}],
             "isError": run.returncode != 0}
+
 
 
 def _failure_hint(exc, transport: str) -> str:

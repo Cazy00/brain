@@ -136,6 +136,12 @@ def cli_flags(values: dict) -> list:
     return flags
 
 
+def ignored_line(ignored) -> str:
+    """The one sentence a caller is told about declared fields not recorded."""
+    return ("ignored: %s — not a valid value, so it is not recorded on the note (the "
+            "tool's schema lists what each field accepts)" % ", ".join(ignored))
+
+
 _DECLARED_SCHEMA = {
     "kind": {"type": "string", "enum": list(KINDS),
              "description": ("What this note is. A correction names, in its text, the id "

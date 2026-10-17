@@ -742,9 +742,14 @@ class _Handler(BaseHTTPRequestHandler):
 
         began = time.monotonic()
         try:
+            # `via` names the transport a capture arrived through. A source is
+            # only ever set on a drop box (run_serve refuses one without), so
+            # the stamp follows from the same startup configuration as the
+            # source, never from the request.
             out = mcp.handle(msg, allow=allow,
                              source=self.server.source, cap=self.server.cap,
-                             log=self._log)
+                             log=self._log,
+                             via="drop-box" if self.server.source else "serve")
         except Exception as exc:
             # Same containment as stdio: one malformed request must never take
             # down a server other sessions are sharing. The exception's text is

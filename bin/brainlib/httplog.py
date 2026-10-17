@@ -69,6 +69,8 @@ EVENTS = frozenset((
     "auth_failed", "keys_refreshed", "keys_unavailable",
     # the tool layer
     "tool_call", "tool_error", "tool_denied", "tool_timeout",
+    # a stamp the endpoint could not write (reason names the field, never its value)
+    "provenance_dropped",
     # mutation
     "capture_accepted", "capture_refused", "capture_deduplicated",
     "capture_rollback", "push_succeeded", "push_failed", "push_pending",

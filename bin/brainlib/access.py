@@ -41,7 +41,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import rs256
+from . import provenance, rs256
 
 # Cloudflare publishes the signing keys here, on the TEAM domain, not on the
 # application hostname. Observed 2026-08-23 on the owner's tenant: two RSA keys,
@@ -108,15 +108,22 @@ class Principal(object):
     `stable_id` is an HMAC, not an email and not a client id. The spec's logging
     contract allows a stable principal identifier and forbids the raw address;
     an HMAC gives both at once, and because the key lives only in the
-    deployment's secrets a leaked log cannot be reversed into an identity."""
+    deployment's secrets a leaked log cannot be reversed into an identity.
 
-    __slots__ = ("mode", "stable_id", "profile", "endpoint")
+    `label` is the operator's own name for this credential (`principal_labels`
+    and `owner_label` in brain-http.json), or None. It is what a capture is
+    stamped `via`, and it exists for the NOTE: it is never logged, and it does
+    not replace `stable_id`, which stays the only principal the log knows."""
 
-    def __init__(self, mode: str, stable_id: str, profile: str, endpoint: str):
+    __slots__ = ("mode", "stable_id", "profile", "endpoint", "label")
+
+    def __init__(self, mode: str, stable_id: str, profile: str, endpoint: str,
+                 label=None):
         self.mode = mode                 # "interactive" | "service"
         self.stable_id = stable_id
         self.profile = profile
         self.endpoint = endpoint
+        self.label = label
 
 
 class JwksCache(object):
@@ -219,7 +226,7 @@ class Verifier(object):
 
     def __init__(self, team_domain: str, endpoints, owner_email: str,
                  service_principals=(), principal_key=b"", jwks=None,
-                 clock=time.time):
+                 clock=time.time, principal_labels=None, owner_label=None):
         team_domain = team_domain.strip().strip("/")
         if not team_domain or "/" in team_domain:
             raise ValueError("team domain must be a bare hostname")
@@ -238,6 +245,17 @@ class Verifier(object):
         self.service_principals = {}
         for name, profile in dict(service_principals).items():
             self.service_principals[str(name).strip()] = profile
+        # Labels are written into notes, so they meet the note's rule here as
+        # well as in the config loader: a Verifier built any other way must not
+        # be able to stamp a value that frontmatter cannot hold.
+        self.principal_labels = {}
+        for name, label in dict(principal_labels or {}).items():
+            if not provenance.is_slug(label):
+                raise ValueError("principal label %r is not a valid slug" % (label,))
+            self.principal_labels[str(name).strip()] = label
+        if owner_label is not None and not provenance.is_slug(owner_label):
+            raise ValueError("owner label %r is not a valid slug" % (owner_label,))
+        self.owner_label = owner_label
         if not principal_key:
             raise ValueError("a principal HMAC key is required")
         self.principal_key = principal_key
@@ -341,14 +359,15 @@ class Verifier(object):
                 # it too is what makes the boundary independent of that policy.
                 raise AccessDenied("service client not authorized here", "wrong_profile")
             return Principal("service", self._stable_id("svc", name),
-                             endpoint.profile, endpoint.hostname)
+                             endpoint.profile, endpoint.hostname,
+                             label=self.principal_labels.get(name))
         normalized = _normalize_email(email)
         if not normalized:
             raise AccessDenied("assertion carries no identity")
         if not hmac.compare_digest(normalized, self.owner_email):
             raise AccessDenied("not the owner", "unknown_principal")
         return Principal("interactive", self._stable_id("usr", normalized),
-                         endpoint.profile, endpoint.hostname)
+                         endpoint.profile, endpoint.hostname, label=self.owner_label)
 
     def _stable_id(self, kind: str, value: str) -> str:
         digest = hmac.new(self.principal_key,

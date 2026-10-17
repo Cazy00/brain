@@ -248,6 +248,89 @@ class McpToolLayerTests(unittest.TestCase):
                       "exposes it has to say so")
 
 
+class CaptureContractParityTests(unittest.TestCase):
+    """Two front ends, one capture contract.
+
+    `brain-mcp` / `brain serve` (mcp.py) and `brain-http` (mcpcore.py) carry
+    their own tool tables. What a caller may DECLARE about a note, and the
+    policy that tells it when to capture, must not differ between them: an
+    agent that learns the contract on one transport uses it on the other.
+    """
+
+    TRANSPORT_ONLY = {"stdio": {"commit"}, "remote": {"client_request_id", "allow_duplicate"}}
+    VENDORS = ("claude", "anthropic", "openai", "chatgpt", "codex", "gemini", "cursor",
+               "copilot", "cloudflare", "github")
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcp, mcpcore, provenance
+        self.mcp, self.mcpcore, self.provenance = mcp, mcpcore, provenance
+        remote = {t["name"]: t for t in mcpcore.tool_table("remote")}
+        self.stdio_tool = mcp.TOOLS_BY_NAME["brain_capture"]
+        self.remote_tool = remote["brain_capture"]
+
+    def props(self, tool):
+        return tool["inputSchema"]["properties"]
+
+    def test_both_front_ends_offer_the_same_capture_fields(self):
+        stdio, remote = self.props(self.stdio_tool), self.props(self.remote_tool)
+        self.assertEqual(set(stdio) - self.TRANSPORT_ONLY["stdio"],
+                         set(remote) - self.TRANSPORT_ONLY["remote"])
+        for field in self.provenance.DECLARED_FIELDS:
+            self.assertIn(field, stdio)
+            self.assertEqual(stdio[field], remote[field], field)
+        self.assertEqual(stdio["kind"]["enum"], list(self.provenance.KINDS))
+        self.assertEqual(stdio["basis"]["enum"], list(self.provenance.BASES))
+
+    def test_no_front_end_lets_a_caller_set_what_the_endpoint_stamps(self):
+        for tool in (self.stdio_tool, self.remote_tool):
+            for field in ("via", "client", "source", "captured_at", "created", "status", "id"):
+                self.assertNotIn(field, self.props(tool))
+
+    def test_both_capture_descriptions_carry_the_one_policy(self):
+        for tool in (self.stdio_tool, self.remote_tool):
+            self.assertIn(self.mcpcore.CAPTURE_POLICY, tool["description"])
+
+    def test_the_policy_says_what_it_must(self):
+        policy = self.mcpcore.CAPTURE_POLICY
+        for rule in ("Capture without asking", "the alternatives rejected", "preference",
+                     "search found nothing", "correction", "names its id",
+                     "remember this", "built-in memory", "Never capture credentials",
+                     "transient state", "Ask first", "private life", "self-contained",
+                     "absolute dates", "kind and basis", "owner-said", "agent-found",
+                     "agent-inferred", "project, job and model"):
+            self.assertIn(rule, policy)
+
+    def test_the_policy_fits_the_budget_clients_truncate_to(self):
+        self.assertLessEqual(len(self.mcpcore.instructions("capture")), 1400)
+        for tool in (self.stdio_tool, self.remote_tool):
+            self.assertLessEqual(len(tool["description"]), 1600, tool["name"])
+
+    def test_the_read_only_profile_keeps_its_read_only_sentence(self):
+        read = self.mcpcore.instructions("read")
+        self.assertIn("read-only", read)
+        self.assertNotIn(self.mcpcore.CAPTURE_POLICY, read)
+        self.assertIn(self.mcpcore.CAPTURE_POLICY, self.mcpcore.instructions("capture"))
+
+    def test_nothing_in_the_policy_names_a_vendor(self):
+        blob = " ".join([self.mcpcore.instructions("capture"), self.mcpcore.instructions("read"),
+                         json.dumps(self.stdio_tool), json.dumps(self.remote_tool)]).lower()
+        for vendor in self.VENDORS:
+            self.assertNotIn(vendor, blob, f"the capture contract names {vendor}")
+
+    def test_stdio_initialize_carries_the_instructions_for_what_it_serves(self):
+        mcp = self.mcp
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        full = mcp.handle(init)["result"]
+        self.assertEqual(full["instructions"], self.mcpcore.instructions("capture"))
+        read = mcp.handle(init, allow=mcp.READ_ONLY_TOOLS)["result"]
+        self.assertEqual(read["instructions"], self.mcpcore.instructions("read"))
+        # A drop box serves a caller that cannot read: telling it to search
+        # first would be an instruction it cannot follow.
+        drop = mcp.handle(init, allow=mcp.WRITE_ONLY_TOOLS, source="support-bot")["result"]
+        self.assertNotIn("instructions", drop)
+
+
 class McpServerTests(unittest.TestCase):
     """One bad request must not kill a server that other sessions are sharing."""
 
@@ -454,6 +537,33 @@ class UniversalClientTests(unittest.TestCase):
             for field in schema.get("required", []):
                 self.assertIn(field, schema.get("properties", {}),
                               f"{tool['name']} requires an undeclared field {field}")
+
+    def test_a_capture_over_stdio_is_stamped_by_the_endpoint(self):
+        """via and client come from the endpoint and the session, the declared
+        fields from the caller — and the caller's own via/client/source are
+        dropped before they can reach the note."""
+        proc, replies = self.session(
+            self.call(1, "brain_capture", text="We chose stdio stamping on 2026-10-18.",
+                      kind="decision", basis="agent-found", project="brain",
+                      via="owner-phone", client="the-owner/1", source="partner",
+                      captured_at="2020-01-01T00:00:00Z"))
+        self.assertFalse(replies[1]["result"].get("isError"), self.text(replies[1]))
+        notes = list((self.repo / "knowledge" / "inbox").glob("*stdio-stamping*.md"))
+        self.assertEqual(len(notes), 1, proc.stderr[-500:])
+        fields = dict(frontmatter_pairs(notes[0].read_text(encoding="utf-8")))
+        self.assertEqual(fields["via"], "stdio")
+        self.assertEqual(fields["client"], "generic-mcp-client/1.0")
+        self.assertEqual(fields["source"], "local")
+        self.assertEqual((fields["kind"], fields["basis"], fields["project"]),
+                         ("decision", "agent-found", "brain"))
+        self.assertNotEqual(fields["captured_at"], "2020-01-01T00:00:00Z")
+
+    def test_initialize_tells_a_generic_client_the_capture_policy(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcpcore
+        _proc, replies = self.session()
+        self.assertEqual(replies[0]["result"].get("instructions"),
+                         mcpcore.instructions("capture"))
 
     def test_capture_search_read_round_trips_over_the_wire(self):
         """The whole tool layer, in one session, with no CLI in sight."""

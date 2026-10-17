@@ -50,7 +50,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import sync
+from . import provenance, sync
 
 LEDGER_FILE = "capture-ledger.db"
 
@@ -341,7 +341,13 @@ class Capturer(object):
         self._run = runner or self._invoke
 
     def capture(self, text: str, profile: str, principal: str, cid: str,
-                client_request_id=None, allow_duplicate: bool = False) -> dict:
+                client_request_id=None, allow_duplicate: bool = False,
+                via=None, client=None, declared=None) -> dict:
+        """`via` and `client` are what the endpoint stamps; `declared` is the
+        caller's cleaned declared fields (provenance.take_declared). None of
+        them is part of either fingerprint: "have I seen this request" and
+        "have I seen this text" are questions about the request id and the
+        text, and a retry that relabels a note is still the same note."""
         if client_request_id:
             previous = self.ledger.lookup("request", profile, client_request_id)
             if previous is not None:
@@ -359,7 +365,10 @@ class Capturer(object):
                                      principal=principal, outcome="deduplicated")
                 return self._replay(previous, "content")
 
-        outcome = self._run(text)
+        flags = provenance.cli_flags({"via": via, "client": client, **(declared or {})})
+        outcome = self._run(text, flags)
+        ignored = [name for name in (outcome.get("ignored") or [])
+                   if name in provenance.DECLARED_FIELDS]
         if outcome.get("status") != "committed":
             if self._log:
                 event = ("capture_refused" if outcome.get("status") == "refused"
@@ -369,12 +378,12 @@ class Capturer(object):
                                  reason=str(outcome.get("status") or "failed"))
             return {"ok": False, "status": outcome.get("status") or "failed",
                     "detail": outcome.get("detail") or "", "note": "", "commit": "",
-                    "provisional": True, "backup": self.queue.state()}
+                    "provisional": True, "backup": self.queue.state(), "ignored": ignored}
 
         self.queue.nudge()
         result = {"ok": True, "status": "committed", "note": outcome.get("note", ""),
                   "commit": outcome.get("commit", ""), "provisional": True,
-                  "backup": self.queue.settle(), "detail": ""}
+                  "backup": self.queue.settle(), "detail": "", "ignored": ignored}
         # Remember AFTER the commit exists. Recording first would make a crash
         # between the two look, to the retry that follows, exactly like a
         # success — and the note would never be written at all.
@@ -411,9 +420,13 @@ class Capturer(object):
                 return str(Path(line.strip()))
         return ""
 
-    def _invoke(self, text: str) -> dict:
+    def _invoke(self, text: str, flags=()) -> dict:
+        # The text goes LAST, after every flag: capture lifts its flags out of
+        # argv by name, and a note whose whole text is "--kind" must not find
+        # a value after it to swallow.
         done = subprocess.run(
-            [sys.executable, self.brain_bin, "capture", "--commit", "--atomic", "--json", text],
+            [sys.executable, self.brain_bin, "capture", "--commit", "--atomic", "--json",
+             *flags, text],
             capture_output=True, text=True, cwd=self.data_root, timeout=self._timeout)
         for line in reversed(done.stdout.strip().splitlines()):
             line = line.strip()
@@ -434,6 +447,13 @@ def format_result(result: dict) -> str:
     Every branch says the word `PROVISIONAL`, because a note that reads as
     settled knowledge the moment it is written is exactly the failure the inbox
     exists to prevent."""
+    text = _format_outcome(result)
+    if result.get("ignored"):
+        text += "\n" + provenance.ignored_line(result["ignored"])
+    return text
+
+
+def _format_outcome(result: dict) -> str:
     if not result.get("ok"):
         if result.get("status") == "refused":
             return ("REFUSED — the text looks like it contains a credential, so nothing "
