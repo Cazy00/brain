@@ -914,13 +914,24 @@ class ConsolidateTests(unittest.TestCase):
     failed still got its work committed and pushed, and the closing message
     said it landed regardless."""
 
+    SEED = "knowledge/inbox/2026-10-15-120000-seed.md"
+
     def setUp(self):
         self.tmp = temp_dir()
         self.repo = make_sandbox(self.tmp.name)
         self.stub_bin = Path(self.tmp.name) / "stubbin"
         self.stub_bin.mkdir()
+        # A home of its own: the digest mines ~/.claude/projects, and the tester's own
+        # transcripts are neither this test's input nor anything a test should read.
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
         for cfg in (["user.email", "t@example.com"], ["user.name", "Test"]):
             subprocess.run(["git", "config", *cfg], cwd=self.repo, check=True)
+        # One capture waiting, so the pass has work and runs its model (E5: an idle pass
+        # makes no model call at all).
+        (self.repo / self.SEED).write_text(
+            "---\ncreated: 2026-10-15\nsource: local\nstatus: draft\n---\n\nA capture.\n",
+            encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-q", "--no-verify", "--allow-empty",
                         "-m", "base"],
@@ -935,11 +946,7 @@ class ConsolidateTests(unittest.TestCase):
         stub.chmod(0o755)
 
     def consolidate(self):
-        git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
-        env = {**os.environ, "PATH": f"{self.stub_bin}:{git_dir}:/usr/bin:/bin"}
-        return subprocess.run([sys.executable, str(self.repo / "bin" / "brain"), "consolidate"],
-                              cwd=self.repo, capture_output=True, text=True,
-                              env=env, timeout=300)
+        return self.consolidate_with()
 
     def commits_on_branch(self):
         out = subprocess.run(["git", "log", "--oneline", "--all"], cwd=self.repo,
@@ -966,7 +973,8 @@ class ConsolidateTests(unittest.TestCase):
         self.stub_claude('if [ -c /dev/stdin ]; then echo devnull > %s; else echo other > %s; fi\nexit 0'
                          % (log, log))
         git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
-        env = {**os.environ, "PATH": f"{self.stub_bin}:{git_dir}:/usr/bin:/bin"}
+        env = {**os.environ, "PATH": f"{self.stub_bin}:{git_dir}:/usr/bin:/bin",
+               "HOME": str(self.home)}
         subprocess.run([sys.executable, str(self.repo / "bin" / "brain"), "consolidate"],
                        cwd=self.repo, input="held by the caller\n", capture_output=True,
                        text=True, env=env, timeout=300)
@@ -983,7 +991,7 @@ class ConsolidateTests(unittest.TestCase):
     def consolidate_with(self, *args, env_extra=None):
         git_dir = str(Path(shutil.which("git") or "/usr/bin/git").parent)
         env = {**os.environ, "PATH": f"{self.stub_bin}:{git_dir}:/usr/bin:/bin",
-               **(env_extra or {})}
+               "HOME": str(self.home), **(env_extra or {})}
         return subprocess.run([sys.executable, str(self.repo / "bin" / "brain"),
                                "consolidate", *args],
                               cwd=self.repo, capture_output=True, text=True,
@@ -1155,6 +1163,182 @@ class ConsolidateTests(unittest.TestCase):
         result = self.consolidate_with("--open-pr")
         self.assertEqual(result.returncode, 1)
         self.assertFalse(log.exists(), "a pull request was opened for blocked work")
+
+    # -- E5/E6: idle passes, cost, and one machine-readable result line --
+
+    RESULT_KEYS = {"v", "status", "idle", "cost_microusd", "tokens_in", "tokens_out",
+                   "digest_entries", "inbox_before"}
+
+    def result_of(self, completed):
+        lines = [l for l in completed.stdout.splitlines() if l.startswith("consolidate-result: ")]
+        self.assertEqual(len(lines), 1, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stdout.rstrip().splitlines()[-1], lines[0],
+                         "the result line is not the last line")
+        payload = json.loads(lines[0][len("consolidate-result: "):])
+        self.assertEqual(set(payload), self.RESULT_KEYS)
+        self.assertEqual(payload["v"], 1)
+        return payload
+
+    def drain_seed(self):
+        commit_at(self.repo, "drain", iso_ago(0), (self.SEED, None))
+
+    def marking_stub(self):
+        mark = Path(self.tmp.name) / "model-called"
+        self.stub_claude(f"touch {mark}\nexit 0")
+        return mark
+
+    def test_an_idle_pass_makes_no_model_call_and_cuts_no_branch(self):
+        self.drain_seed()
+        mark = self.marking_stub()
+        result = self.consolidate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(mark.exists(), "an idle pass called the model")
+        self.assertEqual(self.branches(), "", "an idle pass cut a branch")
+        payload = self.result_of(result)
+        self.assertEqual((payload["status"], payload["idle"]), ("idle", True))
+        self.assertEqual((payload["cost_microusd"], payload["tokens_in"], payload["tokens_out"]),
+                         (None, None, None))
+        self.assertEqual((payload["digest_entries"], payload["inbox_before"]), (0, 0))
+
+    def test_dry_run_reports_what_it_would_decide(self):
+        mark = self.marking_stub()
+        busy = self.consolidate_with("--dry-run")
+        self.assertIn("would decide: run", busy.stdout)
+        self.assertIn("inbox 1", busy.stdout)
+        self.drain_seed()
+        idle = self.consolidate_with("--dry-run")
+        self.assertIn("would decide: idle", idle.stdout)
+        self.assertFalse(mark.exists())
+        self.assertNotIn("consolidate-result:", idle.stdout, "a dry run is not a run")
+
+    def test_each_kind_of_work_wakes_the_pass(self):
+        self.drain_seed()
+        # A journal entry from before the last consolidation was already seen: not work.
+        commit_at(self.repo, "old journal", iso_ago(5), ("knowledge/journal/2026/2026-10-12.md",
+                                                         "An older entry.\n"))
+        commit_at(self.repo, "consolidate: 2026-10-16", iso_ago(2))
+        journal = "knowledge/journal/2026/2026-10-17.md"
+        cases = {
+            "inbox": lambda: (self.repo / "knowledge/inbox/new.md").write_text(
+                "---\ncreated: 2026-10-18\nsource: local\nstatus: draft\n---\n\nNew.\n"),
+            "digest": lambda: self.transcript_turn("A decision typed today", iso_ago(0.1)),
+            "journal": lambda: commit_at(self.repo, "journal", iso_ago(0), (journal, "Today.\n")),
+            "review_by": lambda: commit_at(self.repo, "debt", iso_ago(0), (
+                "knowledge/reference/note-conventions.md",
+                (self.repo / "knowledge/reference/note-conventions.md").read_text().replace(
+                    "review_by: 2027-07-25", "review_by: 2026-01-01"))),
+        }
+        for label, make_work in cases.items():
+            with self.subTest(label):
+                snapshot = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                          capture_output=True, text=True).stdout.strip()
+                idle = self.consolidate_with("--dry-run")
+                self.assertIn("would decide: idle", idle.stdout, idle.stdout)
+                make_work()
+                if label == "inbox":
+                    subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+                    subprocess.run(["git", "commit", "-q", "--no-verify", "-m", "capture"],
+                                   cwd=self.repo, check=True)
+                busy = self.consolidate_with("--dry-run")
+                self.assertIn("would decide: run", busy.stdout, busy.stdout)
+                self.assertIn(f"{label} 1", busy.stdout)
+                subprocess.run(["git", "reset", "-q", "--hard", snapshot], cwd=self.repo, check=True)
+                shutil.rmtree(self.home / ".claude", ignore_errors=True)
+
+    def transcript_turn(self, text, at):
+        folder = self.home / ".claude" / "projects" / "-w-proj"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "s.jsonl").write_text(json.dumps(
+            {"type": "user", "timestamp": at, "cwd": "/w/proj", "turnOrigin": "human",
+             "message": {"role": "user", "content": text}}) + "\n", encoding="utf-8")
+
+    def test_every_outcome_ends_on_one_result_line(self):
+        trunk = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                               capture_output=True, text=True).stdout.strip()
+        outcomes = {
+            "committed": (lambda: self.stub_runner("VERDICT: PASS"), 0),
+            "blocked": (lambda: self.stub_runner("VERDICT: BLOCK — names a private detail"), 1),
+            "failed": (lambda: self.stub_claude("exit 3"), 1),
+            "no_changes": (lambda: self.stub_claude("exit 0"), 0),
+        }
+        for status, (stub, code) in outcomes.items():
+            with self.subTest(status):
+                stub()
+                result = self.consolidate()
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                payload = self.result_of(result)
+                self.assertEqual(payload["status"], status)
+                self.assertIs(payload["idle"], False)
+                self.assertEqual(payload["inbox_before"], 1)
+                self.assertIsNone(payload["cost_microusd"], "plain-text output has no cost")
+                subprocess.run(["git", "checkout", "-q", "-f", trunk], cwd=self.repo, check=True)
+                subprocess.run(["git", "clean", "-fdq", "knowledge"], cwd=self.repo, check=True)
+                for branch in subprocess.run(
+                        ["git", "for-each-ref", "--format=%(refname:short)",
+                         "refs/heads/consolidate/"], cwd=self.repo, capture_output=True,
+                        text=True).stdout.split():
+                    subprocess.run(["git", "branch", "-q", "-D", branch], cwd=self.repo, check=True)
+
+    def json_stub(self, propose, audit):
+        """A runner that answers like `--output-format json`: one JSON object per call."""
+        (self.stub_bin / "propose.json").write_text(json.dumps(propose), encoding="utf-8")
+        (self.stub_bin / "audit.json").write_text(json.dumps(audit), encoding="utf-8")
+        self.stub_claude(
+            'case "$*" in\n'
+            f'  *--tools*) cat {self.stub_bin / "audit.json"}; exit 0 ;;\n'
+            'esac\n'
+            'printf -- "---\\ncreated: 2026-10-15\\nstatus: draft\\n---\\n\\n'
+            'A consolidated note.\\n" > knowledge/inbox/consolidated.md\n'
+            f'cat {self.stub_bin / "propose.json"}\n'
+            'exit 0')
+
+    def test_json_runner_output_reports_cost_and_tokens_summed(self):
+        self.json_stub(
+            {"type": "result", "result": "PROPOSED-TEXT drained one capture",
+             "total_cost_usd": 0.5,
+             "usage": {"input_tokens": 100, "cache_read_input_tokens": 1000,
+                       "cache_creation_input_tokens": 10, "output_tokens": 50}},
+            {"type": "result", "result": "checked\nVERDICT: PASS", "total_cost_usd": 0.25,
+             "usage": {"input_tokens": 20, "output_tokens": 5}})
+        result = self.consolidate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = self.result_of(result)
+        self.assertEqual(payload["status"], "committed")
+        self.assertEqual(payload["cost_microusd"], 750000)
+        self.assertEqual((payload["tokens_in"], payload["tokens_out"]), (1130, 55))
+        self.assertIn("PROPOSED-TEXT drained one capture", result.stdout)
+        self.assertNotIn('"total_cost_usd"', result.stdout, "the raw JSON was shown, not its text")
+
+    def test_the_verdict_is_the_last_verdict_line_of_the_json_result_text(self):
+        self.json_stub({"result": "done", "total_cost_usd": 0.1},
+                       {"result": "VERDICT: PASS\nthen, on reflection:\n"
+                                  "VERDICT: BLOCK — contradicts a current note",
+                        "total_cost_usd": 0.1})
+        result = self.consolidate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("contradicts a current note", result.stdout)
+        payload = self.result_of(result)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["cost_microusd"], 200000)
+
+    def test_digest_from_feeds_the_pass_and_an_unreadable_one_is_only_a_warning(self):
+        drop = Path(self.tmp.name) / "drop" / "other-account"
+        drop.mkdir(parents=True)
+        (drop / "digest.jsonl").write_text(json.dumps(
+            {"v": 1, "at": iso_ago(0.2), "tool": "claude-code", "project": "elsewhere",
+             "text": "IMPORTED-TURN keep the daily pass"}) + "\n", encoding="utf-8")
+        seen = Path(self.tmp.name) / "seen-digest.md"
+        self.stub_claude(f'cp .cache/session-digest.md {seen} 2>/dev/null\nexit 0')
+        result = self.consolidate_with("--digest-from", str(drop.parent))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("IMPORTED-TURN keep the daily pass", seen.read_text(encoding="utf-8"))
+        self.assertIn("elsewhere", seen.read_text(encoding="utf-8"))
+        self.assertEqual(self.result_of(result)["digest_entries"], 1)
+        seen.unlink()
+        missing = self.consolidate_with("--digest-from", str(Path(self.tmp.name) / "nope"))
+        self.assertEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+        self.assertIn("WARNING: --digest-from", missing.stdout)
+        self.assertTrue(seen.exists(), "the pass did not continue without the directory")
 
 
 class SessionDigestTests(unittest.TestCase):
@@ -1328,6 +1512,142 @@ class SessionDigestTests(unittest.TestCase):
                                                      max_chars=100)
         self.assertEqual([e["text"][0] for e in kept], ["4", "5"])
         self.assertEqual(dropped, 3)
+
+
+def commit_at(repo, message, when, *paths_and_texts):
+    """One commit in `repo` whose author and committer dates are `when` (ISO)."""
+    for rel, text in paths_and_texts:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        if text is None:
+            (repo / rel).unlink()
+        else:
+            (repo / rel).write_text(text, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "core.hooksPath=", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", message], cwd=repo, check=True,
+                   capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when})
+
+
+def iso_ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class DigestImportTests(unittest.TestCase):
+    """E4: `consolidate --digest-from DIR` reads digest.v1 files another account produced.
+    The directory is written by a different user, so it is read as untrusted input: regular
+    files only, no symlinks, a size cap, and a line that is not digest.v1 is skipped, never
+    guessed at. The window starts at the last consolidation that reached the trunk."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=self.repo, check=True,
+                       capture_output=True)
+        self.module = load_brain_module()
+        self.module.ROOT = self.repo
+        self.module.K = self.repo / "knowledge"
+        self.module._DEFAULT_BRANCH = None
+        self.module.TRANSCRIPT_ROOT = Path(self.tmp.name) / "no-transcripts"
+        self.drop = Path(self.tmp.name) / "digests"
+        self.drop.mkdir()
+
+    def row(self, text, at, **extra):
+        return json.dumps({"v": 1, "at": at, "tool": "claude-code", "project": "proj",
+                           "text": text, **extra})
+
+    def test_reads_jsonl_in_the_directory_and_one_level_down_only(self):
+        (self.drop / "a.jsonl").write_text("\n".join([
+            self.row("TOP level", iso_ago(1)),
+            "not json at all",
+            json.dumps({"v": 2, "at": iso_ago(1), "tool": "x", "project": "", "text": "V2"}),
+            json.dumps({"v": 1, "at": "2026-10-18 10:00", "tool": "x", "project": "",
+                        "text": "BADAT"}),
+            json.dumps({"v": 1, "at": iso_ago(1), "tool": "x", "project": "a\nb",
+                        "text": "NEWLINE in project"}),
+            json.dumps({"v": 1, "at": iso_ago(1), "tool": "x", "project": "", "text": ""}),
+            json.dumps([1, 2]),
+        ]) + "\n", encoding="utf-8")
+        (self.drop / "user-b").mkdir()
+        (self.drop / "user-b" / "digest.jsonl").write_text(
+            self.row("ONE level down", iso_ago(1), extra_field="ignored") + "\n", encoding="utf-8")
+        (self.drop / "user-b" / "deeper").mkdir()
+        (self.drop / "user-b" / "deeper" / "c.jsonl").write_text(
+            self.row("TWO levels down", iso_ago(1)) + "\n", encoding="utf-8")
+        (self.drop / "notes.txt").write_text(self.row("NOT jsonl", iso_ago(1)) + "\n")
+        outside = Path(self.tmp.name) / "outside.jsonl"
+        outside.write_text(self.row("THROUGH a symlink", iso_ago(1)) + "\n", encoding="utf-8")
+        os.symlink(str(outside), str(self.drop / "link.jsonl"))
+        (self.drop / "big.jsonl").write_text(
+            self.row("TOO big", iso_ago(1)) + "\n" + "x" * (2 * 1024 * 1024), encoding="utf-8")
+
+        entries, report = self.module.read_digest_dir(self.drop)
+        self.assertEqual(sorted(e["text"] for e in entries), ["ONE level down", "TOP level"])
+        self.assertEqual(report["invalid"], 6, report)
+        refused = " ".join(report["refused"])
+        self.assertIn("link.jsonl", refused)
+        self.assertIn("big.jsonl", refused)
+        self.assertNotIn("extra_field", json.dumps(entries))
+        self.assertIsNone(report["error"])
+
+    def test_an_unreadable_directory_is_a_warning_not_a_failure(self):
+        entries, report = self.module.read_digest_dir(Path(self.tmp.name) / "missing")
+        self.assertEqual(entries, [])
+        self.assertTrue(report["error"])
+
+    def test_the_window_starts_at_the_last_consolidation_on_the_trunk(self):
+        commit_at(self.repo, "consolidate: 2026-10-15", iso_ago(3))
+        subprocess.run(["git", "checkout", "-q", "-b", "consolidate/unmerged"], cwd=self.repo,
+                       check=True)
+        commit_at(self.repo, "consolidate: 2026-10-17", iso_ago(1))
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.repo, check=True)
+        (self.drop / "d.jsonl").write_text("\n".join([
+            self.row("BEFORE the last pass", iso_ago(4)),
+            self.row("AFTER the last pass", iso_ago(2)),
+            self.row("AFTER the unmerged branch", iso_ago(0.5)),
+        ]) + "\n", encoding="utf-8")
+        text, count, notes = self.module.consolidation_digest(str(self.drop))
+        self.assertEqual(count, 2, text)
+        self.assertNotIn("BEFORE the last pass", text)
+        self.assertIn("AFTER the last pass", text)
+        self.assertIn("AFTER the unmerged branch", text,
+                      "a consolidation that never reached the trunk moved the window")
+        self.assertIn("claude-code — proj", text, "the entry's tool and project are not shown")
+
+    def test_without_a_recent_consolidation_the_window_is_eight_days(self):
+        for label, setup in (("none", lambda: None),
+                             ("old", lambda: commit_at(self.repo, "consolidate: old", iso_ago(20)))):
+            with self.subTest(label):
+                setup()
+                (self.drop / "d.jsonl").write_text("\n".join([
+                    self.row("NINE days ago", iso_ago(9)),
+                    self.row("SEVEN days ago", iso_ago(7)),
+                ]) + "\n", encoding="utf-8")
+                text, count, _notes = self.module.consolidation_digest(str(self.drop))
+                self.assertEqual(count, 1, text)
+                self.assertIn("SEVEN days ago", text)
+
+    def test_imported_and_local_entries_merge_sorted_and_deduplicated(self):
+        projects = Path(self.tmp.name) / "projects" / "-x"
+        projects.mkdir(parents=True)
+        (projects / "s.jsonl").write_text("\n".join(json.dumps(r) for r in [
+            {"type": "user", "timestamp": iso_ago(2), "cwd": "/w/local-proj",
+             "message": {"role": "user", "content": "LOCAL turn"}},
+            {"type": "user", "timestamp": iso_ago(3), "cwd": "/w/local-proj",
+             "message": {"role": "user", "content": "SAID twice"}},
+        ]), encoding="utf-8")
+        self.module.TRANSCRIPT_ROOT = projects.parent
+        (self.drop / "d.jsonl").write_text("\n".join([
+            self.row("IMPORTED turn", iso_ago(1)),
+            self.row("SAID twice", iso_ago(0.5)),
+        ]) + "\n", encoding="utf-8")
+        text, count, _notes = self.module.consolidation_digest(str(self.drop))
+        self.assertEqual(count, 3, text)
+        self.assertEqual(text.count("SAID twice"), 1)
+        order = [text.index(t) for t in ("LOCAL turn", "IMPORTED turn", "SAID twice")]
+        self.assertEqual(order, sorted(order), "the digest is not in time order")
+        self.assertIn("claude-code — local-proj", text)
 
 
 class SupersedeTests(unittest.TestCase):
@@ -4062,6 +4382,38 @@ class ConsolidationAuditTests(unittest.TestCase):
                       "the auditor could read the session digest it must be blind to")
         self.assertTrue(digest.exists(), "the digest was not restored after the audit")
 
+    def test_a_json_answer_is_read_by_its_result_text_and_its_cost_kept(self):
+        """E5: with --output-format json the runner prints one object; the verdict is the
+        last VERDICT line of its `result`, and its cost and tokens go to the caller."""
+        self.stage_a_change()
+        self.module.subprocess.run = self.fake_claude(json.dumps(
+            {"type": "result", "result": "Checked.\nVERDICT: PASS", "total_cost_usd": 0.02,
+             "usage": {"input_tokens": 7, "cache_read_input_tokens": 2, "output_tokens": 3}}))
+        usage = {}
+        verdict, _detail = self.module.audit_changes(self.runner, usage=usage)
+        self.assertEqual(verdict, "pass")
+        self.assertEqual(usage, {"cost_microusd": 20000, "tokens_in": 9, "tokens_out": 3})
+
+    def test_a_json_answer_without_a_verdict_in_its_result_fails_closed(self):
+        self.stage_a_change()
+        self.module.subprocess.run = self.fake_claude(json.dumps(
+            {"result": "Seems fine to me.", "total_cost_usd": 0.01}))
+        verdict, detail = self.module.audit_changes(self.runner)
+        self.assertEqual(verdict, "error")
+        self.assertIn("no VERDICT", detail)
+
+    def test_runner_output_reads_json_and_leaves_plain_text_alone(self):
+        runner_output = self.module.runner_output
+        self.assertEqual(runner_output("plain\nVERDICT: PASS\n"), ("plain\nVERDICT: PASS\n", None))
+        self.assertEqual(runner_output('{"result": "the text"}'),
+                         ("the text", {"cost_microusd": None, "tokens_in": None,
+                                       "tokens_out": None}))
+        text, usage = runner_output('{"is_error": true, "total_cost_usd": 1.5}')
+        self.assertEqual(text, '{"is_error": true, "total_cost_usd": 1.5}')
+        self.assertEqual(usage["cost_microusd"], 1500000)
+        self.assertEqual(runner_output("[1, 2]"), ("[1, 2]", None))
+        self.assertEqual(runner_output(""), ("", None))
+
     def test_no_staged_changes_passes_without_spawning(self):
         """A pass that changed nothing must not burn a model call."""
         verdict, _detail = self.module.audit_changes(self.runner)
@@ -4302,6 +4654,8 @@ ISOLATED_ARGV = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 CONFINED_ARGV = ["--safe-mode", "--restricted", "--strict-mcp-config",
                  "--mcp-config", '{"mcpServers":{}}', "--tools", "Read",
                  "--permission-prompts", "none", "--no-session-persistence"]
+# E5: both calls answer as one JSON object, which carries the call's cost and tokens.
+JSON_ARGV = ["--output-format", "json"]
 
 
 class ConsolidatorConfigTests(unittest.TestCase):
@@ -4349,14 +4703,15 @@ class ConsolidatorConfigTests(unittest.TestCase):
         tools = ["lint", "lint *", "search *", "read *", "links *", "recent *", "new *",
                  "supersede *", "index", "index *"]
         self.assertEqual(runner["propose"],
-                         ["claude", "--model", "claude-opus-5-5",
+                         ["claude", "--model", "claude-opus-5-5", *JSON_ARGV,
                           "--permission-mode", "acceptEdits", *ISOLATED_ARGV,
                           "--add-dir", engine, "--allowedTools",
                           *["Bash(%s/bin/brain %s)" % (engine, t) for t in tools],
                           *["Bash(git %s *)" % g for g in ("status", "diff", "log", "rev-parse")],
                           "-p"])
         self.assertEqual(runner["audit"],
-                         ["claude", "--model", "claude-opus-5-5", "-p", *CONFINED_ARGV])
+                         ["claude", "--model", "claude-opus-5-5", *JSON_ARGV, "-p",
+                          *CONFINED_ARGV])
         self.assertEqual(runner["propose_timeout"], 1800)
         self.assertEqual(runner["audit_timeout"], 900)
         self.assertIn("consolidator.conf", runner["source"])
@@ -4530,6 +4885,24 @@ class ConsolidatorConfigTests(unittest.TestCase):
         program they establish nothing (review, Astra 9)."""
         self.write_conf(audit="other-runner --model {model} -p " + CONFINED)
         self.assertIn("claude", self.refusal())
+
+    def test_the_audit_line_may_carry_exactly_output_format_json(self):
+        """E5: `--output-format json` changes how the answer is printed and grants nothing,
+        so the allowlist admits that one pair — and no other value, and not twice."""
+        def with_flags(flags):
+            return "claude --model {model} " + flags + " -p " + CONFINED
+        self.write_conf(audit=with_flags("--output-format json"))
+        self.assertEqual(self.module.load_consolidator()["audit"][3:5], JSON_ARGV)
+        for bad in ("--output-format stream-json", "--output-format text",
+                    "--output-format json --output-format json", "--output-format",
+                    "--output-format json extra", "--output-format=stream-json",
+                    "--input-format stream-json"):
+            with self.subTest(bad=bad):
+                self.write_conf(audit=with_flags(bad))
+                self.refusal()
+        self.write_conf(audit="claude --model {model} -p " + CONFINED)
+        self.assertNotIn("--output-format", self.module.load_consolidator()["audit"],
+                         "the flag is admitted, not required")
 
     def test_an_audit_flag_outside_the_allowlist_is_refused(self):
         for extra in ("--agents x", "--append-system-prompt hello", "--setting-sources user"):
