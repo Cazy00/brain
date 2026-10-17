@@ -15,6 +15,10 @@ Commands:
                                    instead of leaving it behind (what the remote
                                    write path asks for); --json reports the
                                    result as one object instead of prose.
+                                   Provenance: --via and --client are what an
+                                   endpoint stamps; --kind, --basis, --project,
+                                   --job and --model are the caller's claims.
+                                   A bad value is dropped, the note kept.
   brain lint [--staged]            validate every note; exit 1 on errors
   brain search "<query>" [--scope all] [--limit N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
