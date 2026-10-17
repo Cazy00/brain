@@ -1733,6 +1733,10 @@ def iso_ago(days):
     return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def utc_in(seconds):
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class DigestImportTests(unittest.TestCase):
     """E4: `consolidate --digest-from DIR` reads digest.v1 files another account produced.
     The directory is written by a different user, so it is read as untrusted input: regular
@@ -5060,6 +5064,27 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         self.assertNotIn("at most 7", text, "the old proposal cap is still stated")
         self.assertNotIn("--tools", text)
 
+    def test_the_prompt_names_the_values_capture_actually_writes(self):
+        """The prompt and brainlib/provenance.py describe the same fields; this keeps the
+        names and enumerations the pass is taught equal to the ones capture stamps."""
+        sys.path.insert(0, str(ROOT / "bin"))
+        try:
+            from brainlib import provenance
+        finally:
+            sys.path.pop(0)
+        text = self.prompt("consolidate-prompt.md")
+        for basis in provenance.BASES:
+            self.assertIn(f"`{basis}`", text)
+        for field in provenance.FIELDS:
+            self.assertIn(f"`{field}:`", text)
+        for via in ("service", "interactive", "stdio", "serve", "drop-box"):
+            self.assertIn(f"`{via}`", text)
+        self.assertIn("name/version", text)
+        mined = re.search(r"`kind: <([a-z |]+)>`", text)
+        self.assertTrue(mined, "the mining step names no kinds")
+        kinds = [k.strip() for k in mined.group(1).split("|")]
+        self.assertTrue(set(kinds) <= set(provenance.KINDS), kinds)
+
     def test_the_audit_prompt_checks_the_rules_it_can_see_in_the_diff(self):
         text = self.prompt("audit-prompt.md")
         for phrase in ("agent-inferred", "owner-said", "session-mining", "expires",
@@ -5579,6 +5604,20 @@ class CaptureCountTests(unittest.TestCase):
             ("session-mining", None, None, "fact", "owner-said"): 1,
         })
         self.assertEqual(payload["groups"][0]["count"], 2, "largest group first")
+
+    def test_reads_the_fields_brain_capture_writes(self):
+        for cfg in (["user.email", "t@example.com"], ["user.name", "Test"]):
+            subprocess.run(["git", "config", *cfg], cwd=self.repo, check=True)
+        since = iso_ago(0.01)
+        done = run_brain("capture", "--commit", "--via", "service", "--client", "Claude AI/1.2",
+                         "--kind", "decision", "--basis", "agent-inferred", "--project", "brain",
+                         "Daily passes, because the inbox outgrew a weekly one", repo=self.repo)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        payload = self.counts(since, utc_in(60))
+        self.assertEqual(payload["total"], 1, payload)
+        self.assertEqual(payload["groups"], [{"source": "local", "via": "service",
+                                              "client": "claude-ai", "kind": "decision",
+                                              "basis": "agent-inferred", "count": 1}])
 
     def test_a_bad_instant_is_a_usage_error(self):
         out = run_brain("stats", "--captures", "--since", "last week", "--json", repo=self.repo)

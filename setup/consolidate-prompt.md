@@ -29,8 +29,13 @@ Do these in order, respecting every cap:
    - `local` is an owner endpoint: the owner, or an agent working for them.
      `basis:` says which: `owner-said` (the owner's own words), `agent-found`
      (an agent checked it, and should say where), `agent-inferred` (an agent's
-     own conclusion). `via:` names the endpoint and `client:` the program that
-     sent it. A note with no `basis:` predates the field: weigh it as before.
+     own conclusion). `via:` says how it arrived — the operator's label for the
+     verified credential (else `service` or `interactive`), `stdio`, `serve`
+     or `drop-box`; absent from the command line — and `client:` is the
+     sending program's own `name/version`, self-reported and never an
+     identity. `kind:`, `basis:`, `project:`, `job:` and `model:` are the
+     writer's claims. A note with no `basis:` predates the field: weigh it as
+     before.
      An `agent-inferred` note is never promoted as settled fact on its own,
      and never supersedes a canonical note whose sources are the owner's (a
      canonical note with no `## Sources` predates them: treat it as the
