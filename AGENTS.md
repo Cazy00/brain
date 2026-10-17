@@ -67,8 +67,30 @@ status:   current   (canonical folders hold current notes ONLY)
 Optional: `valid_from`, `review_by` (date to re-verify perishable facts),
 `supersedes`, `superseded_by`, `sensitivity` (required in people/ and life/:
 normal | personal; `private` content goes to vault/, never plaintext),
-`visibility` (public | private — see below), `source` (which endpoint accepted
-a capture; on inbox notes).
+`visibility` (public | private — see below), and on inbox notes the
+provenance keys below.
+
+**Inbox provenance.** `brain capture` writes these flat keys, in this order,
+leaving out any it was not given:
+
+| Key | Set by | Value |
+|---|---|---|
+| `created` | always | the deployment's local date (`TZ`) |
+| `captured_at` | always | UTC instant, `2026-10-18T05:12:09Z` |
+| `source` | the endpoint | its trust class; `local` by default |
+| `via` | the endpoint | how it arrived: the operator's label for the verified credential (else `service` / `interactive`), `stdio`, `serve` or `drop-box`; absent from the CLI |
+| `client` | the endpoint | the client program's own `name/version`, self-reported |
+| `kind` | the caller | decision \| preference \| fact \| lesson \| idea \| correction \| other |
+| `basis` | the caller | owner-said \| agent-found \| agent-inferred |
+| `project`, `job`, `model` | the caller | slugs |
+| `status` | always | `draft` |
+
+Endpoint keys record what the server verified or was told; no tool argument
+reaches them. Caller keys are **claims**: consolidation weighs them against
+everything else it knows, and none of them promotes or supersedes a note by
+itself. A value that fails validation is dropped and named back to the
+caller, and the note is kept. An inbox `kind` is the declared kind, not a
+canonical one: search lists the note as `inbox` whatever it says.
 
 **`visibility` decides what may leave this brain**, and it has THREE states.
 `public` means a human approved this note for readers outside — customers,
