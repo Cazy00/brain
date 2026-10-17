@@ -6786,16 +6786,41 @@ def cmd_doctor() -> int:
     else:
         print("  [-- ] no search index yet — built automatically on first search")
 
-    inbox_items = sorted((K / "inbox").glob("*.md"), key=lambda p: p.stat().st_mtime)
-    if inbox_items:
-        oldest_days = int((time.time() - inbox_items[0].stat().st_mtime) / 86400)
-        state = "RED" if (len(inbox_items) > 25 or oldest_days > 21) else "ok "
+    # Age from git, not mtime: every clone and checkout stamps mtime to now, so on the
+    # curator's own clone an mtime-based age never grew and this alarm never fired.
+    _born = note_birthdays()
+    captures, proposals, overdue = [], 0, 0
+    for path in sorted((K / "inbox").glob("*.md")):
+        rel = str(path.relative_to(ROOT))
+        fm = parse_frontmatter(read_text(path))[0] or {}
+        if str(fm.get("source") or "") == "session-mining":
+            # A proposal the curator wrote from the session digest. It has its own expiry
+            # and the curator deletes it once that passes, so it is no capture backlog;
+            # one left more than two days past it means the curator stopped pruning.
+            proposals += 1
+            expires = str(fm.get("expires") or "")
+            if valid_date(expires) and (date.today() - date.fromisoformat(expires)).days > 2:
+                overdue += 1
+            continue
+        born = _born.get(rel)
+        captures.append((date.today() - date.fromisoformat(born)).days if born else 0)
+    if captures:
+        oldest_days = max(captures)
+        state = "RED" if (len(captures) > 25 or oldest_days > 21) else "ok "
         if state == "RED":
             ok = False
-        print(f"  [{state}] inbox backlog: {len(inbox_items)} item(s), oldest {oldest_days}d — "
+        print(f"  [{state}] inbox backlog: {len(captures)} capture(s), oldest {oldest_days}d — "
               "drain via bin/brain consolidate")
     else:
-        print("  [ok ] inbox empty")
+        print("  [ok ] inbox empty" + (" of captures" if proposals else ""))
+    if proposals:
+        if overdue:
+            ok = False
+            print(f"  [RED] {proposals} session-mining proposal(s) in the inbox, {overdue} more "
+                  "than 2 days past its expires date — the curator has stopped pruning them")
+        else:
+            print(f"  [ok ] {proposals} session-mining proposal(s) in the inbox, none past "
+                  "its expiry")
 
     # An empty inbox is ambiguous in the worst possible way: it is what a
     # healthy, freshly-drained brain looks like, and it is ALSO exactly what a
@@ -6804,7 +6829,6 @@ def cmd_doctor() -> int:
     # the routing block gets dropped from a global instruction file, or an agent
     # update stops honouring it, and nothing anywhere says the brain stopped
     # growing until someone wonders why it never knows anything recent.
-    _born = note_birthdays()
     _recent = sum(1 for _rel, _day in _born.items()
                   if _rel.endswith(".md") and (ROOT / _rel).exists()
                   and (date.today() - date.fromisoformat(_day)).days <= 30)

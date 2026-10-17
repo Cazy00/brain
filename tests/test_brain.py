@@ -5065,6 +5065,120 @@ class StatsTests(unittest.TestCase):
             self.assertIn(key, payload)
 
 
+def inbox_note(**fm):
+    head = "".join(f"{k}: {v}\n" for k, v in {"created": "2026-10-18", "status": "draft",
+                                              **fm}.items())
+    return f"---\n{head}---\n\nA note.\n"
+
+
+class CaptureCountTests(unittest.TestCase):
+    """E8: `stats --captures` counts what arrived in the inbox in a window, by where it came
+    from, from git — so a note the curator has since drained still counts."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=self.repo, check=True,
+                       capture_output=True)
+
+    def capture(self, name, when, **fm):
+        commit_at(self.repo, f"capture: {name}", when,
+                  (f"knowledge/inbox/{name}.md", inbox_note(**fm)))
+
+    def counts(self, since, until):
+        out = run_brain("stats", "--captures", "--since", since, "--until", until, "--json",
+                        repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout)
+
+    def test_counts_first_adds_on_the_trunk_grouped_by_provenance(self):
+        since, until = iso_ago(5), iso_ago(0)
+        self.capture("a", iso_ago(3), source="local", via="service", client="claude-ai/1.2",
+                     kind="decision", basis="owner-said")
+        self.capture("b", iso_ago(2.5), source="local", via="service", client="claude-ai/1.3",
+                     kind="decision", basis="owner-said")
+        self.capture("c", iso_ago(2), source="local")
+        commit_at(self.repo, "consolidate: drained c", iso_ago(1), ("knowledge/inbox/c.md", None))
+        self.capture("old", iso_ago(10), source="support-bot")
+        self.capture("p", iso_ago(1), source="session-mining", kind="fact", basis="owner-said",
+                     expires="2026-10-25")
+        self.capture("at-since", since, source="local")
+        subprocess.run(["git", "checkout", "-q", "-b", "side"], cwd=self.repo, check=True)
+        self.capture("unmerged", iso_ago(1), source="local")
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=self.repo, check=True)
+        commit_at(self.repo, "edit a", iso_ago(0.5), ("knowledge/inbox/a.md",
+                                                      inbox_note(source="changed")))
+
+        payload = self.counts(since, until)
+        self.assertEqual((payload["v"], payload["since"], payload["until"]), (1, since, until))
+        self.assertEqual(payload["total"], 4, payload)
+        groups = {(g["source"], g["via"], g["client"], g["kind"], g["basis"]): g["count"]
+                  for g in payload["groups"]}
+        self.assertEqual(groups, {
+            ("local", "service", "claude-ai", "decision", "owner-said"): 2,
+            ("local", None, None, None, None): 1,
+            ("session-mining", None, None, "fact", "owner-said"): 1,
+        })
+        self.assertEqual(payload["groups"][0]["count"], 2, "largest group first")
+
+    def test_a_bad_instant_is_a_usage_error(self):
+        out = run_brain("stats", "--captures", "--since", "last week", "--json", repo=self.repo)
+        self.assertEqual(out.returncode, 2, out.stdout)
+
+
+class DoctorInboxTests(unittest.TestCase):
+    """E6: the inbox alarm reads age from git, not mtime (a fresh clone resets mtime), and
+    counts session-mining proposals apart: they have their own expiry, and one left past it
+    means the curator has stopped pruning."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+
+    def inbox_lines(self):
+        out = run_brain("doctor", repo=self.repo)
+        return [l for l in out.stdout.splitlines()
+                if "inbox" in l or "session-mining" in l]
+
+    def test_age_comes_from_git_not_mtime(self):
+        commit_at(self.repo, "capture", iso_ago(30),
+                  ("knowledge/inbox/old.md", inbox_note(source="local")))
+        os.utime(self.repo / "knowledge/inbox/old.md", None)          # mtime: now
+        lines = self.inbox_lines()
+        # 30 days in UTC; a day more where the local calendar is already ahead of UTC.
+        self.assertTrue([l for l in lines if "[RED]" in l
+                         and re.search(r"1 capture\(s\), oldest 3[01]d", l)], lines)
+
+    def test_proposals_are_counted_apart_from_the_backlog_rule(self):
+        future = (date_today() + timedelta(days=5)).isoformat()
+        commit_at(self.repo, "captures", iso_ago(1), *[
+            (f"knowledge/inbox/c{i}.md", inbox_note(source="local")) for i in range(20)], *[
+            (f"knowledge/inbox/p{i}.md", inbox_note(source="session-mining", expires=future))
+            for i in range(10)])
+        lines = self.inbox_lines()
+        self.assertTrue([l for l in lines if "[ok ]" in l and "20 capture(s)" in l], lines)
+        self.assertTrue([l for l in lines if "[ok ]" in l and "10 session-mining" in l], lines)
+
+    def test_a_proposal_past_its_expiry_turns_doctor_red(self):
+        for days, red in ((1, False), (3, True)):
+            with self.subTest(days_past=days):
+                expired = (date_today() - timedelta(days=days)).isoformat()
+                commit_at(self.repo, "proposal", iso_ago(9), ("knowledge/inbox/p.md",
+                          inbox_note(source="session-mining", expires=expired)))
+                lines = [l for l in self.inbox_lines() if "session-mining" in l]
+                self.assertEqual(len(lines), 1, lines)
+                self.assertEqual("[RED]" in lines[0], red, lines)
+                if red:
+                    self.assertIn("stopped pruning", lines[0])
+
+
+def date_today():
+    from datetime import date
+    return date.today()
+
+
 class DefaultBranchTests(unittest.TestCase):
     """`main` was hardcoded where the code decides whether consolidation work
     has been reviewed. On a `master` repo those comparisons named a branch that
