@@ -154,6 +154,7 @@ Full guide, including schedules, the encrypted vault and a second machine:
 | **Supersede protocol** | Outdated notes get `status: superseded` and physically **move out of the search scope**. Being wrong requires effort, not vigilance. |
 | **A commit gate that blocks** | Schema violations, secrets, dangling `[[links]]`, duplicate ids and half-finished supersedes are refused at `git commit`, and again in CI. |
 | **Generous capture, strict promotion** | Quick thoughts land in `inbox/`, outside default search. A weekly pass promotes the few that earn it and deletes the rest. |
+| **Provenance on every capture** | Each inbox note records when it was captured, the endpoint and client that sent it, and what its writer *claims* it is (`kind`, `basis`). The endpoint stamps what it verified; the caller's claims are weighed as claims, so an agent's inference is never read as your own word. |
 | **A validated link graph** | A `[[wikilink]]` to a note that does not exist fails the build. Links rot loudly instead of quietly. |
 | **Trust signals on every read** | `[provisional — unconsolidated]`, an ARCHIVED banner, a passed `review_by` — retrieval tells you how much to trust what it just handed you. |
 | **`brain stats`** | Measures the things that fail *silently*: findability, capture rate, staleness, curation, orphans. |

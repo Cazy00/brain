@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from brainlib import (access, capture, httplog, httpmcp, maintenance, mcpcore,  # noqa: E402
-                      served, sync)
+                      provenance, served, sync)
 
 ENGINE = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = "/etc/brain/brain-http.json"
@@ -102,6 +102,29 @@ def load_config(path: str) -> dict:
         if profile not in mcpcore.PROFILES:
             raise ConfigError("service principal %r has unknown profile %r"
                               % (name, profile))
+
+    # The operator's names for the credentials it verifies, stamped `via` on
+    # every capture they make (brainlib/provenance.py). Optional; without one a
+    # capture is stamped with the principal's mode. A label is written into
+    # notes, so a bad one is a refusal to start like any other config error,
+    # never a value discovered in frontmatter weeks later.
+    rule = ("lowercase letters, digits, '.', '_', ':' and '-', starting with a "
+            "letter or digit, at most %d characters" % provenance.SLUG_MAX)
+    labels = config.get("principal_labels")
+    if labels is not None:
+        if not isinstance(labels, dict):
+            raise ConfigError("principal_labels must be an object: service principal "
+                              "common name -> label")
+        known = dict(config.get("service_principals") or {})
+        for name, label in labels.items():
+            if name not in known:
+                raise ConfigError("principal_labels names %r, which is not one of the "
+                                  "service_principals" % (name,))
+            if not provenance.is_slug(label):
+                raise ConfigError("the label for service principal %r is not valid — %s"
+                                  % (name, rule))
+    if config.get("owner_label") is not None and not provenance.is_slug(config["owner_label"]):
+        raise ConfigError("owner_label is not valid — %s" % rule)
     return config
 
 
@@ -179,6 +202,8 @@ def build(config: dict, data_root, state_dir):
         owner_email=config["owner_email"],
         service_principals=config.get("service_principals") or {},
         principal_key=principal_key,
+        principal_labels=config.get("principal_labels") or {},
+        owner_label=config.get("owner_label"),
     )
     log = httplog.EventLog(state_dir)
     # A push the remote rejects (an owner's PR merged meanwhile) becomes one

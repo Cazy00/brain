@@ -42,6 +42,7 @@ AUD_READ = "a" * 64
 AUD_WRITE = "b" * 64
 OWNER = "owner@example.invalid"
 SERVICE_CLIENT = "0123456789abcdef.access"
+CAPTURE_CLIENT = "fedcba9876543210.access"
 PRINCIPAL_KEY = b"test-principal-key-that-is-long-enough-to-pass"
 KID = "test-kid"
 
@@ -109,7 +110,8 @@ def make_data_root(parent: Path) -> Path:
 class RemoteBrain(object):
     """A running brain: sandbox data, a live socket, and a client that talks to it."""
 
-    def __init__(self, origin_policy="observe", git_push=False, limits=None):
+    def __init__(self, origin_policy="observe", git_push=False, limits=None,
+                 verifier_options=None):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
         self.data_root = make_data_root(base)
@@ -127,8 +129,8 @@ class RemoteBrain(object):
             endpoints=[access.Endpoint("brain-read.test", AUD_READ, "read"),
                        access.Endpoint("brain.test", AUD_WRITE, "capture")],
             owner_email=OWNER,
-            service_principals={SERVICE_CLIENT: "read"},
-            principal_key=PRINCIPAL_KEY, jwks=jwks)
+            service_principals={SERVICE_CLIENT: "read", CAPTURE_CLIENT: "capture"},
+            principal_key=PRINCIPAL_KEY, jwks=jwks, **(verifier_options or {}))
         self.log = httplog.EventLog(self.state_dir)
         self.queue = capture.BackupQueue(self.data_root, log=self.log, enabled=git_push)
         self.capturer = capture.Capturer(
@@ -219,10 +221,12 @@ class RemoteTestCase(unittest.TestCase):
     ORIGIN_POLICY = "observe"
     GIT_PUSH = False
     LIMITS = None
+    VERIFIER_OPTIONS = None
 
     def setUp(self):
         self.brain = RemoteBrain(origin_policy=self.ORIGIN_POLICY,
-                                 git_push=self.GIT_PUSH, limits=self.LIMITS)
+                                 git_push=self.GIT_PUSH, limits=self.LIMITS,
+                                 verifier_options=self.VERIFIER_OPTIONS)
 
     def tearDown(self):
         self.brain.close()
@@ -271,6 +275,20 @@ class HandshakeTests(RemoteTestCase):
         status, _h, _b = self.brain.rpc("tools/list",
                                         headers={"MCP-Protocol-Version": "1999-01-01"})
         self.assertEqual(status, 400)
+
+    def test_the_capture_profile_is_told_the_capture_policy(self):
+        """Every client of every vendor receives `initialize` instructions, so
+        this is where the capture policy reaches a client with no other
+        configuration at all."""
+        _status, _h, body = self.brain.rpc("initialize", {"protocolVersion": "2025-11-25"})
+        self.assertEqual(body["result"]["instructions"], mcpcore.instructions("capture"))
+        self.assertIn(mcpcore.CAPTURE_POLICY, body["result"]["instructions"])
+
+    def test_the_read_profile_is_told_it_is_read_only(self):
+        _status, _h, body = self.brain.rpc("initialize", {"protocolVersion": "2025-11-25"},
+                                           host="brain-read.test")
+        self.assertEqual(body["result"]["instructions"], mcpcore.instructions("read"))
+        self.assertNotIn(mcpcore.CAPTURE_POLICY, body["result"]["instructions"])
 
 
 class CapabilityBoundaryTests(RemoteTestCase):
@@ -640,6 +658,208 @@ class CaptureTests(RemoteTestCase):
                                 cwd=self.brain.data_root, capture_output=True, text=True)
         self.assertEqual(status.stdout.strip(), "",
                          "concurrent captures left the tree dirty")
+
+
+def _frontmatter(text: str) -> dict:
+    lines = text.splitlines()
+    end = lines.index("---", 1)
+    return dict(line.split(": ", 1) for line in lines[1:end])
+
+
+class _StampCases(object):
+    """What the server knows, stamped; what the caller says, recorded as a claim.
+
+    The server knows which verified credential sent a capture and what the
+    client calls itself, and used to write both only to its log, so every note
+    read as `source: local` — the owner, on their own machine — whoever wrote
+    it. `via` and `client` are now stamped from that knowledge, and nothing in
+    a request can set them."""
+
+    def notes(self):
+        return sorted((self.brain.data_root / "knowledge" / "inbox").glob("*.md"))
+
+    def only_note(self):
+        found = self.notes()
+        self.assertEqual(len(found), 1, found)
+        return _frontmatter(found[0].read_text(encoding="utf-8"))
+
+    def modern_capture(self, arguments, client_info=None, assertion=None):
+        meta = {httpmcp.META_VERSION: "2026-07-28", httpmcp.META_CLIENT_CAPS: {}}
+        if client_info is not None:
+            meta[httpmcp.META_CLIENT_INFO] = client_info
+        status, _h, body = self.brain.post(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "brain_capture", "arguments": arguments, "_meta": meta}},
+            assertion=assertion or sign_assertion(owner_claims()),
+            headers={"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/call",
+                     "Mcp-Name": "brain_capture"})
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_a_modern_client_is_stamped_with_its_own_name(self):
+        body = self.modern_capture({"text": "Named by its client, 2026-10-18."},
+                                   {"name": "Generic Client", "version": "2.1"})
+        self.assertFalse(body["result"]["isError"], body)
+        self.assertEqual(self.only_note()["client"], "generic-client/2.1")
+
+    def test_a_client_name_that_is_not_a_label_is_dropped_and_logged(self):
+        body = self.modern_capture({"text": "A client with a strange name."},
+                                   {"name": "evil\nstatus: current", "version": "1"})
+        self.assertFalse(body["result"]["isError"], body)
+        fields = self.only_note()
+        self.assertNotIn("client", fields)
+        self.assertEqual(fields["status"], "draft")
+        events = [json.loads(line) for line in
+                  (self.brain.state_dir / "events.jsonl").read_text(encoding="utf-8")
+                  .splitlines()]
+        dropped = [e for e in events if e["event"] == "provenance_dropped"]
+        self.assertEqual(len(dropped), 1, events)
+        self.assertEqual(dropped[0]["reason"], "client")
+        self.assertNotIn("evil", json.dumps(dropped[0]))
+
+    def test_declared_fields_reach_the_note(self):
+        _status, body = self.brain.call("brain_capture", {
+            "text": "We picked the daily curator over weekly, 2026-10-18.",
+            "kind": "decision", "basis": "owner-said", "project": "brain",
+            "job": "j-0042", "model": "some-model-1"})
+        self.assertFalse(body["result"]["isError"], body)
+        fields = self.only_note()
+        self.assertEqual((fields["kind"], fields["basis"], fields["project"], fields["job"],
+                          fields["model"]),
+                         ("decision", "owner-said", "brain", "j-0042", "some-model-1"))
+
+    def test_a_bad_declared_value_is_named_and_the_note_still_saved(self):
+        _status, body = self.brain.call("brain_capture", {
+            "text": "A note worth more than its label.", "kind": "musing",
+            "basis": "owner-said", "project": 7})
+        self.assertFalse(body["result"]["isError"], body)
+        text = self.brain.text_of(body)
+        self.assertIn("ignored: kind, project", text)
+        self.assertIn("PROVISIONAL", text)
+        fields = self.only_note()
+        self.assertNotIn("kind", fields)
+        self.assertNotIn("project", fields)
+        self.assertEqual(fields["basis"], "owner-said")
+
+    def test_a_caller_cannot_set_what_the_endpoint_stamps(self):
+        for field in ("via", "client", "source", "captured_at", "created", "status"):
+            _status, body = self.brain.call("brain_capture",
+                                            {"text": "claiming %s" % field, field: "local"})
+            self.assertTrue(body["result"]["isError"], field)
+            self.assertIn("unknown argument", self.brain.text_of(body))
+        self.assertEqual(self.notes(), [], "a refused call reached the disk")
+
+    def test_content_dedup_keys_on_the_text_not_the_labels(self):
+        self.brain.call("brain_capture", {"text": "Said once, labelled twice.",
+                                          "kind": "fact"})
+        _status, second = self.brain.call("brain_capture", {"text": "Said once, labelled twice.",
+                                                            "kind": "decision"})
+        self.assertIn("ALREADY SAVED", self.brain.text_of(second))
+        self.assertEqual(len(self.notes()), 1)
+
+
+class CaptureStampTests(_StampCases, RemoteTestCase):
+    """No labels configured: a capture is stamped with the principal's mode."""
+
+    def test_the_owner_is_stamped_with_the_principal_mode(self):
+        _status, body = self.brain.call("brain_capture", {"text": "Stamped by mode, 2026-10-18."})
+        self.assertFalse(body["result"]["isError"], body)
+        fields = self.only_note()
+        self.assertEqual(fields["via"], "interactive")
+        self.assertEqual(fields["source"], "local")
+        # A legacy tools/call carries no clientInfo; absent is the honest answer.
+        self.assertNotIn("client", fields)
+
+    def test_a_service_credential_is_stamped_service(self):
+        assertion = sign_assertion(service_claims(aud=AUD_WRITE, common_name=CAPTURE_CLIENT))
+        _status, body = self.brain.call("brain_capture", {"text": "From a service, 2026-10-18."},
+                                        assertion=assertion)
+        self.assertFalse(body["result"]["isError"], body)
+        self.assertEqual(self.only_note()["via"], "service")
+
+
+class LabelledPrincipalStampTests(_StampCases, RemoteTestCase):
+    """The operator's names for the credentials it verifies."""
+    VERIFIER_OPTIONS = {"principal_labels": {CAPTURE_CLIENT: "relay"},
+                        "owner_label": "owner-sign-in"}
+
+    def test_the_owner_is_stamped_with_the_operators_label(self):
+        self.brain.call("brain_capture", {"text": "The owner, by label, 2026-10-18."})
+        self.assertEqual(self.only_note()["via"], "owner-sign-in")
+
+    def test_a_service_credential_is_stamped_with_its_label(self):
+        assertion = sign_assertion(service_claims(aud=AUD_WRITE, common_name=CAPTURE_CLIENT))
+        self.brain.call("brain_capture", {"text": "The relay, by label, 2026-10-18."},
+                        assertion=assertion)
+        self.assertEqual(self.only_note()["via"], "relay")
+
+    def test_the_stable_id_is_unchanged_by_a_label(self):
+        """The label is for the NOTE; the log's principal id stays the HMAC."""
+        verifier = self.brain.verifier
+        plain = access.Verifier(team_domain=TEAM, endpoints=list(verifier.endpoints.values()),
+                                owner_email=OWNER, principal_key=PRINCIPAL_KEY,
+                                jwks=verifier.jwks)
+        claims = owner_claims()
+        self.assertEqual(verifier._identify(claims, verifier.endpoint_for("brain.test")).stable_id,
+                         plain._identify(claims, plain.endpoint_for("brain.test")).stable_id)
+
+
+class PrincipalLabelConfigTests(unittest.TestCase):
+    """A label is written into notes, so a bad one refuses to start the server."""
+
+    @classmethod
+    def setUpClass(cls):
+        from importlib.machinery import SourceFileLoader
+        import importlib.util
+        loader = SourceFileLoader("brain_http_under_test", str(ENGINE / "bin" / "brain-http"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.module = importlib.util.module_from_spec(spec)
+        loader.exec_module(cls.module)
+
+    def load(self, **extra):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = {"team_domain": TEAM, "owner_email": OWNER, "principal_key_file": "/k",
+                  "endpoints": [{"hostname": "brain.test", "aud": AUD_WRITE,
+                                 "profile": "capture"}],
+                  "service_principals": {CAPTURE_CLIENT: "capture"}}
+        config.update(extra)
+        path = Path(tmp.name) / "brain-http.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return self.module.load_config(str(path))
+
+    def test_good_labels_load(self):
+        config = self.load(principal_labels={CAPTURE_CLIENT: "relay"}, owner_label="owner")
+        self.assertEqual(config["principal_labels"], {CAPTURE_CLIENT: "relay"})
+
+    def test_a_label_that_is_not_a_slug_refuses_to_start(self):
+        for bad in ("Relay Bot", "relay\nstatus: current", "", 7, "x" * 81):
+            with self.assertRaises(self.module.ConfigError, msg=repr(bad)):
+                self.load(principal_labels={CAPTURE_CLIENT: bad})
+            with self.assertRaises(self.module.ConfigError, msg=repr(bad)):
+                self.load(owner_label=bad)
+
+    def test_a_label_for_a_credential_that_is_not_configured_refuses_to_start(self):
+        with self.assertRaises(self.module.ConfigError):
+            self.load(principal_labels={"nobody.access": "relay"})
+
+    def test_principal_labels_must_be_an_object(self):
+        with self.assertRaises(self.module.ConfigError):
+            self.load(principal_labels=["relay"])
+
+    def test_the_labels_reach_the_verifier(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        key = base / "principal.key"
+        key.write_bytes(PRINCIPAL_KEY)
+        key.chmod(0o600)
+        config = self.load(principal_labels={CAPTURE_CLIENT: "relay"}, owner_label="owner")
+        config["principal_key_file"] = str(key)
+        (base / "state").mkdir()
+        service, _queue, _log = self.module.build(config, make_data_root(base), base / "state")
+        self.assertEqual(service.verifier.principal_labels, {CAPTURE_CLIENT: "relay"})
+        self.assertEqual(service.verifier.owner_label, "owner")
 
 
 class MaintenanceTests(RemoteTestCase):
@@ -1371,7 +1591,8 @@ class UnknownArgumentTests(unittest.TestCase):
     def test_the_message_lists_what_the_tool_does_accept(self):
         _, error = mcpcore.validate_args(
             self.tool("brain_capture"), {"text": "x", "colour": "blue"})
-        for accepted in ("text", "client_request_id", "allow_duplicate"):
+        for accepted in ("text", "client_request_id", "allow_duplicate", "kind", "basis",
+                         "project", "job", "model"):
             self.assertIn(accepted, error)
 
     def test_the_correct_spelling_still_works(self):
@@ -1603,6 +1824,30 @@ class DeploymentUnitTests(unittest.TestCase):
         return [line.split("=", 1)[1].strip()
                 for line in path.read_text(encoding="utf-8").splitlines()
                 if line.startswith(key + "=")]
+
+    def compose_block(self, opener, indent):
+        """The lines of one compose block, from its opening line to the next
+        key at the same indentation. No YAML parser, like _compose_services."""
+        lines = self.compose.read_text(encoding="utf-8").splitlines()
+        start = lines.index(opener)
+        block = []
+        for line in lines[start + 1:]:
+            if line.strip() and not line.lstrip().startswith("#") \
+                    and len(line) - len(line.lstrip()) <= indent:
+                break
+            block.append(line.strip())
+        return block
+
+    def test_the_brain_and_maintenance_follow_the_deployments_time_zone(self):
+        """E7: `created`, the inbox file name and the drop box's daily cap are
+        the container's local date, so the container must be told the zone the
+        brain's owner lives in. UTC stays the default; `captured_at` is UTC
+        whatever this says."""
+        self.assertIn("TZ: ${BRAIN_TZ:-UTC}", self.compose_block("x-brain-env: &brain-env", 0))
+        self.assertIn("environment: *brain-env", self.compose_block("  brain:", 2))
+        self.assertIn("<<: *brain-env", self.compose_block("  maintenance:", 2))
+        example = (self.compose.parent / "env.example").read_text(encoding="utf-8")
+        self.assertIn("BRAIN_TZ", example)
 
     def test_every_timer_has_the_service_it_activates(self):
         for timer in self.timers:

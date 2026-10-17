@@ -15,6 +15,10 @@ Commands:
                                    instead of leaving it behind (what the remote
                                    write path asks for); --json reports the
                                    result as one object instead of prose.
+                                   Provenance: --via and --client are what an
+                                   endpoint stamps; --kind, --basis, --project,
+                                   --job and --model are the caller's claims.
+                                   A bad value is dropped, the note kept.
   brain lint [--staged]            validate every note; exit 1 on errors
   brain search "<query>" [--scope all] [--limit N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
@@ -160,7 +164,7 @@ def state_dir() -> Path:
 # file is also exec'd directly by tests/test_brain.py's load_brain_module(),
 # where sys.path[0] belongs to the test runner, not to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import locks, osbackend, served
+from brainlib import locks, osbackend, provenance, served
 # The note contract lives in brainlib/notes.py so that `brain publish` — which
 # decides what a customer may see — applies the SAME rules as lint, rather than
 # a second copy of them that drifts. Imported by name, so every call site in
@@ -2437,7 +2441,9 @@ def cmd_capture(argv: list) -> int:
     # assembled: capture's text is positional and swallows the rest of the
     # line, so a flag parsed by filtering alone leaves its value sitting in
     # the middle of the note.
+    # The provenance flags (brainlib/provenance.py) are lifted the same way.
     source = DEFAULT_SOURCE
+    offered = {}
     words, skip = [], False
     for i, arg in enumerate(argv):
         if skip:
@@ -2448,20 +2454,57 @@ def cmd_capture(argv: list) -> int:
         if arg == "--source" and i + 1 < len(argv):
             source, skip = argv[i + 1], True
             continue
+        if arg.startswith("--") and arg[2:] in provenance.FIELDS and i + 1 < len(argv):
+            offered[arg[2:]], skip = argv[i + 1], True
+            continue
         words.append(arg)
     text = " ".join(words).strip()
     if not text:
-        print("usage: brain capture \"<text>\" [--commit] [--source <slug>] [--atomic] [--json]")
+        print("usage: brain capture \"<text>\" [--commit] [--source <slug>] [--atomic] [--json]\n"
+              "         [--via V] [--client C] [--kind K] [--basis B] [--project P]\n"
+              "         [--job J] [--model M]")
         return 2
-    if not ID_RE.match(source):
+    if not ID_RE.fullmatch(source):
         # Refused here rather than written and linted later: this value is how
         # consolidation decides whether a note is knowledge or a proposal, and
-        # a malformed one is a value nothing downstream can compare.
+        # a malformed one is a value nothing downstream can compare. fullmatch,
+        # because `$` would let a trailing newline through.
         print(f"--source {source!r} is not a valid slug — lowercase letters, digits "
               "and hyphens, 3-80 chars. Nothing was written.")
         return 2
-    today = date.today().isoformat()
-    stamp = time.strftime("%H%M%S")
+    # Unlike --source, a bad provenance value costs the field and never the
+    # note: losing what the user said over a label is the worse failure. A
+    # declared field (the caller's claim) is named back to the caller so it
+    # can be corrected; an endpoint field came from code, so a bad one is a
+    # bug for the operator, said on stderr. A value that would trip the
+    # credential scan is dropped the same way — the text is still scanned
+    # below, and a credential in the TEXT still refuses the whole note.
+    fields, ignored, dropped = {}, [], []
+    for name in provenance.FIELDS:
+        if name not in offered:
+            continue
+        value = provenance.clean(name, offered[name])
+        if value is not None:
+            looks_secret = []
+            scan_secrets(Path(name), looks_secret, raw=f"{name}: {value}".encode("utf-8"))
+            if looks_secret:
+                value = None
+        if value is not None:
+            fields[name] = value
+        elif name in provenance.ENDPOINT_FIELDS:
+            dropped.append(name)
+        else:
+            ignored.append(name)
+    if dropped:
+        sys.stderr.write("brain capture: dropped the endpoint field(s) "
+                         f"{', '.join(dropped)} — not a valid value. The note is saved "
+                         "without them; the endpoint that sent them has a bug.\n")
+    # One clock reading for every stamp, so `created`, the file name and
+    # `captured_at` cannot straddle a midnight between them. `created` and the
+    # file name are the deployment's local date (TZ); `captured_at` is UTC.
+    now = time.time()
+    today = date.fromtimestamp(now).isoformat()
+    stamp = time.strftime("%H%M%S", time.localtime(now))
     slug = slugify(text)[:40]
 
     def fresh_path() -> Path:
@@ -2480,7 +2523,14 @@ def cmd_capture(argv: list) -> int:
     # written by something that never said — and the consolidator would have to
     # guess. It guesses in the trusting direction, which is the failure this
     # field exists to prevent.
-    body = f"---\ncreated: {today}\nsource: {source}\nstatus: draft\n---\n\n{text}\n"
+    #
+    # Never an `id` or a `kind` of a canonical folder's meaning: an inbox note
+    # is provisional, and the index lists it as `inbox` whatever it declares.
+    stamped = {"created": today, "captured_at": provenance.captured_at(now),
+               "source": source, "status": "draft", **fields}
+    head = "".join(f"{name}: {stamped[name]}\n" for name in provenance.ORDER
+                   if name in stamped)
+    body = f"---\n{head}---\n\n{text}\n"
 
     def report(status: str, detail: str = "", commit_id: str = "") -> None:
         if not as_json:
@@ -2495,7 +2545,8 @@ def cmd_capture(argv: list) -> int:
             except ValueError:                # pragma: no cover - path is under ROOT
                 rel = path.name
         print(_json_dumps({"status": status, "note": rel, "commit": commit_id,
-                           "provisional": True, "detail": _safe_detail(detail)}))
+                           "provisional": True, "detail": _safe_detail(detail),
+                           "ignored": ignored}))
 
     # Scan BEFORE the write, not after. Without this the only moment an inbox
     # note ever meets scan_secrets is --commit -> pre-commit -> lint --staged,
@@ -2515,6 +2566,10 @@ def cmd_capture(argv: list) -> int:
         else:
             report("refused", "; ".join(msg for _p, msg in problems))
         return 1
+    if ignored and not as_json:
+        # Before the note's path, which stays the last line a caller reads.
+        print(f"ignored: {', '.join(ignored)} — not a valid value, so it is not "
+              "recorded on the note")
     if not do_commit:
         atomic_write(path, body)
         if not as_json:
@@ -2685,12 +2740,17 @@ def note_records():
             body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
         aliases = (fm or {}).get("aliases") or []
         topics_list = (fm or {}).get("topics") or []
+        # An inbox note's `kind:` is its writer's declared claim (decision,
+        # fact, ...), not a canonical kind, and provisional material never
+        # claims a note id. So in the index an inbox note is always listed as
+        # `inbox`, under the id its file name gives it.
+        provisional = top == "inbox"
         yield {
-            "id": (fm or {}).get("id") or f"{top}-{path.stem}",
+            "id": (None if provisional else (fm or {}).get("id")) or f"{top}-{path.stem}",
             "path": str(path.relative_to(ROOT)),
             "title": str((fm or {}).get("title") or path.stem),
             "folder": top,
-            "kind": str((fm or {}).get("kind") or top),
+            "kind": top if provisional else str((fm or {}).get("kind") or top),
             "created": str((fm or {}).get("created") or ""),
             "aliases": ", ".join(aliases if isinstance(aliases, list) else [str(aliases)]),
             "topics": ", ".join(topics_list if isinstance(topics_list, list) else [str(topics_list)]),

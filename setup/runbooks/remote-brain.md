@@ -31,7 +31,7 @@ Observed behaviour and deviations:
 
 | File | What |
 |---|---|
-| `brain-http.json` | endpoints, audiences, team domain, owner email, service principals |
+| `brain-http.json` | endpoints, audiences, team domain, owner email, service principals, and the optional labels captures are stamped with |
 | `backup.env` | S3-compatible endpoint, bucket, key id, secret |
 | `backup-recipients.txt` | age **public** recipients, `0644` — the identities are offline |
 | `deploy.env` | path overrides for the systemd units; optional |
@@ -231,11 +231,23 @@ sudo nano /etc/brain/brain-http.json
     {"hostname": "brain-read.<ZONE>", "aud": "<AUD_RO>", "profile": "read"}
   ],
   "service_principals": {"<SERVICE_TOKEN_COMMON_NAME>": "read"},
+  "principal_labels": {"<SERVICE_TOKEN_COMMON_NAME>": "<label>"},
+  "owner_label": "<label>",
   "principal_key_file": "/run/secrets/principal-key",
   "git_push": true,
   "log_level": "info"
 }
 ```
+
+`principal_labels` and `owner_label` are optional. Each capture is stamped
+`via: <label>` with your own name for the credential that sent it, so the
+consolidation pass can tell one client from another; without a label the stamp
+is the credential's kind, `service` or `interactive`. A label is a slug
+(lowercase letters, digits, `.`, `_`, `:` and `-`, at most 80 characters), and
+`principal_labels` may only name a common name that `service_principals` also
+names. A bad label stops the server at start, like any other configuration
+error. Labels go into notes, so choose names, never identifiers: not the common
+name itself, not an address.
 
 The age recipients file is the one thing here that is public by nature:
 
@@ -321,10 +333,18 @@ they carry the tunnel id, the audiences and the owner's address.
 ```sh
 cd /srv/brain/engine/deploy
 sudo cp env.example .env && sudo chmod 600 .env
-sudo $EDITOR .env                       # BRAIN_VERSION and the four host paths
+sudo $EDITOR .env                       # BRAIN_VERSION, the four host paths, BRAIN_TZ
 sudo cp cloudflared/config.yml.example cloudflared/config.yml
 sudo $EDITOR cloudflared/config.yml     # replace <TUNNEL_ID>
 ```
+
+`BRAIN_TZ` is the IANA time zone the brain dates captures in (for example
+`Europe/Lisbon`); compose passes it to the brain and maintenance containers as
+`TZ`. A capture's `created` date, its inbox file name and a drop box's daily
+cap follow it, so set it to where the brain's owner lives — left at `UTC`, a
+capture made just after the owner's midnight is dated the day before.
+`captured_at` is UTC either way. `docker compose up -d` applies a change to
+the brain service; maintenance runs pick it up the next time they start.
 
 The connector credential is the one file an agent cannot fetch for you — it is
 a credential, and retrieving it is deliberately a human action. Take it from

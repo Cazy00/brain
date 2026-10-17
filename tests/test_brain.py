@@ -248,6 +248,89 @@ class McpToolLayerTests(unittest.TestCase):
                       "exposes it has to say so")
 
 
+class CaptureContractParityTests(unittest.TestCase):
+    """Two front ends, one capture contract.
+
+    `brain-mcp` / `brain serve` (mcp.py) and `brain-http` (mcpcore.py) carry
+    their own tool tables. What a caller may DECLARE about a note, and the
+    policy that tells it when to capture, must not differ between them: an
+    agent that learns the contract on one transport uses it on the other.
+    """
+
+    TRANSPORT_ONLY = {"stdio": {"commit"}, "remote": {"client_request_id", "allow_duplicate"}}
+    VENDORS = ("claude", "anthropic", "openai", "chatgpt", "codex", "gemini", "cursor",
+               "copilot", "cloudflare", "github")
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcp, mcpcore, provenance
+        self.mcp, self.mcpcore, self.provenance = mcp, mcpcore, provenance
+        remote = {t["name"]: t for t in mcpcore.tool_table("remote")}
+        self.stdio_tool = mcp.TOOLS_BY_NAME["brain_capture"]
+        self.remote_tool = remote["brain_capture"]
+
+    def props(self, tool):
+        return tool["inputSchema"]["properties"]
+
+    def test_both_front_ends_offer_the_same_capture_fields(self):
+        stdio, remote = self.props(self.stdio_tool), self.props(self.remote_tool)
+        self.assertEqual(set(stdio) - self.TRANSPORT_ONLY["stdio"],
+                         set(remote) - self.TRANSPORT_ONLY["remote"])
+        for field in self.provenance.DECLARED_FIELDS:
+            self.assertIn(field, stdio)
+            self.assertEqual(stdio[field], remote[field], field)
+        self.assertEqual(stdio["kind"]["enum"], list(self.provenance.KINDS))
+        self.assertEqual(stdio["basis"]["enum"], list(self.provenance.BASES))
+
+    def test_no_front_end_lets_a_caller_set_what_the_endpoint_stamps(self):
+        for tool in (self.stdio_tool, self.remote_tool):
+            for field in ("via", "client", "source", "captured_at", "created", "status", "id"):
+                self.assertNotIn(field, self.props(tool))
+
+    def test_both_capture_descriptions_carry_the_one_policy(self):
+        for tool in (self.stdio_tool, self.remote_tool):
+            self.assertIn(self.mcpcore.CAPTURE_POLICY, tool["description"])
+
+    def test_the_policy_says_what_it_must(self):
+        policy = self.mcpcore.CAPTURE_POLICY
+        for rule in ("Capture without asking", "the alternatives rejected", "preference",
+                     "search found nothing", "correction", "names its id",
+                     "remember this", "built-in memory", "Never capture credentials",
+                     "transient state", "Ask first", "private life", "self-contained",
+                     "absolute dates", "kind and basis", "owner-said", "agent-found",
+                     "agent-inferred", "project, job and model"):
+            self.assertIn(rule, policy)
+
+    def test_the_policy_fits_the_budget_clients_truncate_to(self):
+        self.assertLessEqual(len(self.mcpcore.instructions("capture")), 1400)
+        for tool in (self.stdio_tool, self.remote_tool):
+            self.assertLessEqual(len(tool["description"]), 1600, tool["name"])
+
+    def test_the_read_only_profile_keeps_its_read_only_sentence(self):
+        read = self.mcpcore.instructions("read")
+        self.assertIn("read-only", read)
+        self.assertNotIn(self.mcpcore.CAPTURE_POLICY, read)
+        self.assertIn(self.mcpcore.CAPTURE_POLICY, self.mcpcore.instructions("capture"))
+
+    def test_nothing_in_the_policy_names_a_vendor(self):
+        blob = " ".join([self.mcpcore.instructions("capture"), self.mcpcore.instructions("read"),
+                         json.dumps(self.stdio_tool), json.dumps(self.remote_tool)]).lower()
+        for vendor in self.VENDORS:
+            self.assertNotIn(vendor, blob, f"the capture contract names {vendor}")
+
+    def test_stdio_initialize_carries_the_instructions_for_what_it_serves(self):
+        mcp = self.mcp
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        full = mcp.handle(init)["result"]
+        self.assertEqual(full["instructions"], self.mcpcore.instructions("capture"))
+        read = mcp.handle(init, allow=mcp.READ_ONLY_TOOLS)["result"]
+        self.assertEqual(read["instructions"], self.mcpcore.instructions("read"))
+        # A drop box serves a caller that cannot read: telling it to search
+        # first would be an instruction it cannot follow.
+        drop = mcp.handle(init, allow=mcp.WRITE_ONLY_TOOLS, source="support-bot")["result"]
+        self.assertNotIn("instructions", drop)
+
+
 class McpServerTests(unittest.TestCase):
     """One bad request must not kill a server that other sessions are sharing."""
 
@@ -454,6 +537,33 @@ class UniversalClientTests(unittest.TestCase):
             for field in schema.get("required", []):
                 self.assertIn(field, schema.get("properties", {}),
                               f"{tool['name']} requires an undeclared field {field}")
+
+    def test_a_capture_over_stdio_is_stamped_by_the_endpoint(self):
+        """via and client come from the endpoint and the session, the declared
+        fields from the caller — and the caller's own via/client/source are
+        dropped before they can reach the note."""
+        proc, replies = self.session(
+            self.call(1, "brain_capture", text="We chose stdio stamping on 2026-10-18.",
+                      kind="decision", basis="agent-found", project="brain",
+                      via="owner-phone", client="the-owner/1", source="partner",
+                      captured_at="2020-01-01T00:00:00Z"))
+        self.assertFalse(replies[1]["result"].get("isError"), self.text(replies[1]))
+        notes = list((self.repo / "knowledge" / "inbox").glob("*stdio-stamping*.md"))
+        self.assertEqual(len(notes), 1, proc.stderr[-500:])
+        fields = dict(frontmatter_pairs(notes[0].read_text(encoding="utf-8")))
+        self.assertEqual(fields["via"], "stdio")
+        self.assertEqual(fields["client"], "generic-mcp-client/1.0")
+        self.assertEqual(fields["source"], "local")
+        self.assertEqual((fields["kind"], fields["basis"], fields["project"]),
+                         ("decision", "agent-found", "brain"))
+        self.assertNotEqual(fields["captured_at"], "2020-01-01T00:00:00Z")
+
+    def test_initialize_tells_a_generic_client_the_capture_policy(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcpcore
+        _proc, replies = self.session()
+        self.assertEqual(replies[0]["result"].get("instructions"),
+                         mcpcore.instructions("capture"))
 
     def test_capture_search_read_round_trips_over_the_wire(self):
         """The whole tool layer, in one session, with no CLI in sight."""
@@ -4276,6 +4386,213 @@ class CaptureProvenanceTests(unittest.TestCase):
         prompt = (ROOT / "setup" / "consolidate-prompt.md").read_text(encoding="utf-8")
         self.assertIn("source", prompt)
         self.assertIn("local", prompt)
+
+
+def frontmatter_pairs(text):
+    """An inbox note's frontmatter as (key, value) pairs, in written order."""
+    lines = text.splitlines()
+    assert lines and lines[0] == "---", text
+    end = lines.index("---", 1)
+    return [tuple(part.strip() for part in line.split(":", 1)) for line in lines[1:end]]
+
+
+class CaptureFieldTests(unittest.TestCase):
+    """Provenance beyond `source`: when, through what, and what the caller says.
+
+    `captured_at` is always written. `via` and `client` are stamped by the
+    endpoint; `kind`, `basis`, `project`, `job` and `model` are the caller's
+    declared claims. Every one of them is a frontmatter line built from a
+    value somebody else chose, so the tests that matter most are the ones
+    proving a crafted value cannot become a second line.
+    """
+
+    ALL_FLAGS = ("--via", "stdio", "--client", "Generic Client/1.0",
+                 "--kind", "Decision", "--basis", "owner-said",
+                 "--project", "brain", "--job", "j-0042", "--model", "some-model-1")
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.repo = make_sandbox(self.tmp.name)
+        self.inbox = self.repo / "knowledge" / "inbox"
+
+    def tearDown(self):
+        cleanup_temp(self.tmp)
+
+    def capture(self, *args, env=None):
+        out = run_brain("capture", *args, "--json", repo=self.repo, env=env)
+        payload = json_payload(out.stdout)
+        note = self.repo / payload["note"] if payload.get("note") else None
+        return out, payload, note.read_text(encoding="utf-8") if note else ""
+
+    def test_captured_at_is_written_in_utc_to_the_second(self):
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        out, payload, text = self.capture("a fact worth a timestamp")
+        after = datetime.now(timezone.utc)
+        self.assertEqual(payload["status"], "written", out.stdout + out.stderr)
+        stamp = dict(frontmatter_pairs(text))["captured_at"]
+        self.assertRegex(stamp, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        when = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertTrue(before <= when <= after, f"{stamp} is not now ({before}..{after})")
+
+    def test_a_plain_capture_carries_only_the_fields_it_always_had(self):
+        _out, _payload, text = self.capture("Postgres over SQLite for the sync layer")
+        self.assertEqual([key for key, _v in frontmatter_pairs(text)],
+                         ["created", "captured_at", "source", "status"])
+
+    def test_every_field_is_written_in_order_and_normalised(self):
+        out, payload, text = self.capture("we chose tabs over spaces", *self.ALL_FLAGS)
+        self.assertEqual(payload["status"], "written", out.stdout + out.stderr)
+        self.assertEqual(payload.get("ignored"), [])
+        pairs = frontmatter_pairs(text)
+        self.assertEqual([key for key, _v in pairs],
+                         ["created", "captured_at", "source", "via", "client", "kind",
+                          "basis", "project", "job", "model", "status"])
+        fields = dict(pairs)
+        self.assertEqual(fields["client"], "generic-client/1.0")
+        self.assertEqual(fields["kind"], "decision")
+        self.assertEqual(fields["source"], "local")
+        self.assertEqual(fields["status"], "draft")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, "lint rejected a provenance note\n" + lint.stdout)
+
+    def test_no_flag_or_value_lands_in_the_note_text(self):
+        _out, _payload, text = self.capture("tabs over spaces", *self.ALL_FLAGS)
+        body = text.split("---", 2)[2]
+        self.assertEqual(body.strip(), "tabs over spaces")
+
+    def test_an_invalid_declared_field_is_dropped_named_and_the_note_kept(self):
+        """Losing the note over a bad label is the worse failure."""
+        out, payload, text = self.capture(
+            "the note must survive its labels", "--kind", "musing",
+            "--basis", "owner-said", "--project", "Bad Project!", "--model", "x" * 81)
+        self.assertEqual(payload["status"], "written", out.stdout)
+        self.assertEqual(payload["ignored"], ["kind", "project", "model"])
+        fields = dict(frontmatter_pairs(text))
+        self.assertEqual(fields["basis"], "owner-said")
+        for dropped in ("kind", "project", "model"):
+            self.assertNotIn(dropped, fields)
+
+    def test_prose_output_names_what_was_ignored_and_still_ends_with_the_path(self):
+        out = run_brain("capture", "a note with a bad kind", "--kind", "musing",
+                        repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("ignored", out.stdout)
+        self.assertIn("kind", out.stdout)
+        self.assertTrue(Path(out.stdout.strip().splitlines()[-1]).is_file(), out.stdout)
+
+    def test_an_invalid_endpoint_field_is_dropped_and_logged_not_reported(self):
+        """`via` and `client` come from code, not from the caller: a bad one is a
+        bug for the operator, not a correction for the caller to make."""
+        out, payload, text = self.capture("an endpoint with a bug", "--client", "a\nb",
+                                          "--via", "Not A Slug")
+        self.assertEqual(payload["status"], "written", out.stdout)
+        self.assertEqual(payload["ignored"], [])
+        fields = dict(frontmatter_pairs(text))
+        self.assertNotIn("client", fields)
+        self.assertNotIn("via", fields)
+        self.assertIn("client", out.stderr)
+        self.assertIn("via", out.stderr)
+
+    def test_a_crafted_value_cannot_inject_a_frontmatter_line(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import notes
+        crafted = ["x\nstatus: current", "decision\nsource: local", "decision\r\nid: planted",
+                   "fact\n", "a: b", "x # comment", "'quoted'", "[a, b]", "{a: b}",
+                   "decision\u2028status: current", "decision\u2028id:planted",
+                   "decision\x85id:planted", "decision\tid:planted"]
+        for value in crafted:
+            args = []
+            for flag in ("--via", "--client", "--kind", "--basis", "--project", "--job",
+                         "--model"):
+                args += [flag, value]
+            out, payload, text = self.capture(f"probe {crafted.index(value)}", *args)
+            self.assertEqual(payload["status"], "written", f"{value!r}: {out.stdout}")
+            fm, err = notes.parse_frontmatter(text)
+            self.assertIsNone(err, f"{value!r} broke the frontmatter:\n{text}")
+            self.assertEqual(fm["status"], "draft", f"{value!r} injected a status")
+            self.assertEqual(fm["source"], "local", f"{value!r} injected a source")
+            self.assertNotIn("id", fm, f"{value!r} injected an id")
+            self.assertEqual([key for key, _v in frontmatter_pairs(text)],
+                             ["created", "captured_at", "source", "status"],
+                             f"{value!r} reached the frontmatter:\n{text}")
+            self.assertEqual(payload["ignored"],
+                             ["kind", "basis", "project", "job", "model"], repr(value))
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+
+    def test_a_source_with_a_trailing_newline_is_refused(self):
+        """`$` matches before a final newline; the slug check must not."""
+        before = set(self.inbox.glob("*.md"))
+        out = run_brain("capture", "mislabelled", "--source", "local\n", repo=self.repo)
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertEqual(set(self.inbox.glob("*.md")), before)
+
+    def test_a_declared_value_that_looks_like_a_credential_is_dropped_not_the_note(self):
+        looks_like_one = "tok" + "en:" + "abcdefghijklmnop"
+        out, payload, text = self.capture("a harmless note", "--job", looks_like_one,
+                                          "--kind", "fact")
+        self.assertEqual(payload["status"], "written", out.stdout)
+        self.assertEqual(payload["ignored"], ["job"])
+        self.assertNotIn(looks_like_one, text)
+        self.assertEqual(dict(frontmatter_pairs(text))["kind"], "fact")
+
+    def test_the_credential_scan_still_covers_the_text(self):
+        looks_like_a_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+        out, payload, _text = self.capture("the key is " + looks_like_a_token,
+                                           "--kind", "fact")
+        self.assertEqual(payload["status"], "refused", out.stdout)
+        self.assertEqual(list(self.inbox.glob("*.md")), [])
+
+    def test_created_and_the_file_name_follow_the_time_zone_and_captured_at_does_not(self):
+        """E7: `created`, the file name and a drop box's daily cap all follow
+        the deployment's TZ; `captured_at` is UTC whatever it is set to."""
+        try:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo("Pacific/Kiritimati")      # UTC+14: never UTC's date for long
+        except Exception:                             # pragma: no cover - no tz database
+            self.skipTest("no time zone database")
+        days = {datetime.now(zone).date().isoformat()}
+        out, payload, text = self.capture("a note dated where its owner lives",
+                                          env={"TZ": "Pacific/Kiritimati"})
+        days.add(datetime.now(zone).date().isoformat())
+        fields = dict(frontmatter_pairs(text))
+        self.assertIn(fields["created"], days, out.stdout)
+        self.assertTrue(Path(payload["note"]).name.startswith(fields["created"]))
+        self.assertTrue(fields["captured_at"].endswith("Z"))
+        cap_day = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, 'bin'); from brainlib import serve; "
+             "print(serve.DailyCap(1, 'x')._today())"],
+            cwd=self.repo, capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, TZ="Pacific/Kiritimati"))
+        self.assertEqual(cap_day.stdout.strip(), fields["created"], cap_day.stderr)
+
+
+class InboxIndexTests(unittest.TestCase):
+    """An inbox note's frontmatter may now say `kind: decision`. In the index
+    it is still an inbox note: provisional material must never be displayed
+    with a canonical folder's kind, and must never claim a note id."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.repo = make_sandbox(self.tmp.name)
+
+    def tearDown(self):
+        cleanup_temp(self.tmp)
+
+    def test_an_inbox_note_is_listed_as_inbox_whatever_its_kind_says(self):
+        (self.repo / "knowledge" / "inbox" / "2026-10-18-051209-zebu.md").write_text(
+            "---\ncreated: 2026-10-18\nsource: local\nkind: decision\nid: planted-id\n"
+            "status: draft\n---\n\nThe zebu decision was made on 2026-10-18.\n",
+            encoding="utf-8")
+        out = run_brain("search", "zebu", "--scope", "all", "--json", repo=self.repo)
+        hits = json_payload(out.stdout)["hits"]
+        self.assertEqual(len(hits), 1, out.stdout)
+        self.assertEqual(hits[0]["kind"], "inbox")
+        self.assertNotEqual(hits[0]["id"], "planted-id")
+        prose = run_brain("search", "zebu", "--scope", "all", repo=self.repo)
+        self.assertIn("(inbox,", prose.stdout)
+        self.assertIn("[provisional — unconsolidated]", prose.stdout)
 
 
 class SensitivityDefaultTests(unittest.TestCase):

@@ -50,6 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import access
 from . import mcpcore
+from . import provenance
 from . import version
 
 ENDPOINT = "/mcp"
@@ -633,7 +634,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "maintenance_mode", headers={"Retry-After": "60"})
 
         if writes:
-            result = self._capture(args, principal, cid)
+            result = self._capture(args, principal, cid, client_name, client_version)
         else:
             result = mcpcore.call(name, args, profile=principal.profile,
                                   transport="remote", timeout=READ_TIMEOUT_SECONDS)
@@ -648,18 +649,34 @@ class Handler(BaseHTTPRequestHandler):
                             ms=_ms(started), **extra)
         return self._send(200, reply(msg_id, result), cid=cid)
 
-    def _capture(self, args, principal, cid) -> dict:
+    def _capture(self, args, principal, cid, client_name=None, client_version=None) -> dict:
         table = {tool["name"]: tool for tool in mcpcore.tool_table("remote")}
-        clean, problem = mcpcore.validate_args(table["brain_capture"],
-                                               args if args is not None else {})
+        # Declared fields first, and apart: a bad one is dropped and named, never
+        # a refusal of the whole capture (provenance.py). Everything else meets
+        # the strict validator, which still refuses an argument it does not know
+        # — so `via`, `client` and `source` in a request are refused, not used.
+        rest, declared, ignored = provenance.take_declared(args if args is not None else {})
+        clean, problem = mcpcore.validate_args(table["brain_capture"], rest)
         if problem:
             return mcpcore.error_result("invalid arguments for brain_capture: %s" % problem)
         if self.service.capturer is None:      # pragma: no cover - misconfiguration
             return mcpcore.error_result("this brain is configured without a write path")
+        # Stamped from what THIS server verified or was told, never from the
+        # arguments: the operator's label for the verified credential, else
+        # its mode; and the client's own self-reported name, when it gave one.
+        client = provenance.client_label(client_name, client_version)
+        if client is None and client_name:
+            # The name itself is not logged: it is text the caller chose.
+            self.service.record("provenance_dropped", cid=cid, principal=principal.stable_id,
+                                reason="client")
         outcome = self.service.capturer.capture(
             clean["text"], principal.profile, principal.stable_id, cid,
             client_request_id=clean.get("client_request_id"),
-            allow_duplicate=bool(clean.get("allow_duplicate", False)))
+            allow_duplicate=bool(clean.get("allow_duplicate", False)),
+            via=principal.label or principal.mode, client=client, declared=declared)
+        later = [name for name in outcome.get("ignored") or [] if name not in ignored]
+        outcome["ignored"] = [name for name in provenance.DECLARED_FIELDS
+                              if name in ignored or name in later]
         from . import capture as capturelib
         return {"content": [{"type": "text", "text": capturelib.format_result(outcome)}],
                 "isError": not outcome.get("ok", False)}
@@ -691,18 +708,8 @@ def search_result_count(result) -> int:
 
 
 def _instructions(profile: str) -> str:
-    common = ("This is the owner's permanent second brain. Search it BEFORE answering "
-              "anything about their decisions, preferences, projects, people or history. "
-              "Results carry trust markers — [provisional — unconsolidated], [journal], "
-              "an ARCHIVED banner, a passed review_by — and those markers are part of the "
-              "answer: never present a provisional or archived note as settled fact. "
-              "If a query misses, try 2-3 lexical variants before concluding there is "
-              "nothing.")
-    if profile == "capture":
-        return common + (" You may also save a note. Capture the WHY, never the "
-                         "recoverable what, never a credential, and always ask first "
-                         "before recording anything about a named person's private life.")
-    return common + " This endpoint is read-only; it cannot save anything."
+    # One policy for every transport, kept in mcpcore beside the tool table.
+    return mcpcore.instructions(profile)
 
 
 def _client_identity(client):
