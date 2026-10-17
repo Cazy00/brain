@@ -30,6 +30,12 @@ x-brain-env: &brain-env
   BRAIN_DATA_ROOT: /srv/brain/data
   BRAIN_STATE_DIR: /srv/brain/state
   BRAIN_HTTP_CONFIG: /etc/brain/brain-http.json
+  # The calendar the brain dates things by. A capture's `created`, its inbox
+  # file name and a drop box's daily cap are all the container's LOCAL date, so
+  # an owner living away from UTC would see a capture made in their small hours
+  # dated the day before. `captured_at` is UTC whatever this says. Set
+  # BRAIN_TZ in deploy/.env; the image ships the zone database.
+  TZ: ${BRAIN_TZ:-UTC}
   # The third durability layer, wired. A capture is ACCEPTED once the local
   # commit exists, but it is not BACKED UP until it reaches the private remote,
   # and the push runs as uid 10001 inside a container with no HOME, no agent

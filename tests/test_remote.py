@@ -1825,6 +1825,30 @@ class DeploymentUnitTests(unittest.TestCase):
                 for line in path.read_text(encoding="utf-8").splitlines()
                 if line.startswith(key + "=")]
 
+    def compose_block(self, opener, indent):
+        """The lines of one compose block, from its opening line to the next
+        key at the same indentation. No YAML parser, like _compose_services."""
+        lines = self.compose.read_text(encoding="utf-8").splitlines()
+        start = lines.index(opener)
+        block = []
+        for line in lines[start + 1:]:
+            if line.strip() and not line.lstrip().startswith("#") \
+                    and len(line) - len(line.lstrip()) <= indent:
+                break
+            block.append(line.strip())
+        return block
+
+    def test_the_brain_and_maintenance_follow_the_deployments_time_zone(self):
+        """E7: `created`, the inbox file name and the drop box's daily cap are
+        the container's local date, so the container must be told the zone the
+        brain's owner lives in. UTC stays the default; `captured_at` is UTC
+        whatever this says."""
+        self.assertIn("TZ: ${BRAIN_TZ:-UTC}", self.compose_block("x-brain-env: &brain-env", 0))
+        self.assertIn("environment: *brain-env", self.compose_block("  brain:", 2))
+        self.assertIn("<<: *brain-env", self.compose_block("  maintenance:", 2))
+        example = (self.compose.parent / "env.example").read_text(encoding="utf-8")
+        self.assertIn("BRAIN_TZ", example)
+
     def test_every_timer_has_the_service_it_activates(self):
         for timer in self.timers:
             self.assertTrue(timer.with_suffix(".service").exists(),
