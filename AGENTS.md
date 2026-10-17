@@ -263,9 +263,53 @@ does not distinguish them — read-only-ness is a property of the specific tool,
 not something a command string carries with it, so swapping runners means
 re-establishing it and writing down how.
 
-Session mining (`bin/brain sessions`) reads Claude Code transcripts only. Every
-other runner simply gets no digest, which the consolidation prompt already
-handles as a normal case — the inbox drain is worth doing on its own.
+Session mining (`bin/brain sessions`) reads Claude Code transcripts, and only
+the turns a person typed: automation, peer and notification turns are dropped.
+Any other tool's sessions reach consolidation as digest.v1 files (below);
+without a digest the pass simply drains the inbox, which is worth doing on its
+own.
+
+What a pass does with it, and what it reports:
+
+- **Window.** The digest holds the entries since the last `consolidate:`
+  commit on the trunk, 8 days at most, so daily passes do not re-mine the same
+  week. `consolidate --digest-from DIR` adds the digest.v1 files in DIR and
+  one level below it to this account's own transcripts.
+- **Proposals.** Mining writes at most 3 per pass, as inbox notes with
+  `source: session-mining` and `expires:` 7 days after `created:`. A later
+  pass promotes one only once something corroborates it, and deletes it once
+  it expires; `doctor` goes red when one is more than 2 days past its expiry.
+- **Idle.** With no captures, no digest entries, no journal entries since the
+  last consolidation and no `review_by` debt, a pass makes no model call and
+  cuts no branch; a proposal inside its expiry is no work on its own.
+  `consolidate --dry-run` prints what it would decide.
+- **Result.** Every pass ends on one line, `consolidate-result: {json}`:
+  `{"v":1, "status": "idle|committed|no_changes|blocked|failed", "idle",
+  "cost_microusd", "tokens_in", "tokens_out", "digest_entries",
+  "inbox_before"}`. Cost and tokens are propose plus audit, read from the
+  runner's `--output-format json` answer, and `null` when it answers in plain
+  text.
+
+### Session digest: digest.v1
+
+The contract between a transcript reader and consolidation. A reader for
+another tool follows it, and nothing in consolidation changes.
+
+- One JSON object per line, one line per turn a person typed:
+  `{"v": 1, "at": "2026-10-18T05:12:09Z", "tool": "claude-code", "project":
+  "brain", "text": "…"}`.
+- `at` is the UTC instant, to the second, with `Z`. `tool` is a lowercase
+  slug naming the reader. `project` is the basename of the working directory,
+  or empty. `text` is the turn as typed, never assistant output.
+- Oldest line first; one line per distinct text (its latest); about 120,000
+  characters of text at most, the oldest dropped first.
+- The file is replaced atomically and created mode 0640, so its owner and
+  group are the only readers; give the group to the consolidating account.
+  `brain sessions --jsonl --out FILE [--days N]` is the Claude Code producer;
+  it needs no brain, so the transcripts' owner can run it from an engine it
+  cannot write, and it writes FILE (and a temporary file beside it) only.
+- The reader skips a line that breaks the contract and counts it; unknown
+  keys are ignored. It reads regular files under 2 MB and refuses symlinks.
 
 ## Hard rules
 

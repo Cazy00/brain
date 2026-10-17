@@ -24,10 +24,18 @@ Commands:
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
                                    Code sessions into .cache/ (never committed)
-  brain consolidate [--dry-run] [--open-pr]   weekly tidy pass via the pinned
-                                   runner in setup/consolidator.conf; lands on a
-                                   branch, pushed only after the audit passes;
-                                   refuses a served folder (run it in its own clone)
+  brain sessions --jsonl --out FILE [--days N]
+                                   the same turns as digest.v1 lines (0640,
+                                   replaced atomically), for the account that
+                                   consolidates to read with --digest-from
+  brain consolidate [--dry-run] [--open-pr] [--digest-from DIR]
+                                   tidy pass via the pinned runner in
+                                   setup/consolidator.conf; lands on a branch,
+                                   pushed only after the audit passes; refuses a
+                                   served folder (run it in its own clone); idle,
+                                   with no model call, when there is nothing to
+                                   do; ends on one consolidate-result: {json} line.
+                                   --digest-from adds digest.v1 files from DIR
   brain sync [--push]              converge the served folder's main with
                                    origin/main (2.4); --push only pushes main
                                    (the post-commit hook's entry). The one pusher.
@@ -57,6 +65,10 @@ Commands:
                                    and no note content by construction
   brain stats [--json] [--record]  is the KNOWLEDGE still healthy: findability,
                                    capture rate, staleness, curation, link graph
+  brain stats --captures [--since ISO] [--until ISO] [--json]
+                                   inbox notes first added on the trunk in
+                                   (since, until], default the last 7 days,
+                                   by source, via, client, kind and basis
   brain retire [--dry-run] [--explain]   retire this brain and start clean.
                                    Interactive, TTY-only, never exposed over
                                    MCP. Moves the repo aside; deletes nothing,
@@ -314,10 +326,12 @@ def ensure_hooks(quiet: bool = False) -> None:
     try:
         want = hooks_path()
         if git("config", "core.hooksPath") != want:
-            subprocess.run(
-                ["git", "config", "core.hooksPath", want], cwd=ROOT, check=False
-            )
-            if not quiet:
+            # Announced only when the write took. A read-only checkout (an engine
+            # installed by another user, a locked-down service) refuses it, and the
+            # notice used to claim the hooks were installed all the same.
+            done = subprocess.run(["git", "config", "core.hooksPath", want], cwd=ROOT,
+                                  capture_output=True, text=True, check=False)
+            if done.returncode == 0 and not quiet:
                 print(f"brain: installed git hooks (core.hooksPath = {want})")
     except Exception:
         pass
@@ -3559,13 +3573,62 @@ _NOISE_PREFIXES = ("<local-command", "<command-name>", "<command-message>",
                    # Mining them laundered assistant prose into the user's
                    # recorded fact — under a header that promises the opposite.
                    "<result>", "<task-notification>", "<system-reminder>",
-                   "[SYSTEM NOTIFICATION", "{\"final\":", "{'final':")
+                   "[SYSTEM NOTIFICATION", "{\"final\":", "{'final':",
+                   # A message another agent session sent into this one: a peer's
+                   # words, delivered as a user turn, never the user's own.
+                   "<agent-message")
 _REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
 
 def digest_path() -> Path:
     # Computed, not a module constant: main() rebinds ROOT for --root.
     return state_dir() / "session-digest.md"
+
+
+# digest.v1 — the contract between a transcript reader and consolidation (AGENTS.md,
+# "Session digest: digest.v1"). One JSON object per line, one line per turn a person
+# typed: {"v": 1, "at": "<UTC instant, seconds, Z>", "tool": "<reader>", "project":
+# "<basename of the working directory, or empty>", "text": "<the turn>"}. A reader for
+# another tool produces these lines and nothing in consolidation changes.
+DIGEST_VERSION = 1
+DIGEST_TOOL = "claude-code"
+DIGEST_DAYS = 8                  # the widest window any digest covers
+DIGEST_MAX_CHARS = 120_000       # total turn text handed to one pass
+DIGEST_MAX_TURN = 2000           # one turn, as _human_turns truncates it
+DIGEST_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_INSTANT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?)?"
+                         r"(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def utc_instant(value) -> str:
+    """`YYYY-MM-DDTHH:MM:SSZ` in UTC for an ISO-8601 date or instant, or '' for anything else.
+
+    A value with no offset is read as UTC (transcripts write UTC); a bare date is its
+    midnight. Hand-parsed because `fromisoformat` learned `Z` and arbitrary fractions only in
+    Python 3.11, and a lexical compare of these strings is a chronological one."""
+    from datetime import datetime as _datetime
+    match = _INSTANT_RE.match(str(value or "").strip())
+    if not match:
+        return ""
+    day, hh, mm, ss, offset = match.groups()
+    try:
+        moment = _datetime.strptime(f"{day}T{hh or '00'}:{mm or '00'}:{ss or '00'}",
+                                    "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return ""
+    if offset and offset != "Z":
+        sign = 1 if offset[0] == "+" else -1
+        moment -= sign * timedelta(hours=int(offset[1:3]), minutes=int(offset[-2:]))
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc_now_minus(days: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+
+
+def _project_of(cwd: str) -> str:
+    return re.split(r"[\\/]", cwd.rstrip("/\\"))[-1] if cwd else ""
+
 
 
 def _human_turns(path: Path, max_turn: int = 2000) -> tuple:
@@ -3592,6 +3655,12 @@ def _human_turns(path: Path, max_turn: int = 2000) -> tuple:
             continue
         if rec.get("isSidechain"):
             continue                       # subagent traffic, not the user
+        # Who typed the turn, where the record says. Automation, peer sessions and
+        # notifications all arrive as user turns; only `human` is the user's own
+        # word. Records written before the field existed carry no key at all and
+        # are read as before; a key with any other value (null included) is not.
+        if "turnOrigin" in rec and rec.get("turnOrigin") != "human":
+            continue
         msg = rec.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, str):
@@ -3602,86 +3671,281 @@ def _human_turns(path: Path, max_turn: int = 2000) -> tuple:
             continue
         if len(text) > max_turn:
             text = text[:max_turn] + " …[truncated]"
-        turns.append((str(rec.get("timestamp") or "")[:19], text))
+        turns.append((utc_instant(rec.get("timestamp")), text))
     return turns, cwd
 
 
-def session_digest(days: int = 8, max_chars: int = 120_000) -> tuple:
-    """(markdown, session_count) of recent human turns across all projects.
+def local_digest_entries(since: str) -> list:
+    """digest.v1 entries for every turn the user typed in this account's Claude Code
+    transcripts later than `since` (a UTC instant), in transcript order.
 
-    Transcripts live outside the repo, so the consolidation model — which runs
-    headless and cannot answer a permission prompt — could not read them
-    itself. The wrapper materializes them into .cache/ (gitignored) first.
-    """
-    cutoff = time.time() - days * 86400
-    # Transcript timestamps are ISO-8601 UTC, so lexical compare == chronological.
-    cutoff_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(cutoff))
-    sessions = []
-    if TRANSCRIPT_ROOT.is_dir():
-        for path in sorted(TRANSCRIPT_ROOT.glob("*/*.jsonl")):
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime < cutoff:
-                continue          # cheap pre-filter: mtime >= every turn in it
-            turns, cwd = _human_turns(path)
-            if not turns:
-                continue
-            # The real filter is when the user actually TALKED. A file merely
-            # touched recently (reindexed, copied) can hold a months-old
-            # conversation, and mining those would resurrect them every week.
-            newest = max(ts for ts, _ in turns)
-            if newest < cutoff_iso:
-                continue
-            sessions.append((newest, cwd, turns))
-
-    sessions.sort(key=lambda s: s[0], reverse=True)   # trim the oldest first
-    # Deduplicate turn TEXT across the whole digest. A resumed session replays
-    # its earlier turns into a new transcript, so the same prompt was mined
-    # repeatedly — the window check gates the FILE (newest turn) and then emits
-    # every turn in it, including ones from weeks earlier. Hashing content rather
-    # than filtering by per-turn timestamp keeps recent turns attached to the
-    # older turns they refer to, and discards nothing that was said only once.
-    seen_turns, blocks, used, kept, deduped_sessions = set(), [], 0, 0, 0
-    for newest, cwd, turns in sessions:
-        fresh = []
-        for ts, text in turns:
-            key = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            if key in seen_turns:
-                continue
-            seen_turns.add(key)
-            fresh.append((ts, text))
-        if not fresh:
-            deduped_sessions += 1          # every turn already appeared above
+    Transcripts live outside the repo, so the consolidation model — which runs headless and
+    cannot answer a permission prompt — could not read them itself. The wrapper materializes
+    them first. The window is per TURN, by when the user actually talked: a file merely
+    touched recently (reindexed, copied) can hold a months-old conversation, and a resumed
+    session replays weeks-old turns into a new file."""
+    entries = []
+    if not TRANSCRIPT_ROOT.is_dir():
+        return entries
+    import calendar
+    try:
+        cutoff = calendar.timegm(time.strptime(since, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, OverflowError):
+        cutoff = 0
+    for path in sorted(TRANSCRIPT_ROOT.glob("*/*.jsonl")):
+        try:
+            if path.stat().st_mtime < cutoff - 86400:
+                continue          # cheap pre-filter: mtime >= every turn in it (a day's slack)
+        except OSError:
             continue
-        turns = fresh
-        head = f"\n## {newest[:10]} — {cwd or 'unknown directory'}\n"
-        # Blockquote every line: prompts often contain their own "## " headings,
-        # which would otherwise be indistinguishable from a session boundary.
-        body = "".join(
-            "\n**[{}]**\n{}\n".format(ts, "\n".join("> " + ln for ln in text.splitlines()))
-            for ts, text in turns)
-        if used + len(head) + len(body) > max_chars and kept:
-            break
-        blocks.append((newest, head + body))
-        used += len(head) + len(body)
-        kept += 1
+        turns, cwd = _human_turns(path)
+        project = _project_of(cwd)
+        for at, text in turns:
+            if at and at > since:
+                entries.append({"v": DIGEST_VERSION, "at": at, "tool": DIGEST_TOOL,
+                                "project": project, "text": text})
+    return entries
 
-    blocks.sort(key=lambda b: b[0])                   # present chronologically
-    dropped = len(sessions) - kept - deduped_sessions
-    header = (f"# Session digest — {kept} session(s), last {days} days\n\n"
+
+def select_digest_entries(entries: list, since: str, max_chars: int = DIGEST_MAX_CHARS) -> tuple:
+    """(kept, dropped): the entries later than `since`, oldest first, one per distinct text.
+
+    Deduplicated on the text's hash, keeping its LATEST occurrence: a resumed session replays
+    its earlier turns into a new transcript, and the copy that matters is the newest — a
+    repeat after the last pass is the user saying it again. Past `max_chars` of turn text the
+    OLDEST entries are dropped first, and `dropped` counts them."""
+    ordered = sorted((e for e in entries if e["at"] > since), key=lambda e: e["at"])
+    last = {hashlib.sha256(e["text"].encode("utf-8")).hexdigest(): i
+            for i, e in enumerate(ordered)}
+    unique = [ordered[i] for i in sorted(last.values())]
+    kept, used = [], 0
+    for entry in reversed(unique):
+        if used + len(entry["text"]) > max_chars and kept:
+            break
+        kept.append(entry)
+        used += len(entry["text"])
+    kept.reverse()
+    return kept, len(unique) - len(kept)
+
+
+def render_digest(entries: list, window: str, dropped: int = 0, notes: tuple = ()) -> str:
+    """The markdown digest a consolidation pass reads, from digest.v1 entries."""
+    count = f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+    header = (f"# Session digest — {count}, {window}\n\n"
               "The user's own prompts only; assistant output is excluded by design.\n"
               "Provisional raw material for consolidation, not knowledge itself.\n")
+    for note in notes:
+        header += f"\nNOTE: {note}\n"
     if dropped:
-        header += f"\nNOTE: {dropped} older session(s) dropped at the size cap.\n"
-    if not kept:
+        header += f"\nNOTE: {dropped} older entr{'y' if dropped == 1 else 'ies'} dropped at the size cap.\n"
+    if not entries:
         header += "\nNo sessions in the window — nothing to mine.\n"
-    return header + "".join(b for _, b in blocks), kept
+    body, group = [], None
+    for entry in entries:
+        key = (entry["at"][:10], entry["tool"], entry["project"])
+        if key != group:
+            body.append(f"\n## {key[0]} — {entry['tool']} — "
+                        f"{entry['project'] or 'unknown project'}\n")
+            group = key
+        # Blockquote every line: prompts often contain their own "## " headings, which
+        # would otherwise be indistinguishable from a group boundary.
+        body.append("\n**[{}]**\n{}\n".format(
+            entry["at"], "\n".join("> " + ln for ln in entry["text"].splitlines())))
+    return header + "".join(body)
+
+
+def session_digest(days: int = DIGEST_DAYS, max_chars: int = DIGEST_MAX_CHARS) -> tuple:
+    """(markdown, entry_count) of the turns typed in this account's recent sessions."""
+    since = utc_now_minus(days)
+    kept, dropped = select_digest_entries(local_digest_entries(since), since, max_chars)
+    return render_digest(kept, f"last {days} days", dropped), len(kept)
+
+
+def write_digest_jsonl(path: Path, entries: list) -> None:
+    """Replace `path` with digest.v1 lines, atomically: a reader sees the old file or the
+    new one, never half of either. Created 0640, so the umask can only narrow it — the
+    group is how a consolidating account reads another account's digest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, "O_NOFOLLOW", 0), 0o640)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+DIGEST_FILE_MAX_BYTES = 2 * 1024 * 1024
+_DIGEST_TOOL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def digest_v1_entry(obj):
+    """The entry a digest.v1 line describes, normalized, or None if the line is not one.
+
+    Unknown keys are ignored (the contract grows additively); a known key with the wrong
+    shape rejects the line. Nothing is guessed: a line that needs repair is a line from a
+    producer that does not follow the contract, and its text never reaches the pass."""
+    if not isinstance(obj, dict):
+        return None
+    if type(obj.get("v")) is not int or obj["v"] != DIGEST_VERSION:
+        return None
+    at, tool, project, text = (obj.get(k) for k in ("at", "tool", "project", "text"))
+    if not isinstance(at, str) or not DIGEST_AT_RE.match(at) or utc_instant(at) != at:
+        return None
+    if not isinstance(tool, str) or not _DIGEST_TOOL_RE.match(tool):
+        return None
+    if not isinstance(project, str) or len(project) > 200 or _CONTROL_RE.search(project):
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text = text.strip()
+    if len(text) > DIGEST_MAX_TURN:
+        text = text[:DIGEST_MAX_TURN] + " …[truncated]"
+    return {"v": DIGEST_VERSION, "at": at, "tool": tool, "project": project, "text": text}
+
+
+def read_digest_dir(directory: Path) -> tuple:
+    """(entries, report) from every `*.jsonl` directly in `directory` and in its immediate
+    subdirectories — one per producing account, typically.
+
+    Another account writes these files, so they are read as untrusted: regular files only
+    (opened without following a symlink, checked again on the open descriptor), at most
+    DIGEST_FILE_MAX_BYTES each, hidden files skipped (a producer's temporary file). report:
+    {"files": read, "invalid": lines skipped, "refused": ["name: why"], "error": str|None}."""
+    import stat
+
+    report = {"files": 0, "invalid": 0, "refused": [], "error": None}
+    entries, candidates = [], []
+
+    def scan(folder: Path, depth: int) -> None:
+        with os.scandir(folder) as listing:
+            items = sorted(listing, key=lambda item: item.name)
+        for item in items:
+            if item.name.startswith("."):
+                continue
+            rel = os.path.relpath(item.path, directory)
+            if item.is_symlink():
+                if item.name.endswith(".jsonl") or depth == 0:
+                    report["refused"].append(f"{rel}: a symlink")
+                continue
+            if item.is_dir(follow_symlinks=False):
+                if depth == 0:
+                    try:
+                        scan(Path(item.path), 1)
+                    except OSError as exc:
+                        report["refused"].append(f"{rel}: unreadable ({exc.strerror or exc})")
+                continue
+            if item.name.endswith(".jsonl"):
+                candidates.append((Path(item.path), rel))
+
+    try:
+        scan(Path(directory), 0)
+    except OSError as exc:
+        report["error"] = f"cannot read {directory}: {exc.strerror or exc}"
+        return [], report
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    for path, rel in candidates:
+        try:
+            fd = os.open(str(path), flags)
+        except OSError as exc:
+            report["refused"].append(f"{rel}: unreadable ({exc.strerror or exc})")
+            continue
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                report["refused"].append(f"{rel}: not a regular file")
+                continue
+            if info.st_size > DIGEST_FILE_MAX_BYTES:
+                report["refused"].append(f"{rel}: larger than {DIGEST_FILE_MAX_BYTES} bytes")
+                continue
+            raw = handle.read(DIGEST_FILE_MAX_BYTES + 1)
+        if len(raw) > DIGEST_FILE_MAX_BYTES:
+            report["refused"].append(f"{rel}: larger than {DIGEST_FILE_MAX_BYTES} bytes")
+            continue
+        report["files"] += 1
+        for line in raw.split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                entry = digest_v1_entry(json.loads(line.decode("utf-8")))
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                entry = None
+            if entry is None:
+                report["invalid"] += 1
+            else:
+                entries.append(entry)
+    return entries, report
+
+
+def last_consolidation(trunk: str = "") -> tuple:
+    """(commit, UTC instant) of the newest `consolidate:` commit on the trunk, or ("", "").
+
+    The trunk, local and as last fetched, never --all: a pass that was blocked or is still
+    waiting for its merge did not land, so what it read has not been consolidated. The
+    committer date, because that is when the pass made it."""
+    trunk = trunk or default_branch()
+    best = ("", "")
+    for ref in (f"refs/heads/{trunk}", f"refs/remotes/origin/{trunk}"):
+        if not git("rev-parse", "--verify", "--quiet", ref):
+            continue
+        line = git("log", "-1", "--format=%H %cI", "--grep=^consolidate:",
+                   "--regexp-ignore-case", ref, "--")
+        if " " in line:
+            commit, when = line.split(" ", 1)
+            at = utc_instant(when)
+            if at > best[1]:
+                best = (commit, at)
+    return best
+
+
+def digest_window_start() -> str:
+    """Entries later than this reach the next pass: the last consolidation on the trunk, so
+    daily passes do not re-mine the same week, and never more than DIGEST_DAYS back."""
+    floor = utc_now_minus(DIGEST_DAYS)
+    _commit, at = last_consolidation()
+    return max(at, floor) if at else floor
+
+
+def consolidation_digest(digest_from: str = "") -> tuple:
+    """(markdown, entry_count, notes) for one consolidation pass: this account's transcripts
+    plus any digest.v1 files under `digest_from`, after the window, deduplicated and capped.
+    notes are lines for the pass's output; an unreadable `digest_from` is one of them, never
+    a failure — the inbox drain is worth doing without it."""
+    since = digest_window_start()
+    entries, notes = local_digest_entries(since), []
+    if digest_from:
+        imported, report = read_digest_dir(Path(digest_from).expanduser())
+        if report["error"]:
+            notes.append(f"WARNING: --digest-from {report['error']} — continuing without it")
+        else:
+            notes.append(f"digest-from {digest_from}: {report['files']} file(s), "
+                         f"{len(imported)} entr{'y' if len(imported) == 1 else 'ies'}, "
+                         f"{report['invalid']} invalid line(s) skipped")
+            for refusal in report["refused"][:20]:
+                notes.append(f"WARNING: --digest-from refused {refusal}")
+        entries += imported
+    kept, dropped = select_digest_entries(entries, since)
+    text = render_digest(kept, f"since {since} (the last consolidation on the trunk, "
+                               f"{DIGEST_DAYS} days at most)", dropped)
+    return text, len(kept), notes
 
 
 def cmd_sessions(argv: list) -> int:
-    days = 8
+    days = DIGEST_DAYS
     for i, arg in enumerate(argv):
         if arg == "--days" and i + 1 < len(argv):
             try:
@@ -3689,6 +3953,24 @@ def cmd_sessions(argv: list) -> int:
             except ValueError:
                 print("--days needs an integer")
                 return 2
+    if "--jsonl" in argv:
+        out = _arg_after(argv, "--out")
+        if not out or out.startswith("--"):
+            print("usage: brain sessions --jsonl --out FILE [--days N]")
+            return 2
+        target = Path(out).expanduser().resolve()
+        root, state = ROOT.resolve(), state_dir().resolve()
+        if (target == root or root in target.parents) and state not in target.parents:
+            # Mined prompts where git can see them are one `git add -A` from history.
+            print("refused: --out must name a file outside the data repository")
+            return 2
+        since = utc_now_minus(days)
+        kept, dropped = select_digest_entries(local_digest_entries(since), since)
+        write_digest_jsonl(target, kept)
+        print(f"session digest: {len(kept)} entr{'y' if len(kept) == 1 else 'ies'} "
+              f"(digest.v1, last {days} days) → {target}"
+              + (f"; {dropped} older dropped at the size cap" if dropped else ""))
+        return 0
     text, count = session_digest(days=days)
     if "--stdout" in argv:
         print(text)
@@ -3696,7 +3978,7 @@ def cmd_sessions(argv: list) -> int:
     out = digest_path()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
-    print(f"session digest: {count} session(s), {len(text)} chars → {out}")
+    print(f"session digest: {count} entr{'y' if count == 1 else 'ies'}, {len(text)} chars → {out}")
     if not count and not TRANSCRIPT_ROOT.is_dir():
         print(f"(no transcripts at {TRANSCRIPT_ROOT})")
     return 0
@@ -3726,10 +4008,12 @@ CONSOLIDATOR_DEFAULTS = {
     # AGENTS.md and run bin/brain, both in the engine (seen live 2026-10-15: without them it
     # changed nothing). The same list a combined brain's .claude/settings.json allows, by
     # absolute path, minus rg (it reads outside the brain; bin/brain search covers it).
-    "propose": ("claude --model {model} --permission-mode acceptEdits --strict-mcp-config "
+    "propose": ("claude --model {model} --output-format json --permission-mode acceptEdits "
+                "--strict-mcp-config "
                 "--mcp-config '{\"mcpServers\":{}}' --add-dir {engine} --allowedTools "
                 '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
-    "audit": ("claude --model {model} -p --safe-mode --restricted --strict-mcp-config "
+    "audit": ("claude --model {model} --output-format json -p --safe-mode --restricted "
+              "--strict-mcp-config "
               "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
               "--no-session-persistence"),
     "audit_cannot_write": ("The auditor's only tool is Read, confined by --restricted to "
@@ -3754,9 +4038,14 @@ AUDIT_SWITCHES = ("--safe-mode", "--restricted", "--strict-mcp-config",
                   "--no-session-persistence")
 AUDIT_VALUES = {"--mcp-config": [{"mcpServers": {}}], "--tools": ["Read"],
                 "--permission-prompts": ["none"]}
+# Admitted, not required, and only with exactly these values: flags that change how the
+# answer is PRINTED and grant nothing. `--output-format json` makes the answer one JSON
+# object carrying the call's cost and tokens (runner_output reads it).
+AUDIT_OPTIONAL_VALUES = {"--output-format": ["json"]}
 # An allowlist, not a denylist: a flag nobody thought of (or a future one) cannot widen
 # the auditor, because anything not named here is refused.
-AUDIT_ALLOWED = {"--model", "-p", "--print", *AUDIT_SWITCHES, *AUDIT_VALUES}
+AUDIT_ALLOWED = {"--model", "-p", "--print", *AUDIT_SWITCHES, *AUDIT_VALUES,
+                 *AUDIT_OPTIONAL_VALUES}
 EMPTY_MCP = {"mcpServers": {}}
 # The one runner whose flags these are. Carried by another program they establish nothing,
 # so swapping the runner means teaching this file that program's confinement first.
@@ -3833,6 +4122,14 @@ def audit_confinement_problem(argv: list):
             return f"{flag} is given more than once"
         if given[0] != expected:
             return f"{flag} must be exactly {expected!r}, got {given[0]!r}"
+    for flag, expected in AUDIT_OPTIONAL_VALUES.items():
+        given = flags.get(flag)
+        if given is None:
+            continue
+        if len(given) != 1:
+            return f"{flag} is given more than once"
+        if given[0] != expected:
+            return f"{flag} may only be {' '.join(expected)!r}, got {given[0]!r}"
     for switch in switches:
         for values in flags.get(switch, []):
             if values:
@@ -4093,9 +4390,10 @@ def remove_snapshot(snap: Path) -> None:
     shutil.rmtree(snap, ignore_errors=True)
 
 
-def audit_changes(runner: dict, timeout: int = None) -> tuple:
+def audit_changes(runner: dict, timeout: int = None, usage: dict = None) -> tuple:
     """Independently audit the staged consolidation diff. Returns (verdict, detail)
-    where verdict is 'pass', 'block' or 'error'.
+    where verdict is 'pass', 'block' or 'error'. When the runner reports what the call
+    cost (runner_output), it is added into `usage`, if given.
 
     Why a second agent here and nowhere else in this system: the pass that reads
     93k characters of untrusted session transcript is the same pass that decides
@@ -4186,7 +4484,12 @@ def audit_changes(runner: dict, timeout: int = None) -> tuple:
         shutil.rmtree(stash_dir, ignore_errors=True)
         remove_snapshot(snap)
 
-    out = (run.stdout or "").strip()
+    text, spent = runner_output(run.stdout)
+    if usage is not None:
+        add_usage(usage, spent)
+    # The verdict is looked for in the answer's TEXT: with --output-format json that is the
+    # `result` field, so a VERDICT line anywhere else in the object counts for nothing.
+    out = text.strip()
     if run.returncode != 0:
         return "error", (f"auditor exited {run.returncode}: "
                          f"{(run.stderr or '').strip()[-300:] or 'no stderr'}")
@@ -4238,7 +4541,14 @@ def open_pull_request(branch: str, trunk: str, title: str, body: str,
 
 def propose_prompt(text: str) -> str:
     """In a split layout the working directory holds only the notes; the protocol (AGENTS.md)
-    and the toolbelt (bin/brain) live in the engine. Say where, so the pass can follow them."""
+    and the toolbelt (bin/brain) live in the engine. Say where, so the pass can follow them.
+
+    The prompt names the digest by its combined-layout path, `.cache/session-digest.md`.
+    With BRAIN_STATE_DIR it is elsewhere, and a pass told to skip step 3 when that file is
+    absent would skip it every time — so the real path is written in its place."""
+    digest = digest_path()
+    if digest != ROOT / ".cache" / "session-digest.md":
+        text = text.replace(".cache/session-digest.md", str(digest))
     if ROOT == ENGINE:
         return text
     return (f"Where things are: the working directory holds this brain's notes. The engine is at "
@@ -4291,12 +4601,116 @@ def cmd_audit_branch(argv: list) -> int:
     return 0 if verdict == "pass" else 1
 
 
+CONSOLIDATE_RESULT = "consolidate-result: "
+
+
+def runner_output(stdout: str) -> tuple:
+    """(text, usage) of one runner call.
+
+    With `--output-format json` the runner prints one JSON object: its `result` is the text
+    (what is shown, and where the auditor's verdict is looked for), and `total_cost_usd` and
+    `usage` say what the call cost. Anything that is not a JSON object is the text itself,
+    exactly as before the flag, and usage is None. usage: {"cost_microusd", "tokens_in",
+    "tokens_out"}, each an int or None; input tokens include cache reads and writes."""
+    raw = stdout or ""
+    try:
+        data = json.loads(raw) if raw.strip().startswith("{") else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        return raw, None
+
+    def count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 \
+            else None
+
+    cost = data.get("total_cost_usd")
+    cost = (int(round(cost * 1_000_000)) if isinstance(cost, (int, float))
+            and not isinstance(cost, bool) and cost >= 0 else None)
+    tokens = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    parts = [count(tokens.get(k)) for k in ("input_tokens", "cache_read_input_tokens",
+                                            "cache_creation_input_tokens")]
+    known = [n for n in parts if n is not None]
+    usage = {"cost_microusd": cost, "tokens_in": sum(known) if known else None,
+             "tokens_out": count(tokens.get("output_tokens"))}
+    text = data["result"] if isinstance(data.get("result"), str) else raw
+    return text, usage
+
+
+def add_usage(total: dict, part) -> None:
+    """Sum one call's usage into `total`. A figure no call reported stays None; one that
+    some calls reported is the sum of those (a lower bound when a call timed out)."""
+    for key in ("cost_microusd", "tokens_in", "tokens_out"):
+        if part and part.get(key) is not None:
+            total[key] = (total.get(key) or 0) + part[key]
+
+
+def journal_changes_since_consolidation() -> list:
+    """Journal files added or changed in commits the last consolidation on the trunk had not
+    seen; with no consolidation yet, those of the last DIGEST_DAYS."""
+    commit, _at = last_consolidation()
+    span = ([f"{commit}..HEAD"] if commit
+            else [f"--since={DIGEST_DAYS} days ago", "HEAD"])
+    out = git("log", "--format=", "--name-only", "--diff-filter=AM", *span,
+              "--", "knowledge/journal")
+    return sorted({line.strip() for line in out.splitlines() if line.strip().endswith(".md")})
+
+
+def inbox_work(inbox_items: list) -> tuple:
+    """(work, waiting): inbox notes a pass has to act on, and session-mining proposals
+    still inside their expiry. A waiting proposal is promoted only once something
+    corroborates it — a capture or a digest entry, which is work of its own — so until it
+    expires it is no reason to run a model."""
+    today, work, waiting = date.today().isoformat(), 0, 0
+    for path in inbox_items:
+        fm = parse_frontmatter(read_text(path))[0] or {}
+        expires = str(fm.get("expires") or "")
+        if (str(fm.get("source") or "") == "session-mining" and valid_date(expires)
+                and expires >= today):
+            waiting += 1
+        else:
+            work += 1
+    return work, waiting
+
+
+def review_debt() -> list:
+    """Canonical notes whose review_by date has passed."""
+    today, due = date.today().isoformat(), []
+    for folder in CANONICAL:
+        for path in sorted((K / folder).rglob("*.md")):
+            fm, _err = parse_frontmatter(read_text(path))
+            review_by = str((fm or {}).get("review_by") or "")
+            if valid_date(review_by) and review_by < today:
+                due.append(str(path.relative_to(ROOT)))
+    return due
+
+
 def cmd_consolidate(argv: list) -> int:
+    """`brain consolidate`: one pass, ending on exactly one `consolidate-result: {json}` line
+    for whatever schedules it — idle, committed, no_changes, blocked or failed (AGENTS.md,
+    "Consolidation"). A dry run is not a pass and prints none."""
+    result = {"v": 1, "status": "failed", "idle": False, "cost_microusd": None,
+              "tokens_in": None, "tokens_out": None, "digest_entries": 0, "inbox_before": 0}
+    try:
+        return _consolidate(argv, result)
+    finally:
+        if "--dry-run" not in argv:
+            print(CONSOLIDATE_RESULT + json.dumps(result))
+
+
+def _consolidate(argv: list, result: dict) -> int:
     prompt_path = ENGINE / "setup" / "consolidate-prompt.md"
     if not prompt_path.exists():
         print("missing setup/consolidate-prompt.md")
         return 1
+    digest_from = ""
+    if "--digest-from" in argv:
+        digest_from = _arg_after(argv, "--digest-from")
+        if not digest_from or digest_from.startswith("--"):
+            print("usage: brain consolidate [--dry-run] [--open-pr] [--digest-from DIR]")
+            return 2
     inbox_items = [p for p in (K / "inbox").glob("*.md")]
+    result["inbox_before"] = len(inbox_items)
     audit_path = ENGINE / "setup" / "audit-prompt.md"
     # Resolve the runner BEFORE anything else, --dry-run included. A config that
     # would drop the audit boundary must fail here, on the ground, rather than
@@ -4314,16 +4728,48 @@ def cmd_consolidate(argv: list) -> int:
         print("  Consolidation runs in its own clone: git clone <remote> <dir>, then run "
               "<dir>/bin/brain consolidate there.")
         return 1
+
+    # The session digest is gathered BEFORE the branch, because whether it holds anything
+    # is part of deciding whether there is a pass to run at all. A failure here is not
+    # fatal — draining the inbox is still worth doing on its own.
+    try:
+        digest_text, digest_entries, digest_notes = consolidation_digest(digest_from)
+        digest_error = None
+    except Exception as exc:
+        digest_text, digest_entries, digest_notes, digest_error = None, 0, [], repr(exc)
+    result["digest_entries"] = digest_entries
+    # E5: a pass with nothing to do makes no model call. Work is a capture waiting, a digest
+    # entry the last pass did not see, a journal entry it did not see, or review_by debt.
+    inbox_count, waiting = inbox_work(inbox_items)
+    work = {"inbox": inbox_count, "digest": digest_entries,
+            "journal": len(journal_changes_since_consolidation()),
+            "review_by": len(review_debt())}
+    decision = (("run — " + ", ".join(f"{k} {v}" for k, v in work.items()))
+                if any(work.values()) else
+                "idle — no captures, no digest entries, no new journal entries and no "
+                "review_by debt, so no model call")
+    if waiting:
+        decision += f"; {waiting} proposal(s) waiting for corroboration"
+    for note in digest_notes:
+        print(f"  {note}")
+    if digest_error:
+        print(f"  session digest skipped: {digest_error}")
+
     if "--dry-run" in argv:
         print(f"would consolidate: {len(inbox_items)} inbox item(s)")
-        _, sessions = session_digest()
-        print(f"would mine: {sessions} recent session(s)")
+        print(f"would mine: {digest_entries} digest entr{'y' if digest_entries == 1 else 'ies'}"
+              f" since the last consolidation (at most {DIGEST_DAYS} days)")
+        print(f"would decide: {decision}")
         print(f"model:  {runner['model']} — {runner['model_reason']}")
         print(f"prompt: {prompt_path}")
         print(f"audit:  {audit_path}"
               + ("" if audit_path.exists() else "  [MISSING — the pass would block]"))
         print(f"runner: {' '.join(runner['propose'])} …  ({runner['source']})")
         print(f"        auditor runs read-only as: {' '.join(runner['audit'])} …")
+        return 0
+    if not any(work.values()):
+        result.update(status="idle", idle=True)
+        print(f"brain consolidate: {decision}")
         return 0
     if not audit_path.exists():
         print("missing setup/audit-prompt.md — the audit gate cannot run, and an "
@@ -4349,15 +4795,17 @@ def cmd_consolidate(argv: list) -> int:
           f"on branch {branch} (runner pinned in {runner['source']})…")
 
     # Materialize the session digest BEFORE handing over: the model runs
-    # headless and cannot approve reads outside the repo. A failure here is not
-    # fatal — draining the inbox is still worth doing on its own.
-    try:
-        text, sessions = session_digest()
-        digest_path().parent.mkdir(parents=True, exist_ok=True)
-        digest_path().write_text(text, encoding="utf-8")
-        print(f"  session digest: {sessions} session(s) → {digest_path()}")
-    except Exception as exc:
-        print(f"  session digest skipped: {exc!r}")
+    # headless and cannot approve reads outside the repo.
+    if digest_error is None:
+        try:
+            digest_path().parent.mkdir(parents=True, exist_ok=True)
+            digest_path().write_text(digest_text, encoding="utf-8")
+            print(f"  session digest: {digest_entries} "
+                  f"entr{'y' if digest_entries == 1 else 'ies'} → {digest_path()}")
+        except Exception as exc:
+            digest_error = repr(exc)
+            print(f"  session digest skipped: {digest_error}")
+    if digest_error is not None:
         try:
             digest_path().unlink()     # never let LAST week's digest be re-mined
         except OSError:
@@ -4380,7 +4828,9 @@ def cmd_consolidate(argv: list) -> int:
             cwd=ROOT, text=True, capture_output=True, timeout=runner["propose_timeout"],
             stdin=subprocess.DEVNULL,
         )
-        print(run.stdout[-2000:] if run.stdout else "(no output)")
+        text, usage = runner_output(run.stdout)
+        add_usage(result, usage)
+        print(text[-2000:] if text else "(no output)")
         if run.returncode != 0:
             failure = (f"{runner_name} exited {run.returncode}: "
                        f"{(run.stderr or '').strip()[-300:] or 'no stderr'}")
@@ -4417,13 +4867,16 @@ def cmd_consolidate(argv: list) -> int:
         failure = f"could not diff the branch against main: {staged_error}"
     changed = bool(staged.strip())
 
-    audit_detail = ""
+    audit_detail, blocked = "", False
     if failure is None and changed:
-        verdict, detail = audit_changes(runner)
+        audit_usage = {}
+        verdict, detail = audit_changes(runner, usage=audit_usage)
+        add_usage(result, audit_usage)
         audit_detail = detail
         print(f"  audit: {detail}")
         if verdict != "pass":
             failure = f"audit {verdict}: {detail}"
+            blocked = verdict == "block"
 
     committed = pushed = False
     uncommitted = bool(git("diff", "--cached", "--name-only").strip())
@@ -4460,6 +4913,7 @@ def cmd_consolidate(argv: list) -> int:
 
     print()
     if failure:
+        result["status"] = "blocked" if blocked else "failed"
         print(f"consolidation DID NOT LAND: {failure}")
         print(f"nothing was pushed; the work is left on {branch} for inspection")
         if uncommitted:
@@ -4467,8 +4921,10 @@ def cmd_consolidate(argv: list) -> int:
         print(f"you are on branch: {here}")
         return 1
     if not changed:
+        result["status"] = "no_changes"
         print("consolidation made no changes — nothing to review")
         return 0
+    result["status"] = "committed"
     print(f"consolidation committed on {branch} (never on main)"
           + ("" if pushed else " — PUSH FAILED, run: git push -u origin " + branch))
     print(f"review:  git diff main...{branch}")
@@ -5807,6 +6263,103 @@ def stats_snapshot() -> dict:
     }
 
 
+CAPTURE_GROUP_KEYS = ("source", "via", "client", "kind", "basis")
+
+
+def _git_blobs(specs: list) -> dict:
+    """{"<commit>:<path>": text} for each spec git can resolve, in one `git cat-file`."""
+    if not specs:
+        return {}
+    run = subprocess.run(["git", "cat-file", "--batch"], cwd=ROOT, capture_output=True,
+                         input=("\n".join(specs) + "\n").encode("utf-8"))
+    out, blobs, pos = run.stdout, {}, 0
+    for spec in specs:
+        end = out.find(b"\n", pos)
+        if end < 0:
+            break
+        header = out[pos:end].split()
+        pos = end + 1
+        if len(header) != 3 or header[1] != b"blob":
+            continue                      # "<spec> missing", or not a file
+        size = int(header[2])
+        blobs[spec] = out[pos:pos + size].decode("utf-8", "replace")
+        pos += size + 1
+    return blobs
+
+
+def capture_counts(since: str, until: str) -> dict:
+    """E8: inbox notes whose FIRST add on the trunk was committed in (since, until], grouped
+    by their provenance fields as the adding commit wrote them.
+
+    From git rather than the folder, so a capture consolidation has since drained still
+    counts, and from the trunk only, so a branch that never landed does not. `client` is
+    grouped by its name (before the first `/`), so a client's versions are one group; a
+    field the note does not carry is null."""
+    trunk = default_branch()
+    ref = f"refs/heads/{trunk}"
+    if not git("rev-parse", "--verify", "--quiet", ref):
+        ref = "HEAD"
+    out = git("-c", "core.quotePath=false", "log", "--diff-filter=A", "--name-only",
+              "--format=%x00%H %cI", ref, "--", "knowledge/inbox")
+    first_add, current = {}, None
+    for line in out.splitlines():
+        if line.startswith("\0"):
+            commit, _, when = line[1:].partition(" ")
+            current = (commit, utc_instant(when))
+        elif current and re.fullmatch(r"knowledge/inbox/[^/]+\.md", line.strip()):
+            # Newest first, so a later sighting is an EARLIER add: the oldest one wins.
+            first_add[line.strip()] = current
+    chosen = sorted(f"{commit}:{rel}" for rel, (commit, at) in first_add.items()
+                    if since < at <= until)
+    blobs = _git_blobs(chosen)
+    groups = {}
+    for spec in chosen:
+        fm, _err = parse_frontmatter(blobs.get(spec, ""))
+        values = []
+        for key in CAPTURE_GROUP_KEYS:
+            value = (fm or {}).get(key)
+            value = (", ".join(map(str, value)) if isinstance(value, list) else
+                     str(value) if value is not None else "").strip()
+            if key == "client":
+                value = value.split("/", 1)[0].strip()
+            values.append(value or None)
+        groups[tuple(values)] = groups.get(tuple(values), 0) + 1
+    ordered = sorted(groups.items(), key=lambda kv: (-kv[1], [v or "" for v in kv[0]]))
+    return {"v": 1, "since": since, "until": until, "total": len(chosen),
+            "groups": [dict(zip(CAPTURE_GROUP_KEYS, key), count=count)
+                       for key, count in ordered]}
+
+
+def cmd_stats_captures(argv: list) -> int:
+    import json
+    usage = "usage: brain stats --captures [--since ISO] [--until ISO] [--json]"
+    until = utc_instant(_arg_after(argv, "--until")) if "--until" in argv else utc_now_minus(0)
+    if "--since" in argv:
+        since = utc_instant(_arg_after(argv, "--since"))
+    else:
+        since = until and time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        time.gmtime(_utc_epoch(until) - 7 * 86400))
+    if not since or not until:
+        print(usage + "\n  ISO is a date (YYYY-MM-DD) or an instant (2026-10-18T05:12:09Z)")
+        return 2
+    counts = capture_counts(since, until)
+    if "--json" in argv:
+        print(json.dumps(counts, indent=2))
+        return 0
+    print(f"\nbrain stats — captures in ({since}, {until}]: {counts['total']}\n")
+    for group in counts["groups"]:
+        label = "  ".join(f"{k}={group[k] if group[k] is not None else '-'}"
+                          for k in CAPTURE_GROUP_KEYS)
+        print(f"  {group['count']:>5}  {label}")
+    print()
+    return 0
+
+
+def _utc_epoch(instant: str) -> int:
+    import calendar
+    return calendar.timegm(time.strptime(instant, "%Y-%m-%dT%H:%M:%SZ"))
+
+
 def cmd_stats(argv: list) -> int:
     """Trend and trust signals — the answer to 'is this thing still working?'
 
@@ -5816,6 +6369,8 @@ def cmd_stats(argv: list) -> int:
     exactly why they need a number rather than a vibe.
     """
     import json
+    if "--captures" in argv:
+        return cmd_stats_captures(argv)
     if "--export" in argv:
         # For the workspace's weekly report: JSON to a file OUTSIDE the data repository.
         # Inside it the file would dirty the tree, which refuses captures (maintenance).
@@ -6264,16 +6819,41 @@ def cmd_doctor() -> int:
     else:
         print("  [-- ] no search index yet — built automatically on first search")
 
-    inbox_items = sorted((K / "inbox").glob("*.md"), key=lambda p: p.stat().st_mtime)
-    if inbox_items:
-        oldest_days = int((time.time() - inbox_items[0].stat().st_mtime) / 86400)
-        state = "RED" if (len(inbox_items) > 25 or oldest_days > 21) else "ok "
+    # Age from git, not mtime: every clone and checkout stamps mtime to now, so on the
+    # consolidating clone an mtime-based age never grew and this alarm never fired.
+    _born = note_birthdays()
+    captures, proposals, overdue = [], 0, 0
+    for path in sorted((K / "inbox").glob("*.md")):
+        rel = str(path.relative_to(ROOT))
+        fm = parse_frontmatter(read_text(path))[0] or {}
+        if str(fm.get("source") or "") == "session-mining":
+            # A proposal consolidation wrote from the session digest. It has its own expiry
+            # and a later pass deletes it once that passes, so it is no capture backlog;
+            # one left more than two days past it means consolidation stopped pruning.
+            proposals += 1
+            expires = str(fm.get("expires") or "")
+            if valid_date(expires) and (date.today() - date.fromisoformat(expires)).days > 2:
+                overdue += 1
+            continue
+        born = _born.get(rel)
+        captures.append((date.today() - date.fromisoformat(born)).days if born else 0)
+    if captures:
+        oldest_days = max(captures)
+        state = "RED" if (len(captures) > 25 or oldest_days > 21) else "ok "
         if state == "RED":
             ok = False
-        print(f"  [{state}] inbox backlog: {len(inbox_items)} item(s), oldest {oldest_days}d — "
+        print(f"  [{state}] inbox backlog: {len(captures)} capture(s), oldest {oldest_days}d — "
               "drain via bin/brain consolidate")
     else:
-        print("  [ok ] inbox empty")
+        print("  [ok ] inbox empty" + (" of captures" if proposals else ""))
+    if proposals:
+        if overdue:
+            ok = False
+            print(f"  [RED] {proposals} session-mining proposal(s) in the inbox, {overdue} more "
+                  "than 2 days past its expires date — consolidation has stopped pruning them")
+        else:
+            print(f"  [ok ] {proposals} session-mining proposal(s) in the inbox, none past "
+                  "its expiry")
 
     # An empty inbox is ambiguous in the worst possible way: it is what a
     # healthy, freshly-drained brain looks like, and it is ALSO exactly what a
@@ -6282,7 +6862,6 @@ def cmd_doctor() -> int:
     # the routing block gets dropped from a global instruction file, or an agent
     # update stops honouring it, and nothing anywhere says the brain stopped
     # growing until someone wonders why it never knows anything recent.
-    _born = note_birthdays()
     _recent = sum(1 for _rel, _day in _born.items()
                   if _rel.endswith(".md") and (ROOT / _rel).exists()
                   and (date.today() - date.fromisoformat(_day)).days <= 30)
@@ -6452,12 +7031,15 @@ def main() -> int:
         _STATE_OVERRIDE = None
         INDEX_DB = state_dir() / "index.db"
         argv = argv[:i] + argv[i + 2:]
-    elif argv[:1] != ["setup"]:
-        # Skipped for setup, and only for setup. Setup runs out of a throwaway
-        # clone of the template and installs the hooks into the DESTINATION,
-        # which phase_create does. Here it would mutate a directory that is
-        # about to be deleted, and announce it — "brain: installed git hooks"
-        # about a temp clone, in the very first output a new user ever sees.
+    elif argv[:1] != ["setup"] and not (argv[:1] == ["sessions"] and "--jsonl" in argv):
+        # Skipped for setup. Setup runs out of a throwaway clone of the template and
+        # installs the hooks into the DESTINATION, which phase_create does. Here it
+        # would mutate a directory that is about to be deleted, and announce it —
+        # "brain: installed git hooks" about a temp clone, in the very first output a
+        # new user ever sees.
+        # Skipped for `sessions --jsonl` too: it is run as the transcripts' owner,
+        # often by a service, against an engine that user cannot write, and it needs
+        # no brain at all — it reads transcripts and writes its one file.
         ensure_hooks(quiet="--json" in argv)
     if not argv:
         print(__doc__)

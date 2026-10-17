@@ -32,8 +32,27 @@ Read them. A second current note asserting the opposite of an existing one is
 a block — the brain would then serve both as true.
 
 Also block if the change set plainly violates the pass's own caps (more than 15
-modified canonical files, or more than 7 new inbox proposals), or if a note was
+modified canonical files, or more than 3 new inbox proposals), or if a note was
 moved into archive/ without a successor carrying its knowledge forward.
+
+**PROVENANCE.** Inbox notes carry `source:` and, where the capturing agent
+declared it, `basis:` — `owner-said`, `agent-found` or `agent-inferred`. A
+deleted inbox note in the diff shows what a canonical change was made from.
+Block if the change set:
+
+- promotes an `agent-inferred` capture into a canonical note as settled fact,
+  when nothing else in the change set or the brain corroborates it (written up
+  plainly as the agent's conclusion, it may pass), or lets one supersede a
+  canonical note whose `## Sources` are the owner's (or that has no
+  `## Sources`, which predates them);
+- adds more than 3 new inbox notes with `source: session-mining`, or adds one
+  without an `expires:` date;
+- creates a canonical note, or merges an input into one, without a
+  `## Sources` line naming that input's basis and date.
+
+You cannot see the session digest, so you cannot check whether a
+session-mining proposal the pass promoted was really corroborated there; do
+not block on that.
 
 ## What you must NOT do
 
