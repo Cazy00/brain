@@ -18,10 +18,12 @@ this one. `allow=None` — every tool — stays the default, because that is wha
 stdio is: a subprocess a client spawned on the machine the user is already
 sitting at.
 
-Two more properties of the ENDPOINT travel the same way, never through the
-message: `source` (what provenance a write is stamped with) and `cap` (how
-much this endpoint may write today). A caller must not be able to set either,
-so neither is a tool argument.
+More properties of the ENDPOINT travel the same way, never through the
+message: `source` (what trust class a write is stamped with), `via` (the
+transport it arrived through) and `cap` (how much this endpoint may write
+today). A caller must not be able to set any of them, so none is a tool
+argument. `client` is stamped from the client's own clientInfo, which is
+self-reported and said to be.
 """
 import json
 import subprocess
