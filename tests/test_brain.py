@@ -1342,14 +1342,14 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(payload["cost_microusd"], 200000)
 
     def test_digest_from_feeds_the_pass_and_an_unreadable_one_is_only_a_warning(self):
-        drop = Path(self.tmp.name) / "drop" / "other-account"
+        drop = Path(self.tmp.name) / "drop"
         drop.mkdir(parents=True)
-        (drop / "digest.jsonl").write_text(json.dumps(
+        (drop / "other-account.jsonl").write_text(json.dumps(
             {"v": 1, "at": iso_ago(0.2), "tool": "claude-code", "project": "elsewhere",
              "text": "IMPORTED-TURN keep the daily pass"}) + "\n", encoding="utf-8")
         seen = Path(self.tmp.name) / "seen-digest.md"
         self.stub_claude(f'cp .cache/session-digest.md {seen} 2>/dev/null\nexit 0')
-        result = self.consolidate_with("--digest-from", str(drop.parent))
+        result = self.consolidate_with("--digest-from", str(drop))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("IMPORTED-TURN keep the daily pass", seen.read_text(encoding="utf-8"))
         self.assertIn("elsewhere", seen.read_text(encoding="utf-8"))
@@ -1524,6 +1524,76 @@ class SessionDigestTests(unittest.TestCase):
         self.assertFalse(inside.exists(), "mined prompts were written where git can see them")
         self.assertEqual(self.sessions("--jsonl").returncode, 2, "--out is required")
 
+    def tree_state(self, root):
+        return sorted((str(path.relative_to(root)), path.stat().st_mtime_ns, path.stat().st_size)
+                      for path in [root, *root.rglob("*")] if not path.is_symlink())
+
+    def set_writable(self, root, writable):
+        for path in [root, *root.rglob("*")]:
+            if path.is_symlink():
+                continue
+            mode = path.stat().st_mode
+            path.chmod((mode | 0o200) if writable else (mode & ~0o222))
+
+    def test_jsonl_export_runs_from_a_read_only_engine_and_writes_only_its_file(self):
+        """How a transcript owner's service runs it: no data root (so ROOT is the engine),
+        engine and home read-only, cwd anywhere. It reads the transcripts and writes its one
+        file: no hooks, no state directory, no index, no lock."""
+        subprocess.run(["git", "config", "--unset", "core.hooksPath"], cwd=self.repo,
+                       check=True)
+        self.write_transcript("a.jsonl", [self.user_turn("READONLY run", self.iso(1))])
+        out_dir = Path(self.tmp.name) / "out"
+        out_dir.mkdir()
+        engine_before = self.tree_state(self.repo)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("BRAIN_DATA_ROOT", "BRAIN_STATE_DIR")}
+        env.update(HOME=str(self.home), PYTHONDONTWRITEBYTECODE="1")
+        self.set_writable(self.repo, False)
+        self.set_writable(self.home, False)
+        try:
+            done = subprocess.run(
+                [sys.executable, str(self.repo / "bin" / "brain"), "sessions", "--jsonl",
+                 "--out", str(out_dir / "digest.jsonl"), "--days", "8"],
+                cwd="/", capture_output=True, text=True, timeout=180, env=env)
+        finally:
+            self.set_writable(self.repo, True)
+            self.set_writable(self.home, True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("installed git hooks", done.stdout)
+        self.assertEqual(self.tree_state(self.repo), engine_before, "the engine was written")
+        hooks = subprocess.run(["git", "config", "core.hooksPath"], cwd=self.repo,
+                               capture_output=True, text=True).stdout.strip()
+        self.assertEqual(hooks, "", "the export touched the engine's git config")
+        self.assertEqual([p.name for p in out_dir.iterdir()], ["digest.jsonl"])
+        self.assertEqual([r["text"] for r in self.read_jsonl(out_dir / "digest.jsonl")],
+                         ["READONLY run"])
+
+    def test_jsonl_export_with_no_transcripts_writes_an_empty_file(self):
+        shutil.rmtree(self.home / ".claude")
+        out_file = Path(self.tmp.name) / "digest.jsonl"
+        out_file.write_text("last run's lines\n", encoding="utf-8")
+        done = self.sessions("--jsonl", "--out", str(out_file), "--days", "8")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(out_file.read_text(encoding="utf-8"), "")
+
+    def test_hooks_are_announced_only_when_the_config_write_took(self):
+        """ensure_hooks printed "installed git hooks" even when git refused the write."""
+        subprocess.run(["git", "config", "--unset", "core.hooksPath"], cwd=self.repo,
+                       check=True)
+        git_dir = self.repo / ".git"
+        git_dir.chmod(0o555)
+        try:
+            refused = self.sessions("--stdout")
+            hooks = subprocess.run(["git", "config", "core.hooksPath"], cwd=self.repo,
+                                   capture_output=True, text=True).stdout.strip()
+        finally:
+            git_dir.chmod(0o755)
+        if hooks:                       # running as root: nothing can be read-only
+            self.skipTest("the git directory stayed writable")
+        self.assertNotIn("installed git hooks", refused.stdout + refused.stderr)
+        took = self.sessions("--stdout")
+        self.assertIn("installed git hooks", took.stdout)
+
     def test_jsonl_export_keeps_the_size_cap_dropping_the_oldest(self):
         module = load_brain_module()
         entries = [{"v": 1, "at": "2026-10-1%dT10:00:00Z" % day, "tool": "claude-code",
@@ -1610,6 +1680,18 @@ class DigestImportTests(unittest.TestCase):
         self.assertIn("big.jsonl", refused)
         self.assertNotIn("extra_field", json.dumps(entries))
         self.assertIsNone(report["error"])
+
+    def test_a_flat_folder_of_account_files_is_read(self):
+        """The usual shape: one `<account>.jsonl` per producing account, side by side."""
+        for account, text in (("alice", "ALICE said"), ("bob", "BOB said")):
+            (self.drop / f"{account}.jsonl").write_text(self.row(text, iso_ago(1)) + "\n",
+                                                        encoding="utf-8")
+        entries, report = self.module.read_digest_dir(self.drop)
+        self.assertEqual(sorted(e["text"] for e in entries), ["ALICE said", "BOB said"])
+        self.assertEqual((report["files"], report["invalid"], report["refused"]), (2, 0, []))
+        text, count, notes = self.module.consolidation_digest(str(self.drop))
+        self.assertEqual(count, 2, text)
+        self.assertIn("2 file(s), 2 entries", " ".join(notes))
 
     def test_an_unreadable_directory_is_a_warning_not_a_failure(self):
         entries, report = self.module.read_digest_dir(Path(self.tmp.name) / "missing")

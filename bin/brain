@@ -326,10 +326,12 @@ def ensure_hooks(quiet: bool = False) -> None:
     try:
         want = hooks_path()
         if git("config", "core.hooksPath") != want:
-            subprocess.run(
-                ["git", "config", "core.hooksPath", want], cwd=ROOT, check=False
-            )
-            if not quiet:
+            # Announced only when the write took. A read-only checkout (an engine
+            # installed by another user, a locked-down service) refuses it, and the
+            # notice used to claim the hooks were installed all the same.
+            done = subprocess.run(["git", "config", "core.hooksPath", want], cwd=ROOT,
+                                  capture_output=True, text=True, check=False)
+            if done.returncode == 0 and not quiet:
                 print(f"brain: installed git hooks (core.hooksPath = {want})")
     except Exception:
         pass
@@ -7029,12 +7031,15 @@ def main() -> int:
         _STATE_OVERRIDE = None
         INDEX_DB = state_dir() / "index.db"
         argv = argv[:i] + argv[i + 2:]
-    elif argv[:1] != ["setup"]:
-        # Skipped for setup, and only for setup. Setup runs out of a throwaway
-        # clone of the template and installs the hooks into the DESTINATION,
-        # which phase_create does. Here it would mutate a directory that is
-        # about to be deleted, and announce it — "brain: installed git hooks"
-        # about a temp clone, in the very first output a new user ever sees.
+    elif argv[:1] != ["setup"] and not (argv[:1] == ["sessions"] and "--jsonl" in argv):
+        # Skipped for setup. Setup runs out of a throwaway clone of the template and
+        # installs the hooks into the DESTINATION, which phase_create does. Here it
+        # would mutate a directory that is about to be deleted, and announce it —
+        # "brain: installed git hooks" about a temp clone, in the very first output a
+        # new user ever sees.
+        # Skipped for `sessions --jsonl` too: it is run as the transcripts' owner,
+        # often by a service, against an engine that user cannot write, and it needs
+        # no brain at all — it reads transcripts and writes its one file.
         ensure_hooks(quiet="--json" in argv)
     if not argv:
         print(__doc__)
