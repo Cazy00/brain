@@ -28,10 +28,14 @@ Commands:
                                    the same turns as digest.v1 lines (0640,
                                    replaced atomically), for the account that
                                    consolidates to read with --digest-from
-  brain consolidate [--dry-run] [--open-pr]   weekly tidy pass via the pinned
-                                   runner in setup/consolidator.conf; lands on a
-                                   branch, pushed only after the audit passes;
-                                   refuses a served folder (run it in its own clone)
+  brain consolidate [--dry-run] [--open-pr] [--digest-from DIR]
+                                   tidy pass via the pinned runner in
+                                   setup/consolidator.conf; lands on a branch,
+                                   pushed only after the audit passes; refuses a
+                                   served folder (run it in its own clone); idle,
+                                   with no model call, when there is nothing to
+                                   do; ends on one consolidate-result: {json} line.
+                                   --digest-from adds digest.v1 files from DIR
   brain sync [--push]              converge the served folder's main with
                                    origin/main (2.4); --push only pushes main
                                    (the post-commit hook's entry). The one pusher.
