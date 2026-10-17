@@ -4654,6 +4654,23 @@ def journal_changes_since_consolidation() -> list:
     return sorted({line.strip() for line in out.splitlines() if line.strip().endswith(".md")})
 
 
+def inbox_work(inbox_items: list) -> tuple:
+    """(work, waiting): inbox notes a pass has to act on, and session-mining proposals
+    still inside their expiry. A waiting proposal is promoted only once something
+    corroborates it — a capture or a digest entry, which is work of its own — so until it
+    expires it is no reason to run a model."""
+    today, work, waiting = date.today().isoformat(), 0, 0
+    for path in inbox_items:
+        fm = parse_frontmatter(read_text(path))[0] or {}
+        expires = str(fm.get("expires") or "")
+        if (str(fm.get("source") or "") == "session-mining" and valid_date(expires)
+                and expires >= today):
+            waiting += 1
+        else:
+            work += 1
+    return work, waiting
+
+
 def review_debt() -> list:
     """Canonical notes whose review_by date has passed."""
     today, due = date.today().isoformat(), []
@@ -4721,13 +4738,16 @@ def _consolidate(argv: list, result: dict) -> int:
     result["digest_entries"] = digest_entries
     # E5: a pass with nothing to do makes no model call. Work is a capture waiting, a digest
     # entry the last pass did not see, a journal entry it did not see, or review_by debt.
-    work = {"inbox": len(inbox_items), "digest": digest_entries,
+    inbox_count, waiting = inbox_work(inbox_items)
+    work = {"inbox": inbox_count, "digest": digest_entries,
             "journal": len(journal_changes_since_consolidation()),
             "review_by": len(review_debt())}
     decision = (("run — " + ", ".join(f"{k} {v}" for k, v in work.items()))
                 if any(work.values()) else
                 "idle — no captures, no digest entries, no new journal entries and no "
                 "review_by debt, so no model call")
+    if waiting:
+        decision += f"; {waiting} proposal(s) waiting for corroboration"
     for note in digest_notes:
         print(f"  {note}")
     if digest_error:
@@ -6269,7 +6289,7 @@ def capture_counts(since: str, until: str) -> dict:
     """E8: inbox notes whose FIRST add on the trunk was committed in (since, until], grouped
     by their provenance fields as the adding commit wrote them.
 
-    From git rather than the folder, so a capture the curator has since drained still
+    From git rather than the folder, so a capture consolidation has since drained still
     counts, and from the trunk only, so a branch that never landed does not. `client` is
     grouped by its name (before the first `/`), so a client's versions are one group; a
     field the note does not carry is null."""
@@ -6798,16 +6818,16 @@ def cmd_doctor() -> int:
         print("  [-- ] no search index yet — built automatically on first search")
 
     # Age from git, not mtime: every clone and checkout stamps mtime to now, so on the
-    # curator's own clone an mtime-based age never grew and this alarm never fired.
+    # consolidating clone an mtime-based age never grew and this alarm never fired.
     _born = note_birthdays()
     captures, proposals, overdue = [], 0, 0
     for path in sorted((K / "inbox").glob("*.md")):
         rel = str(path.relative_to(ROOT))
         fm = parse_frontmatter(read_text(path))[0] or {}
         if str(fm.get("source") or "") == "session-mining":
-            # A proposal the curator wrote from the session digest. It has its own expiry
-            # and the curator deletes it once that passes, so it is no capture backlog;
-            # one left more than two days past it means the curator stopped pruning.
+            # A proposal consolidation wrote from the session digest. It has its own expiry
+            # and a later pass deletes it once that passes, so it is no capture backlog;
+            # one left more than two days past it means consolidation stopped pruning.
             proposals += 1
             expires = str(fm.get("expires") or "")
             if valid_date(expires) and (date.today() - date.fromisoformat(expires)).days > 2:
@@ -6828,7 +6848,7 @@ def cmd_doctor() -> int:
         if overdue:
             ok = False
             print(f"  [RED] {proposals} session-mining proposal(s) in the inbox, {overdue} more "
-                  "than 2 days past its expires date — the curator has stopped pruning them")
+                  "than 2 days past its expires date — consolidation has stopped pruning them")
         else:
             print(f"  [ok ] {proposals} session-mining proposal(s) in the inbox, none past "
                   "its expiry")

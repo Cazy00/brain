@@ -281,7 +281,8 @@ What a pass does with it, and what it reports:
   it expires; `doctor` goes red when one is more than 2 days past its expiry.
 - **Idle.** With no captures, no digest entries, no journal entries since the
   last consolidation and no `review_by` debt, a pass makes no model call and
-  cuts no branch. `consolidate --dry-run` prints what it would decide.
+  cuts no branch; a proposal inside its expiry is no work on its own.
+  `consolidate --dry-run` prints what it would decide.
 - **Result.** Every pass ends on one line, `consolidate-result: {json}`:
   `{"v":1, "status": "idle|committed|no_changes|blocked|failed", "idle",
   "cost_microusd", "tokens_in", "tokens_out", "digest_entries",

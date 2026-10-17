@@ -1245,6 +1245,26 @@ class ConsolidateTests(unittest.TestCase):
                 subprocess.run(["git", "reset", "-q", "--hard", snapshot], cwd=self.repo, check=True)
                 shutil.rmtree(self.home / ".claude", ignore_errors=True)
 
+    def test_a_proposal_waiting_for_corroboration_is_work_only_once_it_expires(self):
+        """A mined proposal waits up to 7 days for something to corroborate it; that
+        something is work of its own. Until it expires, it alone wakes no model."""
+        self.drain_seed()
+        future = (date_today() + timedelta(days=3)).isoformat()
+        past = (date_today() - timedelta(days=1)).isoformat()
+        commit_at(self.repo, "proposal", iso_ago(1), ("knowledge/inbox/p.md",
+                  inbox_note(source="session-mining", expires=future)))
+        idle = self.consolidate_with("--dry-run")
+        self.assertIn("would decide: idle", idle.stdout, idle.stdout)
+        self.assertIn("1 proposal(s) waiting", idle.stdout)
+        commit_at(self.repo, "expired", iso_ago(0), ("knowledge/inbox/p.md",
+                  inbox_note(source="session-mining", expires=past)))
+        busy = self.consolidate_with("--dry-run")
+        self.assertIn("would decide: run", busy.stdout, busy.stdout)
+        self.assertIn("inbox 1", busy.stdout)
+        self.stub_claude("exit 0")
+        result = self.consolidate_with()
+        self.assertEqual(self.result_of(result)["inbox_before"], 1)
+
     def transcript_turn(self, text, at):
         folder = self.home / ".claude" / "projects" / "-w-proj"
         folder.mkdir(parents=True, exist_ok=True)
@@ -5112,7 +5132,7 @@ def inbox_note(**fm):
 
 class CaptureCountTests(unittest.TestCase):
     """E8: `stats --captures` counts what arrived in the inbox in a window, by where it came
-    from, from git — so a note the curator has since drained still counts."""
+    from, from git — so a note consolidation has since drained still counts."""
 
     def setUp(self):
         self.tmp = temp_dir()
@@ -5169,7 +5189,7 @@ class CaptureCountTests(unittest.TestCase):
 class DoctorInboxTests(unittest.TestCase):
     """E6: the inbox alarm reads age from git, not mtime (a fresh clone resets mtime), and
     counts session-mining proposals apart: they have their own expiry, and one left past it
-    means the curator has stopped pruning."""
+    means consolidation has stopped pruning."""
 
     def setUp(self):
         self.tmp = temp_dir()
