@@ -1254,6 +1254,81 @@ class SessionDigestTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("nothing to mine", out.stdout)
 
+    # -- E4: digest.v1, so the account that owns the transcripts can produce the digest --
+
+    def read_jsonl(self, path):
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_jsonl_export_writes_one_digest_v1_object_per_human_turn(self):
+        self.write_transcript("a.jsonl", [
+            self.user_turn("SECOND turn", self.iso(1) + ".250Z", turnOrigin="human"),
+            self.user_turn("REPLAYED turn", self.iso(3) + "Z"),
+            self.user_turn("AUTOMATION turn", self.iso(1), turnOrigin="sdk"),
+            self.user_turn("ANCIENT turn", self.iso(20)),
+        ])
+        replayed_at = self.iso(1) + "Z"
+        self.write_transcript("b.jsonl", [
+            self.user_turn("FIRST turn", self.iso(2)),
+            self.user_turn("REPLAYED turn", replayed_at),
+        ])
+        out_file = Path(self.tmp.name) / "export" / "digest.jsonl"
+        done = self.sessions("--jsonl", "--out", str(out_file))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        rows = self.read_jsonl(out_file)
+        self.assertEqual([r["text"] for r in rows], ["FIRST turn", "SECOND turn", "REPLAYED turn"],
+                         "not newest-last, not deduplicated, or outside the window")
+        for row in rows:
+            self.assertEqual(set(row), {"v", "at", "tool", "project", "text"})
+            self.assertEqual(row["v"], 1)
+            self.assertRegex(row["at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            self.assertEqual(row["tool"], "claude-code")
+            self.assertEqual(row["project"], "proj")
+        self.assertEqual(rows[-1]["at"], replayed_at, "a duplicate kept its older copy")
+
+    def test_jsonl_export_honours_days_and_replaces_the_file_atomically(self):
+        self.write_transcript("a.jsonl", [self.user_turn("THREE days", self.iso(3)),
+                                          self.user_turn("ONE day", self.iso(1))])
+        out_dir = Path(self.tmp.name) / "export"
+        out_dir.mkdir()
+        out_file = out_dir / "digest.jsonl"
+        out_file.write_text("stale\n", encoding="utf-8")
+        done = self.sessions("--jsonl", "--out", str(out_file), "--days", "2")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual([r["text"] for r in self.read_jsonl(out_file)], ["ONE day"])
+        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["digest.jsonl"],
+                         "a temporary file was left beside the export")
+
+    def test_jsonl_export_is_mode_0640_within_the_umask(self):
+        self.write_transcript("a.jsonl", [self.user_turn("PRIVATE prompt", self.iso(1))])
+        for umask, expected in (("022", 0o640), ("077", 0o600)):
+            with self.subTest(umask=umask):
+                out_file = Path(self.tmp.name) / f"digest-{umask}.jsonl"
+                done = subprocess.run(
+                    ["sh", "-c", f'umask {umask}; exec "$0" "$@"', sys.executable,
+                     str(self.repo / "bin" / "brain"), "sessions", "--jsonl", "--out",
+                     str(out_file)],
+                    cwd=self.repo, capture_output=True, text=True, timeout=180,
+                    env={**os.environ, "HOME": str(self.home)})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(out_file.stat().st_mode & 0o777, expected)
+
+    def test_jsonl_export_refuses_a_file_inside_the_data_repository(self):
+        self.write_transcript("a.jsonl", [self.user_turn("PRIVATE prompt", self.iso(1))])
+        inside = self.repo / "knowledge" / "digest.jsonl"
+        done = self.sessions("--jsonl", "--out", str(inside))
+        self.assertEqual(done.returncode, 2, done.stdout)
+        self.assertFalse(inside.exists(), "mined prompts were written where git can see them")
+        self.assertEqual(self.sessions("--jsonl").returncode, 2, "--out is required")
+
+    def test_jsonl_export_keeps_the_size_cap_dropping_the_oldest(self):
+        module = load_brain_module()
+        entries = [{"v": 1, "at": "2026-10-1%dT10:00:00Z" % day, "tool": "claude-code",
+                    "project": "p", "text": "%d" % day * 40} for day in range(1, 6)]
+        kept, dropped = module.select_digest_entries(entries, "2026-10-01T00:00:00Z",
+                                                     max_chars=100)
+        self.assertEqual([e["text"][0] for e in kept], ["4", "5"])
+        self.assertEqual(dropped, 3)
+
 
 class SupersedeTests(unittest.TestCase):
     """The two note-creating commands had no coverage. supersede in particular
