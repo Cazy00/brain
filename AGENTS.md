@@ -295,8 +295,11 @@ What a pass does with it, and what it reports:
 
 - **Window.** The digest holds the entries since the last `consolidate:`
   commit on the trunk, 8 days at most, so daily passes do not re-mine the same
-  week. `consolidate --digest-from DIR` adds the digest.v1 files in DIR and
-  one level below it to this account's own transcripts.
+  week. A scheduler that knows when its last good pass started (one that
+  changed nothing leaves no commit) passes `--digest-since <UTC instant, Z>`
+  instead, still capped at 8 days. `consolidate --digest-from DIR` adds the
+  digest.v1 files in DIR and one level below it to this account's own
+  transcripts.
 - **Proposals.** Mining writes at most 3 per pass, as inbox notes with
   `source: session-mining` and `expires:` 7 days after `created:`. A later
   pass promotes one only once something corroborates it, and deletes it once
@@ -310,7 +313,12 @@ What a pass does with it, and what it reports:
   "cost_microusd", "tokens_in", "tokens_out", "digest_entries",
   "inbox_before"}`. Cost and tokens are propose plus audit, read from the
   runner's `--output-format json` answer, and `null` when it answers in plain
-  text.
+  text. `brain audit-branch` ends the same way, on `audit-result: {"v":1,
+  "verdict": "pass|block|error", "cost_microusd", "tokens_in", "tokens_out"}`.
+- **Known limit.** In a split layout with `BRAIN_STATE_DIR` outside both the
+  data root and the engine, the pass is told the digest's real path but its
+  runner line grants no read access there (`--add-dir` names the engine only),
+  so it may be unable to read the digest.
 
 ### Session digest: digest.v1
 

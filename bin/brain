@@ -32,14 +32,17 @@ Commands:
                                    the same turns as digest.v1 lines (0640,
                                    replaced atomically), for the account that
                                    consolidates to read with --digest-from
-  brain consolidate [--dry-run] [--open-pr] [--digest-from DIR]
+  brain consolidate [--dry-run] [--open-pr] [--digest-from DIR] [--digest-since ISO]
                                    tidy pass via the pinned runner in
                                    setup/consolidator.conf; lands on a branch,
                                    pushed only after the audit passes; refuses a
                                    served folder (run it in its own clone); idle,
                                    with no model call, when there is nothing to
                                    do; ends on one consolidate-result: {json} line.
-                                   --digest-from adds digest.v1 files from DIR
+                                   --digest-from adds digest.v1 files from DIR;
+                                   --digest-since (UTC, ...Z) starts the digest
+                                   window there instead of at the last
+                                   consolidate commit (8 days at most)
   brain sync [--push]              converge the served folder's main with
                                    origin/main (2.4); --push only pushes main
                                    (the post-commit hook's entry). The one pusher.
@@ -3972,20 +3975,22 @@ def last_consolidation(trunk: str = "") -> tuple:
     return best
 
 
-def digest_window_start() -> str:
-    """Entries later than this reach the next pass: the last consolidation on the trunk, so
-    daily passes do not re-mine the same week, and never more than DIGEST_DAYS back."""
+def digest_window_start(since: str = "") -> str:
+    """Entries later than this reach the next pass: `since` when the caller gives it
+    (`consolidate --digest-since`), else the last consolidation on the trunk, so daily
+    passes do not re-mine the same week — and never more than DIGEST_DAYS back."""
     floor = utc_now_minus(DIGEST_DAYS)
-    _commit, at = last_consolidation()
+    at = since or last_consolidation()[1]
     return max(at, floor) if at else floor
 
 
-def consolidation_digest(digest_from: str = "") -> tuple:
+def consolidation_digest(digest_from: str = "", since: str = "") -> tuple:
     """(markdown, entry_count, notes) for one consolidation pass: this account's transcripts
     plus any digest.v1 files under `digest_from`, after the window, deduplicated and capped.
     notes are lines for the pass's output; an unreadable `digest_from` is one of them, never
-    a failure — the inbox drain is worth doing without it."""
-    since = digest_window_start()
+    a failure — the inbox drain is worth doing without it. `since` is --digest-since."""
+    start = since
+    since = digest_window_start(since)
     entries, notes = local_digest_entries(since), []
     if digest_from:
         imported, report = read_digest_dir(Path(digest_from).expanduser())
@@ -3999,8 +4004,9 @@ def consolidation_digest(digest_from: str = "") -> tuple:
                 notes.append(f"WARNING: --digest-from refused {refusal}")
         entries += imported
     kept, dropped = select_digest_entries(entries, since)
-    text = render_digest(kept, f"since {since} (the last consolidation on the trunk, "
-                               f"{DIGEST_DAYS} days at most)", dropped)
+    origin = "--digest-since" if start else "the last consolidation on the trunk"
+    text = render_digest(kept, f"since {since} ({origin}, {DIGEST_DAYS} days at most)",
+                         dropped)
     return text, len(kept), notes
 
 
@@ -4626,7 +4632,22 @@ def cmd_audit_branch(argv: list) -> int:
     exact commit that will be pushed. The branch's tree goes into a private index
     (GIT_INDEX_FILE), so the staged diff and the read-only snapshot audit_changes builds are the
     branch's, and the checkout's own index, working tree and .cache stay untouched (state goes
-    to BRAIN_STATE_DIR). Exit 0 on pass, 1 on block, error or an unknown branch, 2 on usage."""
+    to BRAIN_STATE_DIR). Exit 0 on pass, 1 on block, error or an unknown branch, 2 on usage.
+    Every exit ends on one `audit-result: {json}` line: v, verdict (pass, block or error),
+    and the call's cost_microusd, tokens_in and tokens_out (null when not reported)."""
+    result = {"v": 1, "verdict": "error", "cost_microusd": None, "tokens_in": None,
+              "tokens_out": None}
+    try:
+        return _audit_branch(argv, result)
+    finally:
+        # One line, last, on every exit: what a separate audit cost has to be reportable.
+        print(AUDIT_RESULT + json.dumps(result))
+
+
+AUDIT_RESULT = "audit-result: "
+
+
+def _audit_branch(argv: list, result: dict) -> int:
     import shutil
     import tempfile
 
@@ -4650,7 +4671,8 @@ def cmd_audit_branch(argv: list) -> int:
         if loaded.returncode != 0:
             print(f"  audit: could not read {argv[1]!r}: {(loaded.stderr or '').strip()[-200:]}")
             return 1
-        verdict, detail = audit_changes(runner)
+        verdict, detail = audit_changes(runner, usage=result)
+        result["verdict"] = verdict
     finally:
         if previous is None:
             os.environ.pop("GIT_INDEX_FILE", None)
@@ -4763,11 +4785,24 @@ def _consolidate(argv: list, result: dict) -> int:
     if not prompt_path.exists():
         print("missing setup/consolidate-prompt.md")
         return 1
+    usage = ("usage: brain consolidate [--dry-run] [--open-pr] [--digest-from DIR] "
+             "[--digest-since YYYY-MM-DDTHH:MM:SSZ]")
     digest_from = ""
     if "--digest-from" in argv:
         digest_from = _arg_after(argv, "--digest-from")
         if not digest_from or digest_from.startswith("--"):
-            print("usage: brain consolidate [--dry-run] [--open-pr] [--digest-from DIR]")
+            print(usage)
+            return 2
+    # --digest-since: the instant the caller's last good pass started, which it knows and the
+    # trunk may not (a pass that changed nothing leaves no commit). Strict, because a guessed
+    # window either re-mines a week or silently skips one.
+    digest_since = ""
+    if "--digest-since" in argv:
+        digest_since = _arg_after(argv, "--digest-since")
+        if not (DIGEST_AT_RE.match(digest_since) and utc_instant(digest_since) == digest_since):
+            print(f"consolidation refused — --digest-since needs a UTC instant like "
+                  f"2026-10-18T14:00:00Z, got {digest_since!r}")
+            print(usage)
             return 2
     inbox_items = [p for p in (K / "inbox").glob("*.md")]
     result["inbox_before"] = len(inbox_items)
@@ -4793,7 +4828,8 @@ def _consolidate(argv: list, result: dict) -> int:
     # is part of deciding whether there is a pass to run at all. A failure here is not
     # fatal — draining the inbox is still worth doing on its own.
     try:
-        digest_text, digest_entries, digest_notes = consolidation_digest(digest_from)
+        digest_text, digest_entries, digest_notes = consolidation_digest(digest_from,
+                                                                         digest_since)
         digest_error = None
     except Exception as exc:
         digest_text, digest_entries, digest_notes, digest_error = None, 0, [], repr(exc)
@@ -4818,7 +4854,9 @@ def _consolidate(argv: list, result: dict) -> int:
     if "--dry-run" in argv:
         print(f"would consolidate: {len(inbox_items)} inbox item(s)")
         print(f"would mine: {digest_entries} digest entr{'y' if digest_entries == 1 else 'ies'}"
-              f" since the last consolidation (at most {DIGEST_DAYS} days)")
+              f" since {digest_window_start(digest_since)} "
+              f"({'--digest-since' if digest_since else 'the last consolidation'}, "
+              f"at most {DIGEST_DAYS} days)")
         print(f"would decide: {decision}")
         print(f"model:  {runner['model']} — {runner['model_reason']}")
         print(f"prompt: {prompt_path}")

@@ -1209,7 +1209,10 @@ class ConsolidateTests(unittest.TestCase):
         """The served folder is where captures land. Consolidation switches
         branches and stages everything, so it runs in its own clone — and a
         served folder refuses before a branch is cut, marker or environment."""
-        sys.path.insert(0, str(self.repo / "bin"))
+        # The checkout's own brainlib, as every other test imports it. Importing the
+        # sandbox's cached a package whose directory is deleted at tearDown, and the next
+        # in-process load of bin/brain then failed to import from it.
+        sys.path.insert(0, str(ROOT / "bin"))
         try:
             from brainlib import served
         finally:
@@ -1374,6 +1377,77 @@ class ConsolidateTests(unittest.TestCase):
         self.stub_claude("exit 0")
         result = self.consolidate_with()
         self.assertEqual(self.result_of(result)["inbox_before"], 1)
+
+    def test_digest_since_moves_the_idle_check_too(self):
+        self.drain_seed()
+        self.transcript_turn("A decision typed two days ago", iso_ago(2))
+        busy = self.consolidate_with("--dry-run")
+        self.assertIn("would decide: run", busy.stdout, busy.stdout)
+        self.assertIn("digest 1", busy.stdout)
+        idle = self.consolidate_with("--dry-run", "--digest-since", iso_ago(1))
+        self.assertIn("would decide: idle", idle.stdout, idle.stdout)
+        mark = self.marking_stub()
+        result = self.consolidate_with("--digest-since", iso_ago(1))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.result_of(result)["status"], "idle")
+        self.assertFalse(mark.exists())
+
+    def test_a_malformed_digest_since_refuses_to_start(self):
+        mark = self.marking_stub()
+        for bad in ("2026-10-18", "2026-10-18T14:00:00+04:00", "2026-10-18 14:00:00Z",
+                    "2026-02-30T00:00:00Z", "yesterday", "--open-pr"):
+            with self.subTest(bad=bad):
+                result = self.consolidate_with("--digest-since", bad)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("--digest-since", result.stdout)
+                self.assertEqual(self.result_of(result)["status"], "failed")
+                self.assertFalse(mark.exists(), "a pass started on a malformed instant")
+                self.assertEqual(self.branches(), "")
+        missing = self.consolidate_with("--digest-since")
+        self.assertEqual(missing.returncode, 2, missing.stdout)
+
+    AUDIT_KEYS = {"v", "verdict", "cost_microusd", "tokens_in", "tokens_out"}
+
+    def audit_result_of(self, completed):
+        lines = [l for l in completed.stdout.splitlines() if l.startswith("audit-result: ")]
+        self.assertEqual(len(lines), 1, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stdout.rstrip().splitlines()[-1], lines[0])
+        payload = json.loads(lines[0][len("audit-result: "):])
+        self.assertEqual(set(payload), self.AUDIT_KEYS)
+        self.assertEqual(payload["v"], 1)
+        return payload
+
+    def test_audit_branch_ends_on_one_result_line_with_its_cost(self):
+        self.json_stub({"result": "unused"},
+                       {"result": "checked\nVERDICT: PASS", "total_cost_usd": 0.04,
+                        "usage": {"input_tokens": 300, "cache_creation_input_tokens": 20,
+                                  "output_tokens": 9}})
+        self.branch_with("consolidate/2026-10-18", "knowledge/inbox/x.md",
+                         "---\ncreated: 2026-10-18\nstatus: draft\n---\n\nX.\n")
+        passed = self.audit_branch("--branch", "consolidate/2026-10-18")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertEqual(self.audit_result_of(passed),
+                         {"v": 1, "verdict": "pass", "cost_microusd": 40000,
+                          "tokens_in": 320, "tokens_out": 9})
+        self.json_stub({"result": "unused"},
+                       {"result": "VERDICT: BLOCK — names a private detail",
+                        "total_cost_usd": 0.01})
+        blocked = self.audit_branch("--branch", "consolidate/2026-10-18")
+        self.assertEqual(blocked.returncode, 1)
+        self.assertEqual(self.audit_result_of(blocked)["verdict"], "block")
+        self.stub_claude('case "$*" in *--tools*) echo "VERDICT: PASS"; exit 0;; esac\nexit 3')
+        plain = self.audit_result_of(self.audit_branch("--branch", "consolidate/2026-10-18"))
+        self.assertEqual((plain["verdict"], plain["cost_microusd"]), ("pass", None))
+
+    def test_audit_branch_reports_an_error_on_every_other_exit(self):
+        for args, code in ((("--branch", "consolidate/nope"), 1), ((), 2),
+                           (("--branch", "a b"), 2)):
+            with self.subTest(args=args):
+                done = self.audit_branch(*args)
+                self.assertEqual(done.returncode, code, done.stdout)
+                self.assertEqual(self.audit_result_of(done),
+                                 {"v": 1, "verdict": "error", "cost_microusd": None,
+                                  "tokens_in": None, "tokens_out": None})
 
     def transcript_turn(self, text, at):
         folder = self.home / ".claude" / "projects" / "-w-proj"
@@ -1843,6 +1917,25 @@ class DigestImportTests(unittest.TestCase):
                 text, count, _notes = self.module.consolidation_digest(str(self.drop))
                 self.assertEqual(count, 1, text)
                 self.assertIn("SEVEN days ago", text)
+
+    def test_digest_since_replaces_the_trunk_commit_and_keeps_the_cap(self):
+        """The scheduler knows when its last good pass started, including one that changed
+        nothing and so left no commit; --digest-since is that instant."""
+        commit_at(self.repo, "consolidate: 2026-10-10", iso_ago(6))
+        (self.drop / "d.jsonl").write_text("\n".join([
+            self.row("NINE days ago", iso_ago(9)),
+            self.row("FIVE days ago", iso_ago(5)),
+            self.row("ONE day ago", iso_ago(1)),
+        ]) + "\n", encoding="utf-8")
+        text, count, _notes = self.module.consolidation_digest(str(self.drop),
+                                                                since=iso_ago(2))
+        self.assertEqual(count, 1, text)
+        self.assertIn("ONE day ago", text)
+        self.assertIn("--digest-since", text)
+        text, count, _notes = self.module.consolidation_digest(str(self.drop),
+                                                                since=iso_ago(20))
+        self.assertEqual(count, 2, "the 8-day cap no longer holds:\n" + text)
+        self.assertNotIn("NINE days ago", text)
 
     def test_imported_and_local_entries_merge_sorted_and_deduplicated(self):
         projects = Path(self.tmp.name) / "projects" / "-x"
