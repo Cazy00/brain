@@ -4535,7 +4535,14 @@ def open_pull_request(branch: str, trunk: str, title: str, body: str,
 
 def propose_prompt(text: str) -> str:
     """In a split layout the working directory holds only the notes; the protocol (AGENTS.md)
-    and the toolbelt (bin/brain) live in the engine. Say where, so the pass can follow them."""
+    and the toolbelt (bin/brain) live in the engine. Say where, so the pass can follow them.
+
+    The prompt names the digest by its combined-layout path, `.cache/session-digest.md`.
+    With BRAIN_STATE_DIR it is elsewhere, and a pass told to skip step 3 when that file is
+    absent would skip it every time — so the real path is written in its place."""
+    digest = digest_path()
+    if digest != ROOT / ".cache" / "session-digest.md":
+        text = text.replace(".cache/session-digest.md", str(digest))
     if ROOT == ENGINE:
         return text
     return (f"Where things are: the working directory holds this brain's notes. The engine is at "

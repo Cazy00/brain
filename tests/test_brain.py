@@ -4607,7 +4607,46 @@ class SplitLayoutPromptTests(unittest.TestCase):
 
     def test_combined_layout_prompt_is_unchanged(self):
         self.module.ROOT = self.module.ENGINE
+        self.module._STATE_OVERRIDE = None
         self.assertEqual(self.module.propose_prompt("BODY"), "BODY")
+
+    def test_the_pass_is_told_where_the_digest_really_is(self):
+        """With BRAIN_STATE_DIR the digest is not under .cache/ in the working directory,
+        and a pass told to skip step 3 when .cache/session-digest.md is absent would skip
+        it every time."""
+        self.module.ROOT = self.module.ENGINE
+        self.module._STATE_OVERRIDE = Path("/srv/brain-state")
+        prompt = self.module.propose_prompt("step 3 reads .cache/session-digest.md if present")
+        self.assertIn("/srv/brain-state/session-digest.md", prompt)
+        self.assertNotIn(".cache/session-digest.md", prompt)
+
+    def test_the_shipped_prompt_names_the_digest_path_propose_prompt_rewrites(self):
+        prompt = (ROOT / "setup" / "consolidate-prompt.md").read_text(encoding="utf-8")
+        self.assertIn(".cache/session-digest.md", prompt)
+
+
+class ConsolidationPromptRulesTests(unittest.TestCase):
+    """E3: the rules that make provenance count live only in the prompts, because the
+    consolidator is the only thing that acts on them. The key phrases are pinned here."""
+
+    def prompt(self, name):
+        return (ROOT / "setup" / name).read_text(encoding="utf-8")
+
+    def test_the_consolidation_prompt_reads_basis_and_corrections(self):
+        text = self.prompt("consolidate-prompt.md")
+        for phrase in ("basis", "owner-said", "agent-found", "agent-inferred", "via", "client",
+                       "kind: correction", "## Sources", "session-mining", "expires",
+                       "at most 3", "corroborated"):
+            self.assertIn(phrase, text)
+        self.assertNotIn("at most 7", text, "the old proposal cap is still stated")
+        self.assertNotIn("--tools", text)
+
+    def test_the_audit_prompt_checks_the_rules_it_can_see_in_the_diff(self):
+        text = self.prompt("audit-prompt.md")
+        for phrase in ("agent-inferred", "owner-said", "session-mining", "expires",
+                       "## Sources", "more than 3"):
+            self.assertIn(phrase, text)
+        self.assertNotIn("more than 7", text)
 
 
 class OpenPullRequestTests(unittest.TestCase):
