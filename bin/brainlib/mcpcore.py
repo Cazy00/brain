@@ -52,9 +52,9 @@ PROFILES = {"read": READ_TOOLS, "capture": CAPTURE_TOOLS}
 # owner at their own keyboard, a remote one is anything that got through Access.
 LIMITS = {
     "local": {"query": 100_000, "id_or_path": 100_000, "text": 100_000,
-              "limit": (1, 100), "days": (1, 3650)},
+              "limit": (1, 100), "days": (1, 3650), "offset": 1_000_000},
     "remote": {"query": 2_048, "id_or_path": 512, "text": 65_536,
-               "limit": (1, 20), "days": (1, 365)},
+               "limit": (1, 20), "days": (1, 365), "offset": 100_000},
 }
 
 SEARCH_DESCRIPTION = (
@@ -82,12 +82,11 @@ RECENT_DESCRIPTION = (
 )
 # What every client is told about reading, whatever its profile.
 READ_POLICY = (
-    "This is the user's permanent second brain. Search it before answering anything "
-    "about their decisions, preferences, projects, people or history. Its trust "
-    "markers ([provisional — unconsolidated], [journal], an ARCHIVED banner, a passed "
-    "review_by) are part of the answer: never present a provisional or archived note "
-    "as settled fact. If a query misses, try 2-3 lexical variants before concluding "
-    "there is nothing."
+    "This is the user's permanent second brain. Search it before answering about their "
+    "decisions, preferences, projects, people or history. Its trust markers "
+    "([provisional — unconsolidated], [journal], [correction pending], an ARCHIVED banner, "
+    "a passed review_by) are part of the answer: never present such a note as settled fact. "
+    "If a query misses, retry with 2-3 lexical variants."
 )
 # The capture policy, ONE text for every client of every vendor: the server's
 # instructions and the brain_capture description are the only things every MCP
@@ -101,29 +100,39 @@ READ_POLICY = (
 # is every vendor's, and naming one would make the rule read as theirs.
 CAPTURE_POLICY = (
     "Capture without asking: a decision with its why and the alternatives rejected; "
-    "a stated preference or constraint; a fact about the user's world that could not "
-    "be inferred; a lesson or answer that cost real effort. When a search found "
-    "nothing and the user then gives the answer, capture it. When a note proves "
-    "wrong, capture a correction (kind: correction) that names its id. Offer in one "
-    "line and carry on; \"remember this\" captures at once. Anything about the user "
-    "another agent may need belongs here, not in your client's built-in memory. "
-    "Never capture credentials, transient state, or what the repo, git or files "
-    "already record. Ask first about a named person's private life, health, finances "
-    "or relationships. Write self-contained text with absolute dates (2026-08-23, "
-    "never \"today\"). Fill kind and basis: owner-said when the user said it, "
-    "agent-found when you verified it, agent-inferred when it is your conclusion. "
-    "Add project, job and model when known."
+    "a preference or constraint; a fact about the user's world; a hard-won lesson. If a "
+    "search found nothing and the user answers, capture it. Offer in one line and carry on; "
+    "\"remember this\" captures at once. What other agents need about the user goes here, "
+    "not in built-in memory. Never capture credentials, transient state, or what the repo, "
+    "git or files record. Open to-dos go in the project's tracker, not here; capture only "
+    "the decision behind one. Ask first about a named person's private life, health, "
+    "finances or relationships. Never say you cannot fix or delete a note: capture a kind: "
+    "correction naming its id or path and quoting the wrong line (describe, never repeat, a "
+    "secret or private detail); it stays [correction pending] until a consolidation pass "
+    "applies it. Write self-contained text with absolute dates (2026-08-23). Fill kind and "
+    "basis (owner-said, agent-found, agent-inferred), and project, job and model when known."
+)
+# How a correction is written, in the form the engine reads its target from (search
+# and read mark that target "[correction pending]" until a pass applies it). It
+# travels with brain_capture only: a client needs it when it calls the tool, and the
+# instructions have no room left under their budget.
+CORRECTION_FORMAT = (
+    "To correct a note, start \"Correction to <id or path>: <what is true now>\" or, "
+    "for one that should not exist, \"Retract <id or path>: <the user's reason>\". Find its "
+    "path with brain_search (scope all reaches inbox notes) or brain_recent. Close a handoff "
+    "note (scope handoff) with a correction starting \"Filed <path>: <where now>\" or "
+    "\"Already recorded: <path>: <where>\"."
 )
 READ_ONLY_SENTENCE = "This endpoint is read-only; it cannot save anything."
 LOCAL_CAPTURE_DESCRIPTION = (
     "Save a note to the brain's inbox, committed and backed up at once (pass commit: "
     "false to keep it on this machine). It stays PROVISIONAL until the brain's "
-    "consolidation pass promotes it. " + CAPTURE_POLICY
+    "consolidation pass promotes it. " + CAPTURE_POLICY + " " + CORRECTION_FORMAT
 )
 REMOTE_CAPTURE_DESCRIPTION = (
     "Save a note to the brain's inbox. It is scanned for credentials, committed and "
     "backed up, with no way to hold it back, and it stays PROVISIONAL until the "
-    "brain's consolidation pass promotes it. " + CAPTURE_POLICY
+    "brain's consolidation pass promotes it. " + CAPTURE_POLICY + " " + CORRECTION_FORMAT
 )
 
 
@@ -146,11 +155,17 @@ def tool_table(transport: str = "local") -> list:
                 "properties": {
                     "query": {"type": "string", "description": "Lexical search query.",
                               "maxLength": caps["query"]},
-                    "scope": {"type": "string", "enum": ["canonical", "all"],
+                    "scope": {"type": "string", "enum": ["canonical", "all", "handoff"],
                               "description": "'all' additionally searches the journal and the "
-                                             "unprocessed inbox (results tagged provisional)."},
+                                             "unprocessed inbox (results tagged provisional). "
+                                             "'handoff' lists only notes waiting to be filed in a "
+                                             "project's own records — not brain knowledge; the query "
+                                             "may be empty or a project slug."},
                     "limit": {"type": "integer", "description": "Max hits (default 8).",
                               "minimum": caps["limit"][0], "maximum": caps["limit"][1]},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": caps["offset"],
+                               "description": "Scope handoff only: skip this many hits, to "
+                                              "page (stable order: handoff_at, then path)."},
                 },
                 "required": ["query"],
             },
@@ -241,6 +256,19 @@ def tools_for(profile: str = "capture", transport: str = "local") -> list:
     return [tool for tool in tool_table(transport) if tool["name"] in allowed]
 
 
+def handoff_listing(name, args: dict) -> dict:
+    """`brain_search` with `scope: handoff` lists every handoff note when the query is
+    left out, so a missing query there means an empty one."""
+    if name == "brain_search" and args.get("scope") == "handoff" and args.get("query") is None:
+        return {**args, "query": ""}
+    return args
+
+
+def blank_allowed(name, field: str, args: dict) -> bool:
+    """A blank required argument is refused, except a handoff listing's query."""
+    return name == "brain_search" and field == "query" and args.get("scope") == "handoff"
+
+
 def validate_args(tool: dict, args):
     """Check args against the tool's declared inputSchema BEFORE using them.
 
@@ -285,9 +313,12 @@ def validate_args(tool: dict, args):
             hint = " Did you mean %r?" % near[0]
         return None, ("unknown argument %r.%s %s accepts: %s"
                       % (unknown[0], hint, tool.get("name", "this tool"), accepted))
+    if isinstance(args, dict):
+        args = handoff_listing(tool.get("name"), args)
     for field in schema.get("required", []):
         if field not in args or args[field] is None \
-                or (isinstance(args[field], str) and not args[field].strip()):
+                or (isinstance(args[field], str) and not args[field].strip()
+                    and not blank_allowed(tool.get("name"), field, args)):
             return None, "missing required argument %r" % field
     clean = {}
     for field, spec in props.items():
@@ -340,8 +371,10 @@ def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> l
     capture's cleaned declared fields (provenance.take_declared)."""
     if name == "brain_search":
         cli = ["search", "--limit", str(args.get("limit", 8))]
-        if args.get("scope") == "all":
-            cli += ["--scope", "all"]
+        if args.get("scope") in ("all", "handoff"):
+            cli += ["--scope", args["scope"]]
+        if args.get("scope") == "handoff" and args.get("offset") is not None:
+            cli += ["--offset", str(args["offset"])]
         cli += ["--", args["query"]]      # query text, never parsed as flags
         return cli
     if name == "brain_read":

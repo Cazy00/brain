@@ -33,7 +33,9 @@ a block — the brain would then serve both as true.
 
 Also block if the change set plainly violates the pass's own caps (more than 15
 modified canonical files, or more than 3 new inbox proposals), or if a note was
-moved into archive/ without a successor carrying its knowledge forward.
+moved into archive/ without a successor carrying its knowledge forward — except
+a retraction (`status: retracted`), which has none by design and is checked
+under PROVENANCE.
 
 **PROVENANCE.** Inbox notes carry `source:` and, where the capturing agent
 declared it, `basis:` — `owner-said`, `agent-found` or `agent-inferred`. A
@@ -55,7 +57,20 @@ Block if the change set:
 - adds more than 3 new inbox notes with `source: session-mining`, or adds one
   without an `expires:` date;
 - creates a canonical note, or merges an input into one, with no `## Sources`
-  line for an input at all.
+  line for an input at all;
+- retracts a note — moves it to archive/ with `status: retracted` — unless a
+  `kind: correction` the change set removes from the inbox names it, by id or
+  path, asks for its retraction, and has `source: local` and `basis:
+  owner-said`;
+- promotes an inbox note, or merges it into a canonical note, while a
+  `kind: correction` still in the inbox names it (by its path) and has
+  `source: local`. The pass reads the whole inbox for corrections and applies
+  them first, so one still waiting means its target is not settled.
+
+The engine has already checked, as code, that no drained inbox note is named by
+a local correction still in the inbox and that every retraction which removed
+something is the owner's own (`source: local`, `basis: owner-said`); you check
+what it cannot see: whether the content written follows from those inputs.
 
 The Sources lines the pass writes are, one per input: for a capture that
 declares `basis:`, its basis and date (`- Owner, <date> (via <via>)`,
@@ -65,6 +80,23 @@ declares `basis:`, its basis and date (`- Owner, <date> (via <via>)`,
 entry, `- Journal, <date>`; for a promoted session-mining proposal,
 `- Session mining, <date>, corroborated by <what>`. All of these pass; only
 an input with no `## Sources` line for an input at all is a block.
+
+**STATUS.** Block if the change set writes, into a canonical note it creates
+or merges into, the pending or open status of work: a to-do, an open step,
+"X still needs Y", "not done yet". Pending work belongs in a project's own
+records, and a status goes stale the day the work is done. A decision or
+lesson about the work, phrased as one, passes; this is a check on what the
+note asserts, not on whether it was worth writing.
+
+**HANDOFF.** A capture that belongs in a project's own records is moved to
+knowledge/handoff/<project>/, never promoted. Block if a note the change set
+adds there lacks `handoff_to` (the same as its folder, a valid slug: lowercase
+letters, digits and hyphens, 1-63), `handoff_at` or `handoff_reason`; if the
+change set promotes, or merges into a canonical note, the content of a note in
+knowledge/handoff/; or if it deletes a handoff note with no closing correction
+removed alongside it (`source: local`, its text starting `Filed <path>` or
+`Already recorded: <path>`). The engine checks the keys and the deletions
+before you; you check that no handoff content reached a canonical note.
 
 ## What you must NOT do
 

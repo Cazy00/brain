@@ -616,7 +616,7 @@ def audit(target: Path, root: Path, published: set, vocabulary: set) -> list:
             if str(topic) not in vocabulary:
                 problems.append(f"{rel}: topic {topic!r} is outside the vocabulary "
                                 "shipped with this brain")
-    for folder in ("inbox", "journal", "archive", "vault"):
+    for folder in ("inbox", "journal", "handoff", "archive", "vault"):
         stray = [p for p in (k / folder).rglob("*.md")] if (k / folder).is_dir() else []
         for path in stray:
             problems.append(f"{path.relative_to(target)}: {folder}/ must be empty in a "

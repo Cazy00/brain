@@ -32,7 +32,14 @@ the reasoning is gone within a week.
   or constraint; a fact about the user's world that can't be inferred; an answer
   that cost real effort.
 - Never: anything derivable from code or public docs, transient state,
-  credentials, or a restatement of what was just done.
+  credentials, or a restatement of what was just done. Open to-dos go in the
+  project's own records; capture only the decision or lesson behind one.
+- Asked to change or delete a note: never say you cannot. Capture a
+  `kind: correction` that names its id (an inbox note: its path) and quotes the
+  wrong line — `Correction to <id or path>: <what is true now>` or
+  `Retract <id or path>: <reason>`. Never repeat a credential or private detail
+  in it; describe it. Say it is queued: it stays `[correction pending]` until a
+  consolidation pass applies it.
 - Ask first, every time: a named person's private life, health, finances or
   relationships — captures leave this machine unreviewed on commit, git
   history is permanent, and `bin/brain template` publishes a derived copy.

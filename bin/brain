@@ -20,10 +20,17 @@ Commands:
                                    --job and --model are the caller's claims.
                                    A bad value is dropped, the note kept.
   brain lint [--staged]            validate every note; exit 1 on errors
-  brain search "<query>" [--scope all] [--limit N] [--json]
+  brain search "<query>" [--scope all|handoff] [--limit N] [--offset N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
   brain links <id-or-path> [--json]  wikilink graph: what links here, what it links to
   brain supersede <old-id> "<new title>"   full supersede choreography in one shot
+  brain retract <id-or-path> "<one-line reason>"   archive a note that should not
+                                   exist: status retracted, no successor
+  brain handoff <inbox-path> <project> "<one-line reason>"   move a local capture to
+                                   knowledge/handoff/<project>/, byte for byte, adding
+                                   handoff_to, handoff_at and handoff_reason
+  brain handoff --close <handoff-path>   remove one handoff note once it is filed
+  brain drain <inbox-path>...      remove inbox notes (and nothing outside the inbox)
   brain recent [--days N]          recently touched notes
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
@@ -179,7 +186,15 @@ from brainlib.notes import (  # noqa: F401  (re-exported for tests and publish)
     secret_screen,
 )
 
-STATUSES = {"current", "superseded", "draft"}
+STATUSES = {"current", "superseded", "retracted", "draft"}
+# knowledge/handoff/<project>/ holds captures that belong in a project's own records,
+# waiting to be filed there: not brain knowledge, never canonical, outside every search
+# scope but its own. Its three keys are the interface a filing job reads.
+HANDOFF_SLUG_RE = re.compile(r"^[a-z0-9-]{1,63}$")
+HANDOFF_KEYS = ("handoff_to", "handoff_at", "handoff_reason")
+HANDOFF_STALE_DAYS = 14
+# How a filing job closes one: a local correction whose text starts with either lead.
+HANDOFF_CLOSE_RE = re.compile(r"(?i)^\s*(?:filed:?|already\s+recorded:?)\s+(\S+)")
 SENSITIVITIES = {"normal", "personal", "private"}
 SENSITIVITY_REQUIRED = {"people", "life"}
 # Which endpoint accepted a capture. Stamped by the endpoint, never claimed by
@@ -430,11 +445,50 @@ def check_links(path, text, fm, ctx: LintCtx, hard: bool = True) -> None:
         if target == predecessor:
             continue
         t_rel, t_fm = ctx.metas[target]
-        if t_rel.parts[0] == "archive":
+        if t_rel.parts[0] == "archive" and chain_ends_retracted(target, ctx.metas):
+            ctx.warnings.append((path, f"wikilink [[{target}]] points at a RETRACTED note "
+                                 "(or a supersede chain that ends in one) — it was withdrawn "
+                                 "with no successor; remove the link"))
+        elif t_rel.parts[0] == "archive":
             successor = t_fm.get("superseded_by")
             ctx.warnings.append((path, f"wikilink [[{target}]] points at a SUPERSEDED note"
                                  + (f" — repoint it at [[{successor}]]" if successor else
                                     " with no recorded successor")))
+
+
+def check_retracted(path, fm, text, ctx: LintCtx) -> None:
+    """An archived note withdrawn with no successor: what `brain retract` writes.
+
+    A retraction is not a supersede. Nothing replaced the note — it should never
+    have been written — so it carries the date it was withdrawn and the reason in
+    its banner, and never a successor: one would make `brain read` follow a chain
+    to a note that was never its replacement."""
+    if not fm.get("retracted"):
+        ctx.errors.append((path, "retracted note missing retracted: <YYYY-MM-DD> — the "
+                           "date it was withdrawn (bin/brain retract sets it)"))
+    if fm.get("superseded_by"):
+        ctx.errors.append((path, "a retracted note has no successor — drop superseded_by, "
+                           "or, if a note did replace it, it was superseded (bin/brain "
+                           "supersede), not retracted"))
+    body_lines = [l for l in text.splitlines()[fm.get("_end_line", 0):] if l.strip()]
+    if not body_lines or not body_lines[0].lstrip().startswith("> RETRACTED"):
+        ctx.warnings.append((path, "retracted note body should start with the banner "
+                             "'> RETRACTED <date> — <reason>'"))
+
+
+def chain_ends_retracted(note_id, metas) -> bool:
+    """Does this note, or the supersede chain it starts, end in a retracted note?"""
+    seen = set()
+    while note_id in metas and note_id not in seen and len(seen) < 50:
+        seen.add(note_id)
+        _rel, fm = metas[note_id]
+        if fm.get("status") == "retracted":
+            return True
+        successor = fm.get("superseded_by")
+        if fm.get("status") != "superseded" or not isinstance(successor, str):
+            return False
+        note_id = successor
+    return False
 
 
 def check_visibility(path, folder, in_archive, fm, ctx: LintCtx) -> None:
@@ -488,7 +542,8 @@ def check_source(path, fm, ctx: LintCtx) -> None:
 def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     errors, warnings, topics, metas = ctx.errors, ctx.warnings, ctx.topics, ctx.metas
     for f in ("id", "kind", "title", "created", "status", "sensitivity",
-              "visibility", "supersedes", "superseded_by", "valid_from", "review_by"):
+              "visibility", "supersedes", "superseded_by", "valid_from", "review_by",
+              "retracted"):
         if isinstance(fm.get(f), list):
             errors.append((path, f"{f} must be a single value, not a list"))
             fm[f] = None
@@ -510,7 +565,7 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
         if t not in topics:
             errors.append((path, f"topic {t!r} not in knowledge/topics.yaml — known "
                            "topics: " + (", ".join(sorted(topics)) or "(none)")))
-    for field in ("created", "valid_from", "review_by"):
+    for field in ("created", "valid_from", "review_by", "retracted"):
         value = fm.get(field)
         if value and (not DATE_RE.match(str(value)) or not valid_date(value)):
             errors.append((path, f"{field} must be a real YYYY-MM-DD date, got {value!r}"))
@@ -518,9 +573,12 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     if status and status not in STATUSES:
         errors.append((path, f"status must be one of {sorted(STATUSES)}, got {status!r}"))
 
-    if in_archive:
+    if in_archive and status == "retracted":
+        check_retracted(path, fm, text, ctx)
+    elif in_archive:
         if status and status != "superseded":
-            errors.append((path, "notes in archive/ must have status: superseded"))
+            errors.append((path, "notes in archive/ must have status: superseded (or "
+                           "retracted, with no successor)"))
         successor = fm.get("superseded_by")
         if not successor:
             errors.append((path, "archived note missing superseded_by"))
@@ -547,8 +605,14 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     else:
         if status and status != "current":
             errors.append((path, f"status is {status!r} — canonical folders hold current "
-                           "notes only; superseded notes move to archive/, drafts live "
-                           "in inbox/"))
+                           "notes only; superseded notes move to archive/ (bin/brain "
+                           "supersede), retracted ones too (bin/brain retract), drafts "
+                           "live in inbox/"))
+        if fm.get("retracted"):
+            errors.append((path, "a current note must not carry retracted — that field "
+                           "dates a withdrawn note and belongs only on notes in archive/ "
+                           "(bin/brain retract); if this note was not retracted, delete "
+                           "the field."))
         if fm.get("superseded_by"):
             errors.append((path, "a current note must not carry superseded_by — that field "
                            "marks a note as replaced and belongs only on notes in archive/. "
@@ -622,6 +686,51 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
         check_links(path, text, fm, ctx, hard=True)
 
 
+def check_handoff_file(path, parts, is_md, blob, ctx: LintCtx) -> None:
+    """A capture moved to knowledge/handoff/<project>/ to be filed in that project's own
+    records. Relaxed like the inbox (a bad link warns, never blocks) but its place and its
+    three keys are exact: they are what the filing job reads."""
+    errors, warnings = ctx.errors, ctx.warnings
+    where = ("handoff notes live at knowledge/handoff/<project-slug>/<the capture's file "
+             "name>.md")
+    if len(parts) != 3 or not is_md:
+        errors.append((path, where))
+        return
+    slug = parts[1]
+    if not HANDOFF_SLUG_RE.match(slug):
+        errors.append((path, f"handoff folder {slug!r} is not a project slug (lowercase "
+                       "letters, digits and hyphens, 1-63) — " + where))
+        return
+    text = blob.text()
+    fm, _err = parse_frontmatter(text)
+    if not fm:
+        errors.append((path, "a handoff note keeps the capture's frontmatter and adds "
+                       + ", ".join(HANDOFF_KEYS)))
+        return
+    for key in HANDOFF_KEYS:
+        if isinstance(fm.get(key), list):
+            errors.append((path, f"{key} must be a single value, not a list"))
+            fm[key] = None
+    if fm.get("handoff_to") != slug:
+        errors.append((path, f"handoff_to is {fm.get('handoff_to')!r} but the note sits in "
+                       f"knowledge/handoff/{slug}/ — the two must name the same project"))
+    at = fm.get("handoff_at")
+    if not (at and DATE_RE.match(str(at)) and valid_date(at)):
+        errors.append((path, f"handoff_at must be the YYYY-MM-DD date it was handed off, "
+                       f"got {at!r}"))
+    if not str(fm.get("handoff_reason") or "").strip():
+        errors.append((path, "handoff_reason missing — one line on why this belongs in "
+                       "the project's records rather than the brain"))
+    if fm.get("sensitivity") == "private":
+        errors.append((path, "sensitivity: private must never exist as plaintext "
+                       "— encrypt into vault/ (see setup/runbooks/vault.md)"))
+    check_source(path, fm, ctx)
+    if not (K / "projects" / slug).is_dir():
+        warnings.append((path, f"no knowledge/projects/{slug}/ — consolidation hands off "
+                         "only to a project the brain knows; is the slug right?"))
+    check_links(path, text, fm, ctx, hard=False)
+
+
 def check_knowledge_file(rel: Path, blob: Blob, ctx: LintCtx, fm_cached=None) -> None:
     """Every placement and content rule for ONE file under knowledge/.
 
@@ -676,6 +785,9 @@ def check_knowledge_file(rel: Path, blob: Blob, ctx: LintCtx, fm_cached=None) ->
         if is_md:
             errors.append((path, "notes don't belong in attachments/ — attachments hold "
                            "binaries; notes live in their folders"))
+        return
+    if top == "handoff":
+        check_handoff_file(path, parts, is_md, blob, ctx)
         return
     if top in ("inbox", "journal"):
         if not is_md:
@@ -1130,7 +1242,7 @@ def flag_orphaned_inbound_links(removed: set, changes, ctx: LintCtx) -> None:
         fm, _err = parse_frontmatter(text)
         start = (fm or {}).get("_end_line", 0)
         body = "\n".join(text.splitlines()[start:])
-        provisional = rel.parts[0] in ("inbox", "journal")
+        provisional = rel.parts[0] in ("inbox", "journal", "handoff")
         for target in extract_links(body):
             if target in removed and target != (fm or {}).get("supersedes"):
                 bucket = ctx.warnings if provisional else ctx.errors
@@ -2193,7 +2305,7 @@ def apply_routing(keys: list, dry_run: bool = False) -> int:
 # bin/brain itself. An ignore file narrows the blast radius of a client that
 # indexes anyway; it does not make the rule unnecessary.
 IGNORE_SCOPE = ("knowledge/archive/", "knowledge/vault/", "knowledge/inbox/",
-                "knowledge/journal/", ".cache/")
+                "knowledge/journal/", "knowledge/handoff/", ".cache/")
 IGNORE_FILES = {
     ".geminiignore": "Gemini CLI",
     ".cursorignore": "Cursor",
@@ -2708,13 +2820,20 @@ FOLDER_WEIGHTS = {"decisions": 1.2, "reference": 1.2, "topics": 1.0, "projects":
                   "people": 1.0, "life": 1.0, "journal": 0.6, "inbox": 0.6}
 
 
+# Top-level folders the search index leaves out. One definition, read by both the index
+# and its freshness check: when they disagreed about handoff/, every check reported the
+# index stale straight after building it.
+NOT_INDEXED = ("archive", "vault", "attachments", "handoff")
+
+
 def indexable_paths():
     """Every note the search index should contain — canonical + journal +
-    inbox, never archive/vault/attachments. Single definition so the index and
-    its freshness check can never disagree about what belongs in it."""
+    inbox, never archive/vault/attachments/handoff. Single definition so the index and
+    its freshness check can never disagree about what belongs in it. handoff/ is not
+    brain knowledge: `search --scope handoff` reads it straight off disk."""
     for path in sorted(K.rglob("*.md")):
         rel = path.relative_to(K)
-        if rel.parts[0] in ("archive", "vault", "attachments") or path.name in EXEMPT_NAMES:
+        if rel.parts[0] in NOT_INDEXED or path.name in EXEMPT_NAMES:
             continue
         yield path
 
@@ -2924,7 +3043,7 @@ def index_stale() -> bool:
                 except OSError:
                     continue
                 live += 1
-                if top != "archive" and name not in EXEMPT_NAMES:
+                if top not in NOT_INDEXED and name not in EXEMPT_NAMES:
                     indexable += 1
                 if stat.st_mtime > built:
                     return True
@@ -3023,6 +3142,11 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
             h["stale"] = bool(review_by and DATE_RE.match(str(review_by))
                               and str(review_by) < today)
             h["review_by"] = review_by
+        # A correction waiting in the inbox: the note is not settled until a pass
+        # applies it, so the hit says so (and which capture to read).
+        pending = pending_corrections()
+        for h in hits:
+            h["corrections_pending"] = corrections_naming(pending, h["id"], h["path"])
     return {"mode": mode, "hits": hits, "more": max(0, total - len(hits))}
 
 
@@ -3130,7 +3254,261 @@ def cmd_links(argv: list) -> int:
     return 0
 
 
+# How a correction names the note it corrects (the capture policy gives agents the
+# lead): "Correction to <id or path>: <what is true now>" or "Retract <id or path>:
+# <reason>". A canonical note is named by its id; an inbox note has no id, only its path.
+# The lead is read at the START of the text only: a lead quoted further down ("remove
+# the example 'Retract x: …'") is content, not a second correction.
+CORRECTION_LEAD_RE = re.compile(r"(?i)^\s*(?:correction\s+to|retract)\s+(\S+)")
+CORRECTION_PATH_RE = re.compile(
+    r"(?:knowledge/)?(?:inbox|handoff|decisions|topics|projects|people|life|reference)/"
+    r"[A-Za-z0-9._/-]+?\.md\b")
+# A capture bigger than this is not a correction anyone typed; it is not read.
+MAX_CORRECTION_BYTES = 256 * 1024
+# Enough to hold any capture's frontmatter: kind and source are read from this much
+# before the rest of a file is.
+FRONTMATTER_PEEK = 8192
+
+
+def known_note_ids():
+    """`is_known(id)` against the notes, opened only on first use: most corrections name
+    their target by [[link]] or path and never need it."""
+    held = {}
+
+    def is_known(note_id: str) -> bool:
+        if "index" not in held:
+            held["index"] = MetaIndex()
+        return held["index"].exists(note_id)
+    return is_known
+
+
+def correction_target(word: str, is_known=None):
+    """One named target, normalised: a `knowledge/...md` path, or a note id. A bare word
+    is an id only when it is written as a [[link]] or is a note that exists; anything
+    else ("the", "note") names nothing."""
+    linked = "[[" in word
+    word = word.strip("`'\"()[]<>*,;:.")
+    if CORRECTION_PATH_RE.fullmatch(word):
+        return word if word.startswith("knowledge/") else "knowledge/" + word
+    if ID_RE.fullmatch(word) and (linked or (is_known is not None and is_known(word))):
+        return word
+    return None
+
+
+def correction_targets(body: str, is_known=None) -> list:
+    """The notes a correction names, in order, without repeats.
+
+    A lead at the start of the text names the one target: a handoff's closing lead
+    ("Filed <path>", "Already recorded: <path>"), else "Correction to X" or
+    "Retract X". Without a lead that names a note, only the [[links]] and note paths in
+    the text are targets — never a word that merely follows "retract" in prose."""
+    if is_known is None:
+        is_known = known_note_ids()
+    for lead_re in (HANDOFF_CLOSE_RE, CORRECTION_LEAD_RE):
+        lead = lead_re.match(body)
+        target = correction_target(lead.group(1), is_known) if lead else None
+        if target:
+            return [target]
+    found = [f for f in (correction_target(m.group(0))
+                         for m in CORRECTION_PATH_RE.finditer(body)) if f]
+    found += [l for l in extract_links(body) if ID_RE.fullmatch(l)]
+    return list(dict.fromkeys(found))
+
+
+def pending_corrections() -> dict:
+    """target (note id, or `knowledge/...` path) -> the inbox corrections naming it.
+
+    Computed from the inbox at query time, the WHOLE inbox, so a note is marked from
+    the moment its correction is captured until the consolidation pass applies it.
+    Only a correction from an owner endpoint (`source: local`) marks anything: a drop
+    box's caller must not be able to cast doubt on every note it can name."""
+    out: dict = {}
+    is_known = known_note_ids()
+    for rel, body in local_corrections():
+        for target in correction_targets(body, is_known):
+            if target != rel:
+                out.setdefault(target, []).append(rel)
+    return out
+
+
+def local_corrections():
+    """(inbox path, body) of every `kind: correction` from an owner endpoint.
+
+    Runs on every search, read and recent, so it lists the inbox with one scandir, never
+    follows a symlink, and reads only the head of each file until its frontmatter says it
+    is a local correction."""
+    inbox = K / "inbox"
+    try:
+        entries = sorted(os.scandir(inbox), key=lambda e: e.name)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.endswith(".md"):
+            continue
+        try:
+            if not entry.is_file(follow_symlinks=False) \
+                    or entry.stat(follow_symlinks=False).st_size > MAX_CORRECTION_BYTES:
+                continue
+            with open(entry.path, "rb") as handle:
+                head = handle.read(FRONTMATTER_PEEK)
+                fm, _err = parse_frontmatter(head.decode("utf-8-sig", "replace"))
+                if not fm or fm.get("kind") != "correction" \
+                        or fm.get("source") != DEFAULT_SOURCE:
+                    continue
+                data = head + handle.read()
+        except OSError:
+            continue
+        text = data.decode("utf-8-sig", "replace")
+        fm, _err = parse_frontmatter(text)
+        if not fm:
+            continue
+        yield (str(Path(entry.path).relative_to(ROOT)),
+               "\n".join(text.splitlines()[fm.get("_end_line", 0):]))
+
+
+def closed_handoffs() -> set:
+    """Handoff paths a local correction closes ("Filed <path>" / "Already recorded:
+    <path>"): filed, waiting only for the next pass to delete them."""
+    closed = set()
+    for _rel, body in local_corrections():
+        lead = HANDOFF_CLOSE_RE.match(body)
+        target = correction_target(lead.group(1)) if lead else None
+        if target and target.startswith("knowledge/handoff/"):
+            closed.add(target)
+    return closed
+
+
+def handoff_notes() -> list:
+    """Every note in knowledge/handoff/<project>/, read straight off disk.
+
+    Containment is checked here, at read time, not left to lint: a symlinked project
+    folder or file is skipped, and each file must resolve inside the real handoff root,
+    so nothing outside it can be served as a handoff note."""
+    root = K / "handoff"
+    out = []
+    try:
+        if root.is_symlink():
+            return out
+        real_root = root.resolve(strict=True)
+        projects = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return out
+    for folder in projects:
+        try:
+            if not folder.is_dir(follow_symlinks=False):
+                continue
+            files = sorted(os.scandir(folder.path), key=lambda e: e.name)
+        except OSError:
+            continue
+        for entry in files:
+            path = Path(entry.path)
+            try:
+                if not entry.name.endswith(".md") or not entry.is_file(follow_symlinks=False):
+                    continue
+                if path.resolve(strict=True).parent.parent != real_root:
+                    continue
+                text = read_text(path)
+            except OSError:
+                continue
+            fm, _err = parse_frontmatter(text)
+            fm = fm or {}
+            out.append({"path": str(path.relative_to(ROOT)), "stem": path.stem,
+                        "project": str(fm.get("handoff_to") or folder.name),
+                        "fm": fm,
+                        "body": "\n".join(text.splitlines()[fm.get("_end_line", 0):])})
+    return out
+
+
+def project_slugs() -> set:
+    """The projects the brain knows: one folder each under knowledge/projects/."""
+    try:
+        return {e.name for e in os.scandir(K / "projects") if e.is_dir(follow_symlinks=False)}
+    except OSError:
+        return set()
+
+
+def handoff_stale(note: dict, closed: set, today=None) -> bool:
+    """Older than HANDOFF_STALE_DAYS with no closing correction (an undatable one counts:
+    it can never age out)."""
+    today = today or date.today()
+    at = str(note["fm"].get("handoff_at") or "")
+    if note["path"] in closed:
+        return False
+    if not valid_date(at):
+        return True
+    return (today - date.fromisoformat(at)).days > HANDOFF_STALE_DAYS
+
+
+QUERY_PUNCTUATION = "`'\"()[]<>*,;:.?!"
+
+
+def do_handoff_search(query: str, limit: int = 8, offset: int = 0) -> dict:
+    """`search --scope handoff`: the notes waiting to be filed, never brain knowledge.
+
+    An empty query lists them all. A query of one slug-shaped word is a project: exactly
+    the notes whose `handoff_to` it is, none when it has none — a filing job asking for
+    its own project must never be handed another's. In a longer query a word naming a
+    project the brain knows (a handoff folder or a knowledge/projects/ folder) filters by
+    it, and every other word must appear in the note as a whole word. A query that
+    names nothing usable selects nothing. Hits come in a stable order (handoff_at, then
+    path) so `offset` pages through them."""
+    notes = handoff_notes()
+    known = {n["project"] for n in notes} | project_slugs()
+    raw = query.split()
+    words = [w for w in (r.strip(QUERY_PUNCTUATION).lower() for r in raw) if w]
+    if raw and not words:
+        chosen, mode = [], "none"
+    elif len(words) == 1 and HANDOFF_SLUG_RE.match(words[0]):
+        chosen, mode = [n for n in notes if n["project"] == words[0]], "project"
+    else:
+        wanted = {w for w in words if w in known}
+        rest = [w for w in words if w not in wanted]
+
+        def text_of(n):
+            return " ".join([str(n["fm"].get("title") or ""), n["body"],
+                             str(n["fm"].get("handoff_reason") or "")]).lower()
+
+        def has(word, text):
+            return re.search(r"(?<![\w-])" + re.escape(word) + r"(?![\w-])", text) is not None
+        chosen = [n for n in notes if (not wanted or n["project"] in wanted)
+                  and all(has(w, text_of(n)) for w in rest)]
+        mode = "listing" if not words else ("project" if not rest else "words")
+    chosen.sort(key=lambda n: (str(n["fm"].get("handoff_at") or ""), n["path"]))
+    pending = pending_corrections() if chosen else {}
+    page = chosen[offset:offset + limit]
+    hits = []
+    for n in page:
+        fm = n["fm"]
+        hits.append({
+            "id": f"handoff-{n['stem']}", "path": n["path"],
+            "title": str(fm.get("title") or n["stem"]), "folder": "handoff",
+            "kind": "handoff", "created": str(fm.get("created") or ""),
+            "snippet": " ".join(n["body"].split())[:160],
+            "handoff_to": n["project"], "handoff_at": str(fm.get("handoff_at") or ""),
+            "handoff_reason": str(fm.get("handoff_reason") or ""),
+            "status": None, "stale": False,
+            "corrections_pending": corrections_naming(pending, n["path"])})
+    return {"mode": mode, "scope": "handoff", "hits": hits, "total": len(chosen),
+            "offset": offset, "more": max(0, len(chosen) - offset - len(page))}
+
+
+def corrections_naming(pending: dict, *keys) -> list:
+    """The inbox corrections naming any of `keys` (ids or paths), without repeats."""
+    names = []
+    for key in keys:
+        if key:
+            names.extend(pending.get(key, []))
+    return list(dict.fromkeys(names))
+
+
+def correction_marker(names: list) -> str:
+    return f" [correction pending — {', '.join(names)}]" if names else ""
+
+
 def format_hits(result: dict) -> str:
+    if not result["hits"] and result.get("scope") == "handoff":
+        return ("no handoff notes waiting" + (" for that query" if result["mode"] != "listing"
+                                              else "") + " [scope: handoff]")
     if not result["hits"]:
         return ("no hits — rewrite the query into 2-3 lexical variants (synonyms, "
                 "singular/plural) before concluding the brain has nothing")
@@ -3141,11 +3519,14 @@ def format_hits(result: dict) -> str:
             tag = " [provisional — unconsolidated]"
         elif h["folder"] == "journal":
             tag = " [journal]"
+        elif h["folder"] == "handoff":
+            tag = f" [handoff — belongs in {h['handoff_to']}]"
         # status: current is the norm and says nothing; anything else is news.
         if h.get("status") and h["status"] != "current":
             tag += f" [status: {h['status']}]"
         if h.get("stale"):
             tag += f" [STALE — review_by {h['review_by']} passed]"
+        tag += correction_marker(h.get("corrections_pending") or [])
         lines.append(f"{i}. {h['path']} — {h['title']} ({h['kind']}, {h['created'] or 'n/a'}){tag}")
         if h["snippet"]:
             lines.append(f"   {h['snippet']}")
@@ -3157,11 +3538,20 @@ def format_hits(result: dict) -> str:
 
 def cmd_search(argv: list) -> int:
     import json as _json
-    scope, limit, as_json, terms = "canonical", 8, False, []
+    scope, limit, as_json, terms, offset = "canonical", 8, False, [], 0
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--scope" and i + 1 < len(argv):
+        if a == "--offset" and i + 1 < len(argv):
+            try:
+                offset = int(argv[i + 1])
+            except ValueError:
+                offset = -1
+            if offset < 0:
+                print("--offset takes a whole number of hits to skip (0 or more)")
+                return 2
+            i += 2
+        elif a == "--scope" and i + 1 < len(argv):
             scope = argv[i + 1]
             i += 2
         elif a == "--limit" and i + 1 < len(argv):
@@ -3184,10 +3574,16 @@ def cmd_search(argv: list) -> int:
         else:
             terms.append(a)
             i += 1
-    if scope not in ("canonical", "all"):
+    if scope not in ("canonical", "all", "handoff"):
         scope = "canonical"
+    if scope == "handoff":
+        # Not brain knowledge, and an empty query is allowed: it lists them all.
+        result = do_handoff_search(" ".join(terms), limit=limit, offset=offset)
+        print(_json.dumps(result, indent=2) if as_json else format_hits(result))
+        return 0
     if not terms:
-        print("usage: brain search \"<query>\" [--scope canonical|all] [--limit N] [--json]")
+        print("usage: brain search \"<query>\" [--scope canonical|all|handoff] [--limit N] "
+              "[--offset N] [--json]")
         return 2
     result = do_search(" ".join(terms), scope=scope, limit=limit)
     print(_json.dumps(result, indent=2) if as_json else format_hits(result))
@@ -3426,12 +3822,39 @@ def cmd_read(argv: list) -> int:
             if top == "inbox":
                 print("WARNING: this is an INBOX capture — PROVISIONAL, not consolidated "
                       "knowledge. Do not present it as settled.\n")
+                names = corrections_naming(pending_corrections(),
+                                           "knowledge/" + candidate.resolve().relative_to(
+                                               K.resolve()).as_posix())
+                if names:
+                    print(f"WARNING:{correction_marker(names)} — a correction to this "
+                          "capture waits for the next consolidation; read it before "
+                          "relying on this one.\n")
             elif top == "journal":
                 print("NOTE: this is a JOURNAL entry — a dated observation, not canonical "
                       "knowledge.\n")
+            elif top == "handoff":
+                hfm = parse_frontmatter(read_text(candidate))[0] or {}
+                project = hfm.get("handoff_to") or candidate.parent.name
+                rel_path = "knowledge/" + candidate.resolve().relative_to(
+                    K.resolve()).as_posix()
+                print(f"WARNING: this is a HANDOFF note — not brain knowledge. It belongs in "
+                      f"{project}'s own records and waits to be filed there (handed off "
+                      f"{hfm.get('handoff_at')}: {hfm.get('handoff_reason')}). Close it with "
+                      f"a kind: correction starting \"Filed {rel_path}\" or \"Already "
+                      f"recorded: {rel_path}\", naming where it now lives.\n")
+                names = corrections_naming(pending_corrections(), rel_path)
+                if names:
+                    print(f"NOTE:{correction_marker(names)} — its closing correction waits "
+                          "for the next consolidation.\n")
             elif top == "archive":
-                print("WARNING: this note is ARCHIVED/superseded — HISTORY, not current. "
-                      "Cite it only as 'previously…'.\n")
+                afm = parse_frontmatter(read_text(candidate))[0] or {}
+                if afm.get("status") == "retracted":
+                    print(f"WARNING: this note is ARCHIVED as RETRACTED on "
+                          f"{afm.get('retracted')} — withdrawn with no successor. Nothing in "
+                          "it is true today; do not present any of it as fact.\n")
+                else:
+                    print("WARNING: this note is ARCHIVED/superseded — HISTORY, not current. "
+                          "Cite it only as 'previously…'.\n")
             print(read_text(candidate))
             return 0
         print(f"note {wanted!r} not found (by id or path)")
@@ -3439,9 +3862,15 @@ def cmd_read(argv: list) -> int:
 
     chain = []
     seen = set()
+    member_paths = []
     current_id = target_id
     while True:
         rel, fm = metas.get(current_id)
+        # A correction may name any member by its path, the one it had before it was
+        # archived included.
+        member_paths.append(f"knowledge/{rel.as_posix()}")
+        if rel.parts[0] == "archive":
+            member_paths.append(f"knowledge/{Path(*rel.parts[1:]).as_posix()}")
         successor = fm.get("superseded_by")
         if fm.get("status") == "superseded" and current_id not in seen \
                 and isinstance(successor, str) and metas.get(successor) is not None:
@@ -3460,7 +3889,11 @@ def cmd_read(argv: list) -> int:
         return 1
     print(f"# {fm.get('title')}  ({fm.get('kind')}, created {fm.get('created')}, status {fm.get('status')})")
     print(f"path: knowledge/{rel}")
-    if chain:
+    retracted = fm.get("status") == "retracted"
+    if chain and retracted:
+        print(f"NOTE: {wanted!r} was superseded by a note since RETRACTED — nothing in "
+              f"this chain is current. Chain: {' -> '.join(chain + [current_id])}")
+    elif chain:
         print(f"NOTE: {wanted!r} was superseded — this is the CURRENT version. "
               f"Chain: {' -> '.join(chain + [current_id])}")
     if fm.get("supersedes"):
@@ -3468,7 +3901,11 @@ def cmd_read(argv: list) -> int:
     # Surface staleness/provenance the caller cannot see from the body alone, so
     # a model never presents unverified or historical content as settled truth.
     top = rel.parts[0]
-    if top == "archive" or fm.get("status") == "superseded":
+    if retracted:
+        print(f"WARNING: this note is ARCHIVED as RETRACTED on {fm.get('retracted')} — "
+              "withdrawn with no successor, because it should not have been in the "
+              "brain. Nothing in it is true today; do not present any of it as fact.")
+    elif top == "archive" or fm.get("status") == "superseded":
         print("WARNING: this note is ARCHIVED/superseded — it is HISTORY, not current. "
               "Cite it only as 'previously…', never as true today.")
     elif top == "inbox":
@@ -3480,6 +3917,11 @@ def cmd_read(argv: list) -> int:
     if review_by and str(review_by) < date.today().isoformat():
         print(f"WARNING: review_by {review_by} has passed — this fact may be STALE; verify "
               "before relying on it.")
+    names = corrections_naming(pending_corrections(), wanted, *chain, current_id,
+                               *member_paths)
+    if names:
+        print(f"WARNING:{correction_marker(names)} — a correction to this note waits for "
+              "the next consolidation; read it before relying on this note.")
     # Backlinks: the context a lone note body cannot carry — what else in the
     # brain refers to this. Never triggers an index rebuild; a stale or missing
     # index simply means no graph line, not a slow read.
@@ -3513,6 +3955,7 @@ def cmd_recent(argv: list) -> int:
     if not rows:
         print(f"no notes touched in the last {days} day(s)")
         return 0
+    pending = None
     for mtime, path in sorted(rows, reverse=True)[:30]:
         day = time.strftime("%Y-%m-%d", time.localtime(mtime))
         # Same provisional discipline format_hits applies. Without it `recent`
@@ -3521,7 +3964,16 @@ def cmd_recent(argv: list) -> int:
         # asking "what was I just working on".
         top = path.relative_to(K).parts[0]
         tag = (" [provisional — unconsolidated]" if top == "inbox"
-               else " [journal]" if top == "journal" else "")
+               else " [journal]" if top == "journal"
+               else f" [handoff — belongs in {path.parent.name}]" if top == "handoff"
+               else "")
+        if pending is None:
+            pending = pending_corrections()
+        fm_id = None
+        if top not in ("inbox", "journal", "handoff"):
+            fm_id = (parse_frontmatter(read_text(path))[0] or {}).get("id")
+        tag += correction_marker(corrections_naming(
+            pending, fm_id, str(path.relative_to(ROOT))))
         print(f"{day}  {path.relative_to(ROOT)}{tag}")
     return 0
 
@@ -3622,6 +4074,246 @@ def cmd_supersede(argv: list) -> int:
             "whatever still holds (supersede starts the new note from a blank template).")
     print("now: fill the new note's body and aliases, replace the '<one-line reason>' "
           "in the archived note's banner, run bin/brain lint, then commit." + tail)
+    return 0
+
+
+def cmd_retract(argv: list) -> int:
+    """Withdraw a canonical note that should never have been written.
+
+    A supersede needs a successor, and a note saved by mistake has none: the
+    knowledge was never true, or never the brain's to hold. This archives it as
+    `status: retracted`, dated, with the reason in its banner, so it leaves the
+    default search scope and `brain read` shows it only behind a RETRACTED
+    warning. Like supersede it neither erases nor commits: git history keeps the
+    text, and the caller (normally the consolidation pass, on the owner's
+    correction) lints and commits. The whole check, rewrite and move happens under
+    the repository lock, so no commit can sweep in half a retraction."""
+    usage = 'usage: brain retract <id-or-path> "<one-line reason>"'
+    flags = [a for a in argv if a.startswith("--")]
+    args = [a for a in argv if not a.startswith("--")]
+    if flags:
+        print(usage + f" — unknown option {flags[0]!r}; nothing was changed")
+        return 2
+    if len(args) != 2:
+        print(usage + " — exactly a note and a reason (quote the reason); nothing was "
+              "changed")
+        return 2
+    wanted, reason = args[0], args[1].strip()
+    if not reason or "\n" in reason or "\r" in reason:
+        print(usage + " — the reason is required, on one line: it is what the archived "
+              "note keeps to say why it was withdrawn")
+        return 2
+    as_path = Path(wanted)
+    if as_path.parts[:1] == ("knowledge",):
+        as_path = Path(*as_path.parts[1:]) if len(as_path.parts) > 1 else Path()
+    if as_path.parts[:1] == ("inbox",):
+        print(f"{wanted!r} is an inbox capture: it has no id and is never archived — "
+              "consolidation drains it (with the correction that retracts it)")
+        return 1
+    with repo_lock():
+        metas = all_metas()
+        note_id = wanted if wanted in metas else None
+        if note_id is None and wanted.endswith(".md"):
+            for nid, (nrel, _fm) in metas.items():
+                if nrel == as_path:
+                    note_id = nid
+                    break
+        if note_id is None:
+            print(f"note {wanted!r} not found — retract takes a canonical note's id or path")
+            return 1
+        rel, fm = metas[note_id]
+        if rel.parts[0] == "archive":
+            print(f"{note_id!r} is already archived (status: {fm.get('status')})")
+            return 1
+        if rel.parts[0] not in CANONICAL:
+            print(f"{note_id!r} lives in knowledge/{rel.parts[0]}/ — only a canonical note is "
+                  "retracted; provisional material is drained by consolidation instead")
+            return 1
+        src = K / rel
+        dest = K / "archive" / rel
+        if dest.exists():
+            print(f"{dest.relative_to(ROOT)} already exists — archive history is append-only "
+                  "and must never be overwritten. Resolve that first.")
+            return 1
+        today = date.today().isoformat()
+        # A withdrawn note is never published: approval does not outlive the note.
+        fm_update(src, {"status": "retracted", "retracted": today, "visibility": None},
+                  banner=f"> RETRACTED {today} — {reason}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        moved = subprocess.run(["git", "mv", str(src), str(dest)], cwd=ROOT,
+                               capture_output=True, text=True)
+        if moved.returncode != 0:
+            if dest.exists():
+                print(f"git mv failed and {dest.relative_to(ROOT)} now exists — refusing to "
+                      f"overwrite history. {src.relative_to(ROOT)} is marked retracted; move "
+                      "it into archive/ by hand.")
+                return 1
+            src.replace(dest)
+    linking = []
+    for path in indexable_paths():
+        p_rel = path.relative_to(K)
+        if p_rel.parts[0] not in CANONICAL:
+            continue
+        try:
+            if note_id in extract_links(read_text(path)):
+                linking.append(str(path.relative_to(ROOT)))
+        except OSError:
+            continue
+    index_md = K / "index.md"
+    if index_md.is_file() and note_id in extract_links(read_text(index_md)):
+        linking.append(str(index_md.relative_to(ROOT)))
+    print(f"retracted: {dest}")
+    if linking:
+        print(f"linked from ({len(linking)}): " + ", ".join(sorted(set(linking)))
+              + f" — remove the [[{note_id}]] links there; lint warns about each")
+    print("now: run bin/brain lint, then commit. Retracting does not erase: git history "
+          "still holds the text.")
+    return 0
+
+
+def named_note_file(arg: str, folder: str, depth: int):
+    """(path, None) for the note `arg` names directly under knowledge/<folder>/ at
+    `depth` path parts (inbox/<name>.md is 2, handoff/<project>/<name>.md is 3), or
+    (None, why not). Never a symlink, never outside the real folder: these are the only
+    paths the move and delete commands touch."""
+    rel = Path(arg)
+    if rel.is_absolute():
+        try:
+            rel = rel.relative_to(ROOT)
+        except ValueError:
+            return None, "outside this brain"
+    parts = rel.parts[1:] if rel.parts[:1] == ("knowledge",) else rel.parts
+    if not parts or parts[0] != folder or ".." in parts or len(parts) != depth \
+            or not parts[-1].endswith(".md"):
+        return None, f"not a note in knowledge/{folder}/"
+    root = K / folder
+    path = K.joinpath(*parts)
+    try:
+        if root.is_symlink() or any(K.joinpath(*parts[:i]).is_symlink()
+                                    for i in range(2, len(parts) + 1)):
+            return None, "a symlink — refused"
+        if not path.is_file():
+            return None, "no such note"
+        if path.resolve(strict=True).parent != root.resolve(strict=True).joinpath(
+                *parts[1:-1]):
+            return None, f"resolves outside knowledge/{folder}/"
+    except OSError as exc:
+        return None, f"unreadable ({exc.strerror or exc})"
+    return path, None
+
+
+def add_frontmatter_lines(raw: bytes, lines: list) -> bytes:
+    """`raw` with `lines` appended at the end of its frontmatter, every other byte kept.
+    Raises ValueError when there is no frontmatter block."""
+    rows = raw.split(b"\n")
+    first = rows[0].lstrip(b"\xef\xbb\xbf").rstrip(b"\r")
+    if first != b"---":
+        raise ValueError("no frontmatter")
+    end = next((i for i in range(1, len(rows)) if rows[i].rstrip(b"\r") == b"---"), None)
+    if end is None:
+        raise ValueError("no closing frontmatter line")
+    eol = b"\r" if rows[0].endswith(b"\r") else b""
+    added = [line.encode("utf-8") + eol for line in lines]
+    return b"\n".join(rows[:end] + added + rows[end:])
+
+
+def cmd_handoff(argv: list) -> int:
+    """Move one capture that belongs in a project's own records to
+    knowledge/handoff/<project>/, or remove one that has been filed.
+
+    The pass may run only allowlisted commands, so this is how a handoff happens at all,
+    and it is bounded on purpose: only a capture from an owner endpoint, only out of the
+    inbox, under its own file name, every byte kept, with exactly the three keys added. The
+    mechanical check before the audit holds the pass to the same."""
+    usage = ('usage: brain handoff <inbox-path> <project> "<one-line reason>"\n'
+             '       brain handoff --close <handoff-path>')
+    if argv[:1] == ["--close"]:
+        if len(argv) != 2 or argv[1].startswith("--"):
+            print(usage)
+            return 2
+        with repo_lock():
+            path, problem = named_note_file(argv[1], "handoff", 3)
+            if problem is None and not HANDOFF_SLUG_RE.match(path.parent.name):
+                problem = "its folder is not a project slug"
+            if problem:
+                print(f"{argv[1]!r}: {problem} — nothing was closed")
+                return 1
+            path.unlink()
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+        print(f"closed: {path.relative_to(ROOT)}")
+        return 0
+    if any(a.startswith("--") for a in argv) or len(argv) != 3:
+        print(usage)
+        return 2
+    source_arg, project, reason = argv[0], argv[1], argv[2].strip()
+    if not HANDOFF_SLUG_RE.match(project):
+        print(f"{project!r} is not a project slug (lowercase letters, digits and hyphens, "
+              "1-63) — nothing was moved")
+        return 2
+    if not reason or any(ord(c) < 32 for c in reason) or reason.startswith("["):
+        print(usage + " — the reason is required, on one line")
+        return 2
+    with repo_lock():
+        src, problem = named_note_file(source_arg, "inbox", 2)
+        if problem:
+            print(f"{source_arg!r}: {problem} — only an inbox capture is handed off")
+            return 1
+        raw = src.read_bytes()
+        fm, _err = parse_frontmatter(raw.decode("utf-8-sig", "replace"))
+        if not fm:
+            print(f"{source_arg!r} has no frontmatter — nothing was moved")
+            return 1
+        if fm.get("source") != DEFAULT_SOURCE:
+            print(f"{source_arg!r} came from {fm.get('source')!r}, not an owner endpoint "
+                  "(source: local): it is a proposal, never handed off — nothing was moved")
+            return 1
+        if any(key in fm for key in HANDOFF_KEYS):
+            print(f"{source_arg!r} already carries handoff keys — nothing was moved")
+            return 1
+        handoff_root = K / "handoff"
+        dest = handoff_root / project / src.name
+        if handoff_root.is_symlink() or (handoff_root / project).is_symlink():
+            print("knowledge/handoff/ or its project folder is a symlink — refused")
+            return 1
+        if dest.exists() or dest.is_symlink():
+            print(f"{dest.relative_to(ROOT)} already exists — nothing was moved")
+            return 1
+        try:
+            moved = add_frontmatter_lines(raw, [f"handoff_to: {project}",
+                                                f"handoff_at: {date.today().isoformat()}",
+                                                f"handoff_reason: {reason}"])
+        except ValueError as exc:
+            print(f"{source_arg!r}: {exc} — nothing was moved")
+            return 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(moved)
+        src.unlink()
+    print(f"handed off: {dest.relative_to(ROOT)} (from {src.relative_to(ROOT)})")
+    return 0
+
+
+def cmd_drain(argv: list) -> int:
+    """Remove inbox notes, and only inbox notes: the one way a pass deletes a capture.
+    Every path is checked before anything is removed, so a batch with one bad path
+    removes nothing."""
+    if not argv or any(a.startswith("--") for a in argv):
+        print("usage: brain drain <inbox-path>...")
+        return 2
+    with repo_lock():
+        paths = []
+        for arg in argv:
+            path, problem = named_note_file(arg, "inbox", 2)
+            if problem:
+                print(f"{arg!r}: {problem} — nothing was drained")
+                return 1
+            if path not in paths:
+                paths.append(path)
+        for path in paths:
+            path.unlink()
+    print(f"drained {len(paths)}: " + ", ".join(str(p.relative_to(ROOT)) for p in paths))
     return 0
 
 
@@ -4173,7 +4865,7 @@ CONSOLIDATOR_DEFAULTS = {
     "propose": ("claude --model {model} --output-format json --permission-mode acceptEdits "
                 "--strict-mcp-config "
                 "--mcp-config '{\"mcpServers\":{}}' --add-dir {engine} --allowedTools "
-                '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
+                '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain retract *)" "Bash({engine}/bin/brain handoff *)" "Bash({engine}/bin/brain drain *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
     "audit": ("claude --model {model} --output-format json -p --safe-mode --restricted "
               "--strict-mcp-config "
               "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
@@ -4422,18 +5114,27 @@ def load_consolidator() -> dict:
 
 
 GIT_CONTROL = ("config", "hooks", "info")
+# Files under those that git writes itself and never reads as settings or code. info/refs
+# is the ref listing `git update-server-info` regenerates for dumb-HTTP clients, and
+# git's own background auto-gc runs it (repack.updateServerInfo) whenever a commit just
+# before the pass set one off: counting it as tampering failed honest passes (CI, PR #9).
+GIT_GENERATED = ("info/refs",)
 
 
 def git_control_snapshot(git_dir: Path) -> dict:
     """Every file under the repository's own config, hooks and info, by path: what git reads
-    settings and runnable code from inside a checkout (Harbor Phase 3 final review)."""
+    settings and runnable code from inside a checkout (Harbor Phase 3 final review), less
+    the listings git generates itself (GIT_GENERATED)."""
     snap = {}
+    generated = {git_dir / rel for rel in GIT_GENERATED}
     for name in GIT_CONTROL:
         top = git_dir / name
         paths = [top] if (top.is_file() or top.is_symlink()) else (
             sorted(p for p in top.rglob("*") if p.is_file() or p.is_symlink())
             if top.is_dir() else [])
         for path in paths:
+            if path in generated and not path.is_symlink():
+                continue
             snap[path] = (("link", os.readlink(path)) if path.is_symlink()
                           else ("file", path.read_bytes(), path.stat().st_mode & 0o777))
     return snap
@@ -4816,15 +5517,17 @@ def proposal_problems(today: str):
     PROPOSAL_DAYS later, `basis: owner-said`, a mined kind and `status: draft`. A proposal
     dated to expire years out would otherwise sit outside the idle rule and keep doctor
     green for as long."""
-    names = git("diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A",
-                default_branch(), "--", "knowledge/inbox")
+    rows, error = staged_name_status("knowledge/inbox")
+    if error:
+        return f"could not read the change set ({one_line(error)})"
     proposals = []
-    for rel in names.splitlines():
-        rel = rel.strip()
-        if not re.fullmatch(r"knowledge/inbox/[^/]+\.md", rel):
+    for status, rel in rows:
+        if not status.startswith("A") or not re.fullmatch(r"knowledge/inbox/[^/]+\.md", rel):
             continue
-        shown = subprocess.run(["git", "show", f":{rel}"], cwd=ROOT, capture_output=True)
-        fm = parse_frontmatter(shown.stdout.decode("utf-8", "replace"))[0] or {}
+        raw = git_blob(f":{rel}")
+        if raw is None:
+            return f"could not read {one_line(rel)}"
+        fm = parse_frontmatter(raw.decode("utf-8", "replace"))[0] or {}
         if str(fm.get("source") or "") == "session-mining":
             proposals.append((one_line(rel), fm))
     if len(proposals) > MAX_PROPOSALS:
@@ -4843,6 +5546,218 @@ def proposal_problems(today: str):
             return f"{rel}: kind {fm.get('kind')!r}, not one of {', '.join(MINED_KINDS)}"
         if fm.get("status") != "draft":
             return f"{rel}: status {fm.get('status')!r}, not 'draft'"
+    return None
+
+
+def staged_name_status(*paths):
+    """([(status, path)], None) for the staged change set against the trunk, or (None,
+    error). NUL-separated (-z), so no file name comes back quoted and skipped, and a git
+    failure is an error the caller fails closed on, never an empty change set."""
+    run = subprocess.run(["git", "diff", "--cached", "--no-renames", "--name-status", "-z",
+                          default_branch(), "--", *paths], cwd=ROOT, capture_output=True)
+    if run.returncode != 0:
+        return None, (run.stderr.decode("utf-8", "replace").strip()
+                      or f"git diff exited {run.returncode}")
+    fields = run.stdout.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 2:
+        return None, "git diff answered in a shape this check cannot read"
+    return [(fields[i].decode("ascii", "replace"),
+             fields[i + 1].decode("utf-8", "surrogateescape"))
+            for i in range(0, len(fields), 2)], None
+
+
+def git_blob(spec: str):
+    """The bytes of `<rev>:<path>` (or `:<path>`, the index), or None."""
+    run = subprocess.run(["git", "show", spec], cwd=ROOT, capture_output=True)
+    return run.stdout if run.returncode == 0 else None
+
+
+def without_handoff_keys(raw: bytes):
+    """`raw` minus its three handoff keys, which must each appear exactly once in the
+    frontmatter; None otherwise. A handoff note made by `brain handoff` gives back the
+    capture's bytes exactly."""
+    rows = raw.split(b"\n")
+    if rows[0].lstrip(b"\xef\xbb\xbf").rstrip(b"\r") != b"---":
+        return None
+    end = next((i for i in range(1, len(rows)) if rows[i].rstrip(b"\r") == b"---"), None)
+    if end is None:
+        return None
+    kept, seen = [], {}
+    for i, row in enumerate(rows):
+        key = re.match(rb"(handoff_to|handoff_at|handoff_reason):", row) if 0 < i < end else None
+        if key:
+            seen[key.group(1)] = seen.get(key.group(1), 0) + 1
+            continue
+        kept.append(row)
+    if any(seen.get(k.encode(), 0) != 1 for k in HANDOFF_KEYS):
+        return None
+    return b"\n".join(kept)
+
+
+RETRACT_LEAD_RE = re.compile(r"(?i)^\s*retract\s")
+
+
+def removed_corrections(gone_inbox):
+    """([(path, frontmatter, body)], None) for every `kind: correction` the change set
+    removes from the inbox, read from the trunk (what was trusted before the pass), or
+    (None, error)."""
+    trunk, out = default_branch(), []
+    for rel in sorted(gone_inbox):
+        raw = git_blob(f"{trunk}:{rel}")
+        if raw is None:
+            return None, f"could not read {one_line(rel)} on the trunk"
+        text = raw.decode("utf-8-sig", "replace")
+        fm = parse_frontmatter(text)[0] or {}
+        if fm.get("kind") == "correction":
+            out.append((rel, fm, "\n".join(text.splitlines()[fm.get("_end_line", 0):])))
+    return out, None
+
+
+def trusted_retraction(fm: dict) -> bool:
+    """Only the owner's own words, through an owner endpoint, retract anything."""
+    return fm.get("source") == DEFAULT_SOURCE and fm.get("basis") == "owner-said"
+
+
+def handoff_problems(today: str):
+    """The first way the staged change set breaks the handoff rules, or None. Checked as
+    code before the audit, because the keys are the filing job's interface and a handoff
+    note leaves only once it is filed:
+    - a note added under knowledge/handoff/<project>/ is a capture from an owner endpoint
+      this pass moved out of the inbox under its own file name, to one place only, with
+      every byte kept and exactly the three keys added, dated the pass's day;
+    - a handoff note is never edited by a pass;
+    - one is deleted only alongside a correction removed in the same change set: a local
+      one whose text starts "Filed <its path>" or "Already recorded: <its path>", or the
+      owner's own retraction naming it."""
+    rows, error = staged_name_status("knowledge/handoff", "knowledge/inbox")
+    if error:
+        return f"could not read the change set ({one_line(error)})"
+    trunk = default_branch()
+    gone_inbox = {rel for status, rel in rows
+                  if status.startswith("D") and rel.startswith("knowledge/inbox/")}
+    added, removed, edited = [], [], []
+    for status, rel in rows:
+        if rel.startswith("knowledge/handoff/"):
+            (added if status.startswith("A") else removed if status.startswith("D")
+             else edited).append(rel)
+    for rel in edited:
+        return f"{one_line(rel)}: a pass never edits a handoff note"
+    sources = set()
+    for rel in added:
+        parts = rel.split("/")
+        if len(parts) != 4 or not parts[3].endswith(".md") \
+                or not HANDOFF_SLUG_RE.match(parts[2]):
+            return f"{one_line(rel)}: not knowledge/handoff/<project>/<capture>.md"
+        src = f"knowledge/inbox/{parts[3]}"
+        if src not in gone_inbox:
+            return (f"{one_line(rel)}: not a capture moved out of the inbox under its own "
+                    "file name")
+        if src in sources:
+            return f"{one_line(src)}: handed off to more than one place"
+        sources.add(src)
+        original, moved = git_blob(f"{trunk}:{src}"), git_blob(f":{rel}")
+        if original is None or moved is None:
+            return f"{one_line(rel)}: could not read the capture or its handoff note"
+        source = (parse_frontmatter(original.decode("utf-8-sig", "replace"))[0] or {}).get(
+            "source")
+        if source != DEFAULT_SOURCE:
+            return (f"{one_line(rel)}: handed off from {source!r} — only a capture from an "
+                    "owner endpoint (source: local) is handed off, never a drop box's or a "
+                    "session-mining proposal")
+        if without_handoff_keys(moved) != original:
+            return (f"{one_line(rel)}: changed in the move — a handoff keeps every byte of the "
+                    "capture and adds only handoff_to, handoff_at and handoff_reason, once "
+                    "each (bin/brain handoff does exactly that)")
+        fm = parse_frontmatter(moved.decode("utf-8-sig", "replace"))[0] or {}
+        if str(fm.get("handoff_at") or "") != today:
+            return (f"{one_line(rel)}: handoff_at {fm.get('handoff_at')!r}, not the pass "
+                    f"date {today}")
+        if fm.get("handoff_to") != parts[2]:
+            return f"{one_line(rel)}: handoff_to {fm.get('handoff_to')!r}, not its folder"
+    if removed:
+        corrections, error = removed_corrections(gone_inbox)
+        if error:
+            return error
+        allowed = set()
+        for _rel, fm, body in corrections:
+            if fm.get("source") != DEFAULT_SOURCE:
+                continue
+            lead = HANDOFF_CLOSE_RE.match(body)
+            if lead and correction_target(lead.group(1)):
+                allowed.add(correction_target(lead.group(1)))
+            elif RETRACT_LEAD_RE.match(body) and trusted_retraction(fm):
+                allowed.update(correction_targets(body))
+        for rel in removed:
+            if rel not in allowed:
+                return (f"{one_line(rel)}: a handoff note deleted with no closing correction "
+                        "(\"Filed <path>\" or \"Already recorded: <path>\") or owner's "
+                        "retraction removed with it — handoff notes are filed, never "
+                        "promoted or dropped by a pass")
+    return None
+
+
+def correction_problems():
+    """The first way the staged change set breaks the correction rules, or None. Checked
+    as code before the audit, because the auditor sees only the diff:
+    - an inbox note is never drained while a local correction naming it is still in the
+      inbox: corrections are applied first, across the whole inbox;
+    - a retraction that removes its target (an inbox note, or a canonical note) is the
+      owner's own (source: local, basis: owner-said), read from the trunk;
+    - a note archived as retracted has such a retraction, removed in the same change set,
+      naming it by id or by its canonical path."""
+    rows, error = staged_name_status("knowledge")
+    if error:
+        return f"could not read the change set ({one_line(error)})"
+    trunk = default_branch()
+    deleted = {rel for status, rel in rows if status.startswith("D")}
+    gone_inbox = {rel for rel in deleted if rel.startswith("knowledge/inbox/")}
+    pending = pending_corrections()
+    for rel in sorted(gone_inbox):
+        if pending.get(rel):
+            return (f"{one_line(rel)} was drained while {one_line(pending[rel][0])}, a "
+                    "correction naming it, is still in the inbox — corrections are applied "
+                    "first")
+    removed_ids = {}
+    for rel in sorted(deleted):
+        parts = rel.split("/")
+        if len(parts) >= 3 and parts[1] in CANONICAL:
+            raw = git_blob(f"{trunk}:{rel}")
+            if raw is None:
+                return f"could not read {one_line(rel)} on the trunk"
+            note_id = (parse_frontmatter(raw.decode("utf-8-sig", "replace"))[0] or {}).get("id")
+            if note_id:
+                removed_ids[str(note_id)] = rel
+    corrections, error = removed_corrections(gone_inbox)
+    if error:
+        return error
+    trusted = set()
+    for rel, fm, body in corrections:
+        if not RETRACT_LEAD_RE.match(body):
+            continue
+        targets = correction_targets(body)
+        if trusted_retraction(fm):
+            trusted.update(targets)
+            continue
+        hit = next((t for t in targets if t in deleted or t in removed_ids), None)
+        if hit:
+            return (f"{one_line(rel)} (source {fm.get('source')!r}, basis "
+                    f"{fm.get('basis')!r}) removed {one_line(hit)} — only the owner's own "
+                    "correction (source: local, basis: owner-said) retracts anything")
+    for status, rel in rows:
+        if not (status.startswith("A") and rel.startswith("knowledge/archive/")):
+            continue
+        raw = git_blob(f":{rel}")
+        if raw is None:
+            return f"could not read {one_line(rel)}"
+        fm = parse_frontmatter(raw.decode("utf-8-sig", "replace"))[0] or {}
+        if fm.get("status") != "retracted":
+            continue
+        canonical = "knowledge/" + "/".join(rel.split("/")[2:])
+        if str(fm.get("id") or "") not in trusted and canonical not in trusted:
+            return (f"{one_line(rel)}: archived as retracted with no retraction from the "
+                    "owner (source: local, basis: owner-said) removed with it")
     return None
 
 
@@ -5196,6 +6111,14 @@ def _consolidate(argv: list, result: dict) -> int:
         problem = proposal_problems(today)
         if problem:
             failure, blocked = f"proposal check: {problem}", True
+    if failure is None and changed:
+        problem = handoff_problems(today)
+        if problem:
+            failure, blocked = f"handoff check: {problem}", True
+    if failure is None and changed:
+        problem = correction_problems()
+        if problem:
+            failure, blocked = f"correction check: {problem}", True
 
     # The pass's final commit, made BEFORE the audit so the audit sees what will be pushed,
     # and carrying `Digest-until:` — when the digest was collected — for the next window.
@@ -5593,7 +6516,8 @@ def cmd_template(argv: list) -> int:
 
     # Keep every canonical folder present so a fresh brain has somewhere to put
     # its first note, and git actually tracks the empty directories.
-    skeleton = list(CANONICAL) + ["inbox", "journal", "archive", "vault", "attachments"]
+    skeleton = list(CANONICAL) + ["inbox", "journal", "handoff", "archive", "vault",
+                                  "attachments"]
     for folder in skeleton:
         d = dest / "knowledge" / folder
         d.mkdir(parents=True, exist_ok=True)
@@ -6487,7 +7411,7 @@ def stats_snapshot() -> dict:
         rel = str(path.relative_to(ROOT))
         parts = path.relative_to(K).parts
         top = parts[0] if parts else ""
-        if top in ("archive", "vault"):
+        if top in ("archive", "vault", "handoff"):
             continue
         fm, _err = parse_frontmatter(read_text(path))
         if not fm:
@@ -6543,8 +7467,15 @@ def stats_snapshot() -> dict:
     # healthy, and it is also exactly what a brain that has silently STOPPED
     # being written to looks like. Only the trend tells them apart.
     def added_within(days):
+        # A move to handoff/ is the same capture in a new place, never a new note.
         return sum(1 for rel, born in birthdays.items()
-                   if (days_since(born) is not None and days_since(born) <= days))
+                   if not rel.startswith("knowledge/handoff/")
+                   and (days_since(born) is not None and days_since(born) <= days))
+
+    handoffs, closed = handoff_notes(), closed_handoffs()
+    handoff_projects = {}
+    for note in handoffs:
+        handoff_projects[note["project"]] = handoff_projects.get(note["project"], 0) + 1
 
     inbox_items = sorted(
         (rel for rel in birthdays
@@ -6591,6 +7522,11 @@ def stats_snapshot() -> dict:
         "integrity": {
             "index_stale": index_stale(),
             "duplicate_ids": len(id_of_path) - len(set(id_of_path.values())),
+        },
+        "handoff": {
+            "waiting": len(handoffs),
+            "projects": dict(sorted(handoff_projects.items())),
+            "stale": sum(1 for n in handoffs if handoff_stale(n, closed, today)),
         },
     }
 
@@ -6749,6 +7685,14 @@ def cmd_stats(argv: list) -> int:
     if cap["inbox_waiting"]:
         print(f"             {cap['inbox_waiting']} in inbox, oldest "
               f"{cap['inbox_oldest_days']}d")
+    hand = snap["handoff"]
+    if hand["waiting"]:
+        listing = ", ".join(f"{p} {n}" for p, n in hand["projects"].items())
+        print(f"\n  handoff    {hand['waiting']} waiting to be filed in a project's own "
+              f"records ({listing})")
+        if hand["stale"]:
+            print(f"             [RED] {hand['stale']} older than {HANDOFF_STALE_DAYS} days "
+                  "with no closing correction — the filing job is not running")
 
     checked = find["checked"]
     missed = len(find["unfindable"])
@@ -7196,6 +8140,24 @@ def cmd_doctor() -> int:
         else:
             print(f"  [ok ] {proposals} session-mining proposal(s) in the inbox, none past "
                   "its expiry")
+    # Captures consolidation handed off to a project's own records. A filing job moves
+    # them there and closes each with a correction; one waiting past HANDOFF_STALE_DAYS
+    # with no closing correction means that job is not running.
+    handoffs = handoff_notes()
+    if handoffs:
+        closed = closed_handoffs()
+        per = {}
+        for note in handoffs:
+            per[note["project"]] = per.get(note["project"], 0) + 1
+        stale = [n for n in handoffs if handoff_stale(n, closed)]
+        listing = ", ".join(f"{p} {n}" for p, n in sorted(per.items()))
+        if stale:
+            ok = False
+            print(f"  [RED] handoff: {len(handoffs)} note(s) waiting to be filed ({listing}); "
+                  f"{len(stale)} older than {HANDOFF_STALE_DAYS} days with no closing "
+                  "correction — the filing job is not running")
+        else:
+            print(f"  [ok ] handoff: {len(handoffs)} note(s) waiting to be filed ({listing})")
 
     # An empty inbox is ambiguous in the worst possible way: it is what a
     # healthy, freshly-drained brain looks like, and it is ALSO exactly what a
@@ -7459,6 +8421,12 @@ def main() -> int:
         return cmd_sync(rest)
     if cmd == "supersede":
         return cmd_supersede(rest)
+    if cmd == "retract":
+        return cmd_retract(rest)
+    if cmd == "handoff":
+        return cmd_handoff(rest)
+    if cmd == "drain":
+        return cmd_drain(rest)
     if cmd == "sessions":
         return cmd_sessions(rest)
     if cmd == "consolidate":

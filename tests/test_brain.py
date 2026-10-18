@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -294,12 +294,44 @@ class CaptureContractParityTests(unittest.TestCase):
     def test_the_policy_says_what_it_must(self):
         policy = self.mcpcore.CAPTURE_POLICY
         for rule in ("Capture without asking", "the alternatives rejected", "preference",
-                     "search found nothing", "correction", "names its id",
+                     "search found nothing", "correction", "naming its id",
                      "remember this", "built-in memory", "Never capture credentials",
                      "transient state", "Ask first", "private life", "self-contained",
                      "absolute dates", "kind and basis", "owner-said", "agent-found",
                      "agent-inferred", "project, job and model"):
             self.assertIn(rule, policy)
+
+    def test_the_policy_sends_open_todos_to_the_projects_tracker(self):
+        """A to-do saved here copies what the project's own records already track, and
+        it goes stale the day the work is done. Only the decision behind one belongs here."""
+        policy = self.mcpcore.CAPTURE_POLICY
+        for rule in ("Open to-dos go in the project's tracker", "not here",
+                     "capture only the decision behind one"):
+            self.assertIn(rule, policy)
+
+    def test_the_policy_never_answers_that_a_note_cannot_be_fixed(self):
+        """Asked to delete a note, an agent said it could not delete or edit notes. A
+        capture can always correct one: the pass applies it, and the agent says so."""
+        policy = self.mcpcore.CAPTURE_POLICY
+        for rule in ("Never say you cannot fix or delete a note", "kind: correction",
+                     "naming its id or path", "quoting the wrong line",
+                     "describe, never repeat, a secret or private detail",
+                     "it stays [correction pending] until a consolidation pass applies it"):
+            self.assertIn(rule, policy)
+        self.assertNotIn("next consolidation", policy, "a correction may wait more than one pass")
+
+    def test_both_capture_descriptions_give_the_correction_format(self):
+        """The exact lead the engine reads a correction's target from travels with the
+        tool, which is where a client needs it, outside the instructions' budget."""
+        for tool in (self.stdio_tool, self.remote_tool):
+            for words in ("Correction to <id or path>: <what is true now>",
+                          "Retract <id or path>: <the user's reason>", "scope all",
+                          "brain_recent"):
+                self.assertIn(words, tool["description"], tool["name"])
+
+    def test_both_profiles_name_the_pending_correction_marker(self):
+        for profile in ("read", "capture"):
+            self.assertIn("[correction pending]", self.mcpcore.instructions(profile))
 
     def test_the_policy_fits_the_budget_clients_truncate_to(self):
         self.assertLessEqual(len(self.mcpcore.instructions("capture")), 1400)
@@ -1171,6 +1203,26 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual((self.repo / ".git" / "config").read_text(), before)
         self.assertFalse((self.repo / ".git" / "hooks" / "pre-commit").exists())
 
+    def test_gits_own_server_info_is_not_proposer_tampering(self):
+        """CI, PR #9: a commit just before the pass started git's background auto-gc, whose
+        repack ran update-server-info and rewrote .git/info/refs while the proposer ran. That
+        file is a listing git generates for dumb-HTTP clients, never settings or code, so it
+        must not fail the pass; a planted info/attributes still must."""
+        audited = self.audited_stub(
+            f"{self.toolbelt('drain', self.SEED).strip()}\n"
+            "git update-server-info\n"
+            "printf 'stale\\n' >> .git/info/refs\n")
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+        self.assertTrue(audited.exists())
+        self.back_to_trunk()
+        commit_at(self.repo, "another capture", iso_ago(0),
+                  ("knowledge/inbox/2026-10-16-000000-two.md", inbox_note(source="local")))
+        self.audited_stub("printf '* filter=evil\\n' > .git/info/attributes\n")
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "failed", result.stdout)
+        self.assertIn("git control files (info/attributes)", result.stdout)
+
     # -- Harbor Phase 5 (5.4): `audit-branch`, for an auditor that may not write the checkout --
 
     def audit_branch(self, *args, env_extra=None):
@@ -1524,6 +1576,215 @@ class ConsolidateTests(unittest.TestCase):
         good = self.consolidate()
         self.assertEqual(self.result_of(good)["status"], "committed", good.stdout)
         self.assertTrue(audited.exists())
+
+    def handoff_move(self, name="2026-10-15-120000-seed.md", project="acme", at=None,
+                     drop=""):
+        """Shell that moves an inbox capture to handoff/<project>/ and adds the three keys
+        (`drop` names one to leave out), as a pass is told to."""
+        at = at or datetime.now().date().isoformat()
+        keys = {"handoff_to": project, "handoff_at": at,
+                "handoff_reason": "pending work that belongs in the project's records"}
+        extra = "".join(f"{k}: {v}\\n" for k, v in keys.items() if k != drop)
+        return (f"mkdir -p knowledge/handoff/{project}\n"
+                f"rm knowledge/inbox/{name}\n"
+                f'printf -- "---\\ncreated: 2026-10-15\\nsource: local\\nstatus: draft\\n'
+                f'{extra}---\\n\\nA capture.\\n" > knowledge/handoff/{project}/{name}\n')
+
+    def audited_stub(self, body):
+        audited = Path(self.tmp.name) / "audited"
+        if audited.exists():
+            audited.unlink()
+        self.stub_claude(f'case "$*" in *--tools*) touch {audited}; echo "VERDICT: PASS";'
+                         f' exit 0;; esac\n{body}exit 0')
+        return audited
+
+    def toolbelt(self, *args):
+        """A shell line running this checkout's bin/brain, as the proposer's allowlist does."""
+        return " ".join([shlex.quote(sys.executable), "bin/brain",
+                         *(shlex.quote(a) for a in args)]) + "\n"
+
+    def test_a_handoff_move_is_committed_and_audited(self):
+        """Review B1: the pass hands off with the allowlisted command, not rm or mv."""
+        audited = self.audited_stub(self.toolbelt(
+            "handoff", self.SEED, "acme", "pending work that belongs in the project's records"))
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+        self.assertTrue(audited.exists())
+
+    def test_handoff_moves_are_checked_before_the_audit(self):
+        """The handoff keys are the filing job's interface and a handoff note leaves only
+        when it is filed, so code checks both before any auditor is spent."""
+        held = handoff_note("acme", "2026-10-10-100000-held.md",
+                            datetime.now().date().isoformat())
+        commit_at(self.repo, "a handoff waiting", iso_ago(0), held)
+        cases = {
+            "dated another day": self.handoff_move(at="2026-01-01"),
+            "not moved out of the inbox": self.handoff_move(name="2026-10-15-120000-seed.md")
+                .replace("rm knowledge/inbox/2026-10-15-120000-seed.md\n", "")
+                .replace("acme/2026-10-15-120000-seed.md", "acme/2026-10-15-120000-other.md"),
+            "an edited handoff note": f"echo more >> {held[0]}\n",
+            "a handoff dropped without a closing correction": f"rm {held[0]}\n",
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                audited = self.audited_stub(body)
+                result = self.consolidate()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("handoff check", result.stdout)
+                self.assertEqual(self.result_of(result)["status"], "blocked")
+                self.assertFalse(audited.exists(), "the auditor was spent on it")
+                self.back_to_trunk()
+
+    def test_a_filed_handoff_leaves_with_its_closing_correction(self):
+        held = handoff_note("acme", "2026-10-10-100000-held.md",
+                            datetime.now().date().isoformat())
+        closing = ("knowledge/inbox/2026-10-18-070000-filed.md",
+                   "---\ncreated: 2026-10-18\nsource: local\nkind: correction\nstatus: draft\n"
+                   f"---\n\nFiled {held[0]} to github.com/example/acme docs/backlog.md B7 "
+                   "(PR #12).\n")
+        commit_at(self.repo, "a handoff and its closing correction", iso_ago(0), held, closing)
+        audited = self.audited_stub(self.toolbelt("handoff", "--close", held[0])
+                                    + self.toolbelt("drain", closing[0]))
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+        self.assertTrue(audited.exists())
+
+    def blocked(self, body, label):
+        """Run a pass whose proposer does `body`; it must be blocked by `label` before the
+        audit, and the trunk left as it was."""
+        audited = self.audited_stub(body)
+        try:
+            result = self.consolidate()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(label, result.stdout)
+            self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+            self.assertFalse(audited.exists(), "the auditor was spent on it")
+        finally:
+            self.back_to_trunk()
+
+    def committed(self, body):
+        audited = self.audited_stub(body)
+        try:
+            result = self.consolidate()
+            self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+            self.assertTrue(audited.exists())
+        finally:
+            self.back_to_trunk()
+
+    def correction(self, name, text, source="local", basis="owner-said"):
+        return (f"knowledge/inbox/{name}",
+                f"---\ncreated: 2026-10-18\nsource: {source}\nkind: correction\n"
+                f"basis: {basis}\nstatus: draft\n---\n\n{text}\n")
+
+    def reference(self, name):
+        return (f"knowledge/reference/{name}.md",
+                f"---\nid: {name}\nkind: reference\ntitle: {name}\ntopics: [brain]\n"
+                f"aliases: [{name}]\ncreated: 2026-07-01\nstatus: current\n---\n\nA fact.\n")
+
+    def test_a_handoff_keeps_the_capture_exactly_as_it_was(self):
+        """Review B2: the check compares the moved note with the capture on the trunk."""
+        name = self.SEED.rsplit("/", 1)[-1]
+        today = datetime.now().date().isoformat()
+        keys = (f"handoff_to: acme\\nhandoff_at: {today}\\n"
+                "handoff_reason: pending work\\n")
+
+        def write(folder, head, body):
+            return (f"mkdir -p knowledge/handoff/{folder}\n"
+                    f'printf -- "---\\n{head}{keys}---\\n\\n{body}\\n" '
+                    f"> knowledge/handoff/{folder}/{name}\n")
+        rm = f"rm {self.SEED}\n"
+        same = "created: 2026-10-15\\nsource: local\\nstatus: draft\\n"
+        cases = {
+            "the body changed": (rm + write("acme", same, "Something else."),
+                                 "changed in the move"),
+            "a frontmatter field changed": (rm + write(
+                "acme", "created: 2026-10-16\\nsource: local\\nstatus: draft\\n", "A capture."),
+                "changed in the move"),
+            "two destinations": (rm + write("acme", same, "A capture.") + write(
+                "beta", same, "A capture.").replace("handoff_to: acme", "handoff_to: beta"),
+                "handed off to more than one place"),
+        }
+        for label, (body, why) in cases.items():
+            with self.subTest(label):
+                self.blocked(body, why)
+        bot = "knowledge/inbox/2026-10-14-100000-bot.md"
+        commit_at(self.repo, "a drop box's capture", iso_ago(0),
+                  (bot, "---\ncreated: 2026-10-14\nsource: support-bot\nstatus: draft\n---\n\n"
+                        "A capture.\n"))
+        self.blocked(f"rm {bot}\nmkdir -p knowledge/handoff/acme\n"
+                     f'printf -- "---\\ncreated: 2026-10-14\\nsource: support-bot\\n'
+                     f'status: draft\\n{keys}---\\n\\nA capture.\\n" '
+                     f"> knowledge/handoff/acme/2026-10-14-100000-bot.md\n",
+                     "only a capture from an owner endpoint")
+
+    def test_handoff_checks_read_names_git_would_quote(self):
+        """Review B3: git quotes a name with a quote mark or a non-ASCII letter unless asked
+        for NUL-separated output, and the check skipped what it could not read."""
+        odd = 'knowledge/inbox/2026-10-14-100000-café "q".md'
+        commit_at(self.repo, "an oddly named capture", iso_ago(0),
+                  (odd, "---\ncreated: 2026-10-14\nsource: local\nstatus: draft\n---\n\n"
+                        "A capture.\n"))
+        today = datetime.now().date().isoformat()
+        dest = "knowledge/handoff/acme/" + odd.rsplit("/", 1)[-1]
+        self.blocked(f"rm {shlex.quote(odd)}\nmkdir -p knowledge/handoff/acme\n"
+                     f'printf -- "---\\ncreated: 2026-10-14\\nsource: local\\nstatus: draft\\n'
+                     f'handoff_to: acme\\nhandoff_at: {today}\\nhandoff_reason: r\\n---\\n\\n'
+                     f'Rewritten.\\n" > {shlex.quote(dest)}\n', "changed in the move")
+
+    def test_an_inbox_note_a_correction_still_names_is_never_drained(self):
+        """Review B4(a): corrections are applied first; the auditor cannot see a correction
+        the change set did not touch, so code checks it."""
+        name = self.SEED.rsplit("/", 1)[-1]
+        commit_at(self.repo, "a correction waiting", iso_ago(0), self.correction(
+            "2026-10-18-070000-fix.md", f"Correction to {self.SEED}: it was 2026-10-14."))
+        self.blocked(self.toolbelt("drain", self.SEED), "corrections are applied first")
+        self.assertTrue((self.repo / self.SEED).exists(), name)
+
+    def test_a_retraction_needs_the_owners_own_words_from_an_owner_endpoint(self):
+        """Review B4(b): an untrusted correction must never remove a capture or a note."""
+        for label, source, basis in (("a drop box", "support-bot", "owner-said"),
+                                     ("agent-found", "local", "agent-found")):
+            with self.subTest(label):
+                fix = self.correction("2026-10-18-070000-retract.md",
+                                      f"Retract {self.SEED}: it should not be in the brain.",
+                                      source=source, basis=basis)
+                commit_at(self.repo, "a retraction", iso_ago(0), fix)
+                self.blocked(self.toolbelt("drain", self.SEED, fix[0]),
+                             "only the owner's own correction")
+                commit_at(self.repo, "drop it", iso_ago(0), (fix[0], None))
+        fix = self.correction("2026-10-18-070000-retract.md",
+                              f"Retract {self.SEED}: it should not be in the brain.")
+        commit_at(self.repo, "the owner's retraction", iso_ago(0), fix)
+        self.committed(self.toolbelt("drain", self.SEED, fix[0]))
+
+    def test_an_archived_retraction_needs_its_trusted_correction(self):
+        """Review B4(b, c): a note archived as retracted is checked against the correction
+        removed with it, read from the trunk."""
+        note = self.reference("vendor-limits")
+        commit_at(self.repo, "a note", iso_ago(0), note)
+        self.blocked(self.toolbelt("retract", "vendor-limits", "saved by mistake"),
+                     "archived as retracted with no retraction from the owner")
+        bot = self.correction("2026-10-18-070000-retract.md",
+                              "Retract vendor-limits: it should not be in the brain.",
+                              source="support-bot")
+        commit_at(self.repo, "an untrusted retraction", iso_ago(0), bot)
+        self.blocked(self.toolbelt("retract", "vendor-limits", "saved by mistake")
+                     + self.toolbelt("drain", bot[0]), "only the owner's own correction")
+        commit_at(self.repo, "drop it", iso_ago(0), (bot[0], None))
+        fix = self.correction("2026-10-18-070000-retract.md",
+                              "Retract vendor-limits: it should not be in the brain.")
+        commit_at(self.repo, "the owner's retraction", iso_ago(0), fix)
+        self.committed(self.toolbelt("retract", "vendor-limits", "saved by mistake")
+                       + self.toolbelt("drain", fix[0]))
+
+    def test_the_owners_retraction_may_remove_a_handoff_note(self):
+        held = handoff_note("acme", "2026-10-10-100000-held.md",
+                            datetime.now().date().isoformat())
+        fix = self.correction("2026-10-18-070000-retract.md",
+                              f"Retract {held[0]}: it should not have been saved.")
+        commit_at(self.repo, "a handoff and its retraction", iso_ago(0), held, fix)
+        self.committed(self.toolbelt("handoff", "--close", held[0])
+                       + self.toolbelt("drain", fix[0]))
 
     def test_an_idle_pass_over_a_dirty_tree_is_refused(self):
         """S7: an uncommitted journal entry is work nothing else sees."""
@@ -2360,6 +2621,873 @@ class SupersedeTests(unittest.TestCase):
         self.assertIn("still the empty template", lint.stdout)
 
 
+class RetractTests(unittest.TestCase):
+    """A note that should never have been written has no successor, so supersede cannot
+    remove it. `brain retract` archives it as retracted: out of default search, read back
+    only behind a RETRACTED warning, with the reason it was withdrawn."""
+
+    REASON = "saved by mistake; it belongs in the project's own records"
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        for cfg in (["user.email", "t@example.com"], ["user.name", "Test"]):
+            subprocess.run(["git", "config", *cfg], cwd=self.repo, check=True)
+        self.ref = self.repo / "knowledge" / "reference"
+        self.ref.mkdir(parents=True, exist_ok=True)
+        self.today = date.today().isoformat()
+
+    def write_ref(self, name, body="The vendor rate limit is 500 requests per minute.",
+                  folder=None, **fm):
+        extra = "".join(f"{k}: {v}\n" for k, v in fm.items())
+        path = (folder or self.ref) / f"{name}.md"
+        path.write_text(
+            f"---\nid: {name}\nkind: reference\ntitle: {name}\ntopics: [brain]\n"
+            f"aliases: [{name}]\ncreated: 2026-07-01\nstatus: current\n{extra}---\n\n{body}\n",
+            encoding="utf-8")
+        return path
+
+    def archived(self, name="seed-note"):
+        return self.repo / "knowledge" / "archive" / "reference" / f"{name}.md"
+
+    def fm(self, path):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import notes
+        fm, _err = notes.parse_frontmatter(path.read_text(encoding="utf-8"))
+        return fm
+
+    def test_retract_archives_the_note_with_its_date_and_reason_and_no_successor(self):
+        self.write_ref("seed-note")
+        out = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse((self.ref / "seed-note.md").exists(), "the note stayed canonical")
+        archived = self.archived()
+        self.assertTrue(archived.exists(), out.stdout)
+        fm = self.fm(archived)
+        self.assertEqual(fm.get("status"), "retracted")
+        self.assertEqual(str(fm.get("retracted")), self.today)
+        self.assertNotIn("superseded_by", fm)
+        text = archived.read_text(encoding="utf-8")
+        self.assertIn(f"> RETRACTED {self.today} — {self.REASON}", text)
+        self.assertIn("500 requests per minute", text, "retract must not erase the history")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, "retract left the tree un-lintable:\n" + lint.stdout)
+
+    def test_a_retracted_note_leaves_search_and_reads_back_as_retracted(self):
+        self.write_ref("seed-note")
+        before = run_brain("search", "vendor rate limit", repo=self.repo)
+        self.assertIn("seed-note", before.stdout, "precondition: the note ranks")
+        run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        after = run_brain("search", "vendor rate limit", repo=self.repo)
+        self.assertNotIn("seed-note", after.stdout, "a retracted note is still served")
+        read = run_brain("read", "seed-note", repo=self.repo)
+        self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
+        self.assertIn("RETRACTED", read.stdout)
+        self.assertIn("ARCHIVED", read.stdout)
+        self.assertIn(self.REASON, read.stdout)
+
+    def test_retract_drops_publication_approval(self):
+        self.write_ref("seed-note", visibility="public")
+        run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertNotIn("visibility", self.fm(self.archived()))
+
+    def test_retract_needs_a_one_line_reason(self):
+        self.write_ref("seed-note")
+        for reason in ("", "   ", "two\nlines"):
+            with self.subTest(reason=reason):
+                out = run_brain("retract", "seed-note", reason, repo=self.repo)
+                self.assertEqual(out.returncode, 2, out.stdout)
+                self.assertTrue((self.ref / "seed-note.md").exists())
+        out = run_brain("retract", "seed-note", repo=self.repo)
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("usage", out.stdout)
+
+    def test_retract_refuses_an_unknown_an_archived_or_an_inbox_note(self):
+        self.write_ref("seed-note")
+        self.assertEqual(run_brain("retract", "no-such-note", self.REASON,
+                                   repo=self.repo).returncode, 1)
+        self.assertEqual(run_brain("retract", "seed-note", self.REASON,
+                                   repo=self.repo).returncode, 0)
+        again = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(again.returncode, 1, again.stdout)
+        self.assertIn("already archived", again.stdout)
+        inbox = self.repo / "knowledge" / "inbox" / "2026-10-18-0512-stray.md"
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        inbox.write_text(inbox_note(source="local"), encoding="utf-8")
+        out = run_brain("retract", "knowledge/inbox/2026-10-18-0512-stray.md", self.REASON,
+                        repo=self.repo)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("inbox", out.stdout)
+        self.assertTrue(inbox.exists(), "an inbox capture is deleted by consolidation, "
+                        "never archived")
+
+    def test_retract_never_overwrites_archive_history(self):
+        self.write_ref("seed-note")
+        self.archived().parent.mkdir(parents=True, exist_ok=True)
+        self.archived().write_text("older history\n", encoding="utf-8")
+        out = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertEqual(self.archived().read_text(encoding="utf-8"), "older history\n")
+        self.assertTrue((self.ref / "seed-note.md").exists())
+
+    def test_retract_names_the_notes_that_still_link_to_it_and_lint_warns(self):
+        self.write_ref("seed-note")
+        self.write_ref("hub-note", body="See [[seed-note]] for the limit.")
+        out = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("hub-note", out.stdout, "the linking note was not named")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+        self.assertIn("RETRACTED", lint.stdout, "a link to a retracted note did not warn")
+
+    def test_a_chain_ending_in_a_retraction_is_never_called_current(self):
+        self.write_ref("seed-note", body="The original claim.")
+        run_brain("supersede", "seed-note", "Seed note v2", repo=self.repo)
+        successor = self.ref / "seed-note-v2.md"
+        successor.write_text(successor.read_text(encoding="utf-8").replace(
+            "## What\n", "## What\n\nThe revised claim.\n"), encoding="utf-8")
+        old = self.archived()
+        old.write_text(old.read_text(encoding="utf-8").replace(
+            "<one-line reason>", "the claim changed"), encoding="utf-8")
+        out = run_brain("retract", "seed-note-v2", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+        read = run_brain("read", "seed-note", repo=self.repo)
+        self.assertIn("RETRACTED", read.stdout)
+        self.assertNotIn("this is the CURRENT version", read.stdout)
+
+    def test_retract_refuses_unknown_options_and_extra_words(self):
+        """Review should-fix: `--dry-run` was dropped silently and the note retracted; an
+        unquoted reason lost every word after the first."""
+        self.write_ref("seed-note")
+        for args in (("--dry-run", "seed-note", self.REASON), ("seed-note", "wrong", "note")):
+            with self.subTest(args=args):
+                out = run_brain("retract", *args, repo=self.repo)
+                self.assertEqual(out.returncode, 2, out.stdout)
+                self.assertTrue((self.ref / "seed-note.md").exists())
+                self.assertIn("status: current",
+                              (self.ref / "seed-note.md").read_text(encoding="utf-8"))
+
+    def test_retract_accepts_a_canonical_notes_path(self):
+        """Search and recent print paths, not ids; a retraction written against the path an
+        agent was shown must still apply."""
+        for name, arg in (("one-note", "knowledge/reference/one-note.md"),
+                          ("two-note", "reference/two-note.md")):
+            with self.subTest(arg):
+                self.write_ref(name)
+                out = run_brain("retract", arg, self.REASON, repo=self.repo)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertTrue(self.archived(name).exists())
+
+    def test_a_link_into_a_chain_that_ends_retracted_never_says_repoint(self):
+        """Review should-fix: A superseded by B, B retracted. A link to A was told to repoint
+        at B, a note withdrawn as never true."""
+        self.write_ref("seed-note", body="The original claim.")
+        run_brain("supersede", "seed-note", "Seed note v2", repo=self.repo)
+        successor = self.ref / "seed-note-v2.md"
+        successor.write_text(successor.read_text(encoding="utf-8").replace(
+            "## What\n", "## What\n\nThe revised claim.\n"), encoding="utf-8")
+        old = self.archived()
+        old.write_text(old.read_text(encoding="utf-8").replace(
+            "<one-line reason>", "the claim changed"), encoding="utf-8")
+        run_brain("retract", "seed-note-v2", self.REASON, repo=self.repo)
+        self.write_ref("hub-note", body="See [[seed-note]].")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+        rows = [l for l in lint.stdout.splitlines() if "[[seed-note]]" in l]
+        self.assertTrue(rows, lint.stdout)
+        self.assertIn("RETRACTED", rows[0])
+        self.assertNotIn("repoint", rows[0])
+
+    def test_reading_an_archived_retracted_path_says_retracted(self):
+        path = self.repo / "knowledge" / "archive" / "reference" / "no-id.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\nstatus: retracted\nretracted: 2026-10-18\n---\n\n"
+                        "> RETRACTED 2026-10-18 — saved by mistake\n", encoding="utf-8")
+        out = run_brain("read", "knowledge/archive/reference/no-id.md", repo=self.repo)
+        self.assertIn("RETRACTED", out.stdout.splitlines()[0])
+
+    def test_retract_takes_the_documented_place_in_the_toolbelt(self):
+        out = run_brain("--help", repo=self.repo)
+        for usage in ("brain retract <id-or-path>", "brain handoff <inbox-path> <project>",
+                      "brain handoff --close <handoff-path>", "brain drain <inbox-path>"):
+            self.assertIn(usage, out.stdout)
+
+
+class RetractedLintTests(unittest.TestCase):
+    """What lint holds a retracted note to: archived, dated, and with no successor."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+
+    def write(self, rel, extra):
+        path = self.repo / "knowledge" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\nid: {path.stem}\nkind: reference\ntitle: {path.stem}\ntopics: [brain]\n"
+            f"aliases: [{path.stem}]\ncreated: 2026-07-01\n{extra}---\n\n"
+            "> RETRACTED 2026-10-18 — saved by mistake\n\nThe old text.\n", encoding="utf-8")
+
+    def lint(self):
+        return run_brain("lint", repo=self.repo)
+
+    def test_a_retracted_note_is_clean_in_the_archive(self):
+        self.write("archive/reference/gone-note.md", "status: retracted\nretracted: 2026-10-18\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 0, out.stdout)
+
+    def test_retracted_status_in_a_canonical_folder_is_an_error(self):
+        self.write("reference/gone-note.md", "status: retracted\nretracted: 2026-10-18\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("brain retract", out.stdout)
+
+    def test_a_retracted_note_needs_a_real_retracted_date(self):
+        for extra in ("status: retracted\n", "status: retracted\nretracted: 2026-13-40\n"):
+            with self.subTest(extra=extra):
+                self.write("archive/reference/gone-note.md", extra)
+                out = self.lint()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn("retracted", out.stdout)
+
+    def test_a_retracted_note_has_no_successor(self):
+        self.write("reference/other-note.md", "status: current\n")
+        self.write("archive/reference/gone-note.md",
+                   "status: retracted\nretracted: 2026-10-18\nsuperseded_by: other-note\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("no successor", out.stdout)
+
+    def test_a_current_note_may_not_claim_a_retraction_date(self):
+        self.write("reference/live-note.md", "status: current\nretracted: 2026-10-18\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("retracted", out.stdout)
+
+
+class PendingCorrectionTests(unittest.TestCase):
+    """Until a pass applies it, a correction waits in the inbox while the note it names is
+    still served. Search, read and recent mark that note `[correction pending — <path>]`,
+    computed from the inbox at query time, so it is never served as if settled."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.ref = self.repo / "knowledge" / "reference"
+        self.ref.mkdir(parents=True, exist_ok=True)
+        self.inbox = self.repo / "knowledge" / "inbox"
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        (self.ref / "vendor-limits.md").write_text(
+            "---\nid: vendor-limits\nkind: reference\ntitle: Vendor limits\ntopics: [brain]\n"
+            "aliases: [rate limit]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+            "The vendor rate limit is 500 requests per minute.\n", encoding="utf-8")
+
+    def capture(self, name, body, **fm):
+        head = {"created": "2026-10-18", "source": "local", "kind": "correction",
+                "basis": "owner-said", "status": "draft", **fm}
+        (self.inbox / name).write_text(
+            "---\n" + "".join(f"{k}: {v}\n" for k, v in head.items()) + f"---\n\n{body}\n",
+            encoding="utf-8")
+        return f"knowledge/inbox/{name}"
+
+    def search(self, *extra):
+        out = run_brain("search", "vendor rate limit", *extra, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout
+
+    def line_for(self, text, needle):
+        rows = [l for l in text.splitlines() if needle in l and "—" in l]
+        self.assertTrue(rows, f"{needle} not listed:\n{text}")
+        return rows[0]
+
+    def test_search_and_read_mark_a_canonical_note_a_correction_names(self):
+        path = self.capture("2026-10-18-0600-fix.md",
+                            "Correction to vendor-limits: the limit is 800 requests per minute "
+                            "since 2026-10-01. Wrong line: \"500 requests per minute\".")
+        row = self.line_for(self.search(), "knowledge/reference/vendor-limits.md")
+        self.assertIn(f"[correction pending — {path}]", row)
+        read = run_brain("read", "vendor-limits", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", read.stdout)
+
+    def test_an_inbox_note_named_by_a_retraction_is_marked(self):
+        (self.inbox / "2026-10-17-0900-limit.md").write_text(
+            inbox_note(source="local", kind="fact").replace(
+                "A note.", "The vendor rate limit is 500 requests per minute."),
+            encoding="utf-8")
+        path = self.capture("2026-10-18-0600-retract.md",
+                            "Retract knowledge/inbox/2026-10-17-0900-limit.md: it should not be "
+                            "in the brain — it was a client's figure.")
+        row = self.line_for(self.search("--scope", "all"),
+                            "knowledge/inbox/2026-10-17-0900-limit.md")
+        self.assertIn(f"[correction pending — {path}]", row)
+        read = run_brain("read", "knowledge/inbox/2026-10-17-0900-limit.md", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", read.stdout)
+        recent = run_brain("recent", "--days", "2", repo=self.repo)
+        rows = [l for l in recent.stdout.splitlines() if "2026-10-17-0900-limit.md" in l]
+        self.assertTrue(rows, recent.stdout)
+        self.assertIn(f"[correction pending — {path}]", rows[0])
+
+    def test_a_correction_beyond_the_drain_cap_still_marks(self):
+        for n in range(25):
+            (self.inbox / f"2026-10-01-{n:04d}-other.md").write_text(
+                inbox_note(source="local", kind="fact"), encoding="utf-8")
+        path = self.capture("2026-10-18-2359-late-fix.md",
+                            "Correction to [[vendor-limits]]: 800 per minute, not 500.")
+        self.assertIn(f"[correction pending — {path}]",
+                      self.line_for(self.search(), "vendor-limits.md"))
+
+    def test_a_correction_from_an_untrusted_source_marks_nothing(self):
+        self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: it is 9000.",
+                     source="support-bot")
+        self.assertNotIn("correction pending", self.search())
+
+    def test_a_note_no_correction_names_is_not_marked(self):
+        self.capture("2026-10-18-0600-fix.md", "Correction to some-other-note: wrong date.")
+        self.assertNotIn("correction pending", self.search())
+
+    def test_search_json_carries_the_pending_corrections(self):
+        path = self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: 800.")
+        out = run_brain("search", "vendor rate limit", "--json", repo=self.repo)
+        hits = json_payload(out.stdout)["hits"]
+        hit = [h for h in hits if h["id"] == "vendor-limits"][0]
+        self.assertEqual(hit["corrections_pending"], [path])
+
+    def test_the_named_targets_are_read_from_the_lead_first(self):
+        module = load_brain_module()
+        known = {"vendor-limits", "pricing-2026", "alpha-note", "beta-note"}
+
+        def targets(body):
+            return module.correction_targets(body, is_known=known.__contains__)
+        self.assertEqual(targets("Correction to `vendor-limits`: 800."), ["vendor-limits"])
+        self.assertEqual(targets("Retract [[vendor-limits]] — saved by mistake."),
+                         ["vendor-limits"])
+        self.assertEqual(targets("Retract knowledge/inbox/2026-10-17-x.md: wrong."),
+                         ["knowledge/inbox/2026-10-17-x.md"])
+        self.assertEqual(targets("retract inbox/2026-10-17-x.md."),
+                         ["knowledge/inbox/2026-10-17-x.md"])
+        self.assertEqual(targets("Correction to decisions/2026-10-01-a.md: no."),
+                         ["knowledge/decisions/2026-10-01-a.md"])
+        # The lead names the target; a link to where the truth lives is not one.
+        self.assertEqual(targets("Correction to vendor-limits: see [[pricing-2026]]."),
+                         ["vendor-limits"])
+        # Without the lead, the links and paths the text names are the targets.
+        self.assertEqual(targets("The note [[vendor-limits]] is wrong: 800."),
+                         ["vendor-limits"])
+
+    def test_only_the_lead_at_the_start_names_a_target(self):
+        """Review B5: a lead quoted inside the text is not a second correction, and a word
+        after a lead that is no note id ("the") names nothing."""
+        module = load_brain_module()
+        known = {"vendor-limits", "alpha-note", "beta-note"}
+
+        def targets(body):
+            return module.correction_targets(body, is_known=known.__contains__)
+        self.assertEqual(targets('Correction to alpha-note: remove the example '
+                                 '"Retract beta-note: wrong".'), ["alpha-note"])
+        # "the" is no note id, so the lead names nothing and the link is the target.
+        self.assertEqual(targets("Retract the note [[vendor-limits]]: saved by mistake."),
+                         ["vendor-limits"])
+        # No lead: prose that happens to say "retract their" or "correction to our" is
+        # never read as one; only links and paths count.
+        self.assertEqual(targets("The [[vendor-limits]] note should retract their 500 and "
+                                 "the correction to our figure is 800."), ["vendor-limits"])
+        # A bare word is a target only when it is a known note id.
+        self.assertEqual(targets("Correction to no-such-note: 800."), [])
+        self.assertEqual(targets("  Correction to vendor-limits: 800."), ["vendor-limits"])
+
+    def test_a_correction_to_an_earlier_chain_members_path_still_marks_the_read(self):
+        """Review should-fix: read resolves a supersede chain; a correction naming any
+        member of it, by id or by its path, marks the note read back."""
+        seed = self.ref / "seed-note.md"
+        seed.write_text("---\nid: seed-note\nkind: reference\ntitle: Seed\ntopics: [brain]\n"
+                        "aliases: [seed]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+                        "The original claim.\n", encoding="utf-8")
+        run_brain("supersede", "seed-note", "Seed note v2", repo=self.repo)
+        succ = self.ref / "seed-note-v2.md"
+        succ.write_text(succ.read_text(encoding="utf-8").replace(
+            "## What\n", "## What\n\nThe revised claim.\n"), encoding="utf-8")
+        path = self.capture("2026-10-18-0600-fix.md",
+                            "Correction to knowledge/reference/seed-note.md: it is 800.")
+        out = run_brain("read", "seed-note", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", out.stdout)
+
+def handoff_note(project, name, at, reason="pending work that belongs in the project's records",
+                 body="The staging smoke test still needs a re-run.", folder=None, **fm):
+    """(rel, text) for a handoff note: the original capture's frontmatter plus the three
+    keys consolidation adds. A key passed as None is left out."""
+    head = {"created": "2026-10-15", "source": "local", "kind": "fact", "basis": "owner-said",
+            "status": "draft", "handoff_to": project, "handoff_at": at,
+            "handoff_reason": reason, **fm}
+    text = ("---\n" + "".join(f"{k}: {v}\n" for k, v in head.items() if v is not None)
+            + f"---\n\n{body}\n")
+    return (f"knowledge/handoff/{folder or project}/{name}", text)
+
+
+class HandoffLintTests(unittest.TestCase):
+    """knowledge/handoff/<project>/ holds captures that belong in a project's own records,
+    waiting to be filed there. Relaxed like the inbox, never canonical — but the three keys
+    are the interface the filing job reads, so lint holds them exactly."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+
+    def put(self, rel_text):
+        rel, text = rel_text
+        path = self.repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def lint(self):
+        return run_brain("lint", repo=self.repo)
+
+    def test_a_handoff_note_with_its_three_keys_is_clean(self):
+        self.put(handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18"))
+        out = self.lint()
+        self.assertEqual(out.returncode, 0, out.stdout)
+
+    def test_each_key_is_required_and_agrees_with_its_folder(self):
+        cases = {"no handoff_to": {"project": None, "folder": "acme"},
+                 "another project": {"project": "beta", "folder": "acme"},
+                 "no handoff_at": {"at": None},
+                 "not a date": {"at": "2026-13-01"},
+                 "no reason": {"reason": None}}
+        for label, change in cases.items():
+            with self.subTest(label):
+                args = {"project": "acme", "at": "2026-10-18", **change}
+                path = self.put(handoff_note(args.pop("project"), "2026-10-15-120000-smoke.md",
+                                             args.pop("at"), **args))
+                out = self.lint()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn("handoff", out.stdout)
+                path.unlink()
+
+    def test_a_handoff_note_lives_in_a_project_slug_folder(self):
+        for rel in ("knowledge/handoff/x.md", "knowledge/handoff/Acme_Co/x.md",
+                    "knowledge/handoff/acme/deeper/x.md",
+                    "knowledge/handoff/" + "a" * 64 + "/x.md"):
+            with self.subTest(rel):
+                project = rel.split("/")[2] if rel.count("/") >= 3 else "acme"
+                path = self.put((rel, handoff_note(project, "x.md", "2026-10-18")[1]))
+                out = self.lint()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn("handoff", out.stdout)
+                path.unlink()
+
+    def test_an_unknown_project_is_only_a_warning(self):
+        self.put(handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18"))
+        out = self.lint()
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("knowledge/projects/acme", out.stdout)
+
+    def test_private_material_is_refused_here_as_everywhere(self):
+        self.put(handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18",
+                              sensitivity="private"))
+        self.assertEqual(self.lint().returncode, 1)
+
+
+class HandoffReadTests(unittest.TestCase):
+    """Handoff notes are not brain knowledge: default and `all` search never return them.
+    `--scope handoff` lists them for the filing job, a query may be empty or a project slug,
+    and read and recent say plainly what they are."""
+
+    A = "knowledge/handoff/acme/2026-10-15-120000-smoke.md"
+    B = "knowledge/handoff/beta/2026-10-16-090000-rotate.md"
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        for rel, text in (handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18"),
+                          handoff_note("beta", "2026-10-16-090000-rotate.md", "2026-10-18",
+                                       body="The staging smoke test waits on a rotated "
+                                            "credential.")):
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / rel).write_text(text, encoding="utf-8")
+        ref = self.repo / "knowledge" / "reference"
+        ref.mkdir(parents=True, exist_ok=True)
+        (ref / "smoke-tests.md").write_text(
+            "---\nid: smoke-tests\nkind: reference\ntitle: Smoke tests\ntopics: [brain]\n"
+            "aliases: [smoke]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+            "Every staging smoke test runs from the deploy job.\n", encoding="utf-8")
+
+    def search(self, *args):
+        out = run_brain("search", *args, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout
+
+    def test_default_and_all_search_never_return_handoff_notes(self):
+        for extra in ((), ("--scope", "all")):
+            text = self.search("staging smoke test", *extra)
+            self.assertIn("smoke-tests", text, "precondition: the canonical note ranks")
+            self.assertNotIn("knowledge/handoff/", text, extra)
+
+    def test_scope_handoff_lists_every_note_for_an_empty_query(self):
+        text = self.search("--scope", "handoff")
+        for path, project in ((self.A, "acme"), (self.B, "beta")):
+            rows = [l for l in text.splitlines() if path in l]
+            self.assertTrue(rows, text)
+            self.assertIn(f"[handoff — belongs in {project}]", rows[0])
+        self.assertNotIn("smoke-tests", text, "scope handoff returned brain knowledge")
+
+    def test_a_project_slug_in_the_query_filters_by_handoff_to(self):
+        text = self.search("--scope", "handoff", "acme")
+        self.assertIn(self.A, text)
+        self.assertNotIn(self.B, text)
+
+    def test_other_words_filter_by_the_notes_text(self):
+        text = self.search("--scope", "handoff", "rotated credential")
+        self.assertIn(self.B, text)
+        self.assertNotIn(self.A, text)
+
+    def hits(self, *args):
+        out = run_brain("search", "--scope", "handoff", "--json", *args, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json_payload(out.stdout)
+
+    def test_a_single_slug_filters_exactly_by_handoff_to(self):
+        """Review B6: a filing job asking for its own project's notes must never be handed
+        another project's, even when its own has none."""
+        self.assertEqual([h["path"] for h in self.hits("beta")["hits"]], [self.B])
+        for query in ("team-a", "acme-api", "credential"):
+            with self.subTest(query):
+                self.assertEqual(self.hits(query)["hits"], [])
+
+    def test_a_known_project_with_no_notes_selects_nothing(self):
+        overview = self.repo / "knowledge" / "projects" / "gamma" / "overview.md"
+        overview.parent.mkdir(parents=True, exist_ok=True)
+        overview.write_text("---\nid: gamma\nkind: project\ntitle: Gamma\ntopics: [brain]\n"
+                            "aliases: [gamma]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+                            "A project.\n", encoding="utf-8")
+        self.assertEqual(self.hits("gamma staging smoke")["hits"], [])
+
+    def test_a_query_that_selects_nothing_returns_nothing(self):
+        """No splitting a hyphenated word into one-letter substrings, and no "any word"
+        fallback that lets a stray letter match every note."""
+        for query in ("?", "smoke x-ray", "a"):
+            with self.subTest(query):
+                self.assertEqual(self.hits(query)["hits"], [])
+
+    def test_handoff_results_page_in_a_stable_order(self):
+        for rel, text in (handoff_note("acme", "2026-10-11-000000-c.md", "2026-10-12"),
+                          handoff_note("acme", "2026-10-12-000000-b.md", "2026-10-11"),
+                          handoff_note("acme", "2026-10-13-000000-a.md", "2026-10-11")):
+            (self.repo / rel).write_text(text, encoding="utf-8")
+        first = self.hits("acme", "--limit", "2")
+        order = [h["path"].rsplit("/", 1)[-1] for h in first["hits"]]
+        self.assertEqual(order, ["2026-10-12-000000-b.md", "2026-10-13-000000-a.md"])
+        self.assertEqual((first["total"], first["offset"], first["more"]), (4, 0, 2))
+        second = self.hits("acme", "--limit", "2", "--offset", "2")
+        order = [h["path"].rsplit("/", 1)[-1] for h in second["hits"]]
+        self.assertEqual(order, ["2026-10-11-000000-c.md", "2026-10-15-120000-smoke.md"])
+        self.assertEqual((second["offset"], second["more"]), (2, 0))
+        bad = run_brain("search", "--scope", "handoff", "--offset", "-1", repo=self.repo)
+        self.assertEqual(bad.returncode, 2, bad.stdout)
+
+    def test_symlinked_directories_and_files_are_never_read(self):
+        """Review should-fix: containment is checked at query time, not left to lint."""
+        root = self.repo / "knowledge" / "handoff"
+        os.symlink("../reference", root / "evil")
+        os.symlink("../../reference/smoke-tests.md", root / "acme" / "linked.md")
+        text = self.search("--scope", "handoff")
+        self.assertNotIn("evil", text)
+        self.assertNotIn("linked.md", text)
+        self.assertNotIn("smoke-tests", text)
+
+    def test_scope_handoff_json_carries_the_interface_keys(self):
+        out = run_brain("search", "--scope", "handoff", "--json", repo=self.repo)
+        hits = {h["path"]: h for h in json_payload(out.stdout)["hits"]}
+        self.assertEqual(set(hits), {self.A, self.B})
+        hit = hits[self.A]
+        self.assertEqual((hit["handoff_to"], hit["handoff_at"], hit["folder"]),
+                         ("acme", "2026-10-18", "handoff"))
+        self.assertTrue(hit["handoff_reason"])
+
+    def test_read_shows_a_handoff_banner(self):
+        out = run_brain("read", self.A, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("HANDOFF", out.stdout)
+        self.assertIn("belongs in acme", out.stdout)
+        self.assertIn("not brain knowledge", out.stdout)
+        self.assertIn("pending work that belongs in the project's records", out.stdout)
+
+    def test_recent_tags_handoff_rows(self):
+        out = run_brain("recent", "--days", "2", repo=self.repo)
+        rows = [l for l in out.stdout.splitlines() if self.A in l]
+        self.assertTrue(rows, out.stdout)
+        self.assertIn("[handoff — belongs in acme]", rows[0])
+
+    def test_a_closing_correction_marks_the_handoff_note(self):
+        inbox = self.repo / "knowledge" / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "2026-10-18-0700-filed.md").write_text(
+            "---\ncreated: 2026-10-18\nsource: local\nkind: correction\nbasis: agent-found\n"
+            f"status: draft\n---\n\nFiled {self.A} to github.com/example/acme docs/backlog.md "
+            "B7 (PR #12).\n", encoding="utf-8")
+        rows = [l for l in self.search("--scope", "handoff").splitlines() if self.A in l]
+        self.assertIn("[correction pending — knowledge/inbox/2026-10-18-0700-filed.md]", rows[0])
+
+    def test_the_closing_leads_name_the_handoff_path(self):
+        targets = load_brain_module().correction_targets
+        self.assertEqual(targets(f"Filed {self.A} to github.com/example/acme issue #3."),
+                         [self.A])
+        self.assertEqual(targets(f"Already recorded: {self.A} — github.com/example/acme "
+                                 "docs/backlog.md B2 (commit 1a2b3c4)."), [self.A])
+        self.assertEqual(targets(f"Filed: {self.A} to github.com/example/acme issue #3."),
+                         [self.A])
+
+
+class HandoffCommandTests(unittest.TestCase):
+    """Review B1: the proposer may run only allowlisted commands, and it had none that
+    moves or deletes a file. `brain handoff`, `brain handoff --close` and `brain drain` are
+    the only ways a pass moves or removes a note, each bounded to its folder."""
+
+    NAME = "2026-10-15-120000-smoke.md"
+    CAPTURE = ("---\ncreated: 2026-10-15\ncaptured_at: 2026-10-15T12:00:00Z\nsource: local\n"
+               "kind: fact\nbasis: owner-said\nproject: acme\nstatus: draft\n---\n\n"
+               "Acme's staging smoke test still needs a re-run.\n")
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.inbox = self.repo / "knowledge" / "inbox"
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        self.src = self.inbox / self.NAME
+        self.src.write_bytes(self.CAPTURE.encode("utf-8"))
+        self.dest = self.repo / "knowledge" / "handoff" / "acme" / self.NAME
+        self.today = date.today().isoformat()
+
+    def brain(self, *args):
+        return run_brain(*args, repo=self.repo)
+
+    def test_handoff_moves_a_capture_byte_for_byte_and_adds_only_the_three_keys(self):
+        out = self.brain("handoff", f"knowledge/inbox/{self.NAME}", "acme", "pending work for acme")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(self.src.exists(), "the inbox file stayed")
+        expected = self.CAPTURE.replace(
+            "status: draft\n---\n",
+            f"status: draft\nhandoff_to: acme\nhandoff_at: {self.today}\n"
+            "handoff_reason: pending work for acme\n---\n")
+        self.assertEqual(self.dest.read_bytes(), expected.encode("utf-8"))
+        lint = self.brain("lint")
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+
+    def test_handoff_refuses_what_is_not_a_local_inbox_capture(self):
+        ref = self.repo / "knowledge" / "reference" / "a-note.md"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text("---\nid: a-note\nkind: reference\ntitle: A\ntopics: [brain]\n"
+                       "aliases: [a]\ncreated: 2026-07-01\nstatus: current\n---\n\nA.\n",
+                       encoding="utf-8")
+        (self.inbox / "sub").mkdir()
+        (self.inbox / "sub" / "x.md").write_text(self.CAPTURE, encoding="utf-8")
+        os.symlink(self.NAME, self.inbox / "linked.md")
+        for name, source in (("bot.md", "support-bot"), ("mined.md", "session-mining"),
+                             ("unstamped.md", None)):
+            text = self.CAPTURE if source is None else self.CAPTURE.replace(
+                "source: local", f"source: {source}")
+            if source is None:
+                text = text.replace("source: local\n", "")
+            (self.inbox / name).write_text(text, encoding="utf-8")
+        (self.inbox / "again.md").write_text(self.CAPTURE.replace(
+            "status: draft", "status: draft\nhandoff_to: acme"), encoding="utf-8")
+        cases = {
+            "a canonical note": ("knowledge/reference/a-note.md", "acme", "r"),
+            "outside the inbox": ("knowledge/inbox/../reference/a-note.md", "acme", "r"),
+            "a nested path": ("knowledge/inbox/sub/x.md", "acme", "r"),
+            "a missing file": ("knowledge/inbox/nope.md", "acme", "r"),
+            "a symlink": ("knowledge/inbox/linked.md", "acme", "r"),
+            "a drop box's capture": ("knowledge/inbox/bot.md", "acme", "r"),
+            "a session-mining proposal": ("knowledge/inbox/mined.md", "acme", "r"),
+            "no source": ("knowledge/inbox/unstamped.md", "acme", "r"),
+            "already handed off once": ("knowledge/inbox/again.md", "acme", "r"),
+            "an upper-case slug": (f"knowledge/inbox/{self.NAME}", "Acme", "r"),
+            "a long slug": (f"knowledge/inbox/{self.NAME}", "a" * 64, "r"),
+            "a path as slug": (f"knowledge/inbox/{self.NAME}", "../acme", "r"),
+            "no reason": (f"knowledge/inbox/{self.NAME}", "acme", " "),
+            "two-line reason": (f"knowledge/inbox/{self.NAME}", "acme", "one\ntwo"),
+        }
+        for label, args in cases.items():
+            with self.subTest(label):
+                out = self.brain("handoff", *args)
+                self.assertNotEqual(out.returncode, 0, out.stdout)
+                self.assertTrue(self.src.exists())
+                self.assertFalse((self.repo / "knowledge" / "handoff").exists()
+                                 and any((self.repo / "knowledge" / "handoff").rglob("*.md")),
+                                 out.stdout)
+        self.dest.parent.mkdir(parents=True)
+        self.dest.write_text("older\n", encoding="utf-8")
+        out = self.brain("handoff", f"knowledge/inbox/{self.NAME}", "acme", "r")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.dest.read_text(encoding="utf-8"), "older\n")
+        self.assertTrue(self.src.exists())
+
+    def test_handoff_close_removes_one_handoff_note_and_nothing_else(self):
+        self.brain("handoff", f"knowledge/inbox/{self.NAME}", "acme", "pending work for acme")
+        other = self.inbox / "2026-10-16-000000-other.md"
+        other.write_text(self.CAPTURE, encoding="utf-8")
+        for arg in (f"knowledge/inbox/{other.name}", "knowledge/reference",
+                    "knowledge/handoff/acme/nope.md", "knowledge/handoff/acme"):
+            with self.subTest(arg):
+                out = self.brain("handoff", "--close", arg)
+                self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertTrue(other.exists())
+        out = self.brain("handoff", "--close", f"knowledge/handoff/acme/{self.NAME}")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(self.dest.exists())
+
+    def test_drain_removes_inbox_notes_and_refuses_anything_else_whole(self):
+        second = self.inbox / "2026-10-16-000000-second.md"
+        second.write_text(self.CAPTURE, encoding="utf-8")
+        ref = self.repo / "knowledge" / "reference" / "a-note.md"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text("keep\n", encoding="utf-8")
+        out = self.brain("drain", f"knowledge/inbox/{self.NAME}", "knowledge/reference/a-note.md")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertTrue(self.src.exists(), "a refused batch drained part of itself")
+        self.assertTrue(ref.exists())
+        out = self.brain("drain", f"knowledge/inbox/{self.NAME}", f"inbox/{second.name}")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(self.src.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(self.brain("drain").returncode, 2)
+
+
+class HandoffMcpTests(unittest.TestCase):
+    """Both front ends offer `scope: handoff`, pass it through, and tell a client how a
+    handoff note is closed."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcp, mcpcore
+        self.mcp, self.mcpcore = mcp, mcpcore
+        self.remote = {t["name"]: t for t in mcpcore.tool_table("remote")}
+
+    def test_both_front_ends_offer_scope_handoff(self):
+        for tool in (self.mcp.TOOLS_BY_NAME["brain_search"], self.remote["brain_search"]):
+            scope = tool["inputSchema"]["properties"]["scope"]
+            self.assertEqual(scope["enum"], ["canonical", "all", "handoff"])
+            self.assertIn("handoff", scope["description"])
+            self.assertIn("not brain knowledge", scope["description"])
+
+    def test_both_front_ends_pass_scope_handoff_to_the_cli(self):
+        self.assertEqual(self.mcpcore.cli_for("brain_search", {"query": "", "scope": "handoff"}),
+                         ["search", "--limit", "8", "--scope", "handoff", "--", ""])
+        answer = self.mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "brain_search",
+                                             "arguments": {"query": "", "scope": "handoff"}}})
+        result = answer["result"]
+        self.assertFalse(result.get("isError"), result)
+        self.assertIn("handoff", result["content"][0]["text"])
+
+    def test_both_front_ends_page_handoff_results_with_an_offset(self):
+        for tool in (self.mcp.TOOLS_BY_NAME["brain_search"], self.remote["brain_search"]):
+            offset = tool["inputSchema"]["properties"]["offset"]
+            self.assertEqual((offset["type"], offset["minimum"]), ("integer", 0))
+        self.assertEqual(
+            self.mcpcore.cli_for("brain_search", {"query": "acme", "scope": "handoff",
+                                                  "offset": 2}),
+            ["search", "--limit", "8", "--scope", "handoff", "--offset", "2", "--", "acme"])
+        answer = self.mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "brain_search",
+                                             "arguments": {"query": "", "scope": "handoff",
+                                                           "offset": 3}}})
+        self.assertFalse(answer["result"].get("isError"), answer)
+
+    def test_both_capture_descriptions_say_how_a_handoff_is_closed(self):
+        for tool in (self.mcp.TOOLS_BY_NAME["brain_capture"], self.remote["brain_capture"]):
+            self.assertIn("Filed <path>", tool["description"])
+            self.assertIn("Already recorded: <path>", tool["description"])
+            self.assertLessEqual(len(tool["description"]), 1600)
+
+
+class HandoffHealthTests(unittest.TestCase):
+    """doctor and stats count handoff notes per project. One older than 14 days with no
+    closing correction turns doctor RED: the filing job is not running."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.today = date_today()
+
+    def ago(self, days):
+        return (self.today - timedelta(days=days)).isoformat()
+
+    def handoff_lines(self):
+        out = run_brain("doctor", repo=self.repo)
+        return [l for l in out.stdout.splitlines() if "handoff" in l]
+
+    def test_doctor_counts_handoff_notes_per_project(self):
+        commit_at(self.repo, "handoffs", iso_ago(0),
+                  handoff_note("acme", "a1.md", self.ago(0)),
+                  handoff_note("acme", "a2.md", self.ago(1)),
+                  handoff_note("beta", "b1.md", self.ago(2)))
+        lines = self.handoff_lines()
+        self.assertTrue([l for l in lines if "[ok ]" in l and "3 note(s)" in l
+                         and "acme 2" in l and "beta 1" in l], lines)
+
+    def test_an_old_handoff_with_no_closing_correction_turns_doctor_red(self):
+        commit_at(self.repo, "handoff", iso_ago(0), handoff_note("acme", "a1.md", self.ago(15)))
+        lines = self.handoff_lines()
+        self.assertTrue([l for l in lines if "[RED]" in l
+                         and "the filing job is not running" in l], lines)
+
+    def test_a_closing_correction_keeps_an_old_handoff_green(self):
+        rel, text = handoff_note("acme", "a1.md", self.ago(15))
+        commit_at(self.repo, "handoff", iso_ago(0), (rel, text),
+                  ("knowledge/inbox/2026-10-18-0700-filed.md",
+                   "---\ncreated: 2026-10-18\nsource: local\nkind: correction\n"
+                   f"status: draft\n---\n\nAlready recorded: {rel} — github.com/example/acme "
+                   "docs/backlog.md B2.\n"))
+        lines = self.handoff_lines()
+        self.assertFalse([l for l in lines if "[RED]" in l], lines)
+
+    def test_a_closing_lead_may_carry_a_colon_after_filed(self):
+        rel, text = handoff_note("acme", "a1.md", self.ago(15))
+        commit_at(self.repo, "handoff", iso_ago(0), (rel, text),
+                  ("knowledge/inbox/2026-10-18-0700-filed.md",
+                   "---\ncreated: 2026-10-18\nsource: local\nkind: correction\n"
+                   f"status: draft\n---\n\nFiled: {rel} to github.com/example/acme issue #3.\n"))
+        self.assertFalse([l for l in self.handoff_lines() if "[RED]" in l])
+
+    def test_the_index_stays_fresh_beside_handoff_notes(self):
+        """Review should-fix: the freshness check counted handoff notes as indexable while
+        the index left them out, so every search rebuilt the index for nothing."""
+        commit_at(self.repo, "handoff", iso_ago(0), handoff_note("acme", "a1.md", self.ago(0)))
+        built = run_brain("index", repo=self.repo)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        doctor = run_brain("doctor", repo=self.repo).stdout
+        self.assertIn("[ok ] search index fresh", doctor, doctor)
+
+    def test_stats_counts_handoff_apart_from_the_corpus(self):
+        commit_at(self.repo, "handoffs", iso_ago(0),
+                  handoff_note("acme", "a1.md", self.ago(0)),
+                  handoff_note("acme", "a2.md", self.ago(20)),
+                  handoff_note("beta", "b1.md", self.ago(0)))
+        snap = json_payload(run_brain("stats", "--json", repo=self.repo).stdout)
+        self.assertEqual(snap["handoff"], {"waiting": 3, "projects": {"acme": 2, "beta": 1},
+                                           "stale": 1})
+        self.assertNotIn("handoff", snap["corpus"])
+
+    def test_a_move_to_handoff_is_not_a_second_capture(self):
+        name = "2026-10-17-080000-smoke.md"
+        commit_at(self.repo, "capture", iso_ago(1),
+                  (f"knowledge/inbox/{name}", inbox_note(source="local")))
+        commit_at(self.repo, "consolidate: handoff", iso_ago(0),
+                  (f"knowledge/inbox/{name}", None),
+                  handoff_note("acme", name, self.ago(0)))
+        out = run_brain("stats", "--captures", "--since", iso_ago(3), "--json", repo=self.repo)
+        self.assertEqual(json_payload(out.stdout)["total"], 1, out.stdout)
+
+
 class LintIntegrityTests(unittest.TestCase):
     """Knowledge-integrity checks that keep superseded/contradictory content
     from being served as one current fact."""
@@ -2597,6 +3725,53 @@ class RepoLockCoverageTests(unittest.TestCase):
             "aliases: [lock seed]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"
             "---\n\nThe original claim.\n", encoding="utf-8")
         self.assert_blocks_on_repo_lock("supersede", "lock-seed", "Lock seed revised")
+
+    def test_retract_changes_nothing_before_it_holds_the_lock(self):
+        """Review should-fix: the note was marked retracted in its canonical folder before
+        the lock was taken, so a capture's commit could sweep the half-done state in."""
+        try:
+            import fcntl
+        except ImportError:
+            self.skipTest("no fcntl on this platform")
+        note = self.repo / "knowledge/reference/lock-seed.md"
+        note.write_text(
+            "---\nid: lock-seed\nkind: reference\ntitle: Lock seed\ntopics: [brain]\n"
+            "aliases: [lock seed]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"
+            "---\n\nThe original claim.\n", encoding="utf-8")
+        before = note.read_text(encoding="utf-8")
+        (self.repo / ".cache").mkdir(exist_ok=True)
+        holder = open(self.repo / ".cache" / "git.lock", "w")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        proc = subprocess.Popen([sys.executable, str(self.repo / "bin" / "brain"), "retract",
+                                 "lock-seed", "saved by mistake"], cwd=self.repo,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                proc.communicate(timeout=self.HELD)
+            self.assertEqual(note.read_text(encoding="utf-8"), before,
+                             "retract changed the note while another process held the lock")
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        out, _ = proc.communicate(timeout=120)
+        self.assertTrue((self.repo / "knowledge/archive/reference/lock-seed.md").exists(), out)
+
+    def test_handoff_and_drain_take_the_lock(self):
+        inbox = self.repo / "knowledge" / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "a.md").write_text("---\ncreated: 2026-10-18\nsource: local\n"
+                                    "status: draft\n---\n\nA.\n", encoding="utf-8")
+        (inbox / "b.md").write_text("---\ncreated: 2026-10-18\nsource: local\n"
+                                    "status: draft\n---\n\nB.\n", encoding="utf-8")
+        self.assert_blocks_on_repo_lock("handoff", "knowledge/inbox/a.md", "acme", "reason")
+        self.assert_blocks_on_repo_lock("drain", "knowledge/inbox/b.md")
+
+    def test_retract_takes_the_lock(self):
+        (self.repo / "knowledge/reference/lock-seed.md").write_text(
+            "---\nid: lock-seed\nkind: reference\ntitle: Lock seed\ntopics: [brain]\n"
+            "aliases: [lock seed]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"
+            "---\n\nThe original claim.\n", encoding="utf-8")
+        self.assert_blocks_on_repo_lock("retract", "lock-seed", "saved by mistake")
 
     def consolidate_env(self):
         stub_bin = Path(self.tmp.name) / "stubbin"
@@ -5508,6 +6683,146 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         audit = self.flat("audit-prompt.md")
         self.assertIn("no `## Sources` line for an input at all", audit)
 
+    def test_the_drain_deletes_pending_work_instead_of_promoting_it(self):
+        """A capture of pending work copies a project's record and goes stale once the work
+        is done; promoted, its "still open" is read back as true. Step 1 deletes it and keeps
+        only a decision or lesson inside it, and no canonical note states open status."""
+        text = self.flat("consolidate-prompt.md")
+        drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
+        rule = drain[drain.index("PENDING WORK"):drain.index("Proposals an earlier pass wrote")]
+        for phrase in ("deleted, not promoted", "a project's own records", "already tracked",
+                       "decision or a lesson", "rewritten as one",
+                       "never states the open or pending status of work"):
+            self.assertIn(phrase, rule)
+
+    def test_the_auditor_blocks_a_canonical_note_that_states_open_status(self):
+        text = self.flat("audit-prompt.md")
+        rule = text[text.index("**STATUS.**"):text.index("## What you must NOT do")]
+        for phrase in ("Block", "canonical note", "pending or open status of work",
+                       "a project's own records", "decision or lesson"):
+            self.assertIn(phrase, rule)
+
+    def test_the_drain_applies_corrections_first_across_the_whole_inbox(self):
+        """An original promoted in the same pass as its own correction, because the
+        correction sat beyond the 20-item cap, would be served as settled. Corrections are
+        read from the whole inbox and applied first, by where their target is now."""
+        text = self.flat("consolidate-prompt.md")
+        drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
+        self.assertIn("Apply CORRECTIONS (below) first, across the WHOLE inbox", drain)
+        rule = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
+        for phrase in ("the WHOLE inbox", "not only the oldest 20", "beyond the cap",
+                       "do not count toward the 20",
+                       # the target is still in the inbox
+                       "still in the inbox", "a retraction deletes both notes",
+                       "only the corrected content",
+                       # the target is canonical
+                       "the supersede protocol", "`bin/brain retract <id> \"<reason>\"`",
+                       # the target moved
+                       "consolidate commit bodies", "the quoted line",
+                       "leave the correction in the inbox and say so in the commit message",
+                       # trust: a retraction needs the owner's own words
+                       "a retraction only with `source: local` and `basis: owner-said`"):
+            self.assertIn(phrase, rule)
+        caps = text[text.index("Hard caps"):text.index("Finish:")]
+        self.assertIn("corrections not counted", caps)
+        finish = text[text.index("Finish:"):]
+        self.assertIn("what it became", finish)
+
+    def test_the_auditor_checks_retractions_and_corrections_first(self):
+        text = self.flat("audit-prompt.md")
+        for phrase in ("`status: retracted`", "`source: local` and `basis: owner-said`",
+                       "names it", "a `kind: correction` still in the inbox names",
+                       "whole inbox"):
+            self.assertIn(phrase, text)
+
+    def test_the_protocol_fixes_a_note_instead_of_refusing_to(self):
+        """AGENTS.md carries the whole correction rule: what an agent captures when asked
+        to change or delete a note, what search shows meanwhile, and how a pass retracts."""
+        text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+        policy = text[text.index("## What earns a note"):text.index("## Work that lives elsewhere")]
+        for phrase in ("never answer that you cannot", "`--scope all`", "`brain recent`",
+                       "`Correction to <id or path>: <what is true now>`",
+                       "`Retract <id or path>: it should not be in the brain — <the reason>`",
+                       "quotes the wrong line", "`basis: owner-said`",
+                       "Never repeat a credential or a person's private details",
+                       "until a consolidation pass applies it",
+                       "never promise a correction you could not queue",
+                       "`[correction pending — <inbox path>]`", "until a purge"):
+            self.assertIn(phrase, policy)
+        retract = text[text.index("## Retracting"):text.index("## Searching")]
+        for phrase in ("bin/brain retract <id-or-path>", "`status: retracted`", "`retracted:",
+                       "no successor", "RETRACTED", "`basis: owner-said`", "purge"):
+            self.assertIn(phrase, retract)
+        search = text[text.index("## Searching"):text.index("## Consolidation")]
+        self.assertIn("[correction pending — <inbox path>]", search)
+        passes = text[text.index("## Consolidation"):text.index("### Session digest")]
+        self.assertIn("Corrections first", passes)
+
+    def test_the_drain_hands_off_what_belongs_in_a_projects_records(self):
+        text = self.flat("consolidate-prompt.md")
+        drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
+        rule = drain[drain.index("HANDOFF —"):drain.index("PROVENANCE —")]
+        for phrase in ("not promoted", "already tracked", "drain it",
+                       "knowledge/handoff/<project>/", "the same file name",
+                       "`handoff_to: <project>`", "`handoff_at: <today>`",
+                       "`handoff_reason: <one line>`",
+                       "a decision or lesson inside it", "Unknown project",
+                       "leave it in the inbox and say so in the commit message",
+                       "do not count toward the 20", "never promote"):
+            self.assertIn(phrase, rule)
+        corrections = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
+        for phrase in ("`Filed <handoff path>`", "`Already recorded: <handoff path>`",
+                       "close that handoff note"):
+            self.assertIn(phrase, corrections)
+
+    def test_only_the_owners_own_correction_retracts(self):
+        """Review B4: corroboration lets an untrusted correction supersede or promote, never
+        retract."""
+        text = self.flat("consolidate-prompt.md")
+        rule = text[text.index("CORRECTIONS —"):text.index("PROPOSALS —")]
+        self.assertIn("never supersedes or promotes anything without", rule)
+        self.assertNotIn("retracts or promotes", rule)
+        self.assertIn("never retracts anything", rule)
+
+    def test_the_pass_moves_and_deletes_only_through_the_toolbelt(self):
+        text = self.flat("consolidate-prompt.md")
+        for phrase in ("`bin/brain drain <inbox path>`",
+                       "`bin/brain handoff <inbox path> <project> \"<one line>\"`",
+                       "`bin/brain handoff --close <handoff path>`",
+                       "Nothing else moves or deletes a file"):
+            self.assertIn(phrase, text)
+
+    def test_the_auditor_checks_handoff_moves(self):
+        text = self.flat("audit-prompt.md")
+        rule = text[text.index("**HANDOFF.**"):text.index("## What you must NOT do")]
+        for phrase in ("knowledge/handoff/", "`handoff_to`", "`handoff_at`", "`handoff_reason`",
+                       "valid slug", "promotes", "closing correction"):
+            self.assertIn(phrase, rule)
+
+    def test_the_protocol_documents_the_handoff_area(self):
+        text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+        handoff = text[text.index("## Handoff"):text.index("## Searching")]
+        for phrase in ("knowledge/handoff/<project-slug>/", "not brain knowledge",
+                       "`handoff_to: <project-slug>`", "`handoff_at: YYYY-MM-DD`",
+                       "`handoff_reason: <one line>`", "the original inbox file name",
+                       "`--scope handoff`", "`Filed <handoff path>`",
+                       "`Already recorded: <handoff path>`", "14 days", "doctor",
+                       "[handoff — belongs in <project>]"):
+            self.assertIn(phrase, handoff)
+        self.assertIn("handoff/", text[text.index("## Layout"):text.index("## Note contract")])
+
+    def test_the_protocol_keeps_pending_work_out_and_never_promotes_its_status(self):
+        """AGENTS.md is the bar every pass is told to apply, so the rule lives there too."""
+        text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+        never = text[text.index("Never capture:"):text.index("Ask first, every single time")]
+        for phrase in ("pending work", "still needs", "the project's own records",
+                       "never here", "decision or a lesson", "not as a status"):
+            self.assertIn(phrase, never)
+        bar = text[text.index("Promotion bar"):text.index("Offer, don't nag")]
+        for phrase in ("records pending work", "deleted, not promoted", "rewritten as one",
+                       "never states the open or pending status of work"):
+            self.assertIn(phrase, bar)
+
 
 class OpenPullRequestTests(unittest.TestCase):
     """--open-pr opens the consolidation's PR with gh, or prints the command."""
@@ -5600,7 +6915,7 @@ class ConsolidatorConfigTests(unittest.TestCase):
         runner = self.module.load_consolidator()
         engine = str(self.module.ENGINE)
         tools = ["lint", "lint *", "search *", "read *", "links *", "recent *", "new *",
-                 "supersede *", "index", "index *"]
+                 "supersede *", "retract *", "handoff *", "drain *", "index", "index *"]
         self.assertEqual(runner["propose"],
                          ["claude", "--model", "claude-opus-5-5", *JSON_ARGV,
                           "--permission-mode", "acceptEdits", *ISOLATED_ARGV,
@@ -5765,19 +7080,43 @@ class ConsolidatorConfigTests(unittest.TestCase):
 
     def test_the_shipped_propose_line_reaches_the_engine_and_its_toolbelt(self):
         """Split layout (seen live 2026-10-15): the proposer could not read AGENTS.md or run
-        bin/brain, both in the engine outside the data folder, and changed nothing."""
-        self.module.ENGINE = Path("/opt/brain-engine")
+        bin/brain, both in the engine outside the data folder, and changed nothing.
+        The engine path is one no machine has, so a real engine installed at the usual
+        place cannot stand in for the built-in defaults this reads."""
+        engine = Path(self.tmp.name) / "opt" / "brain-engine"
+        self.module.ENGINE = engine
         self.conf.unlink()  # the built-in defaults: the same line as the shipped conf (synced)
         propose = self.module.load_consolidator()["propose"]
-        self.assertEqual(propose[propose.index("--add-dir") + 1], "/opt/brain-engine")
+        self.assertEqual(propose[propose.index("--add-dir") + 1], str(engine))
         allowed = propose[propose.index("--allowedTools") + 1:propose.index("-p")]
-        for sub in ("lint", "search", "read", "links", "recent", "new", "supersede"):
-            self.assertTrue([a for a in allowed if a.startswith("Bash(/opt/brain-engine/bin/brain %s" % sub)],
+        for sub in ("lint", "search", "read", "links", "recent", "new", "supersede", "retract",
+                    "handoff", "drain"):
+            self.assertTrue([a for a in allowed if a.startswith("Bash(%s/bin/brain %s" % (engine, sub))],
                             sub)
         self.assertFalse([a for a in allowed if "rg" in a.split("(")[1].split()[0]])
         for forbidden in ("capture", "serve", "setup", "init", "schedule", "publish", "consolidate"):
             self.assertFalse([a for a in allowed if ("bin/brain %s" % forbidden) in a], forbidden)
         self.assertEqual(propose[-1], "-p")
+
+    def test_the_repos_own_settings_allow_the_same_toolbelt_as_the_proposer(self):
+        """Review B1: the toolbelt commands a pass may run, kept in step in all three places
+        — the shipped conf, the built-in defaults and the repo's own .claude/settings.json."""
+        def toolbelt(rules):
+            return sorted(r.split("bin/brain ", 1)[1].rstrip(")") for r in rules
+                          if "bin/brain " in r and not r.startswith("Bash(python3"))
+        engine = "{engine}"
+        line = self.module.CONSOLIDATOR_DEFAULTS["propose"]
+        defaults = toolbelt(re.findall(r'"(Bash\([^"]+\))"', line))
+        shipped = toolbelt(re.findall(r'"(Bash\([^"]+\))"',
+                                      (ROOT / "setup" / "consolidator.conf").read_text(
+                                          encoding="utf-8")))
+        settings = toolbelt(json.loads((ROOT / ".claude" / "settings.json").read_text(
+            encoding="utf-8"))["permissions"]["allow"])
+        self.assertEqual(defaults, shipped)
+        self.assertEqual(defaults, settings)
+        for command in ("handoff *", "drain *", "retract *"):
+            self.assertIn(command, defaults)
+        self.assertIn(engine, line)
 
     def test_an_auditor_that_is_not_the_claude_cli_is_refused(self):
         """The confinement flags are facts about the Claude CLI; carried by another
