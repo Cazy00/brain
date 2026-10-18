@@ -24,6 +24,8 @@ Commands:
   brain read <id-or-path>          full note with supersede chain resolved
   brain links <id-or-path> [--json]  wikilink graph: what links here, what it links to
   brain supersede <old-id> "<new title>"   full supersede choreography in one shot
+  brain retract <id> "<one-line reason>"   archive a note that should not exist:
+                                   status retracted, no successor
   brain recent [--days N]          recently touched notes
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
@@ -179,7 +181,7 @@ from brainlib.notes import (  # noqa: F401  (re-exported for tests and publish)
     secret_screen,
 )
 
-STATUSES = {"current", "superseded", "draft"}
+STATUSES = {"current", "superseded", "retracted", "draft"}
 SENSITIVITIES = {"normal", "personal", "private"}
 SENSITIVITY_REQUIRED = {"people", "life"}
 # Which endpoint accepted a capture. Stamped by the endpoint, never claimed by
@@ -430,11 +432,34 @@ def check_links(path, text, fm, ctx: LintCtx, hard: bool = True) -> None:
         if target == predecessor:
             continue
         t_rel, t_fm = ctx.metas[target]
-        if t_rel.parts[0] == "archive":
+        if t_rel.parts[0] == "archive" and t_fm.get("status") == "retracted":
+            ctx.warnings.append((path, f"wikilink [[{target}]] points at a RETRACTED note "
+                                 "— it was withdrawn with no successor; remove the link"))
+        elif t_rel.parts[0] == "archive":
             successor = t_fm.get("superseded_by")
             ctx.warnings.append((path, f"wikilink [[{target}]] points at a SUPERSEDED note"
                                  + (f" — repoint it at [[{successor}]]" if successor else
                                     " with no recorded successor")))
+
+
+def check_retracted(path, fm, text, ctx: LintCtx) -> None:
+    """An archived note withdrawn with no successor: what `brain retract` writes.
+
+    A retraction is not a supersede. Nothing replaced the note — it should never
+    have been written — so it carries the date it was withdrawn and the reason in
+    its banner, and never a successor: one would make `brain read` follow a chain
+    to a note that was never its replacement."""
+    if not fm.get("retracted"):
+        ctx.errors.append((path, "retracted note missing retracted: <YYYY-MM-DD> — the "
+                           "date it was withdrawn (bin/brain retract sets it)"))
+    if fm.get("superseded_by"):
+        ctx.errors.append((path, "a retracted note has no successor — drop superseded_by, "
+                           "or, if a note did replace it, it was superseded (bin/brain "
+                           "supersede), not retracted"))
+    body_lines = [l for l in text.splitlines()[fm.get("_end_line", 0):] if l.strip()]
+    if not body_lines or not body_lines[0].lstrip().startswith("> RETRACTED"):
+        ctx.warnings.append((path, "retracted note body should start with the banner "
+                             "'> RETRACTED <date> — <reason>'"))
 
 
 def check_visibility(path, folder, in_archive, fm, ctx: LintCtx) -> None:
@@ -488,7 +513,8 @@ def check_source(path, fm, ctx: LintCtx) -> None:
 def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     errors, warnings, topics, metas = ctx.errors, ctx.warnings, ctx.topics, ctx.metas
     for f in ("id", "kind", "title", "created", "status", "sensitivity",
-              "visibility", "supersedes", "superseded_by", "valid_from", "review_by"):
+              "visibility", "supersedes", "superseded_by", "valid_from", "review_by",
+              "retracted"):
         if isinstance(fm.get(f), list):
             errors.append((path, f"{f} must be a single value, not a list"))
             fm[f] = None
@@ -510,7 +536,7 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
         if t not in topics:
             errors.append((path, f"topic {t!r} not in knowledge/topics.yaml — known "
                            "topics: " + (", ".join(sorted(topics)) or "(none)")))
-    for field in ("created", "valid_from", "review_by"):
+    for field in ("created", "valid_from", "review_by", "retracted"):
         value = fm.get(field)
         if value and (not DATE_RE.match(str(value)) or not valid_date(value)):
             errors.append((path, f"{field} must be a real YYYY-MM-DD date, got {value!r}"))
@@ -518,9 +544,12 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     if status and status not in STATUSES:
         errors.append((path, f"status must be one of {sorted(STATUSES)}, got {status!r}"))
 
-    if in_archive:
+    if in_archive and status == "retracted":
+        check_retracted(path, fm, text, ctx)
+    elif in_archive:
         if status and status != "superseded":
-            errors.append((path, "notes in archive/ must have status: superseded"))
+            errors.append((path, "notes in archive/ must have status: superseded (or "
+                           "retracted, with no successor)"))
         successor = fm.get("superseded_by")
         if not successor:
             errors.append((path, "archived note missing superseded_by"))
@@ -547,8 +576,14 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
     else:
         if status and status != "current":
             errors.append((path, f"status is {status!r} — canonical folders hold current "
-                           "notes only; superseded notes move to archive/, drafts live "
-                           "in inbox/"))
+                           "notes only; superseded notes move to archive/ (bin/brain "
+                           "supersede), retracted ones too (bin/brain retract), drafts "
+                           "live in inbox/"))
+        if fm.get("retracted"):
+            errors.append((path, "a current note must not carry retracted — that field "
+                           "dates a withdrawn note and belongs only on notes in archive/ "
+                           "(bin/brain retract); if this note was not retracted, delete "
+                           "the field."))
         if fm.get("superseded_by"):
             errors.append((path, "a current note must not carry superseded_by — that field "
                            "marks a note as replaced and belongs only on notes in archive/. "
@@ -3460,7 +3495,11 @@ def cmd_read(argv: list) -> int:
         return 1
     print(f"# {fm.get('title')}  ({fm.get('kind')}, created {fm.get('created')}, status {fm.get('status')})")
     print(f"path: knowledge/{rel}")
-    if chain:
+    retracted = fm.get("status") == "retracted"
+    if chain and retracted:
+        print(f"NOTE: {wanted!r} was superseded by a note since RETRACTED — nothing in "
+              f"this chain is current. Chain: {' -> '.join(chain + [current_id])}")
+    elif chain:
         print(f"NOTE: {wanted!r} was superseded — this is the CURRENT version. "
               f"Chain: {' -> '.join(chain + [current_id])}")
     if fm.get("supersedes"):
@@ -3468,7 +3507,11 @@ def cmd_read(argv: list) -> int:
     # Surface staleness/provenance the caller cannot see from the body alone, so
     # a model never presents unverified or historical content as settled truth.
     top = rel.parts[0]
-    if top == "archive" or fm.get("status") == "superseded":
+    if retracted:
+        print(f"WARNING: this note is ARCHIVED as RETRACTED on {fm.get('retracted')} — "
+              "withdrawn with no successor, because it should not have been in the "
+              "brain. Nothing in it is true today; do not present any of it as fact.")
+    elif top == "archive" or fm.get("status") == "superseded":
         print("WARNING: this note is ARCHIVED/superseded — it is HISTORY, not current. "
               "Cite it only as 'previously…', never as true today.")
     elif top == "inbox":
@@ -3622,6 +3665,90 @@ def cmd_supersede(argv: list) -> int:
             "whatever still holds (supersede starts the new note from a blank template).")
     print("now: fill the new note's body and aliases, replace the '<one-line reason>' "
           "in the archived note's banner, run bin/brain lint, then commit." + tail)
+    return 0
+
+
+def cmd_retract(argv: list) -> int:
+    """Withdraw a canonical note that should never have been written.
+
+    A supersede needs a successor, and a note saved by mistake has none: the
+    knowledge was never true, or never the brain's to hold. This archives it as
+    `status: retracted`, dated, with the reason in its banner, so it leaves the
+    default search scope and `brain read` shows it only behind a RETRACTED
+    warning. Like supersede it neither erases nor commits: git history keeps the
+    text, and the caller (normally the consolidation pass, on the owner's
+    correction) lints and commits."""
+    args = [a for a in argv if not a.startswith("--")]
+    usage = 'usage: brain retract <id> "<one-line reason>"'
+    if len(args) < 2:
+        print(usage)
+        return 2
+    note_id, reason = args[0], args[1].strip()
+    if not reason or "\n" in reason or "\r" in reason:
+        print(usage + " — the reason is required, on one line: it is what the archived "
+              "note keeps to say why it was withdrawn")
+        return 2
+    metas = all_metas()
+    if note_id not in metas:
+        if "/" in note_id or note_id.endswith(".md"):
+            top = Path(note_id).parts[1] if note_id.startswith("knowledge/") \
+                and len(Path(note_id).parts) > 1 else Path(note_id).parts[0]
+            if top == "inbox":
+                print(f"{note_id!r} is an inbox capture: it has no id and is never archived — "
+                      "consolidation deletes it (with the correction that retracts it)")
+                return 1
+        print(f"note {note_id!r} not found — retract takes the id of a canonical note")
+        return 1
+    rel, fm = metas[note_id]
+    if rel.parts[0] == "archive":
+        print(f"{note_id!r} is already archived (status: {fm.get('status')})")
+        return 1
+    if rel.parts[0] not in CANONICAL:
+        print(f"{note_id!r} lives in knowledge/{rel.parts[0]}/ — only a canonical note is "
+              "retracted; provisional material is deleted by consolidation instead")
+        return 1
+    src = K / rel
+    dest = K / "archive" / rel
+    if dest.exists():
+        print(f"{dest.relative_to(ROOT)} already exists — archive history is append-only and "
+              "must never be overwritten. Resolve that first.")
+        return 1
+    today = date.today().isoformat()
+    # A withdrawn note is never published: approval does not outlive the note.
+    fm_update(src, {"status": "retracted", "retracted": today, "visibility": None},
+              banner=f"> RETRACTED {today} — {reason}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # The same lock supersede takes for its git mv, for the same reason: a commit in
+    # the same instant could sweep half a retraction into itself.
+    with repo_lock():
+        moved = subprocess.run(["git", "mv", str(src), str(dest)], cwd=ROOT,
+                               capture_output=True, text=True)
+    if moved.returncode != 0:
+        if dest.exists():
+            print(f"git mv failed and {dest.relative_to(ROOT)} now exists — refusing to "
+                  f"overwrite history. {src.relative_to(ROOT)} is marked retracted; move it "
+                  "into archive/ by hand.")
+            return 1
+        src.replace(dest)
+    linking = []
+    for path in indexable_paths():
+        p_rel = path.relative_to(K)
+        if p_rel.parts[0] not in CANONICAL and p_rel != Path("index.md"):
+            continue
+        try:
+            if note_id in extract_links(read_text(path)):
+                linking.append(str(path.relative_to(ROOT)))
+        except OSError:
+            continue
+    index_md = K / "index.md"
+    if index_md.is_file() and note_id in extract_links(read_text(index_md)):
+        linking.append(str(index_md.relative_to(ROOT)))
+    print(f"retracted: {dest}")
+    if linking:
+        print(f"linked from ({len(linking)}): " + ", ".join(sorted(set(linking)))
+              + f" — remove the [[{note_id}]] links there; lint warns about each")
+    print("now: run bin/brain lint, then commit. Retracting does not erase: git history "
+          "still holds the text.")
     return 0
 
 
@@ -4173,7 +4300,7 @@ CONSOLIDATOR_DEFAULTS = {
     "propose": ("claude --model {model} --output-format json --permission-mode acceptEdits "
                 "--strict-mcp-config "
                 "--mcp-config '{\"mcpServers\":{}}' --add-dir {engine} --allowedTools "
-                '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
+                '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain retract *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
     "audit": ("claude --model {model} --output-format json -p --safe-mode --restricted "
               "--strict-mcp-config "
               "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
@@ -7459,6 +7586,8 @@ def main() -> int:
         return cmd_sync(rest)
     if cmd == "supersede":
         return cmd_supersede(rest)
+    if cmd == "retract":
+        return cmd_retract(rest)
     if cmd == "sessions":
         return cmd_sessions(rest)
     if cmd == "consolidate":

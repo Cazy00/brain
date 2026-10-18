@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -2368,6 +2368,201 @@ class SupersedeTests(unittest.TestCase):
         self.assertIn("still the empty template", lint.stdout)
 
 
+class RetractTests(unittest.TestCase):
+    """A note that should never have been written has no successor, so supersede cannot
+    remove it. `brain retract` archives it as retracted: out of default search, read back
+    only behind a RETRACTED warning, with the reason it was withdrawn."""
+
+    REASON = "saved by mistake; it belongs in the project's own records"
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        for cfg in (["user.email", "t@example.com"], ["user.name", "Test"]):
+            subprocess.run(["git", "config", *cfg], cwd=self.repo, check=True)
+        self.ref = self.repo / "knowledge" / "reference"
+        self.ref.mkdir(parents=True, exist_ok=True)
+        self.today = date.today().isoformat()
+
+    def write_ref(self, name, body="The vendor rate limit is 500 requests per minute.",
+                  folder=None, **fm):
+        extra = "".join(f"{k}: {v}\n" for k, v in fm.items())
+        path = (folder or self.ref) / f"{name}.md"
+        path.write_text(
+            f"---\nid: {name}\nkind: reference\ntitle: {name}\ntopics: [brain]\n"
+            f"aliases: [{name}]\ncreated: 2026-07-01\nstatus: current\n{extra}---\n\n{body}\n",
+            encoding="utf-8")
+        return path
+
+    def archived(self, name="seed-note"):
+        return self.repo / "knowledge" / "archive" / "reference" / f"{name}.md"
+
+    def fm(self, path):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import notes
+        fm, _err = notes.parse_frontmatter(path.read_text(encoding="utf-8"))
+        return fm
+
+    def test_retract_archives_the_note_with_its_date_and_reason_and_no_successor(self):
+        self.write_ref("seed-note")
+        out = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse((self.ref / "seed-note.md").exists(), "the note stayed canonical")
+        archived = self.archived()
+        self.assertTrue(archived.exists(), out.stdout)
+        fm = self.fm(archived)
+        self.assertEqual(fm.get("status"), "retracted")
+        self.assertEqual(str(fm.get("retracted")), self.today)
+        self.assertNotIn("superseded_by", fm)
+        text = archived.read_text(encoding="utf-8")
+        self.assertIn(f"> RETRACTED {self.today} — {self.REASON}", text)
+        self.assertIn("500 requests per minute", text, "retract must not erase the history")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, "retract left the tree un-lintable:\n" + lint.stdout)
+
+    def test_a_retracted_note_leaves_search_and_reads_back_as_retracted(self):
+        self.write_ref("seed-note")
+        before = run_brain("search", "vendor rate limit", repo=self.repo)
+        self.assertIn("seed-note", before.stdout, "precondition: the note ranks")
+        run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        after = run_brain("search", "vendor rate limit", repo=self.repo)
+        self.assertNotIn("seed-note", after.stdout, "a retracted note is still served")
+        read = run_brain("read", "seed-note", repo=self.repo)
+        self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
+        self.assertIn("RETRACTED", read.stdout)
+        self.assertIn("ARCHIVED", read.stdout)
+        self.assertIn(self.REASON, read.stdout)
+
+    def test_retract_drops_publication_approval(self):
+        self.write_ref("seed-note", visibility="public")
+        run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertNotIn("visibility", self.fm(self.archived()))
+
+    def test_retract_needs_a_one_line_reason(self):
+        self.write_ref("seed-note")
+        for reason in ("", "   ", "two\nlines"):
+            with self.subTest(reason=reason):
+                out = run_brain("retract", "seed-note", reason, repo=self.repo)
+                self.assertEqual(out.returncode, 2, out.stdout)
+                self.assertTrue((self.ref / "seed-note.md").exists())
+        out = run_brain("retract", "seed-note", repo=self.repo)
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("usage", out.stdout)
+
+    def test_retract_refuses_an_unknown_an_archived_or_an_inbox_note(self):
+        self.write_ref("seed-note")
+        self.assertEqual(run_brain("retract", "no-such-note", self.REASON,
+                                   repo=self.repo).returncode, 1)
+        self.assertEqual(run_brain("retract", "seed-note", self.REASON,
+                                   repo=self.repo).returncode, 0)
+        again = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(again.returncode, 1, again.stdout)
+        self.assertIn("already archived", again.stdout)
+        inbox = self.repo / "knowledge" / "inbox" / "2026-10-18-0512-stray.md"
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        inbox.write_text(inbox_note(source="local"), encoding="utf-8")
+        out = run_brain("retract", "knowledge/inbox/2026-10-18-0512-stray.md", self.REASON,
+                        repo=self.repo)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("inbox", out.stdout)
+        self.assertTrue(inbox.exists(), "an inbox capture is deleted by consolidation, "
+                        "never archived")
+
+    def test_retract_never_overwrites_archive_history(self):
+        self.write_ref("seed-note")
+        self.archived().parent.mkdir(parents=True, exist_ok=True)
+        self.archived().write_text("older history\n", encoding="utf-8")
+        out = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertEqual(self.archived().read_text(encoding="utf-8"), "older history\n")
+        self.assertTrue((self.ref / "seed-note.md").exists())
+
+    def test_retract_names_the_notes_that_still_link_to_it_and_lint_warns(self):
+        self.write_ref("seed-note")
+        self.write_ref("hub-note", body="See [[seed-note]] for the limit.")
+        out = run_brain("retract", "seed-note", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("hub-note", out.stdout, "the linking note was not named")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+        self.assertIn("RETRACTED", lint.stdout, "a link to a retracted note did not warn")
+
+    def test_a_chain_ending_in_a_retraction_is_never_called_current(self):
+        self.write_ref("seed-note", body="The original claim.")
+        run_brain("supersede", "seed-note", "Seed note v2", repo=self.repo)
+        successor = self.ref / "seed-note-v2.md"
+        successor.write_text(successor.read_text(encoding="utf-8").replace(
+            "## What\n", "## What\n\nThe revised claim.\n"), encoding="utf-8")
+        old = self.archived()
+        old.write_text(old.read_text(encoding="utf-8").replace(
+            "<one-line reason>", "the claim changed"), encoding="utf-8")
+        out = run_brain("retract", "seed-note-v2", self.REASON, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+        read = run_brain("read", "seed-note", repo=self.repo)
+        self.assertIn("RETRACTED", read.stdout)
+        self.assertNotIn("this is the CURRENT version", read.stdout)
+
+    def test_retract_takes_the_documented_place_in_the_toolbelt(self):
+        out = run_brain("--help", repo=self.repo)
+        self.assertIn("brain retract <id>", out.stdout)
+
+
+class RetractedLintTests(unittest.TestCase):
+    """What lint holds a retracted note to: archived, dated, and with no successor."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+
+    def write(self, rel, extra):
+        path = self.repo / "knowledge" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\nid: {path.stem}\nkind: reference\ntitle: {path.stem}\ntopics: [brain]\n"
+            f"aliases: [{path.stem}]\ncreated: 2026-07-01\n{extra}---\n\n"
+            "> RETRACTED 2026-10-18 — saved by mistake\n\nThe old text.\n", encoding="utf-8")
+
+    def lint(self):
+        return run_brain("lint", repo=self.repo)
+
+    def test_a_retracted_note_is_clean_in_the_archive(self):
+        self.write("archive/reference/gone-note.md", "status: retracted\nretracted: 2026-10-18\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 0, out.stdout)
+
+    def test_retracted_status_in_a_canonical_folder_is_an_error(self):
+        self.write("reference/gone-note.md", "status: retracted\nretracted: 2026-10-18\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("brain retract", out.stdout)
+
+    def test_a_retracted_note_needs_a_real_retracted_date(self):
+        for extra in ("status: retracted\n", "status: retracted\nretracted: 2026-13-40\n"):
+            with self.subTest(extra=extra):
+                self.write("archive/reference/gone-note.md", extra)
+                out = self.lint()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn("retracted", out.stdout)
+
+    def test_a_retracted_note_has_no_successor(self):
+        self.write("reference/other-note.md", "status: current\n")
+        self.write("archive/reference/gone-note.md",
+                   "status: retracted\nretracted: 2026-10-18\nsuperseded_by: other-note\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("no successor", out.stdout)
+
+    def test_a_current_note_may_not_claim_a_retraction_date(self):
+        self.write("reference/live-note.md", "status: current\nretracted: 2026-10-18\n")
+        out = self.lint()
+        self.assertEqual(out.returncode, 1, out.stdout)
+        self.assertIn("retracted", out.stdout)
+
+
 class LintIntegrityTests(unittest.TestCase):
     """Knowledge-integrity checks that keep superseded/contradictory content
     from being served as one current fact."""
@@ -2605,6 +2800,13 @@ class RepoLockCoverageTests(unittest.TestCase):
             "aliases: [lock seed]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"
             "---\n\nThe original claim.\n", encoding="utf-8")
         self.assert_blocks_on_repo_lock("supersede", "lock-seed", "Lock seed revised")
+
+    def test_retract_takes_the_lock(self):
+        (self.repo / "knowledge/reference/lock-seed.md").write_text(
+            "---\nid: lock-seed\nkind: reference\ntitle: Lock seed\ntopics: [brain]\n"
+            "aliases: [lock seed]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"
+            "---\n\nThe original claim.\n", encoding="utf-8")
+        self.assert_blocks_on_repo_lock("retract", "lock-seed", "saved by mistake")
 
     def consolidate_env(self):
         stub_bin = Path(self.tmp.name) / "stubbin"
@@ -5639,7 +5841,7 @@ class ConsolidatorConfigTests(unittest.TestCase):
         runner = self.module.load_consolidator()
         engine = str(self.module.ENGINE)
         tools = ["lint", "lint *", "search *", "read *", "links *", "recent *", "new *",
-                 "supersede *", "index", "index *"]
+                 "supersede *", "retract *", "index", "index *"]
         self.assertEqual(runner["propose"],
                          ["claude", "--model", "claude-opus-5-5", *JSON_ARGV,
                           "--permission-mode", "acceptEdits", *ISOLATED_ARGV,
@@ -5804,14 +6006,17 @@ class ConsolidatorConfigTests(unittest.TestCase):
 
     def test_the_shipped_propose_line_reaches_the_engine_and_its_toolbelt(self):
         """Split layout (seen live 2026-10-15): the proposer could not read AGENTS.md or run
-        bin/brain, both in the engine outside the data folder, and changed nothing."""
-        self.module.ENGINE = Path("/opt/brain-engine")
+        bin/brain, both in the engine outside the data folder, and changed nothing.
+        The engine path is one no machine has, so a real engine installed at the usual
+        place cannot stand in for the built-in defaults this reads."""
+        engine = Path(self.tmp.name) / "opt" / "brain-engine"
+        self.module.ENGINE = engine
         self.conf.unlink()  # the built-in defaults: the same line as the shipped conf (synced)
         propose = self.module.load_consolidator()["propose"]
-        self.assertEqual(propose[propose.index("--add-dir") + 1], "/opt/brain-engine")
+        self.assertEqual(propose[propose.index("--add-dir") + 1], str(engine))
         allowed = propose[propose.index("--allowedTools") + 1:propose.index("-p")]
-        for sub in ("lint", "search", "read", "links", "recent", "new", "supersede"):
-            self.assertTrue([a for a in allowed if a.startswith("Bash(/opt/brain-engine/bin/brain %s" % sub)],
+        for sub in ("lint", "search", "read", "links", "recent", "new", "supersede", "retract"):
+            self.assertTrue([a for a in allowed if a.startswith("Bash(%s/bin/brain %s" % (engine, sub))],
                             sub)
         self.assertFalse([a for a in allowed if "rg" in a.split("(")[1].split()[0]])
         for forbidden in ("capture", "serve", "setup", "init", "schedule", "publish", "consolidate"):

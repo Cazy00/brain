@@ -10,6 +10,7 @@
       "Bash(bin/brain links *)",
       "Bash(bin/brain recent *)",
       "Bash(bin/brain supersede *)",
+      "Bash(bin/brain retract *)",
       "Bash(bin/brain index)",
       "Bash(bin/brain index *)",
       "Bash(python3 bin/brain *)",
