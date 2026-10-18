@@ -45,14 +45,26 @@ Block if the change set:
   plainly as the agent's conclusion, it may pass), or lets one supersede a
   canonical note whose `## Sources` are the owner's (or that has no
   `## Sources`, which predates them);
+- promotes, or supersedes a canonical note on the strength of, an input whose
+  `source:` is not `local` — a drop box, `session-mining` — whatever `basis:`
+  it declares (a `kind: correction` included), unless an independent trusted
+  input corroborates it: a `source: local` capture or a canonical note, which
+  you can read and must check, or — for `session-mining` only — a later digest
+  entry its `## Sources` line names, which you cannot see (accept that claim;
+  do not block on it);
 - adds more than 3 new inbox notes with `source: session-mining`, or adds one
   without an `expires:` date;
-- creates a canonical note, or merges an input into one, without a
-  `## Sources` line naming that input's basis and date.
+- creates a canonical note, or merges an input into one, with no `## Sources`
+  line for an input at all.
 
-You cannot see the session digest, so you cannot check whether a
-session-mining proposal the pass promoted was really corroborated there; do
-not block on that.
+The Sources lines the pass writes are, one per input: for a capture that
+declares `basis:`, its basis and date (`- Owner, <date> (via <via>)`,
+`- Agent-found, <date>, from <where>`, `- Agent-inferred, <date>
+(<client>)`); for a capture with no `basis:`,
+`- Capture, <date> (basis not declared, via <via or source>)`; for a journal
+entry, `- Journal, <date>`; for a promoted session-mining proposal,
+`- Session mining, <date>, corroborated by <what>`. All of these pass; only
+an input with no `## Sources` line for an input at all is a block.
 
 ## What you must NOT do
 
