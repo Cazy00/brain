@@ -189,7 +189,7 @@ HANDOFF_SLUG_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 HANDOFF_KEYS = ("handoff_to", "handoff_at", "handoff_reason")
 HANDOFF_STALE_DAYS = 14
 # How a filing job closes one: a local correction whose text starts with either lead.
-HANDOFF_CLOSE_RE = re.compile(r"(?i)^\s*(?:filed|already\s+recorded:?)\s+(\S+)")
+HANDOFF_CLOSE_RE = re.compile(r"(?i)^\s*(?:filed:?|already\s+recorded:?)\s+(\S+)")
 SENSITIVITIES = {"normal", "personal", "private"}
 SENSITIVITY_REQUIRED = {"people", "life"}
 # Which endpoint accepted a capture. Stamped by the endpoint, never claimed by
@@ -3231,40 +3231,61 @@ def cmd_links(argv: list) -> int:
 # How a correction names the note it corrects (the capture policy gives agents the
 # lead): "Correction to <id or path>: <what is true now>" or "Retract <id or path>:
 # <reason>". A canonical note is named by its id; an inbox note has no id, only its path.
-CORRECTION_LEAD_RE = re.compile(r"(?i)\b(?:correction\s+to|retract)\s+(\S+)")
+# The lead is read at the START of the text only: a lead quoted further down ("remove
+# the example 'Retract x: …'") is content, not a second correction.
+CORRECTION_LEAD_RE = re.compile(r"(?i)^\s*(?:correction\s+to|retract)\s+(\S+)")
 CORRECTION_PATH_RE = re.compile(
     r"(?:knowledge/)?(?:inbox|handoff|decisions|topics|projects|people|life|reference)/"
     r"[A-Za-z0-9._/-]+?\.md\b")
 # A capture bigger than this is not a correction anyone typed; it is not read.
 MAX_CORRECTION_BYTES = 256 * 1024
+# Enough to hold any capture's frontmatter: kind and source are read from this much
+# before the rest of a file is.
+FRONTMATTER_PEEK = 8192
 
 
-def correction_target(word: str):
-    """One named target, normalised: a note id, or a `knowledge/...md` path. None if the
-    word is neither."""
+def known_note_ids():
+    """`is_known(id)` against the notes, opened only on first use: most corrections name
+    their target by [[link]] or path and never need it."""
+    held = {}
+
+    def is_known(note_id: str) -> bool:
+        if "index" not in held:
+            held["index"] = MetaIndex()
+        return held["index"].exists(note_id)
+    return is_known
+
+
+def correction_target(word: str, is_known=None):
+    """One named target, normalised: a `knowledge/...md` path, or a note id. A bare word
+    is an id only when it is written as a [[link]] or is a note that exists; anything
+    else ("the", "note") names nothing."""
+    linked = "[[" in word
     word = word.strip("`'\"()[]<>*,;:.")
     if CORRECTION_PATH_RE.fullmatch(word):
         return word if word.startswith("knowledge/") else "knowledge/" + word
-    if ID_RE.match(word):
+    if ID_RE.fullmatch(word) and (linked or (is_known is not None and is_known(word))):
         return word
     return None
 
 
-def correction_targets(body: str) -> list:
+def correction_targets(body: str, is_known=None) -> list:
     """The notes a correction names, in order, without repeats.
 
-    The lead names the target. Without one, the [[links]] and note paths the text
-    names are its targets. With one, other links are where the truth lives, not
-    what is wrong, so they are not targets."""
-    closing = HANDOFF_CLOSE_RE.match(body)
-    if closing and correction_target(closing.group(1)):
-        return [correction_target(closing.group(1))]
-    found = [correction_target(m.group(1)) for m in CORRECTION_LEAD_RE.finditer(body)]
-    found = [f for f in found if f]
-    if not found:
-        found = [f for f in (correction_target(m.group(0))
-                             for m in CORRECTION_PATH_RE.finditer(body)) if f]
-        found += [l for l in extract_links(body) if ID_RE.match(l)]
+    A lead at the start of the text names the one target: a handoff's closing lead
+    ("Filed <path>", "Already recorded: <path>"), else "Correction to X" or
+    "Retract X". Without a lead that names a note, only the [[links]] and note paths in
+    the text are targets — never a word that merely follows "retract" in prose."""
+    if is_known is None:
+        is_known = known_note_ids()
+    for lead_re in (HANDOFF_CLOSE_RE, CORRECTION_LEAD_RE):
+        lead = lead_re.match(body)
+        target = correction_target(lead.group(1), is_known) if lead else None
+        if target:
+            return [target]
+    found = [f for f in (correction_target(m.group(0))
+                         for m in CORRECTION_PATH_RE.finditer(body)) if f]
+    found += [l for l in extract_links(body) if ID_RE.fullmatch(l)]
     return list(dict.fromkeys(found))
 
 
@@ -3276,30 +3297,46 @@ def pending_corrections() -> dict:
     Only a correction from an owner endpoint (`source: local`) marks anything: a drop
     box's caller must not be able to cast doubt on every note it can name."""
     out: dict = {}
+    is_known = known_note_ids()
     for rel, body in local_corrections():
-        for target in correction_targets(body):
+        for target in correction_targets(body, is_known):
             if target != rel:
                 out.setdefault(target, []).append(rel)
     return out
 
 
 def local_corrections():
-    """(inbox path, body) of every `kind: correction` from an owner endpoint."""
+    """(inbox path, body) of every `kind: correction` from an owner endpoint.
+
+    Runs on every search, read and recent, so it lists the inbox with one scandir, never
+    follows a symlink, and reads only the head of each file until its frontmatter says it
+    is a local correction."""
     inbox = K / "inbox"
-    if not inbox.is_dir():
+    try:
+        entries = sorted(os.scandir(inbox), key=lambda e: e.name)
+    except OSError:
         return
-    for path in sorted(inbox.glob("*.md")):
+    for entry in entries:
+        if not entry.name.endswith(".md"):
+            continue
         try:
-            if path.is_symlink() or not path.is_file() \
-                    or path.stat().st_size > MAX_CORRECTION_BYTES:
+            if not entry.is_file(follow_symlinks=False) \
+                    or entry.stat(follow_symlinks=False).st_size > MAX_CORRECTION_BYTES:
                 continue
-            text = read_text(path)
+            with open(entry.path, "rb") as handle:
+                head = handle.read(FRONTMATTER_PEEK)
+                fm, _err = parse_frontmatter(head.decode("utf-8-sig", "replace"))
+                if not fm or fm.get("kind") != "correction" \
+                        or fm.get("source") != DEFAULT_SOURCE:
+                    continue
+                data = head + handle.read()
         except OSError:
             continue
+        text = data.decode("utf-8-sig", "replace")
         fm, _err = parse_frontmatter(text)
-        if not fm or fm.get("kind") != "correction" or fm.get("source") != DEFAULT_SOURCE:
+        if not fm:
             continue
-        yield (str(path.relative_to(ROOT)),
+        yield (str(Path(entry.path).relative_to(ROOT)),
                "\n".join(text.splitlines()[fm.get("_end_line", 0):]))
 
 
@@ -3742,9 +3779,15 @@ def cmd_read(argv: list) -> int:
 
     chain = []
     seen = set()
+    member_paths = []
     current_id = target_id
     while True:
         rel, fm = metas.get(current_id)
+        # A correction may name any member by its path, the one it had before it was
+        # archived included.
+        member_paths.append(f"knowledge/{rel.as_posix()}")
+        if rel.parts[0] == "archive":
+            member_paths.append(f"knowledge/{Path(*rel.parts[1:]).as_posix()}")
         successor = fm.get("superseded_by")
         if fm.get("status") == "superseded" and current_id not in seen \
                 and isinstance(successor, str) and metas.get(successor) is not None:
@@ -3792,7 +3835,7 @@ def cmd_read(argv: list) -> int:
         print(f"WARNING: review_by {review_by} has passed — this fact may be STALE; verify "
               "before relying on it.")
     names = corrections_naming(pending_corrections(), wanted, *chain, current_id,
-                               f"knowledge/{rel.as_posix()}")
+                               *member_paths)
     if names:
         print(f"WARNING:{correction_marker(names)} — a correction to this note waits for "
               "the next consolidation; read it before relying on this note.")

@@ -2738,7 +2738,10 @@ class PendingCorrectionTests(unittest.TestCase):
 
     def test_the_named_targets_are_read_from_the_lead_first(self):
         module = load_brain_module()
-        targets = module.correction_targets
+        known = {"vendor-limits", "pricing-2026", "alpha-note", "beta-note"}
+
+        def targets(body):
+            return module.correction_targets(body, is_known=known.__contains__)
         self.assertEqual(targets("Correction to `vendor-limits`: 800."), ["vendor-limits"])
         self.assertEqual(targets("Retract [[vendor-limits]] — saved by mistake."),
                          ["vendor-limits"])
@@ -2755,6 +2758,42 @@ class PendingCorrectionTests(unittest.TestCase):
         self.assertEqual(targets("The note [[vendor-limits]] is wrong: 800."),
                          ["vendor-limits"])
 
+    def test_only_the_lead_at_the_start_names_a_target(self):
+        """Review B5: a lead quoted inside the text is not a second correction, and a word
+        after a lead that is no note id ("the") names nothing."""
+        module = load_brain_module()
+        known = {"vendor-limits", "alpha-note", "beta-note"}
+
+        def targets(body):
+            return module.correction_targets(body, is_known=known.__contains__)
+        self.assertEqual(targets('Correction to alpha-note: remove the example '
+                                 '"Retract beta-note: wrong".'), ["alpha-note"])
+        # "the" is no note id, so the lead names nothing and the link is the target.
+        self.assertEqual(targets("Retract the note [[vendor-limits]]: saved by mistake."),
+                         ["vendor-limits"])
+        # No lead: prose that happens to say "retract their" or "correction to our" is
+        # never read as one; only links and paths count.
+        self.assertEqual(targets("The [[vendor-limits]] note should retract their 500 and "
+                                 "the correction to our figure is 800."), ["vendor-limits"])
+        # A bare word is a target only when it is a known note id.
+        self.assertEqual(targets("Correction to no-such-note: 800."), [])
+        self.assertEqual(targets("  Correction to vendor-limits: 800."), ["vendor-limits"])
+
+    def test_a_correction_to_an_earlier_chain_members_path_still_marks_the_read(self):
+        """Review should-fix: read resolves a supersede chain; a correction naming any
+        member of it, by id or by its path, marks the note read back."""
+        seed = self.ref / "seed-note.md"
+        seed.write_text("---\nid: seed-note\nkind: reference\ntitle: Seed\ntopics: [brain]\n"
+                        "aliases: [seed]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+                        "The original claim.\n", encoding="utf-8")
+        run_brain("supersede", "seed-note", "Seed note v2", repo=self.repo)
+        succ = self.ref / "seed-note-v2.md"
+        succ.write_text(succ.read_text(encoding="utf-8").replace(
+            "## What\n", "## What\n\nThe revised claim.\n"), encoding="utf-8")
+        path = self.capture("2026-10-18-0600-fix.md",
+                            "Correction to knowledge/reference/seed-note.md: it is 800.")
+        out = run_brain("read", "seed-note", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", out.stdout)
 
 def handoff_note(project, name, at, reason="pending work that belongs in the project's records",
                  body="The staging smoke test still needs a re-run.", folder=None, **fm):
@@ -2926,6 +2965,8 @@ class HandoffReadTests(unittest.TestCase):
                          [self.A])
         self.assertEqual(targets(f"Already recorded: {self.A} — github.com/example/acme "
                                  "docs/backlog.md B2 (commit 1a2b3c4)."), [self.A])
+        self.assertEqual(targets(f"Filed: {self.A} to github.com/example/acme issue #3."),
+                         [self.A])
 
 
 class HandoffMcpTests(unittest.TestCase):
@@ -3003,6 +3044,14 @@ class HandoffHealthTests(unittest.TestCase):
                    "docs/backlog.md B2.\n"))
         lines = self.handoff_lines()
         self.assertFalse([l for l in lines if "[RED]" in l], lines)
+
+    def test_a_closing_lead_may_carry_a_colon_after_filed(self):
+        rel, text = handoff_note("acme", "a1.md", self.ago(15))
+        commit_at(self.repo, "handoff", iso_ago(0), (rel, text),
+                  ("knowledge/inbox/2026-10-18-0700-filed.md",
+                   "---\ncreated: 2026-10-18\nsource: local\nkind: correction\n"
+                   f"status: draft\n---\n\nFiled: {rel} to github.com/example/acme issue #3.\n"))
+        self.assertFalse([l for l in self.handoff_lines() if "[RED]" in l])
 
     def test_stats_counts_handoff_apart_from_the_corpus(self):
         commit_at(self.repo, "handoffs", iso_ago(0),
