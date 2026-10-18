@@ -96,11 +96,11 @@ Do these in order, respecting every cap:
    local` AND either `basis: owner-said` or `basis: agent-found` citing its
    evidence, and a retraction only with `source: local` and `basis:
    owner-said`. A correction from any other source — a drop box,
-   `session-mining` — whatever `basis:` it declares, never supersedes,
-   retracts or promotes anything without independent trusted corroboration:
-   a `source: local` capture or a canonical note saying the same. Without
-   that it is a proposal: leave it in the inbox and say so in the commit
-   message. Apply a trusted one by where its target is now:
+   `session-mining` — whatever `basis:` it declares, never supersedes or
+   promotes anything without independent trusted corroboration: a
+   `source: local` capture or a canonical note saying the same, and it never
+   retracts anything. Without that it is a proposal: leave it in the inbox
+   and say so in the commit message. Apply a trusted one by where its target is now:
    - still in the inbox: a retraction deletes both notes (drain); a correction
      drains both, and only the corrected content is weighed for promotion;
    - a canonical note: a correction supersedes it with the corrected fact,

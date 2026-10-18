@@ -5508,15 +5508,17 @@ def proposal_problems(today: str):
     PROPOSAL_DAYS later, `basis: owner-said`, a mined kind and `status: draft`. A proposal
     dated to expire years out would otherwise sit outside the idle rule and keep doctor
     green for as long."""
-    names = git("diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A",
-                default_branch(), "--", "knowledge/inbox")
+    rows, error = staged_name_status("knowledge/inbox")
+    if error:
+        return f"could not read the change set ({one_line(error)})"
     proposals = []
-    for rel in names.splitlines():
-        rel = rel.strip()
-        if not re.fullmatch(r"knowledge/inbox/[^/]+\.md", rel):
+    for status, rel in rows:
+        if not status.startswith("A") or not re.fullmatch(r"knowledge/inbox/[^/]+\.md", rel):
             continue
-        shown = subprocess.run(["git", "show", f":{rel}"], cwd=ROOT, capture_output=True)
-        fm = parse_frontmatter(shown.stdout.decode("utf-8", "replace"))[0] or {}
+        raw = git_blob(f":{rel}")
+        if raw is None:
+            return f"could not read {one_line(rel)}"
+        fm = parse_frontmatter(raw.decode("utf-8", "replace"))[0] or {}
         if str(fm.get("source") or "") == "session-mining":
             proposals.append((one_line(rel), fm))
     if len(proposals) > MAX_PROPOSALS:
@@ -5538,59 +5540,215 @@ def proposal_problems(today: str):
     return None
 
 
+def staged_name_status(*paths):
+    """([(status, path)], None) for the staged change set against the trunk, or (None,
+    error). NUL-separated (-z), so no file name comes back quoted and skipped, and a git
+    failure is an error the caller fails closed on, never an empty change set."""
+    run = subprocess.run(["git", "diff", "--cached", "--no-renames", "--name-status", "-z",
+                          default_branch(), "--", *paths], cwd=ROOT, capture_output=True)
+    if run.returncode != 0:
+        return None, (run.stderr.decode("utf-8", "replace").strip()
+                      or f"git diff exited {run.returncode}")
+    fields = run.stdout.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    if len(fields) % 2:
+        return None, "git diff answered in a shape this check cannot read"
+    return [(fields[i].decode("ascii", "replace"),
+             fields[i + 1].decode("utf-8", "surrogateescape"))
+            for i in range(0, len(fields), 2)], None
+
+
+def git_blob(spec: str):
+    """The bytes of `<rev>:<path>` (or `:<path>`, the index), or None."""
+    run = subprocess.run(["git", "show", spec], cwd=ROOT, capture_output=True)
+    return run.stdout if run.returncode == 0 else None
+
+
+def without_handoff_keys(raw: bytes):
+    """`raw` minus its three handoff keys, which must each appear exactly once in the
+    frontmatter; None otherwise. A handoff note made by `brain handoff` gives back the
+    capture's bytes exactly."""
+    rows = raw.split(b"\n")
+    if rows[0].lstrip(b"\xef\xbb\xbf").rstrip(b"\r") != b"---":
+        return None
+    end = next((i for i in range(1, len(rows)) if rows[i].rstrip(b"\r") == b"---"), None)
+    if end is None:
+        return None
+    kept, seen = [], {}
+    for i, row in enumerate(rows):
+        key = re.match(rb"(handoff_to|handoff_at|handoff_reason):", row) if 0 < i < end else None
+        if key:
+            seen[key.group(1)] = seen.get(key.group(1), 0) + 1
+            continue
+        kept.append(row)
+    if any(seen.get(k.encode(), 0) != 1 for k in HANDOFF_KEYS):
+        return None
+    return b"\n".join(kept)
+
+
+RETRACT_LEAD_RE = re.compile(r"(?i)^\s*retract\s")
+
+
+def removed_corrections(gone_inbox):
+    """([(path, frontmatter, body)], None) for every `kind: correction` the change set
+    removes from the inbox, read from the trunk (what was trusted before the pass), or
+    (None, error)."""
+    trunk, out = default_branch(), []
+    for rel in sorted(gone_inbox):
+        raw = git_blob(f"{trunk}:{rel}")
+        if raw is None:
+            return None, f"could not read {one_line(rel)} on the trunk"
+        text = raw.decode("utf-8-sig", "replace")
+        fm = parse_frontmatter(text)[0] or {}
+        if fm.get("kind") == "correction":
+            out.append((rel, fm, "\n".join(text.splitlines()[fm.get("_end_line", 0):])))
+    return out, None
+
+
+def trusted_retraction(fm: dict) -> bool:
+    """Only the owner's own words, through an owner endpoint, retract anything."""
+    return fm.get("source") == DEFAULT_SOURCE and fm.get("basis") == "owner-said"
+
+
 def handoff_problems(today: str):
     """The first way the staged change set breaks the handoff rules, or None. Checked as
     code before the audit, because the keys are the filing job's interface and a handoff
     note leaves only once it is filed:
-    - a note added under knowledge/handoff/ is a capture this pass moved out of the inbox
-      under its own file name, dated the pass's day (lint holds its place and keys);
+    - a note added under knowledge/handoff/<project>/ is a capture from an owner endpoint
+      this pass moved out of the inbox under its own file name, to one place only, with
+      every byte kept and exactly the three keys added, dated the pass's day;
     - a handoff note is never edited by a pass;
-    - one is deleted only alongside a local correction, deleted in the same change set,
-      whose text starts "Filed <its path>" or "Already recorded: <its path>"."""
+    - one is deleted only alongside a correction removed in the same change set: a local
+      one whose text starts "Filed <its path>" or "Already recorded: <its path>", or the
+      owner's own retraction naming it."""
+    rows, error = staged_name_status("knowledge/handoff", "knowledge/inbox")
+    if error:
+        return f"could not read the change set ({one_line(error)})"
     trunk = default_branch()
-    rows = git("diff", "--cached", "--no-renames", "--name-status", trunk,
-               "--", "knowledge/handoff", "knowledge/inbox")
-    added, removed, edited, gone_inbox = [], [], [], set()
-    for row in rows.splitlines():
-        status, _sep, rel = row.partition("\t")
-        rel = rel.strip()
-        if rel.startswith("knowledge/inbox/"):
-            if status.startswith("D"):
-                gone_inbox.add(rel)
-            continue
-        if not rel.endswith(".md"):
-            continue
-        (added if status.startswith("A") else removed if status.startswith("D")
-         else edited).append(rel)
+    gone_inbox = {rel for status, rel in rows
+                  if status.startswith("D") and rel.startswith("knowledge/inbox/")}
+    added, removed, edited = [], [], []
+    for status, rel in rows:
+        if rel.startswith("knowledge/handoff/"):
+            (added if status.startswith("A") else removed if status.startswith("D")
+             else edited).append(rel)
     for rel in edited:
         return f"{one_line(rel)}: a pass never edits a handoff note"
+    sources = set()
     for rel in added:
-        name = rel.rsplit("/", 1)[-1]
-        if f"knowledge/inbox/{name}" not in gone_inbox:
+        parts = rel.split("/")
+        if len(parts) != 4 or not parts[3].endswith(".md") \
+                or not HANDOFF_SLUG_RE.match(parts[2]):
+            return f"{one_line(rel)}: not knowledge/handoff/<project>/<capture>.md"
+        src = f"knowledge/inbox/{parts[3]}"
+        if src not in gone_inbox:
             return (f"{one_line(rel)}: not a capture moved out of the inbox under its own "
                     "file name")
-        shown = subprocess.run(["git", "show", f":{rel}"], cwd=ROOT, capture_output=True)
-        fm = parse_frontmatter(shown.stdout.decode("utf-8", "replace"))[0] or {}
+        if src in sources:
+            return f"{one_line(src)}: handed off to more than one place"
+        sources.add(src)
+        original, moved = git_blob(f"{trunk}:{src}"), git_blob(f":{rel}")
+        if original is None or moved is None:
+            return f"{one_line(rel)}: could not read the capture or its handoff note"
+        source = (parse_frontmatter(original.decode("utf-8-sig", "replace"))[0] or {}).get(
+            "source")
+        if source != DEFAULT_SOURCE:
+            return (f"{one_line(rel)}: handed off from {source!r} — only a capture from an "
+                    "owner endpoint (source: local) is handed off, never a drop box's or a "
+                    "session-mining proposal")
+        if without_handoff_keys(moved) != original:
+            return (f"{one_line(rel)}: changed in the move — a handoff keeps every byte of the "
+                    "capture and adds only handoff_to, handoff_at and handoff_reason, once "
+                    "each (bin/brain handoff does exactly that)")
+        fm = parse_frontmatter(moved.decode("utf-8-sig", "replace"))[0] or {}
         if str(fm.get("handoff_at") or "") != today:
             return (f"{one_line(rel)}: handoff_at {fm.get('handoff_at')!r}, not the pass "
                     f"date {today}")
+        if fm.get("handoff_to") != parts[2]:
+            return f"{one_line(rel)}: handoff_to {fm.get('handoff_to')!r}, not its folder"
     if removed:
-        closing = set()
-        for rel in gone_inbox:
-            shown = subprocess.run(["git", "show", f"{trunk}:{rel}"], cwd=ROOT,
-                                   capture_output=True)
-            text = shown.stdout.decode("utf-8", "replace")
-            fm = parse_frontmatter(text)[0] or {}
-            if fm.get("kind") != "correction" or fm.get("source") != DEFAULT_SOURCE:
+        corrections, error = removed_corrections(gone_inbox)
+        if error:
+            return error
+        allowed = set()
+        for _rel, fm, body in corrections:
+            if fm.get("source") != DEFAULT_SOURCE:
                 continue
-            lead = HANDOFF_CLOSE_RE.match("\n".join(text.splitlines()[fm.get("_end_line", 0):]))
+            lead = HANDOFF_CLOSE_RE.match(body)
             if lead and correction_target(lead.group(1)):
-                closing.add(correction_target(lead.group(1)))
+                allowed.add(correction_target(lead.group(1)))
+            elif RETRACT_LEAD_RE.match(body) and trusted_retraction(fm):
+                allowed.update(correction_targets(body))
         for rel in removed:
-            if rel not in closing:
+            if rel not in allowed:
                 return (f"{one_line(rel)}: a handoff note deleted with no closing correction "
-                        "(\"Filed <path>\" or \"Already recorded: <path>\") removed with it "
-                        "— handoff notes are filed, never promoted or dropped by a pass")
+                        "(\"Filed <path>\" or \"Already recorded: <path>\") or owner's "
+                        "retraction removed with it — handoff notes are filed, never "
+                        "promoted or dropped by a pass")
+    return None
+
+
+def correction_problems():
+    """The first way the staged change set breaks the correction rules, or None. Checked
+    as code before the audit, because the auditor sees only the diff:
+    - an inbox note is never drained while a local correction naming it is still in the
+      inbox: corrections are applied first, across the whole inbox;
+    - a retraction that removes its target (an inbox note, or a canonical note) is the
+      owner's own (source: local, basis: owner-said), read from the trunk;
+    - a note archived as retracted has such a retraction, removed in the same change set,
+      naming it by id or by its canonical path."""
+    rows, error = staged_name_status("knowledge")
+    if error:
+        return f"could not read the change set ({one_line(error)})"
+    trunk = default_branch()
+    deleted = {rel for status, rel in rows if status.startswith("D")}
+    gone_inbox = {rel for rel in deleted if rel.startswith("knowledge/inbox/")}
+    pending = pending_corrections()
+    for rel in sorted(gone_inbox):
+        if pending.get(rel):
+            return (f"{one_line(rel)} was drained while {one_line(pending[rel][0])}, a "
+                    "correction naming it, is still in the inbox — corrections are applied "
+                    "first")
+    removed_ids = {}
+    for rel in sorted(deleted):
+        parts = rel.split("/")
+        if len(parts) >= 3 and parts[1] in CANONICAL:
+            raw = git_blob(f"{trunk}:{rel}")
+            if raw is None:
+                return f"could not read {one_line(rel)} on the trunk"
+            note_id = (parse_frontmatter(raw.decode("utf-8-sig", "replace"))[0] or {}).get("id")
+            if note_id:
+                removed_ids[str(note_id)] = rel
+    corrections, error = removed_corrections(gone_inbox)
+    if error:
+        return error
+    trusted = set()
+    for rel, fm, body in corrections:
+        if not RETRACT_LEAD_RE.match(body):
+            continue
+        targets = correction_targets(body)
+        if trusted_retraction(fm):
+            trusted.update(targets)
+            continue
+        hit = next((t for t in targets if t in deleted or t in removed_ids), None)
+        if hit:
+            return (f"{one_line(rel)} (source {fm.get('source')!r}, basis "
+                    f"{fm.get('basis')!r}) removed {one_line(hit)} — only the owner's own "
+                    "correction (source: local, basis: owner-said) retracts anything")
+    for status, rel in rows:
+        if not (status.startswith("A") and rel.startswith("knowledge/archive/")):
+            continue
+        raw = git_blob(f":{rel}")
+        if raw is None:
+            return f"could not read {one_line(rel)}"
+        fm = parse_frontmatter(raw.decode("utf-8-sig", "replace"))[0] or {}
+        if fm.get("status") != "retracted":
+            continue
+        canonical = "knowledge/" + "/".join(rel.split("/")[2:])
+        if str(fm.get("id") or "") not in trusted and canonical not in trusted:
+            return (f"{one_line(rel)}: archived as retracted with no retraction from the "
+                    "owner (source: local, basis: owner-said) removed with it")
     return None
 
 
@@ -5948,6 +6106,10 @@ def _consolidate(argv: list, result: dict) -> int:
         problem = handoff_problems(today)
         if problem:
             failure, blocked = f"handoff check: {problem}", True
+    if failure is None and changed:
+        problem = correction_problems()
+        if problem:
+            failure, blocked = f"correction check: {problem}", True
 
     # The pass's final commit, made BEFORE the audit so the audit sees what will be pushed,
     # and carrying `Digest-until:` — when the digest was collected — for the next window.

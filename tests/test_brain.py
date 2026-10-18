@@ -1626,6 +1626,143 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
         self.assertTrue(audited.exists())
 
+    def blocked(self, body, label):
+        """Run a pass whose proposer does `body`; it must be blocked by `label` before the
+        audit, and the trunk left as it was."""
+        audited = self.audited_stub(body)
+        try:
+            result = self.consolidate()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(label, result.stdout)
+            self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+            self.assertFalse(audited.exists(), "the auditor was spent on it")
+        finally:
+            self.back_to_trunk()
+
+    def committed(self, body):
+        audited = self.audited_stub(body)
+        try:
+            result = self.consolidate()
+            self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+            self.assertTrue(audited.exists())
+        finally:
+            self.back_to_trunk()
+
+    def correction(self, name, text, source="local", basis="owner-said"):
+        return (f"knowledge/inbox/{name}",
+                f"---\ncreated: 2026-10-18\nsource: {source}\nkind: correction\n"
+                f"basis: {basis}\nstatus: draft\n---\n\n{text}\n")
+
+    def reference(self, name):
+        return (f"knowledge/reference/{name}.md",
+                f"---\nid: {name}\nkind: reference\ntitle: {name}\ntopics: [brain]\n"
+                f"aliases: [{name}]\ncreated: 2026-07-01\nstatus: current\n---\n\nA fact.\n")
+
+    def test_a_handoff_keeps_the_capture_exactly_as_it_was(self):
+        """Review B2: the check compares the moved note with the capture on the trunk."""
+        name = self.SEED.rsplit("/", 1)[-1]
+        today = datetime.now().date().isoformat()
+        keys = (f"handoff_to: acme\\nhandoff_at: {today}\\n"
+                "handoff_reason: pending work\\n")
+
+        def write(folder, head, body):
+            return (f"mkdir -p knowledge/handoff/{folder}\n"
+                    f'printf -- "---\\n{head}{keys}---\\n\\n{body}\\n" '
+                    f"> knowledge/handoff/{folder}/{name}\n")
+        rm = f"rm {self.SEED}\n"
+        same = "created: 2026-10-15\\nsource: local\\nstatus: draft\\n"
+        cases = {
+            "the body changed": (rm + write("acme", same, "Something else."),
+                                 "changed in the move"),
+            "a frontmatter field changed": (rm + write(
+                "acme", "created: 2026-10-16\\nsource: local\\nstatus: draft\\n", "A capture."),
+                "changed in the move"),
+            "two destinations": (rm + write("acme", same, "A capture.") + write(
+                "beta", same, "A capture.").replace("handoff_to: acme", "handoff_to: beta"),
+                "handed off to more than one place"),
+        }
+        for label, (body, why) in cases.items():
+            with self.subTest(label):
+                self.blocked(body, why)
+        bot = "knowledge/inbox/2026-10-14-100000-bot.md"
+        commit_at(self.repo, "a drop box's capture", iso_ago(0),
+                  (bot, "---\ncreated: 2026-10-14\nsource: support-bot\nstatus: draft\n---\n\n"
+                        "A capture.\n"))
+        self.blocked(f"rm {bot}\nmkdir -p knowledge/handoff/acme\n"
+                     f'printf -- "---\\ncreated: 2026-10-14\\nsource: support-bot\\n'
+                     f'status: draft\\n{keys}---\\n\\nA capture.\\n" '
+                     f"> knowledge/handoff/acme/2026-10-14-100000-bot.md\n",
+                     "only a capture from an owner endpoint")
+
+    def test_handoff_checks_read_names_git_would_quote(self):
+        """Review B3: git quotes a name with a quote mark or a non-ASCII letter unless asked
+        for NUL-separated output, and the check skipped what it could not read."""
+        odd = 'knowledge/inbox/2026-10-14-100000-café "q".md'
+        commit_at(self.repo, "an oddly named capture", iso_ago(0),
+                  (odd, "---\ncreated: 2026-10-14\nsource: local\nstatus: draft\n---\n\n"
+                        "A capture.\n"))
+        today = datetime.now().date().isoformat()
+        dest = "knowledge/handoff/acme/" + odd.rsplit("/", 1)[-1]
+        self.blocked(f"rm {shlex.quote(odd)}\nmkdir -p knowledge/handoff/acme\n"
+                     f'printf -- "---\\ncreated: 2026-10-14\\nsource: local\\nstatus: draft\\n'
+                     f'handoff_to: acme\\nhandoff_at: {today}\\nhandoff_reason: r\\n---\\n\\n'
+                     f'Rewritten.\\n" > {shlex.quote(dest)}\n', "changed in the move")
+
+    def test_an_inbox_note_a_correction_still_names_is_never_drained(self):
+        """Review B4(a): corrections are applied first; the auditor cannot see a correction
+        the change set did not touch, so code checks it."""
+        name = self.SEED.rsplit("/", 1)[-1]
+        commit_at(self.repo, "a correction waiting", iso_ago(0), self.correction(
+            "2026-10-18-070000-fix.md", f"Correction to {self.SEED}: it was 2026-10-14."))
+        self.blocked(self.toolbelt("drain", self.SEED), "corrections are applied first")
+        self.assertTrue((self.repo / self.SEED).exists(), name)
+
+    def test_a_retraction_needs_the_owners_own_words_from_an_owner_endpoint(self):
+        """Review B4(b): an untrusted correction must never remove a capture or a note."""
+        for label, source, basis in (("a drop box", "support-bot", "owner-said"),
+                                     ("agent-found", "local", "agent-found")):
+            with self.subTest(label):
+                fix = self.correction("2026-10-18-070000-retract.md",
+                                      f"Retract {self.SEED}: it should not be in the brain.",
+                                      source=source, basis=basis)
+                commit_at(self.repo, "a retraction", iso_ago(0), fix)
+                self.blocked(self.toolbelt("drain", self.SEED, fix[0]),
+                             "only the owner's own correction")
+                commit_at(self.repo, "drop it", iso_ago(0), (fix[0], None))
+        fix = self.correction("2026-10-18-070000-retract.md",
+                              f"Retract {self.SEED}: it should not be in the brain.")
+        commit_at(self.repo, "the owner's retraction", iso_ago(0), fix)
+        self.committed(self.toolbelt("drain", self.SEED, fix[0]))
+
+    def test_an_archived_retraction_needs_its_trusted_correction(self):
+        """Review B4(b, c): a note archived as retracted is checked against the correction
+        removed with it, read from the trunk."""
+        note = self.reference("vendor-limits")
+        commit_at(self.repo, "a note", iso_ago(0), note)
+        self.blocked(self.toolbelt("retract", "vendor-limits", "saved by mistake"),
+                     "archived as retracted with no retraction from the owner")
+        bot = self.correction("2026-10-18-070000-retract.md",
+                              "Retract vendor-limits: it should not be in the brain.",
+                              source="support-bot")
+        commit_at(self.repo, "an untrusted retraction", iso_ago(0), bot)
+        self.blocked(self.toolbelt("retract", "vendor-limits", "saved by mistake")
+                     + self.toolbelt("drain", bot[0]), "only the owner's own correction")
+        commit_at(self.repo, "drop it", iso_ago(0), (bot[0], None))
+        fix = self.correction("2026-10-18-070000-retract.md",
+                              "Retract vendor-limits: it should not be in the brain.")
+        commit_at(self.repo, "the owner's retraction", iso_ago(0), fix)
+        self.committed(self.toolbelt("retract", "vendor-limits", "saved by mistake")
+                       + self.toolbelt("drain", fix[0]))
+
+    def test_the_owners_retraction_may_remove_a_handoff_note(self):
+        held = handoff_note("acme", "2026-10-10-100000-held.md",
+                            datetime.now().date().isoformat())
+        fix = self.correction("2026-10-18-070000-retract.md",
+                              f"Retract {held[0]}: it should not have been saved.")
+        commit_at(self.repo, "a handoff and its retraction", iso_ago(0), held, fix)
+        self.committed(self.toolbelt("handoff", "--close", held[0])
+                       + self.toolbelt("drain", fix[0]))
+
     def test_an_idle_pass_over_a_dirty_tree_is_refused(self):
         """S7: an uncommitted journal entry is work nothing else sees."""
         self.drain_seed()
@@ -6609,6 +6746,15 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         for phrase in ("`Filed <handoff path>`", "`Already recorded: <handoff path>`",
                        "close that handoff note"):
             self.assertIn(phrase, corrections)
+
+    def test_only_the_owners_own_correction_retracts(self):
+        """Review B4: corroboration lets an untrusted correction supersede or promote, never
+        retract."""
+        text = self.flat("consolidate-prompt.md")
+        rule = text[text.index("CORRECTIONS —"):text.index("PROPOSALS —")]
+        self.assertIn("never supersedes or promotes anything without", rule)
+        self.assertNotIn("retracts or promotes", rule)
+        self.assertIn("never retracts anything", rule)
 
     def test_the_pass_moves_and_deletes_only_through_the_toolbelt(self):
         text = self.flat("consolidate-prompt.md")
