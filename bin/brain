@@ -440,9 +440,10 @@ def check_links(path, text, fm, ctx: LintCtx, hard: bool = True) -> None:
         if target == predecessor:
             continue
         t_rel, t_fm = ctx.metas[target]
-        if t_rel.parts[0] == "archive" and t_fm.get("status") == "retracted":
+        if t_rel.parts[0] == "archive" and chain_ends_retracted(target, ctx.metas):
             ctx.warnings.append((path, f"wikilink [[{target}]] points at a RETRACTED note "
-                                 "— it was withdrawn with no successor; remove the link"))
+                                 "(or a supersede chain that ends in one) — it was withdrawn "
+                                 "with no successor; remove the link"))
         elif t_rel.parts[0] == "archive":
             successor = t_fm.get("superseded_by")
             ctx.warnings.append((path, f"wikilink [[{target}]] points at a SUPERSEDED note"
@@ -468,6 +469,21 @@ def check_retracted(path, fm, text, ctx: LintCtx) -> None:
     if not body_lines or not body_lines[0].lstrip().startswith("> RETRACTED"):
         ctx.warnings.append((path, "retracted note body should start with the banner "
                              "'> RETRACTED <date> — <reason>'"))
+
+
+def chain_ends_retracted(note_id, metas) -> bool:
+    """Does this note, or the supersede chain it starts, end in a retracted note?"""
+    seen = set()
+    while note_id in metas and note_id not in seen and len(seen) < 50:
+        seen.add(note_id)
+        _rel, fm = metas[note_id]
+        if fm.get("status") == "retracted":
+            return True
+        successor = fm.get("superseded_by")
+        if fm.get("status") != "superseded" or not isinstance(successor, str):
+            return False
+        note_id = successor
+    return False
 
 
 def check_visibility(path, folder, in_archive, fm, ctx: LintCtx) -> None:
@@ -3826,8 +3842,14 @@ def cmd_read(argv: list) -> int:
                     print(f"NOTE:{correction_marker(names)} — its closing correction waits "
                           "for the next consolidation.\n")
             elif top == "archive":
-                print("WARNING: this note is ARCHIVED/superseded — HISTORY, not current. "
-                      "Cite it only as 'previously…'.\n")
+                afm = parse_frontmatter(read_text(candidate))[0] or {}
+                if afm.get("status") == "retracted":
+                    print(f"WARNING: this note is ARCHIVED as RETRACTED on "
+                          f"{afm.get('retracted')} — withdrawn with no successor. Nothing in "
+                          "it is true today; do not present any of it as fact.\n")
+                else:
+                    print("WARNING: this note is ARCHIVED/superseded — HISTORY, not current. "
+                          "Cite it only as 'previously…'.\n")
             print(read_text(candidate))
             return 0
         print(f"note {wanted!r} not found (by id or path)")
@@ -4059,63 +4081,73 @@ def cmd_retract(argv: list) -> int:
     default search scope and `brain read` shows it only behind a RETRACTED
     warning. Like supersede it neither erases nor commits: git history keeps the
     text, and the caller (normally the consolidation pass, on the owner's
-    correction) lints and commits."""
+    correction) lints and commits. The whole check, rewrite and move happens under
+    the repository lock, so no commit can sweep in half a retraction."""
+    usage = 'usage: brain retract <id-or-path> "<one-line reason>"'
+    flags = [a for a in argv if a.startswith("--")]
     args = [a for a in argv if not a.startswith("--")]
-    usage = 'usage: brain retract <id> "<one-line reason>"'
-    if len(args) < 2:
-        print(usage)
+    if flags:
+        print(usage + f" — unknown option {flags[0]!r}; nothing was changed")
         return 2
-    note_id, reason = args[0], args[1].strip()
+    if len(args) != 2:
+        print(usage + " — exactly a note and a reason (quote the reason); nothing was "
+              "changed")
+        return 2
+    wanted, reason = args[0], args[1].strip()
     if not reason or "\n" in reason or "\r" in reason:
         print(usage + " — the reason is required, on one line: it is what the archived "
               "note keeps to say why it was withdrawn")
         return 2
-    metas = all_metas()
-    if note_id not in metas:
-        if "/" in note_id or note_id.endswith(".md"):
-            top = Path(note_id).parts[1] if note_id.startswith("knowledge/") \
-                and len(Path(note_id).parts) > 1 else Path(note_id).parts[0]
-            if top == "inbox":
-                print(f"{note_id!r} is an inbox capture: it has no id and is never archived — "
-                      "consolidation deletes it (with the correction that retracts it)")
-                return 1
-        print(f"note {note_id!r} not found — retract takes the id of a canonical note")
+    as_path = Path(wanted)
+    if as_path.parts[:1] == ("knowledge",):
+        as_path = Path(*as_path.parts[1:]) if len(as_path.parts) > 1 else Path()
+    if as_path.parts[:1] == ("inbox",):
+        print(f"{wanted!r} is an inbox capture: it has no id and is never archived — "
+              "consolidation drains it (with the correction that retracts it)")
         return 1
-    rel, fm = metas[note_id]
-    if rel.parts[0] == "archive":
-        print(f"{note_id!r} is already archived (status: {fm.get('status')})")
-        return 1
-    if rel.parts[0] not in CANONICAL:
-        print(f"{note_id!r} lives in knowledge/{rel.parts[0]}/ — only a canonical note is "
-              "retracted; provisional material is deleted by consolidation instead")
-        return 1
-    src = K / rel
-    dest = K / "archive" / rel
-    if dest.exists():
-        print(f"{dest.relative_to(ROOT)} already exists — archive history is append-only and "
-              "must never be overwritten. Resolve that first.")
-        return 1
-    today = date.today().isoformat()
-    # A withdrawn note is never published: approval does not outlive the note.
-    fm_update(src, {"status": "retracted", "retracted": today, "visibility": None},
-              banner=f"> RETRACTED {today} — {reason}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    # The same lock supersede takes for its git mv, for the same reason: a commit in
-    # the same instant could sweep half a retraction into itself.
     with repo_lock():
+        metas = all_metas()
+        note_id = wanted if wanted in metas else None
+        if note_id is None and wanted.endswith(".md"):
+            for nid, (nrel, _fm) in metas.items():
+                if nrel == as_path:
+                    note_id = nid
+                    break
+        if note_id is None:
+            print(f"note {wanted!r} not found — retract takes a canonical note's id or path")
+            return 1
+        rel, fm = metas[note_id]
+        if rel.parts[0] == "archive":
+            print(f"{note_id!r} is already archived (status: {fm.get('status')})")
+            return 1
+        if rel.parts[0] not in CANONICAL:
+            print(f"{note_id!r} lives in knowledge/{rel.parts[0]}/ — only a canonical note is "
+                  "retracted; provisional material is drained by consolidation instead")
+            return 1
+        src = K / rel
+        dest = K / "archive" / rel
+        if dest.exists():
+            print(f"{dest.relative_to(ROOT)} already exists — archive history is append-only "
+                  "and must never be overwritten. Resolve that first.")
+            return 1
+        today = date.today().isoformat()
+        # A withdrawn note is never published: approval does not outlive the note.
+        fm_update(src, {"status": "retracted", "retracted": today, "visibility": None},
+                  banner=f"> RETRACTED {today} — {reason}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
         moved = subprocess.run(["git", "mv", str(src), str(dest)], cwd=ROOT,
                                capture_output=True, text=True)
-    if moved.returncode != 0:
-        if dest.exists():
-            print(f"git mv failed and {dest.relative_to(ROOT)} now exists — refusing to "
-                  f"overwrite history. {src.relative_to(ROOT)} is marked retracted; move it "
-                  "into archive/ by hand.")
-            return 1
-        src.replace(dest)
+        if moved.returncode != 0:
+            if dest.exists():
+                print(f"git mv failed and {dest.relative_to(ROOT)} now exists — refusing to "
+                      f"overwrite history. {src.relative_to(ROOT)} is marked retracted; move "
+                      "it into archive/ by hand.")
+                return 1
+            src.replace(dest)
     linking = []
     for path in indexable_paths():
         p_rel = path.relative_to(K)
-        if p_rel.parts[0] not in CANONICAL and p_rel != Path("index.md"):
+        if p_rel.parts[0] not in CANONICAL:
             continue
         try:
             if note_id in extract_links(read_text(path)):

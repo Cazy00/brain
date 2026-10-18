@@ -2590,6 +2590,57 @@ class RetractTests(unittest.TestCase):
         self.assertIn("RETRACTED", read.stdout)
         self.assertNotIn("this is the CURRENT version", read.stdout)
 
+    def test_retract_refuses_unknown_options_and_extra_words(self):
+        """Review should-fix: `--dry-run` was dropped silently and the note retracted; an
+        unquoted reason lost every word after the first."""
+        self.write_ref("seed-note")
+        for args in (("--dry-run", "seed-note", self.REASON), ("seed-note", "wrong", "note")):
+            with self.subTest(args=args):
+                out = run_brain("retract", *args, repo=self.repo)
+                self.assertEqual(out.returncode, 2, out.stdout)
+                self.assertTrue((self.ref / "seed-note.md").exists())
+                self.assertIn("status: current",
+                              (self.ref / "seed-note.md").read_text(encoding="utf-8"))
+
+    def test_retract_accepts_a_canonical_notes_path(self):
+        """Search and recent print paths, not ids; a retraction written against the path an
+        agent was shown must still apply."""
+        for name, arg in (("one-note", "knowledge/reference/one-note.md"),
+                          ("two-note", "reference/two-note.md")):
+            with self.subTest(arg):
+                self.write_ref(name)
+                out = run_brain("retract", arg, self.REASON, repo=self.repo)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertTrue(self.archived(name).exists())
+
+    def test_a_link_into_a_chain_that_ends_retracted_never_says_repoint(self):
+        """Review should-fix: A superseded by B, B retracted. A link to A was told to repoint
+        at B, a note withdrawn as never true."""
+        self.write_ref("seed-note", body="The original claim.")
+        run_brain("supersede", "seed-note", "Seed note v2", repo=self.repo)
+        successor = self.ref / "seed-note-v2.md"
+        successor.write_text(successor.read_text(encoding="utf-8").replace(
+            "## What\n", "## What\n\nThe revised claim.\n"), encoding="utf-8")
+        old = self.archived()
+        old.write_text(old.read_text(encoding="utf-8").replace(
+            "<one-line reason>", "the claim changed"), encoding="utf-8")
+        run_brain("retract", "seed-note-v2", self.REASON, repo=self.repo)
+        self.write_ref("hub-note", body="See [[seed-note]].")
+        lint = run_brain("lint", repo=self.repo)
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+        rows = [l for l in lint.stdout.splitlines() if "[[seed-note]]" in l]
+        self.assertTrue(rows, lint.stdout)
+        self.assertIn("RETRACTED", rows[0])
+        self.assertNotIn("repoint", rows[0])
+
+    def test_reading_an_archived_retracted_path_says_retracted(self):
+        path = self.repo / "knowledge" / "archive" / "reference" / "no-id.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\nstatus: retracted\nretracted: 2026-10-18\n---\n\n"
+                        "> RETRACTED 2026-10-18 — saved by mistake\n", encoding="utf-8")
+        out = run_brain("read", "knowledge/archive/reference/no-id.md", repo=self.repo)
+        self.assertIn("RETRACTED", out.stdout.splitlines()[0])
+
     def test_retract_takes_the_documented_place_in_the_toolbelt(self):
         out = run_brain("--help", repo=self.repo)
         self.assertIn("brain retract <id>", out.stdout)
@@ -3388,6 +3439,36 @@ class RepoLockCoverageTests(unittest.TestCase):
             "aliases: [lock seed]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"
             "---\n\nThe original claim.\n", encoding="utf-8")
         self.assert_blocks_on_repo_lock("supersede", "lock-seed", "Lock seed revised")
+
+    def test_retract_changes_nothing_before_it_holds_the_lock(self):
+        """Review should-fix: the note was marked retracted in its canonical folder before
+        the lock was taken, so a capture's commit could sweep the half-done state in."""
+        try:
+            import fcntl
+        except ImportError:
+            self.skipTest("no fcntl on this platform")
+        note = self.repo / "knowledge/reference/lock-seed.md"
+        note.write_text(
+            "---\nid: lock-seed\nkind: reference\ntitle: Lock seed\ntopics: [brain]\n"
+            "aliases: [lock seed]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"
+            "---\n\nThe original claim.\n", encoding="utf-8")
+        before = note.read_text(encoding="utf-8")
+        (self.repo / ".cache").mkdir(exist_ok=True)
+        holder = open(self.repo / ".cache" / "git.lock", "w")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        proc = subprocess.Popen([sys.executable, str(self.repo / "bin" / "brain"), "retract",
+                                 "lock-seed", "saved by mistake"], cwd=self.repo,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                proc.communicate(timeout=self.HELD)
+            self.assertEqual(note.read_text(encoding="utf-8"), before,
+                             "retract changed the note while another process held the lock")
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        out, _ = proc.communicate(timeout=120)
+        self.assertTrue((self.repo / "knowledge/archive/reference/lock-seed.md").exists(), out)
 
     def test_retract_takes_the_lock(self):
         (self.repo / "knowledge/reference/lock-seed.md").write_text(
