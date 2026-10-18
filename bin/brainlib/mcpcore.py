@@ -52,9 +52,9 @@ PROFILES = {"read": READ_TOOLS, "capture": CAPTURE_TOOLS}
 # owner at their own keyboard, a remote one is anything that got through Access.
 LIMITS = {
     "local": {"query": 100_000, "id_or_path": 100_000, "text": 100_000,
-              "limit": (1, 100), "days": (1, 3650)},
+              "limit": (1, 100), "days": (1, 3650), "offset": 1_000_000},
     "remote": {"query": 2_048, "id_or_path": 512, "text": 65_536,
-               "limit": (1, 20), "days": (1, 365)},
+               "limit": (1, 20), "days": (1, 365), "offset": 100_000},
 }
 
 SEARCH_DESCRIPTION = (
@@ -164,6 +164,9 @@ def tool_table(transport: str = "local") -> list:
                                              "may be empty or a project slug."},
                     "limit": {"type": "integer", "description": "Max hits (default 8).",
                               "minimum": caps["limit"][0], "maximum": caps["limit"][1]},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": caps["offset"],
+                               "description": "Scope handoff only: skip this many hits, to "
+                                              "page (stable order: handoff_at, then path)."},
                 },
                 "required": ["query"],
             },
@@ -371,6 +374,8 @@ def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> l
         cli = ["search", "--limit", str(args.get("limit", 8))]
         if args.get("scope") in ("all", "handoff"):
             cli += ["--scope", args["scope"]]
+        if args.get("scope") == "handoff" and args.get("offset") is not None:
+            cli += ["--offset", str(args["offset"])]
         cli += ["--", args["query"]]      # query text, never parsed as flags
         return cli
     if name == "brain_read":

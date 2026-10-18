@@ -20,7 +20,7 @@ Commands:
                                    --job and --model are the caller's claims.
                                    A bad value is dropped, the note kept.
   brain lint [--staged]            validate every note; exit 1 on errors
-  brain search "<query>" [--scope all|handoff] [--limit N] [--json]
+  brain search "<query>" [--scope all|handoff] [--limit N] [--offset N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
   brain links <id-or-path> [--json]  wikilink graph: what links here, what it links to
   brain supersede <old-id> "<new title>"   full supersede choreography in one shot
@@ -3353,25 +3353,52 @@ def closed_handoffs() -> set:
 
 
 def handoff_notes() -> list:
-    """Every note in knowledge/handoff/<project>/, read straight off disk."""
+    """Every note in knowledge/handoff/<project>/, read straight off disk.
+
+    Containment is checked here, at read time, not left to lint: a symlinked project
+    folder or file is skipped, and each file must resolve inside the real handoff root,
+    so nothing outside it can be served as a handoff note."""
     root = K / "handoff"
     out = []
-    if not root.is_dir():
+    try:
+        if root.is_symlink():
+            return out
+        real_root = root.resolve(strict=True)
+        projects = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
         return out
-    for path in sorted(root.glob("*/*.md")):
+    for folder in projects:
         try:
-            if path.is_symlink() or not path.is_file():
+            if not folder.is_dir(follow_symlinks=False):
                 continue
-            text = read_text(path)
+            files = sorted(os.scandir(folder.path), key=lambda e: e.name)
         except OSError:
             continue
-        fm, _err = parse_frontmatter(text)
-        fm = fm or {}
-        out.append({"path": str(path.relative_to(ROOT)), "stem": path.stem,
-                    "project": str(fm.get("handoff_to") or path.parent.name),
-                    "fm": fm,
-                    "body": "\n".join(text.splitlines()[fm.get("_end_line", 0):])})
+        for entry in files:
+            path = Path(entry.path)
+            try:
+                if not entry.name.endswith(".md") or not entry.is_file(follow_symlinks=False):
+                    continue
+                if path.resolve(strict=True).parent.parent != real_root:
+                    continue
+                text = read_text(path)
+            except OSError:
+                continue
+            fm, _err = parse_frontmatter(text)
+            fm = fm or {}
+            out.append({"path": str(path.relative_to(ROOT)), "stem": path.stem,
+                        "project": str(fm.get("handoff_to") or folder.name),
+                        "fm": fm,
+                        "body": "\n".join(text.splitlines()[fm.get("_end_line", 0):])})
     return out
+
+
+def project_slugs() -> set:
+    """The projects the brain knows: one folder each under knowledge/projects/."""
+    try:
+        return {e.name for e in os.scandir(K / "projects") if e.is_dir(follow_symlinks=False)}
+    except OSError:
+        return set()
 
 
 def handoff_stale(note: dict, closed: set, today=None) -> bool:
@@ -3386,30 +3413,45 @@ def handoff_stale(note: dict, closed: set, today=None) -> bool:
     return (today - date.fromisoformat(at)).days > HANDOFF_STALE_DAYS
 
 
-def do_handoff_search(query: str, limit: int = 8) -> dict:
+QUERY_PUNCTUATION = "`'\"()[]<>*,;:.?!"
+
+
+def do_handoff_search(query: str, limit: int = 8, offset: int = 0) -> dict:
     """`search --scope handoff`: the notes waiting to be filed, never brain knowledge.
 
-    An empty query lists them all. A word naming a project that has handoff notes filters
-    by `handoff_to`; any other words must appear in the note (all of them, else any)."""
+    An empty query lists them all. A query of one slug-shaped word is a project: exactly
+    the notes whose `handoff_to` it is, none when it has none — a filing job asking for
+    its own project must never be handed another's. In a longer query a word naming a
+    project the brain knows (a handoff folder or a knowledge/projects/ folder) filters by
+    it, and every other word must appear in the note as a whole word. A query that
+    names nothing usable selects nothing. Hits come in a stable order (handoff_at, then
+    path) so `offset` pages through them."""
     notes = handoff_notes()
-    projects = {n["project"] for n in notes}
-    words = query.split()
-    wanted = {w.lower() for w in words if w.lower() in projects}
-    rest = [t.lower() for w in words if w.lower() not in wanted
-            for t in re.findall(r"\w+", w)]
-    chosen = [n for n in notes if not wanted or n["project"] in wanted]
+    known = {n["project"] for n in notes} | project_slugs()
+    raw = query.split()
+    words = [w for w in (r.strip(QUERY_PUNCTUATION).lower() for r in raw) if w]
+    if raw and not words:
+        chosen, mode = [], "none"
+    elif len(words) == 1 and HANDOFF_SLUG_RE.match(words[0]):
+        chosen, mode = [n for n in notes if n["project"] == words[0]], "project"
+    else:
+        wanted = {w for w in words if w in known}
+        rest = [w for w in words if w not in wanted]
 
-    def text_of(n):
-        return " ".join([str(n["fm"].get("title") or ""), n["body"],
-                         str(n["fm"].get("handoff_reason") or "")]).lower()
-    mode = "project" if wanted else "listing"
-    if rest:
-        every = [n for n in chosen if all(t in text_of(n) for t in rest)]
-        some = [n for n in chosen if any(t in text_of(n) for t in rest)]
-        chosen, mode = (every, "all-terms") if every else (some, "any-term" if some else "none")
-    pending = pending_corrections()
+        def text_of(n):
+            return " ".join([str(n["fm"].get("title") or ""), n["body"],
+                             str(n["fm"].get("handoff_reason") or "")]).lower()
+
+        def has(word, text):
+            return re.search(r"(?<![\w-])" + re.escape(word) + r"(?![\w-])", text) is not None
+        chosen = [n for n in notes if (not wanted or n["project"] in wanted)
+                  and all(has(w, text_of(n)) for w in rest)]
+        mode = "listing" if not words else ("project" if not rest else "words")
+    chosen.sort(key=lambda n: (str(n["fm"].get("handoff_at") or ""), n["path"]))
+    pending = pending_corrections() if chosen else {}
+    page = chosen[offset:offset + limit]
     hits = []
-    for n in chosen:
+    for n in page:
         fm = n["fm"]
         hits.append({
             "id": f"handoff-{n['stem']}", "path": n["path"],
@@ -3420,8 +3462,8 @@ def do_handoff_search(query: str, limit: int = 8) -> dict:
             "handoff_reason": str(fm.get("handoff_reason") or ""),
             "status": None, "stale": False,
             "corrections_pending": corrections_naming(pending, n["path"])})
-    return {"mode": mode, "scope": "handoff", "hits": hits[:limit],
-            "more": max(0, len(hits) - limit)}
+    return {"mode": mode, "scope": "handoff", "hits": hits, "total": len(chosen),
+            "offset": offset, "more": max(0, len(chosen) - offset - len(page))}
 
 
 def corrections_naming(pending: dict, *keys) -> list:
@@ -3470,11 +3512,20 @@ def format_hits(result: dict) -> str:
 
 def cmd_search(argv: list) -> int:
     import json as _json
-    scope, limit, as_json, terms = "canonical", 8, False, []
+    scope, limit, as_json, terms, offset = "canonical", 8, False, [], 0
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--scope" and i + 1 < len(argv):
+        if a == "--offset" and i + 1 < len(argv):
+            try:
+                offset = int(argv[i + 1])
+            except ValueError:
+                offset = -1
+            if offset < 0:
+                print("--offset takes a whole number of hits to skip (0 or more)")
+                return 2
+            i += 2
+        elif a == "--scope" and i + 1 < len(argv):
             scope = argv[i + 1]
             i += 2
         elif a == "--limit" and i + 1 < len(argv):
@@ -3501,12 +3552,12 @@ def cmd_search(argv: list) -> int:
         scope = "canonical"
     if scope == "handoff":
         # Not brain knowledge, and an empty query is allowed: it lists them all.
-        result = do_handoff_search(" ".join(terms), limit=limit)
+        result = do_handoff_search(" ".join(terms), limit=limit, offset=offset)
         print(_json.dumps(result, indent=2) if as_json else format_hits(result))
         return 0
     if not terms:
         print("usage: brain search \"<query>\" [--scope canonical|all|handoff] [--limit N] "
-              "[--json]")
+              "[--offset N] [--json]")
         return 2
     result = do_search(" ".join(terms), scope=scope, limit=limit)
     print(_json.dumps(result, indent=2) if as_json else format_hits(result))

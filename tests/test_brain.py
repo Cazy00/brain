@@ -2922,9 +2922,63 @@ class HandoffReadTests(unittest.TestCase):
         self.assertNotIn(self.B, text)
 
     def test_other_words_filter_by_the_notes_text(self):
-        text = self.search("--scope", "handoff", "credential")
+        text = self.search("--scope", "handoff", "rotated credential")
         self.assertIn(self.B, text)
         self.assertNotIn(self.A, text)
+
+    def hits(self, *args):
+        out = run_brain("search", "--scope", "handoff", "--json", *args, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json_payload(out.stdout)
+
+    def test_a_single_slug_filters_exactly_by_handoff_to(self):
+        """Review B6: a filing job asking for its own project's notes must never be handed
+        another project's, even when its own has none."""
+        self.assertEqual([h["path"] for h in self.hits("beta")["hits"]], [self.B])
+        for query in ("team-a", "acme-api", "credential"):
+            with self.subTest(query):
+                self.assertEqual(self.hits(query)["hits"], [])
+
+    def test_a_known_project_with_no_notes_selects_nothing(self):
+        overview = self.repo / "knowledge" / "projects" / "gamma" / "overview.md"
+        overview.parent.mkdir(parents=True, exist_ok=True)
+        overview.write_text("---\nid: gamma\nkind: project\ntitle: Gamma\ntopics: [brain]\n"
+                            "aliases: [gamma]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+                            "A project.\n", encoding="utf-8")
+        self.assertEqual(self.hits("gamma staging smoke")["hits"], [])
+
+    def test_a_query_that_selects_nothing_returns_nothing(self):
+        """No splitting a hyphenated word into one-letter substrings, and no "any word"
+        fallback that lets a stray letter match every note."""
+        for query in ("?", "smoke x-ray", "a"):
+            with self.subTest(query):
+                self.assertEqual(self.hits(query)["hits"], [])
+
+    def test_handoff_results_page_in_a_stable_order(self):
+        for rel, text in (handoff_note("acme", "2026-10-11-000000-c.md", "2026-10-12"),
+                          handoff_note("acme", "2026-10-12-000000-b.md", "2026-10-11"),
+                          handoff_note("acme", "2026-10-13-000000-a.md", "2026-10-11")):
+            (self.repo / rel).write_text(text, encoding="utf-8")
+        first = self.hits("acme", "--limit", "2")
+        order = [h["path"].rsplit("/", 1)[-1] for h in first["hits"]]
+        self.assertEqual(order, ["2026-10-12-000000-b.md", "2026-10-13-000000-a.md"])
+        self.assertEqual((first["total"], first["offset"], first["more"]), (4, 0, 2))
+        second = self.hits("acme", "--limit", "2", "--offset", "2")
+        order = [h["path"].rsplit("/", 1)[-1] for h in second["hits"]]
+        self.assertEqual(order, ["2026-10-11-000000-c.md", "2026-10-15-120000-smoke.md"])
+        self.assertEqual((second["offset"], second["more"]), (2, 0))
+        bad = run_brain("search", "--scope", "handoff", "--offset", "-1", repo=self.repo)
+        self.assertEqual(bad.returncode, 2, bad.stdout)
+
+    def test_symlinked_directories_and_files_are_never_read(self):
+        """Review should-fix: containment is checked at query time, not left to lint."""
+        root = self.repo / "knowledge" / "handoff"
+        os.symlink("../reference", root / "evil")
+        os.symlink("../../reference/smoke-tests.md", root / "acme" / "linked.md")
+        text = self.search("--scope", "handoff")
+        self.assertNotIn("evil", text)
+        self.assertNotIn("linked.md", text)
+        self.assertNotIn("smoke-tests", text)
 
     def test_scope_handoff_json_carries_the_interface_keys(self):
         out = run_brain("search", "--scope", "handoff", "--json", repo=self.repo)
@@ -2995,6 +3049,20 @@ class HandoffMcpTests(unittest.TestCase):
         result = answer["result"]
         self.assertFalse(result.get("isError"), result)
         self.assertIn("handoff", result["content"][0]["text"])
+
+    def test_both_front_ends_page_handoff_results_with_an_offset(self):
+        for tool in (self.mcp.TOOLS_BY_NAME["brain_search"], self.remote["brain_search"]):
+            offset = tool["inputSchema"]["properties"]["offset"]
+            self.assertEqual((offset["type"], offset["minimum"]), ("integer", 0))
+        self.assertEqual(
+            self.mcpcore.cli_for("brain_search", {"query": "acme", "scope": "handoff",
+                                                  "offset": 2}),
+            ["search", "--limit", "8", "--scope", "handoff", "--offset", "2", "--", "acme"])
+        answer = self.mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "brain_search",
+                                             "arguments": {"query": "", "scope": "handoff",
+                                                           "offset": 3}}})
+        self.assertFalse(answer["result"].get("isError"), answer)
 
     def test_both_capture_descriptions_say_how_a_handoff_is_closed(self):
         for tool in (self.mcp.TOOLS_BY_NAME["brain_capture"], self.remote["brain_capture"]):

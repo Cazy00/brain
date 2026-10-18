@@ -57,6 +57,9 @@ TOOLS = [
                                          "project's own records — not brain knowledge; the query "
                                          "may be empty or a project slug."},
                 "limit": {"type": "integer", "description": "Max hits (default 8)."},
+                "offset": {"type": "integer", "minimum": 0,
+                           "description": "Scope handoff only: skip this many hits, to page "
+                                          "(stable order: handoff_at, then path)."},
             },
             "required": ["query"],
         },
@@ -333,6 +336,8 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
         cli = ["search", "--limit", str(args.get("limit", 8))]
         if args.get("scope") in ("all", "handoff"):
             cli += ["--scope", args["scope"]]
+        if args.get("scope") == "handoff" and args.get("offset") is not None:
+            cli += ["--offset", str(args["offset"])]
         cli += ["--", args["query"]]      # query text, never parsed as flags
     elif name == "brain_read":
         cli = ["read", args["id_or_path"]]
