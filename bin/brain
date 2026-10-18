@@ -2799,6 +2799,12 @@ FOLDER_WEIGHTS = {"decisions": 1.2, "reference": 1.2, "topics": 1.0, "projects":
                   "people": 1.0, "life": 1.0, "journal": 0.6, "inbox": 0.6}
 
 
+# Top-level folders the search index leaves out. One definition, read by both the index
+# and its freshness check: when they disagreed about handoff/, every check reported the
+# index stale straight after building it.
+NOT_INDEXED = ("archive", "vault", "attachments", "handoff")
+
+
 def indexable_paths():
     """Every note the search index should contain — canonical + journal +
     inbox, never archive/vault/attachments/handoff. Single definition so the index and
@@ -2806,8 +2812,7 @@ def indexable_paths():
     brain knowledge: `search --scope handoff` reads it straight off disk."""
     for path in sorted(K.rglob("*.md")):
         rel = path.relative_to(K)
-        if rel.parts[0] in ("archive", "vault", "attachments", "handoff") \
-                or path.name in EXEMPT_NAMES:
+        if rel.parts[0] in NOT_INDEXED or path.name in EXEMPT_NAMES:
             continue
         yield path
 
@@ -3017,7 +3022,7 @@ def index_stale() -> bool:
                 except OSError:
                     continue
                 live += 1
-                if top != "archive" and name not in EXEMPT_NAMES:
+                if top not in NOT_INDEXED and name not in EXEMPT_NAMES:
                     indexable += 1
                 if stat.st_mtime > built:
                     return True

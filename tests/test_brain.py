@@ -3121,6 +3121,15 @@ class HandoffHealthTests(unittest.TestCase):
                    f"status: draft\n---\n\nFiled: {rel} to github.com/example/acme issue #3.\n"))
         self.assertFalse([l for l in self.handoff_lines() if "[RED]" in l])
 
+    def test_the_index_stays_fresh_beside_handoff_notes(self):
+        """Review should-fix: the freshness check counted handoff notes as indexable while
+        the index left them out, so every search rebuilt the index for nothing."""
+        commit_at(self.repo, "handoff", iso_ago(0), handoff_note("acme", "a1.md", self.ago(0)))
+        built = run_brain("index", repo=self.repo)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        doctor = run_brain("doctor", repo=self.repo).stdout
+        self.assertIn("[ok ] search index fresh", doctor, doctor)
+
     def test_stats_counts_handoff_apart_from_the_corpus(self):
         commit_at(self.repo, "handoffs", iso_ago(0),
                   handoff_note("acme", "a1.md", self.ago(0)),
