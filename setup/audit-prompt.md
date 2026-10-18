@@ -33,7 +33,9 @@ a block — the brain would then serve both as true.
 
 Also block if the change set plainly violates the pass's own caps (more than 15
 modified canonical files, or more than 3 new inbox proposals), or if a note was
-moved into archive/ without a successor carrying its knowledge forward.
+moved into archive/ without a successor carrying its knowledge forward — except
+a retraction (`status: retracted`), which has none by design and is checked
+under PROVENANCE.
 
 **PROVENANCE.** Inbox notes carry `source:` and, where the capturing agent
 declared it, `basis:` — `owner-said`, `agent-found` or `agent-inferred`. A
@@ -55,7 +57,15 @@ Block if the change set:
 - adds more than 3 new inbox notes with `source: session-mining`, or adds one
   without an `expires:` date;
 - creates a canonical note, or merges an input into one, with no `## Sources`
-  line for an input at all.
+  line for an input at all;
+- retracts a note — moves it to archive/ with `status: retracted` — unless a
+  `kind: correction` the change set removes from the inbox names it, by id or
+  path, asks for its retraction, and has `source: local` and `basis:
+  owner-said`;
+- promotes an inbox note, or merges it into a canonical note, while a
+  `kind: correction` still in the inbox names it (by its path) and has
+  `source: local`. The pass reads the whole inbox for corrections and applies
+  them first, so one still waiting means its target is not settled.
 
 The Sources lines the pass writes are, one per input: for a capture that
 declares `basis:`, its basis and date (`- Owner, <date> (via <via>)`,

@@ -5866,6 +5866,39 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
                        "a project's own records", "decision or lesson"):
             self.assertIn(phrase, rule)
 
+    def test_the_drain_applies_corrections_first_across_the_whole_inbox(self):
+        """An original promoted in the same pass as its own correction, because the
+        correction sat beyond the 20-item cap, would be served as settled. Corrections are
+        read from the whole inbox and applied first, by where their target is now."""
+        text = self.flat("consolidate-prompt.md")
+        drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
+        self.assertIn("Apply CORRECTIONS (below) first, across the WHOLE inbox", drain)
+        rule = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
+        for phrase in ("the WHOLE inbox", "not only the oldest 20", "beyond the cap",
+                       "do not count toward the 20",
+                       # the target is still in the inbox
+                       "still in the inbox", "a retraction deletes both notes",
+                       "only the corrected content",
+                       # the target is canonical
+                       "the supersede protocol", "`bin/brain retract <id> \"<reason>\"`",
+                       # the target moved
+                       "consolidate commit bodies", "the quoted line",
+                       "leave the correction in the inbox and say so in the commit message",
+                       # trust: a retraction needs the owner's own words
+                       "a retraction only with `source: local` and `basis: owner-said`"):
+            self.assertIn(phrase, rule)
+        caps = text[text.index("Hard caps"):text.index("Finish:")]
+        self.assertIn("corrections not counted", caps)
+        finish = text[text.index("Finish:"):]
+        self.assertIn("what it became", finish)
+
+    def test_the_auditor_checks_retractions_and_corrections_first(self):
+        text = self.flat("audit-prompt.md")
+        for phrase in ("`status: retracted`", "`source: local` and `basis: owner-said`",
+                       "names it", "a `kind: correction` still in the inbox names",
+                       "whole inbox"):
+            self.assertIn(phrase, text)
+
     def test_the_protocol_keeps_pending_work_out_and_never_promotes_its_status(self):
         """AGENTS.md is the bar every pass is told to apply, so the rule lives there too."""
         text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
