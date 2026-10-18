@@ -2563,6 +2563,114 @@ class RetractedLintTests(unittest.TestCase):
         self.assertIn("retracted", out.stdout)
 
 
+class PendingCorrectionTests(unittest.TestCase):
+    """Until a pass applies it, a correction waits in the inbox while the note it names is
+    still served. Search, read and recent mark that note `[correction pending — <path>]`,
+    computed from the inbox at query time, so it is never served as if settled."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.ref = self.repo / "knowledge" / "reference"
+        self.ref.mkdir(parents=True, exist_ok=True)
+        self.inbox = self.repo / "knowledge" / "inbox"
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        (self.ref / "vendor-limits.md").write_text(
+            "---\nid: vendor-limits\nkind: reference\ntitle: Vendor limits\ntopics: [brain]\n"
+            "aliases: [rate limit]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+            "The vendor rate limit is 500 requests per minute.\n", encoding="utf-8")
+
+    def capture(self, name, body, **fm):
+        head = {"created": "2026-10-18", "source": "local", "kind": "correction",
+                "basis": "owner-said", "status": "draft", **fm}
+        (self.inbox / name).write_text(
+            "---\n" + "".join(f"{k}: {v}\n" for k, v in head.items()) + f"---\n\n{body}\n",
+            encoding="utf-8")
+        return f"knowledge/inbox/{name}"
+
+    def search(self, *extra):
+        out = run_brain("search", "vendor rate limit", *extra, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout
+
+    def line_for(self, text, needle):
+        rows = [l for l in text.splitlines() if needle in l and "—" in l]
+        self.assertTrue(rows, f"{needle} not listed:\n{text}")
+        return rows[0]
+
+    def test_search_and_read_mark_a_canonical_note_a_correction_names(self):
+        path = self.capture("2026-10-18-0600-fix.md",
+                            "Correction to vendor-limits: the limit is 800 requests per minute "
+                            "since 2026-10-01. Wrong line: \"500 requests per minute\".")
+        row = self.line_for(self.search(), "knowledge/reference/vendor-limits.md")
+        self.assertIn(f"[correction pending — {path}]", row)
+        read = run_brain("read", "vendor-limits", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", read.stdout)
+
+    def test_an_inbox_note_named_by_a_retraction_is_marked(self):
+        (self.inbox / "2026-10-17-0900-limit.md").write_text(
+            inbox_note(source="local", kind="fact").replace(
+                "A note.", "The vendor rate limit is 500 requests per minute."),
+            encoding="utf-8")
+        path = self.capture("2026-10-18-0600-retract.md",
+                            "Retract knowledge/inbox/2026-10-17-0900-limit.md: it should not be "
+                            "in the brain — it was a client's figure.")
+        row = self.line_for(self.search("--scope", "all"),
+                            "knowledge/inbox/2026-10-17-0900-limit.md")
+        self.assertIn(f"[correction pending — {path}]", row)
+        read = run_brain("read", "knowledge/inbox/2026-10-17-0900-limit.md", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", read.stdout)
+        recent = run_brain("recent", "--days", "2", repo=self.repo)
+        rows = [l for l in recent.stdout.splitlines() if "2026-10-17-0900-limit.md" in l]
+        self.assertTrue(rows, recent.stdout)
+        self.assertIn(f"[correction pending — {path}]", rows[0])
+
+    def test_a_correction_beyond_the_drain_cap_still_marks(self):
+        for n in range(25):
+            (self.inbox / f"2026-10-01-{n:04d}-other.md").write_text(
+                inbox_note(source="local", kind="fact"), encoding="utf-8")
+        path = self.capture("2026-10-18-2359-late-fix.md",
+                            "Correction to [[vendor-limits]]: 800 per minute, not 500.")
+        self.assertIn(f"[correction pending — {path}]",
+                      self.line_for(self.search(), "vendor-limits.md"))
+
+    def test_a_correction_from_an_untrusted_source_marks_nothing(self):
+        self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: it is 9000.",
+                     source="support-bot")
+        self.assertNotIn("correction pending", self.search())
+
+    def test_a_note_no_correction_names_is_not_marked(self):
+        self.capture("2026-10-18-0600-fix.md", "Correction to some-other-note: wrong date.")
+        self.assertNotIn("correction pending", self.search())
+
+    def test_search_json_carries_the_pending_corrections(self):
+        path = self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: 800.")
+        out = run_brain("search", "vendor rate limit", "--json", repo=self.repo)
+        hits = json_payload(out.stdout)["hits"]
+        hit = [h for h in hits if h["id"] == "vendor-limits"][0]
+        self.assertEqual(hit["corrections_pending"], [path])
+
+    def test_the_named_targets_are_read_from_the_lead_first(self):
+        module = load_brain_module()
+        targets = module.correction_targets
+        self.assertEqual(targets("Correction to `vendor-limits`: 800."), ["vendor-limits"])
+        self.assertEqual(targets("Retract [[vendor-limits]] — saved by mistake."),
+                         ["vendor-limits"])
+        self.assertEqual(targets("Retract knowledge/inbox/2026-10-17-x.md: wrong."),
+                         ["knowledge/inbox/2026-10-17-x.md"])
+        self.assertEqual(targets("retract inbox/2026-10-17-x.md."),
+                         ["knowledge/inbox/2026-10-17-x.md"])
+        self.assertEqual(targets("Correction to decisions/2026-10-01-a.md: no."),
+                         ["knowledge/decisions/2026-10-01-a.md"])
+        # The lead names the target; a link to where the truth lives is not one.
+        self.assertEqual(targets("Correction to vendor-limits: see [[pricing-2026]]."),
+                         ["vendor-limits"])
+        # Without the lead, the links and paths the text names are the targets.
+        self.assertEqual(targets("The note [[vendor-limits]] is wrong: 800."),
+                         ["vendor-limits"])
+
+
 class LintIntegrityTests(unittest.TestCase):
     """Knowledge-integrity checks that keep superseded/contradictory content
     from being served as one current fact."""

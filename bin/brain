@@ -3058,6 +3058,11 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
             h["stale"] = bool(review_by and DATE_RE.match(str(review_by))
                               and str(review_by) < today)
             h["review_by"] = review_by
+        # A correction waiting in the inbox: the note is not settled until a pass
+        # applies it, so the hit says so (and which capture to read).
+        pending = pending_corrections()
+        for h in hits:
+            h["corrections_pending"] = corrections_naming(pending, h["id"], h["path"])
     return {"mode": mode, "hits": hits, "more": max(0, total - len(hits))}
 
 
@@ -3165,6 +3170,86 @@ def cmd_links(argv: list) -> int:
     return 0
 
 
+# How a correction names the note it corrects (the capture policy gives agents the
+# lead): "Correction to <id or path>: <what is true now>" or "Retract <id or path>:
+# <reason>". A canonical note is named by its id; an inbox note has no id, only its path.
+CORRECTION_LEAD_RE = re.compile(r"(?i)\b(?:correction\s+to|retract)\s+(\S+)")
+CORRECTION_PATH_RE = re.compile(
+    r"(?:knowledge/)?(?:inbox|decisions|topics|projects|people|life|reference)/"
+    r"[A-Za-z0-9._/-]+?\.md\b")
+# A capture bigger than this is not a correction anyone typed; it is not read.
+MAX_CORRECTION_BYTES = 256 * 1024
+
+
+def correction_target(word: str):
+    """One named target, normalised: a note id, or a `knowledge/...md` path. None if the
+    word is neither."""
+    word = word.strip("`'\"()[]<>*,;:.")
+    if CORRECTION_PATH_RE.fullmatch(word):
+        return word if word.startswith("knowledge/") else "knowledge/" + word
+    if ID_RE.match(word):
+        return word
+    return None
+
+
+def correction_targets(body: str) -> list:
+    """The notes a correction names, in order, without repeats.
+
+    The lead names the target. Without one, the [[links]] and note paths the text
+    names are its targets. With one, other links are where the truth lives, not
+    what is wrong, so they are not targets."""
+    found = [correction_target(m.group(1)) for m in CORRECTION_LEAD_RE.finditer(body)]
+    found = [f for f in found if f]
+    if not found:
+        found = [f for f in (correction_target(m.group(0))
+                             for m in CORRECTION_PATH_RE.finditer(body)) if f]
+        found += [l for l in extract_links(body) if ID_RE.match(l)]
+    return list(dict.fromkeys(found))
+
+
+def pending_corrections() -> dict:
+    """target (note id, or `knowledge/...` path) -> the inbox corrections naming it.
+
+    Computed from the inbox at query time, the WHOLE inbox, so a note is marked from
+    the moment its correction is captured until the consolidation pass applies it.
+    Only a correction from an owner endpoint (`source: local`) marks anything: a drop
+    box's caller must not be able to cast doubt on every note it can name."""
+    out: dict = {}
+    inbox = K / "inbox"
+    if not inbox.is_dir():
+        return out
+    for path in sorted(inbox.glob("*.md")):
+        try:
+            if path.is_symlink() or not path.is_file() \
+                    or path.stat().st_size > MAX_CORRECTION_BYTES:
+                continue
+            text = read_text(path)
+        except OSError:
+            continue
+        fm, _err = parse_frontmatter(text)
+        if not fm or fm.get("kind") != "correction" or fm.get("source") != DEFAULT_SOURCE:
+            continue
+        rel = str(path.relative_to(ROOT))
+        body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
+        for target in correction_targets(body):
+            if target != rel:
+                out.setdefault(target, []).append(rel)
+    return out
+
+
+def corrections_naming(pending: dict, *keys) -> list:
+    """The inbox corrections naming any of `keys` (ids or paths), without repeats."""
+    names = []
+    for key in keys:
+        if key:
+            names.extend(pending.get(key, []))
+    return list(dict.fromkeys(names))
+
+
+def correction_marker(names: list) -> str:
+    return f" [correction pending — {', '.join(names)}]" if names else ""
+
+
 def format_hits(result: dict) -> str:
     if not result["hits"]:
         return ("no hits — rewrite the query into 2-3 lexical variants (synonyms, "
@@ -3181,6 +3266,7 @@ def format_hits(result: dict) -> str:
             tag += f" [status: {h['status']}]"
         if h.get("stale"):
             tag += f" [STALE — review_by {h['review_by']} passed]"
+        tag += correction_marker(h.get("corrections_pending") or [])
         lines.append(f"{i}. {h['path']} — {h['title']} ({h['kind']}, {h['created'] or 'n/a'}){tag}")
         if h["snippet"]:
             lines.append(f"   {h['snippet']}")
@@ -3461,6 +3547,13 @@ def cmd_read(argv: list) -> int:
             if top == "inbox":
                 print("WARNING: this is an INBOX capture — PROVISIONAL, not consolidated "
                       "knowledge. Do not present it as settled.\n")
+                names = corrections_naming(pending_corrections(),
+                                           "knowledge/" + candidate.resolve().relative_to(
+                                               K.resolve()).as_posix())
+                if names:
+                    print(f"WARNING:{correction_marker(names)} — a correction to this "
+                          "capture waits for the next consolidation; read it before "
+                          "relying on this one.\n")
             elif top == "journal":
                 print("NOTE: this is a JOURNAL entry — a dated observation, not canonical "
                       "knowledge.\n")
@@ -3523,6 +3616,11 @@ def cmd_read(argv: list) -> int:
     if review_by and str(review_by) < date.today().isoformat():
         print(f"WARNING: review_by {review_by} has passed — this fact may be STALE; verify "
               "before relying on it.")
+    names = corrections_naming(pending_corrections(), wanted, *chain, current_id,
+                               f"knowledge/{rel.as_posix()}")
+    if names:
+        print(f"WARNING:{correction_marker(names)} — a correction to this note waits for "
+              "the next consolidation; read it before relying on this note.")
     # Backlinks: the context a lone note body cannot carry — what else in the
     # brain refers to this. Never triggers an index rebuild; a stale or missing
     # index simply means no graph line, not a slow read.
@@ -3556,6 +3654,7 @@ def cmd_recent(argv: list) -> int:
     if not rows:
         print(f"no notes touched in the last {days} day(s)")
         return 0
+    pending = None
     for mtime, path in sorted(rows, reverse=True)[:30]:
         day = time.strftime("%Y-%m-%d", time.localtime(mtime))
         # Same provisional discipline format_hits applies. Without it `recent`
@@ -3565,6 +3664,13 @@ def cmd_recent(argv: list) -> int:
         top = path.relative_to(K).parts[0]
         tag = (" [provisional — unconsolidated]" if top == "inbox"
                else " [journal]" if top == "journal" else "")
+        if pending is None:
+            pending = pending_corrections()
+        fm_id = None
+        if top not in ("inbox", "journal"):
+            fm_id = (parse_frontmatter(read_text(path))[0] or {}).get("id")
+        tag += correction_marker(corrections_naming(
+            pending, fm_id, str(path.relative_to(ROOT))))
         print(f"{day}  {path.relative_to(ROOT)}{tag}")
     return 0
 
