@@ -145,7 +145,8 @@ def ignored_line(ignored) -> str:
 _DECLARED_SCHEMA = {
     "kind": {"type": "string", "enum": list(KINDS),
              "description": ("What this note is. A correction names, in its text, the id "
-                             "of the note it corrects.")},
+                             "of the note it corrects (an inbox note's path, which is all "
+                             "an inbox note has).")},
     "basis": {"type": "string", "enum": list(BASES),
               "description": ("Why it is believed: owner-said when the user said it, "
                               "agent-found when you verified it, agent-inferred when it is "

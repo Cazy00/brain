@@ -309,6 +309,27 @@ class CaptureContractParityTests(unittest.TestCase):
                      "capture only the decision behind one"):
             self.assertIn(rule, policy)
 
+    def test_the_policy_never_answers_that_a_note_cannot_be_fixed(self):
+        """Asked to delete a note, an agent said it could not delete or edit notes. A
+        capture can always correct one: the pass applies it, and the agent says so."""
+        policy = self.mcpcore.CAPTURE_POLICY
+        for rule in ("Never say you cannot fix or delete a note", "kind: correction",
+                     "names its id or path", "quotes the wrong line", "next consolidation"):
+            self.assertIn(rule, policy)
+
+    def test_both_capture_descriptions_give_the_correction_format(self):
+        """The exact lead the engine reads a correction's target from travels with the
+        tool, which is where a client needs it, outside the instructions' budget."""
+        for tool in (self.stdio_tool, self.remote_tool):
+            for words in ("Correction to <id or path>: <what is true now>",
+                          "Retract <id or path>: <the user's reason>", "scope all",
+                          "brain_recent"):
+                self.assertIn(words, tool["description"], tool["name"])
+
+    def test_both_profiles_name_the_pending_correction_marker(self):
+        for profile in ("read", "capture"):
+            self.assertIn("[correction pending]", self.mcpcore.instructions(profile))
+
     def test_the_policy_fits_the_budget_clients_truncate_to(self):
         self.assertLessEqual(len(self.mcpcore.instructions("capture")), 1400)
         for tool in (self.stdio_tool, self.remote_tool):
