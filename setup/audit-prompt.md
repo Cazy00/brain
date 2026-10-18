@@ -67,6 +67,11 @@ Block if the change set:
   `source: local`. The pass reads the whole inbox for corrections and applies
   them first, so one still waiting means its target is not settled.
 
+The engine has already checked, as code, that no drained inbox note is named by
+a local correction still in the inbox and that every retraction which removed
+something is the owner's own (`source: local`, `basis: owner-said`); you check
+what it cannot see: whether the content written follows from those inputs.
+
 The Sources lines the pass writes are, one per input: for a capture that
 declares `basis:`, its basis and date (`- Owner, <date> (via <via>)`,
 `- Agent-found, <date>, from <where>`, `- Agent-inferred, <date>

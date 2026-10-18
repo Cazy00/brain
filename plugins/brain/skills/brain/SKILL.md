@@ -37,7 +37,9 @@ the reasoning is gone within a week.
 - Asked to change or delete a note: never say you cannot. Capture a
   `kind: correction` that names its id (an inbox note: its path) and quotes the
   wrong line — `Correction to <id or path>: <what is true now>` or
-  `Retract <id or path>: <reason>` — and say the next consolidation applies it.
+  `Retract <id or path>: <reason>`. Never repeat a credential or private detail
+  in it; describe it. Say it is queued: it stays `[correction pending]` until a
+  consolidation pass applies it.
 - Ask first, every time: a named person's private life, health, finances or
   relationships — captures leave this machine unreviewed on commit, git
   history is permanent, and `bin/brain template` publishes a derived copy.

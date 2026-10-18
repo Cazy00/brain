@@ -38,9 +38,9 @@ setup/            templates, runbooks (this system's own docs)
                   independent, digest-blind, write-less check on that work
                   consolidator.conf names the ONE agent allowed to run them
 bin/brain         toolbelt: setup | connect | new | capture | search | read |
-                  links | recent | supersede | retract | index | sessions |
-                  consolidate | schedule | template | publish | plugin | lint |
-                  doctor | logs | stats | reset
+                  links | recent | supersede | retract | handoff | drain |
+                  index | sessions | consolidate | schedule | template |
+                  publish | plugin | lint | doctor | logs | stats | reset
                   (`bin/brain --help` is authoritative; doctor reports whether
                   the machinery works, stats whether the KNOWLEDGE still does,
                   and logs what `brain serve` recorded — machine-local, outside
@@ -170,17 +170,21 @@ done, and a stale "still open" is read back as true.
 
 **Asked to change or delete a note, never answer that you cannot.** Find it
 with `brain search` (`--scope all` reaches the inbox) or `brain recent` — an
-inbox note has only a path, a canonical note an id — and capture a
-`kind: correction` (`basis: owner-said` when the request is the user's) that
-names that id or path and quotes the wrong line, in one of two forms:
+inbox note has only a path, a canonical note an id or its path — and capture
+a `kind: correction` (`basis: owner-said` when the request is the user's)
+that names that id or path and quotes the wrong line, in one of two forms:
 `Correction to <id or path>: <what is true now>`, or
 `Retract <id or path>: it should not be in the brain — <the reason>`.
-Tell the user in one line that the next consolidation applies it (see
-Retracting, below); until then search and read mark the note
-`[correction pending — <inbox path>]`. If what must go is a credential or a
-named person's private details, say too that git history keeps it until a
-purge: rewriting history is a permanent deletion, so it is the owner's call,
-and no agent tool does it.
+Never repeat a credential or a person's private details in it: describe what
+is wrong ("the line with the API key") instead of quoting it. Tell the user in
+one line that the correction is queued: search and read mark the note
+`[correction pending — <inbox path>]` until a consolidation pass applies it
+(see Retracting, below), and that can take more than one pass. If what must go
+is a credential or a named person's private details, say too that git history
+keeps it until a purge: rewriting history is a permanent deletion, so it is
+the owner's call, and no agent tool does it. With no capture tool in your
+session, say so and ask where the note should go; never promise a correction
+you could not queue.
 
 Offer, don't nag. When something above passes the bar mid-conversation, say so
 in one line and carry on — do not save the offer for the end of the session,
@@ -257,19 +261,21 @@ A note saved by mistake — never true, or never the brain's to hold — has no
 successor, so it is retracted, not superseded:
 
 ```
-bin/brain retract <id> "<one-line reason>"
+bin/brain retract <id-or-path> "<one-line reason>"
 ```
 
 sets `status: retracted` and `retracted: <date>`, stamps
 `> RETRACTED <date> — <reason>`, drops `visibility` and moves the note to
 `archive/`, out of default search; `brain read` still shows it, behind a
-RETRACTED warning. It names the notes still linking to it: remove those links
-(lint warns about each), lint, commit. Consolidation retracts only on a
-`kind: correction` from `source: local` with `basis: owner-said`, and never
-an inbox capture, which it deletes instead. Retracting does not erase: git
-history keeps the text. A credential or a named person's private details saved
-by mistake also need a purge of that history, which is a permanent deletion
-and the owner's decision alone — no tool here does it.
+RETRACTED warning. It does all of that under the repository lock, refuses
+unknown options and anything but a note and one reason, and names the notes
+still linking to it: remove those links (lint warns about each), lint, commit.
+Consolidation retracts only on a `kind: correction` from `source: local` with
+`basis: owner-said`, and never an inbox capture, which it drains instead; the
+engine checks both before the audit. Retracting does not erase: git history
+keeps the text. A credential or a named person's private details saved by
+mistake also need a purge of that history, which is a permanent deletion and
+the owner's decision alone — no tool here does it.
 
 ## Handoff — what belongs in a project's own records
 
@@ -286,18 +292,28 @@ A handoff note keeps the original capture's frontmatter and body under the
 original inbox file name, and adds `handoff_to: <project-slug>` (lowercase
 letters, digits and hyphens, 1-63; the same as its folder),
 `handoff_at: YYYY-MM-DD` (the day it was moved) and
-`handoff_reason: <one line>`. Lint holds its place and keys, and the engine
-checks every move before the audit. `bin/brain search` with `--scope handoff`
-(MCP: `brain_search` with `scope: "handoff"`; an empty query lists them all, a
-project slug filters by `handoff_to`) returns handoff notes only, each marked
-`[handoff — belongs in <project>]`; `--scope all` never includes them.
+`handoff_reason: <one line>`. Only `bin/brain handoff <inbox-path> <project>
+"<one-line reason>"` makes one: it moves a capture from an owner endpoint
+(`source: local`) every byte kept, adding just those keys, and refuses
+anything else. Lint holds the place and keys, and before the audit the engine
+compares every moved note with the capture on the trunk.
+
+`bin/brain search` with `--scope handoff` (MCP: `brain_search` with
+`scope: "handoff"`) returns handoff notes only, each marked
+`[handoff — belongs in <project>]`, in a stable order (`handoff_at`, then
+path) that `--offset N` (MCP: `offset`) pages through. An empty query lists
+them all; one project slug lists exactly that project's, and none when it has
+none; in a longer query a known project's slug filters by it and every other
+word must appear as a whole word. `--scope all` never includes them.
 `brain read <handoff path>` shows one behind a HANDOFF banner.
 
 A filing job files each note in its project's records, then closes it with a
 `kind: correction` from an owner endpoint whose text starts
 `Filed <handoff path>` or `Already recorded: <handoff path>`, naming where it
 now lives (repository and record path, and the PR or commit). The next pass
-deletes the handoff note and drains the correction, before the inbox cap. A
+removes the handoff note (`bin/brain handoff --close <handoff-path>`) and
+drains the correction (`bin/brain drain`), before the inbox cap; the owner's
+own retraction may remove one too. A
 handoff note older than 14 days with no closing correction stays, and `doctor`
 goes RED: the filing job is not running. `doctor` and `stats` count handoff
 notes per project.
@@ -395,7 +411,10 @@ What a pass does with it, and what it reports:
   waits. A correction to a canonical note supersedes it, a retraction archives
   it with `brain retract`, and one to an inbox note drains both. Each
   consolidate commit names every drained inbox path and what it became, which
-  is how a later correction finds a target that has moved.
+  is how a later correction finds a target that has moved. A pass moves or
+  deletes a note only through `drain`, `handoff`, `retract` and `supersede`.
+  Before the audit the engine blocks a pass that drains a note a local
+  correction still names, or that retracts without the owner's own correction.
 - **Proposals.** Mining writes at most 3 per pass, as inbox notes with
   `source: session-mining`, `basis: owner-said`, a kind, `status: draft`,
   `created:` the pass date and `expires:` exactly 7 days later; the engine

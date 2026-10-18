@@ -294,7 +294,7 @@ class CaptureContractParityTests(unittest.TestCase):
     def test_the_policy_says_what_it_must(self):
         policy = self.mcpcore.CAPTURE_POLICY
         for rule in ("Capture without asking", "the alternatives rejected", "preference",
-                     "search found nothing", "correction", "names its id",
+                     "search found nothing", "correction", "naming its id",
                      "remember this", "built-in memory", "Never capture credentials",
                      "transient state", "Ask first", "private life", "self-contained",
                      "absolute dates", "kind and basis", "owner-said", "agent-found",
@@ -314,8 +314,11 @@ class CaptureContractParityTests(unittest.TestCase):
         capture can always correct one: the pass applies it, and the agent says so."""
         policy = self.mcpcore.CAPTURE_POLICY
         for rule in ("Never say you cannot fix or delete a note", "kind: correction",
-                     "names its id or path", "quotes the wrong line", "next consolidation"):
+                     "naming its id or path", "quoting the wrong line",
+                     "describe, never repeat, a secret or private detail",
+                     "it stays [correction pending] until a consolidation pass applies it"):
             self.assertIn(rule, policy)
+        self.assertNotIn("next consolidation", policy, "a correction may wait more than one pass")
 
     def test_both_capture_descriptions_give_the_correction_format(self):
         """The exact lead the engine reads a correction's target from travels with the
@@ -6718,11 +6721,14 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         for phrase in ("never answer that you cannot", "`--scope all`", "`brain recent`",
                        "`Correction to <id or path>: <what is true now>`",
                        "`Retract <id or path>: it should not be in the brain — <the reason>`",
-                       "quotes the wrong line", "`basis: owner-said`", "the next consolidation",
+                       "quotes the wrong line", "`basis: owner-said`",
+                       "Never repeat a credential or a person's private details",
+                       "until a consolidation pass applies it",
+                       "never promise a correction you could not queue",
                        "`[correction pending — <inbox path>]`", "until a purge"):
             self.assertIn(phrase, policy)
         retract = text[text.index("## Retracting"):text.index("## Searching")]
-        for phrase in ("bin/brain retract <id>", "`status: retracted`", "`retracted:",
+        for phrase in ("bin/brain retract <id-or-path>", "`status: retracted`", "`retracted:",
                        "no successor", "RETRACTED", "`basis: owner-said`", "purge"):
             self.assertIn(phrase, retract)
         search = text[text.index("## Searching"):text.index("## Consolidation")]

@@ -82,11 +82,11 @@ RECENT_DESCRIPTION = (
 )
 # What every client is told about reading, whatever its profile.
 READ_POLICY = (
-    "This is the user's permanent second brain. Search it before answering anything "
-    "about their decisions, preferences, projects, people or history. Its trust "
-    "markers ([provisional — unconsolidated], [journal], [correction pending], an "
-    "ARCHIVED banner, a passed review_by) are part of the answer: never present such a "
-    "note as settled fact. If a query misses, retry with 2-3 lexical variants."
+    "This is the user's permanent second brain. Search it before answering about their "
+    "decisions, preferences, projects, people or history. Its trust markers "
+    "([provisional — unconsolidated], [journal], [correction pending], an ARCHIVED banner, "
+    "a passed review_by) are part of the answer: never present such a note as settled fact. "
+    "If a query misses, retry with 2-3 lexical variants."
 )
 # The capture policy, ONE text for every client of every vendor: the server's
 # instructions and the brain_capture description are the only things every MCP
@@ -100,18 +100,17 @@ READ_POLICY = (
 # is every vendor's, and naming one would make the rule read as theirs.
 CAPTURE_POLICY = (
     "Capture without asking: a decision with its why and the alternatives rejected; "
-    "a stated preference or constraint; a fact about the user's world you could not "
-    "infer; a hard-won lesson or answer. If a search found nothing and the user "
-    "answers, capture it. Offer in one line and carry on; \"remember this\" captures "
-    "at once. What another agent may need about the user goes here, not in your "
-    "client's built-in memory. Never capture credentials, transient state, or what "
-    "the repo, git or files record. Open to-dos go in the project's tracker, not here; "
-    "capture only the decision behind one. Ask first about a named person's private "
-    "life, health, finances or relationships. Never say you cannot fix or delete a "
-    "note: capture a kind: correction that names its id or path and quotes the wrong "
-    "line; the next consolidation applies it. Write self-contained text with absolute "
-    "dates (2026-08-23, never \"today\"). Fill kind and basis (owner-said, agent-found "
-    "or agent-inferred), and project, job and model when known."
+    "a preference or constraint; a fact about the user's world; a hard-won lesson. If a "
+    "search found nothing and the user answers, capture it. Offer in one line and carry on; "
+    "\"remember this\" captures at once. What other agents need about the user goes here, "
+    "not in built-in memory. Never capture credentials, transient state, or what the repo, "
+    "git or files record. Open to-dos go in the project's tracker, not here; capture only "
+    "the decision behind one. Ask first about a named person's private life, health, "
+    "finances or relationships. Never say you cannot fix or delete a note: capture a kind: "
+    "correction naming its id or path and quoting the wrong line (describe, never repeat, a "
+    "secret or private detail); it stays [correction pending] until a consolidation pass "
+    "applies it. Write self-contained text with absolute dates (2026-08-23). Fill kind and "
+    "basis (owner-said, agent-found, agent-inferred), and project, job and model when known."
 )
 # How a correction is written, in the form the engine reads its target from (search
 # and read mark that target "[correction pending]" until a pass applies it). It
@@ -119,10 +118,10 @@ CAPTURE_POLICY = (
 # instructions have no room left under their budget.
 CORRECTION_FORMAT = (
     "To correct a note, start \"Correction to <id or path>: <what is true now>\" or, "
-    "for one that should not exist, \"Retract <id or path>: <the user's reason>\". Find the id with brain_search (scope all reaches inbox notes, which "
-    "have only a path) or brain_recent. Close a handoff note (scope handoff) with a "
-    "correction starting \"Filed <path>: <where now>\" or \"Already recorded: <path>: "
-    "<where>\"."
+    "for one that should not exist, \"Retract <id or path>: <the user's reason>\". Find its "
+    "path with brain_search (scope all reaches inbox notes) or brain_recent. Close a handoff "
+    "note (scope handoff) with a correction starting \"Filed <path>: <where now>\" or "
+    "\"Already recorded: <path>: <where>\"."
 )
 READ_ONLY_SENTENCE = "This endpoint is read-only; it cannot save anything."
 LOCAL_CAPTURE_DESCRIPTION = (

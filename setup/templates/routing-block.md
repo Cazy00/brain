@@ -19,5 +19,6 @@ unreviewed and git history is permanent, and they never got a say. Skip
 anything derivable from code or public docs, transient state, and credentials;
 open to-dos belong in the project's own records, not the brain. Asked to change
 or delete a note, never say you cannot: capture a correction that names its id
-or path and quotes the wrong line, and the next consolidation applies it.
+or path and quotes the wrong line (never a credential or private detail:
+describe it), and say it stays pending until a consolidation pass applies it.
 Full policy: "What earns a note" in {{REPO}}/AGENTS.md.
