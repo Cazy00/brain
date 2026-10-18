@@ -301,6 +301,14 @@ class CaptureContractParityTests(unittest.TestCase):
                      "agent-inferred", "project, job and model"):
             self.assertIn(rule, policy)
 
+    def test_the_policy_sends_open_todos_to_the_projects_tracker(self):
+        """A to-do saved here copies what the project's own records already track, and
+        it goes stale the day the work is done. Only the decision behind one belongs here."""
+        policy = self.mcpcore.CAPTURE_POLICY
+        for rule in ("Open to-dos go in the project's tracker", "not here",
+                     "capture only the decision behind one"):
+            self.assertIn(rule, policy)
+
     def test_the_policy_fits_the_budget_clients_truncate_to(self):
         self.assertLessEqual(len(self.mcpcore.instructions("capture")), 1400)
         for tool in (self.stdio_tool, self.remote_tool):
