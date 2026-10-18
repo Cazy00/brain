@@ -1,12 +1,15 @@
 # Default search scope is CURRENT CANONICAL knowledge only.
-# archive/ = superseded notes (history, searched only when explicitly asked)
+# archive/ = superseded and retracted notes (history, searched only when asked)
 # vault/   = encrypted sensitive notes (never in default search)
 # journal/ = dated observations, opt-in (rg --no-ignore knowledge/journal/,
 #            or bin/brain search --scope all)
 # inbox/   = provisional captures awaiting consolidation, opt-in the same way.
 #            Excluded so generous capture can never degrade retrieval; lint and
 #            gitleaks still scan it (they read the git index, not rg).
+# handoff/ = captures that belong in a project's own records, waiting to be
+#            filed there: not brain knowledge (bin/brain search --scope handoff).
 knowledge/archive/
 knowledge/vault/
 knowledge/journal/
 knowledge/inbox/
+knowledge/handoff/

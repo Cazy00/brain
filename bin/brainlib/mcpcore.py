@@ -118,10 +118,11 @@ CAPTURE_POLICY = (
 # travels with brain_capture only: a client needs it when it calls the tool, and the
 # instructions have no room left under their budget.
 CORRECTION_FORMAT = (
-    "To correct a note, start the text \"Correction to <id or path>: <what is true "
-    "now>\" or, for a note that should not exist, \"Retract <id or path>: <the user's "
-    "reason>\". Find the id with brain_search (scope all reaches inbox notes, which "
-    "have only a path) or brain_recent."
+    "To correct a note, start \"Correction to <id or path>: <what is true now>\" or, "
+    "for one that should not exist, \"Retract <id or path>: <the user's reason>\". Find the id with brain_search (scope all reaches inbox notes, which "
+    "have only a path) or brain_recent. Close a handoff note (scope handoff) with a "
+    "correction starting \"Filed <path>: <where now>\" or \"Already recorded: <path>: "
+    "<where>\"."
 )
 READ_ONLY_SENTENCE = "This endpoint is read-only; it cannot save anything."
 LOCAL_CAPTURE_DESCRIPTION = (
@@ -155,9 +156,12 @@ def tool_table(transport: str = "local") -> list:
                 "properties": {
                     "query": {"type": "string", "description": "Lexical search query.",
                               "maxLength": caps["query"]},
-                    "scope": {"type": "string", "enum": ["canonical", "all"],
+                    "scope": {"type": "string", "enum": ["canonical", "all", "handoff"],
                               "description": "'all' additionally searches the journal and the "
-                                             "unprocessed inbox (results tagged provisional)."},
+                                             "unprocessed inbox (results tagged provisional). "
+                                             "'handoff' lists only notes waiting to be filed in a "
+                                             "project's own records — not brain knowledge; the query "
+                                             "may be empty or a project slug."},
                     "limit": {"type": "integer", "description": "Max hits (default 8).",
                               "minimum": caps["limit"][0], "maximum": caps["limit"][1]},
                 },
@@ -250,6 +254,19 @@ def tools_for(profile: str = "capture", transport: str = "local") -> list:
     return [tool for tool in tool_table(transport) if tool["name"] in allowed]
 
 
+def handoff_listing(name, args: dict) -> dict:
+    """`brain_search` with `scope: handoff` lists every handoff note when the query is
+    left out, so a missing query there means an empty one."""
+    if name == "brain_search" and args.get("scope") == "handoff" and args.get("query") is None:
+        return {**args, "query": ""}
+    return args
+
+
+def blank_allowed(name, field: str, args: dict) -> bool:
+    """A blank required argument is refused, except a handoff listing's query."""
+    return name == "brain_search" and field == "query" and args.get("scope") == "handoff"
+
+
 def validate_args(tool: dict, args):
     """Check args against the tool's declared inputSchema BEFORE using them.
 
@@ -294,9 +311,12 @@ def validate_args(tool: dict, args):
             hint = " Did you mean %r?" % near[0]
         return None, ("unknown argument %r.%s %s accepts: %s"
                       % (unknown[0], hint, tool.get("name", "this tool"), accepted))
+    if isinstance(args, dict):
+        args = handoff_listing(tool.get("name"), args)
     for field in schema.get("required", []):
         if field not in args or args[field] is None \
-                or (isinstance(args[field], str) and not args[field].strip()):
+                or (isinstance(args[field], str) and not args[field].strip()
+                    and not blank_allowed(tool.get("name"), field, args)):
             return None, "missing required argument %r" % field
     clean = {}
     for field, spec in props.items():
@@ -349,8 +369,8 @@ def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> l
     capture's cleaned declared fields (provenance.take_declared)."""
     if name == "brain_search":
         cli = ["search", "--limit", str(args.get("limit", 8))]
-        if args.get("scope") == "all":
-            cli += ["--scope", "all"]
+        if args.get("scope") in ("all", "handoff"):
+            cli += ["--scope", args["scope"]]
         cli += ["--", args["query"]]      # query text, never parsed as flags
         return cli
     if name == "brain_read":

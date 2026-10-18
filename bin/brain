@@ -20,7 +20,7 @@ Commands:
                                    --job and --model are the caller's claims.
                                    A bad value is dropped, the note kept.
   brain lint [--staged]            validate every note; exit 1 on errors
-  brain search "<query>" [--scope all] [--limit N] [--json]
+  brain search "<query>" [--scope all|handoff] [--limit N] [--json]
   brain read <id-or-path>          full note with supersede chain resolved
   brain links <id-or-path> [--json]  wikilink graph: what links here, what it links to
   brain supersede <old-id> "<new title>"   full supersede choreography in one shot
@@ -182,6 +182,14 @@ from brainlib.notes import (  # noqa: F401  (re-exported for tests and publish)
 )
 
 STATUSES = {"current", "superseded", "retracted", "draft"}
+# knowledge/handoff/<project>/ holds captures that belong in a project's own records,
+# waiting to be filed there: not brain knowledge, never canonical, outside every search
+# scope but its own. Its three keys are the interface a filing job reads.
+HANDOFF_SLUG_RE = re.compile(r"^[a-z0-9-]{1,63}$")
+HANDOFF_KEYS = ("handoff_to", "handoff_at", "handoff_reason")
+HANDOFF_STALE_DAYS = 14
+# How a filing job closes one: a local correction whose text starts with either lead.
+HANDOFF_CLOSE_RE = re.compile(r"(?i)^\s*(?:filed|already\s+recorded:?)\s+(\S+)")
 SENSITIVITIES = {"normal", "personal", "private"}
 SENSITIVITY_REQUIRED = {"people", "life"}
 # Which endpoint accepted a capture. Stamped by the endpoint, never claimed by
@@ -657,6 +665,51 @@ def check_note(path, rel, folder, in_archive, fm, text, ctx: LintCtx):
         check_links(path, text, fm, ctx, hard=True)
 
 
+def check_handoff_file(path, parts, is_md, blob, ctx: LintCtx) -> None:
+    """A capture moved to knowledge/handoff/<project>/ to be filed in that project's own
+    records. Relaxed like the inbox (a bad link warns, never blocks) but its place and its
+    three keys are exact: they are what the filing job reads."""
+    errors, warnings = ctx.errors, ctx.warnings
+    where = ("handoff notes live at knowledge/handoff/<project-slug>/<the capture's file "
+             "name>.md")
+    if len(parts) != 3 or not is_md:
+        errors.append((path, where))
+        return
+    slug = parts[1]
+    if not HANDOFF_SLUG_RE.match(slug):
+        errors.append((path, f"handoff folder {slug!r} is not a project slug (lowercase "
+                       "letters, digits and hyphens, 1-63) — " + where))
+        return
+    text = blob.text()
+    fm, _err = parse_frontmatter(text)
+    if not fm:
+        errors.append((path, "a handoff note keeps the capture's frontmatter and adds "
+                       + ", ".join(HANDOFF_KEYS)))
+        return
+    for key in HANDOFF_KEYS:
+        if isinstance(fm.get(key), list):
+            errors.append((path, f"{key} must be a single value, not a list"))
+            fm[key] = None
+    if fm.get("handoff_to") != slug:
+        errors.append((path, f"handoff_to is {fm.get('handoff_to')!r} but the note sits in "
+                       f"knowledge/handoff/{slug}/ — the two must name the same project"))
+    at = fm.get("handoff_at")
+    if not (at and DATE_RE.match(str(at)) and valid_date(at)):
+        errors.append((path, f"handoff_at must be the YYYY-MM-DD date it was handed off, "
+                       f"got {at!r}"))
+    if not str(fm.get("handoff_reason") or "").strip():
+        errors.append((path, "handoff_reason missing — one line on why this belongs in "
+                       "the project's records rather than the brain"))
+    if fm.get("sensitivity") == "private":
+        errors.append((path, "sensitivity: private must never exist as plaintext "
+                       "— encrypt into vault/ (see setup/runbooks/vault.md)"))
+    check_source(path, fm, ctx)
+    if not (K / "projects" / slug).is_dir():
+        warnings.append((path, f"no knowledge/projects/{slug}/ — consolidation hands off "
+                         "only to a project the brain knows; is the slug right?"))
+    check_links(path, text, fm, ctx, hard=False)
+
+
 def check_knowledge_file(rel: Path, blob: Blob, ctx: LintCtx, fm_cached=None) -> None:
     """Every placement and content rule for ONE file under knowledge/.
 
@@ -711,6 +764,9 @@ def check_knowledge_file(rel: Path, blob: Blob, ctx: LintCtx, fm_cached=None) ->
         if is_md:
             errors.append((path, "notes don't belong in attachments/ — attachments hold "
                            "binaries; notes live in their folders"))
+        return
+    if top == "handoff":
+        check_handoff_file(path, parts, is_md, blob, ctx)
         return
     if top in ("inbox", "journal"):
         if not is_md:
@@ -1165,7 +1221,7 @@ def flag_orphaned_inbound_links(removed: set, changes, ctx: LintCtx) -> None:
         fm, _err = parse_frontmatter(text)
         start = (fm or {}).get("_end_line", 0)
         body = "\n".join(text.splitlines()[start:])
-        provisional = rel.parts[0] in ("inbox", "journal")
+        provisional = rel.parts[0] in ("inbox", "journal", "handoff")
         for target in extract_links(body):
             if target in removed and target != (fm or {}).get("supersedes"):
                 bucket = ctx.warnings if provisional else ctx.errors
@@ -2228,7 +2284,7 @@ def apply_routing(keys: list, dry_run: bool = False) -> int:
 # bin/brain itself. An ignore file narrows the blast radius of a client that
 # indexes anyway; it does not make the rule unnecessary.
 IGNORE_SCOPE = ("knowledge/archive/", "knowledge/vault/", "knowledge/inbox/",
-                "knowledge/journal/", ".cache/")
+                "knowledge/journal/", "knowledge/handoff/", ".cache/")
 IGNORE_FILES = {
     ".geminiignore": "Gemini CLI",
     ".cursorignore": "Cursor",
@@ -2745,11 +2801,13 @@ FOLDER_WEIGHTS = {"decisions": 1.2, "reference": 1.2, "topics": 1.0, "projects":
 
 def indexable_paths():
     """Every note the search index should contain — canonical + journal +
-    inbox, never archive/vault/attachments. Single definition so the index and
-    its freshness check can never disagree about what belongs in it."""
+    inbox, never archive/vault/attachments/handoff. Single definition so the index and
+    its freshness check can never disagree about what belongs in it. handoff/ is not
+    brain knowledge: `search --scope handoff` reads it straight off disk."""
     for path in sorted(K.rglob("*.md")):
         rel = path.relative_to(K)
-        if rel.parts[0] in ("archive", "vault", "attachments") or path.name in EXEMPT_NAMES:
+        if rel.parts[0] in ("archive", "vault", "attachments", "handoff") \
+                or path.name in EXEMPT_NAMES:
             continue
         yield path
 
@@ -3175,7 +3233,7 @@ def cmd_links(argv: list) -> int:
 # <reason>". A canonical note is named by its id; an inbox note has no id, only its path.
 CORRECTION_LEAD_RE = re.compile(r"(?i)\b(?:correction\s+to|retract)\s+(\S+)")
 CORRECTION_PATH_RE = re.compile(
-    r"(?:knowledge/)?(?:inbox|decisions|topics|projects|people|life|reference)/"
+    r"(?:knowledge/)?(?:inbox|handoff|decisions|topics|projects|people|life|reference)/"
     r"[A-Za-z0-9._/-]+?\.md\b")
 # A capture bigger than this is not a correction anyone typed; it is not read.
 MAX_CORRECTION_BYTES = 256 * 1024
@@ -3198,6 +3256,9 @@ def correction_targets(body: str) -> list:
     The lead names the target. Without one, the [[links]] and note paths the text
     names are its targets. With one, other links are where the truth lives, not
     what is wrong, so they are not targets."""
+    closing = HANDOFF_CLOSE_RE.match(body)
+    if closing and correction_target(closing.group(1)):
+        return [correction_target(closing.group(1))]
     found = [correction_target(m.group(1)) for m in CORRECTION_LEAD_RE.finditer(body)]
     found = [f for f in found if f]
     if not found:
@@ -3215,9 +3276,18 @@ def pending_corrections() -> dict:
     Only a correction from an owner endpoint (`source: local`) marks anything: a drop
     box's caller must not be able to cast doubt on every note it can name."""
     out: dict = {}
+    for rel, body in local_corrections():
+        for target in correction_targets(body):
+            if target != rel:
+                out.setdefault(target, []).append(rel)
+    return out
+
+
+def local_corrections():
+    """(inbox path, body) of every `kind: correction` from an owner endpoint."""
     inbox = K / "inbox"
     if not inbox.is_dir():
-        return out
+        return
     for path in sorted(inbox.glob("*.md")):
         try:
             if path.is_symlink() or not path.is_file() \
@@ -3229,12 +3299,92 @@ def pending_corrections() -> dict:
         fm, _err = parse_frontmatter(text)
         if not fm or fm.get("kind") != "correction" or fm.get("source") != DEFAULT_SOURCE:
             continue
-        rel = str(path.relative_to(ROOT))
-        body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
-        for target in correction_targets(body):
-            if target != rel:
-                out.setdefault(target, []).append(rel)
+        yield (str(path.relative_to(ROOT)),
+               "\n".join(text.splitlines()[fm.get("_end_line", 0):]))
+
+
+def closed_handoffs() -> set:
+    """Handoff paths a local correction closes ("Filed <path>" / "Already recorded:
+    <path>"): filed, waiting only for the next pass to delete them."""
+    closed = set()
+    for _rel, body in local_corrections():
+        lead = HANDOFF_CLOSE_RE.match(body)
+        target = correction_target(lead.group(1)) if lead else None
+        if target and target.startswith("knowledge/handoff/"):
+            closed.add(target)
+    return closed
+
+
+def handoff_notes() -> list:
+    """Every note in knowledge/handoff/<project>/, read straight off disk."""
+    root = K / "handoff"
+    out = []
+    if not root.is_dir():
+        return out
+    for path in sorted(root.glob("*/*.md")):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            text = read_text(path)
+        except OSError:
+            continue
+        fm, _err = parse_frontmatter(text)
+        fm = fm or {}
+        out.append({"path": str(path.relative_to(ROOT)), "stem": path.stem,
+                    "project": str(fm.get("handoff_to") or path.parent.name),
+                    "fm": fm,
+                    "body": "\n".join(text.splitlines()[fm.get("_end_line", 0):])})
     return out
+
+
+def handoff_stale(note: dict, closed: set, today=None) -> bool:
+    """Older than HANDOFF_STALE_DAYS with no closing correction (an undatable one counts:
+    it can never age out)."""
+    today = today or date.today()
+    at = str(note["fm"].get("handoff_at") or "")
+    if note["path"] in closed:
+        return False
+    if not valid_date(at):
+        return True
+    return (today - date.fromisoformat(at)).days > HANDOFF_STALE_DAYS
+
+
+def do_handoff_search(query: str, limit: int = 8) -> dict:
+    """`search --scope handoff`: the notes waiting to be filed, never brain knowledge.
+
+    An empty query lists them all. A word naming a project that has handoff notes filters
+    by `handoff_to`; any other words must appear in the note (all of them, else any)."""
+    notes = handoff_notes()
+    projects = {n["project"] for n in notes}
+    words = query.split()
+    wanted = {w.lower() for w in words if w.lower() in projects}
+    rest = [t.lower() for w in words if w.lower() not in wanted
+            for t in re.findall(r"\w+", w)]
+    chosen = [n for n in notes if not wanted or n["project"] in wanted]
+
+    def text_of(n):
+        return " ".join([str(n["fm"].get("title") or ""), n["body"],
+                         str(n["fm"].get("handoff_reason") or "")]).lower()
+    mode = "project" if wanted else "listing"
+    if rest:
+        every = [n for n in chosen if all(t in text_of(n) for t in rest)]
+        some = [n for n in chosen if any(t in text_of(n) for t in rest)]
+        chosen, mode = (every, "all-terms") if every else (some, "any-term" if some else "none")
+    pending = pending_corrections()
+    hits = []
+    for n in chosen:
+        fm = n["fm"]
+        hits.append({
+            "id": f"handoff-{n['stem']}", "path": n["path"],
+            "title": str(fm.get("title") or n["stem"]), "folder": "handoff",
+            "kind": "handoff", "created": str(fm.get("created") or ""),
+            "snippet": " ".join(n["body"].split())[:160],
+            "handoff_to": n["project"], "handoff_at": str(fm.get("handoff_at") or ""),
+            "handoff_reason": str(fm.get("handoff_reason") or ""),
+            "status": None, "stale": False,
+            "corrections_pending": corrections_naming(pending, n["path"])})
+    return {"mode": mode, "scope": "handoff", "hits": hits[:limit],
+            "more": max(0, len(hits) - limit)}
 
 
 def corrections_naming(pending: dict, *keys) -> list:
@@ -3251,6 +3401,9 @@ def correction_marker(names: list) -> str:
 
 
 def format_hits(result: dict) -> str:
+    if not result["hits"] and result.get("scope") == "handoff":
+        return ("no handoff notes waiting" + (" for that query" if result["mode"] != "listing"
+                                              else "") + " [scope: handoff]")
     if not result["hits"]:
         return ("no hits — rewrite the query into 2-3 lexical variants (synonyms, "
                 "singular/plural) before concluding the brain has nothing")
@@ -3261,6 +3414,8 @@ def format_hits(result: dict) -> str:
             tag = " [provisional — unconsolidated]"
         elif h["folder"] == "journal":
             tag = " [journal]"
+        elif h["folder"] == "handoff":
+            tag = f" [handoff — belongs in {h['handoff_to']}]"
         # status: current is the norm and says nothing; anything else is news.
         if h.get("status") and h["status"] != "current":
             tag += f" [status: {h['status']}]"
@@ -3305,10 +3460,16 @@ def cmd_search(argv: list) -> int:
         else:
             terms.append(a)
             i += 1
-    if scope not in ("canonical", "all"):
+    if scope not in ("canonical", "all", "handoff"):
         scope = "canonical"
+    if scope == "handoff":
+        # Not brain knowledge, and an empty query is allowed: it lists them all.
+        result = do_handoff_search(" ".join(terms), limit=limit)
+        print(_json.dumps(result, indent=2) if as_json else format_hits(result))
+        return 0
     if not terms:
-        print("usage: brain search \"<query>\" [--scope canonical|all] [--limit N] [--json]")
+        print("usage: brain search \"<query>\" [--scope canonical|all|handoff] [--limit N] "
+              "[--json]")
         return 2
     result = do_search(" ".join(terms), scope=scope, limit=limit)
     print(_json.dumps(result, indent=2) if as_json else format_hits(result))
@@ -3557,6 +3718,20 @@ def cmd_read(argv: list) -> int:
             elif top == "journal":
                 print("NOTE: this is a JOURNAL entry — a dated observation, not canonical "
                       "knowledge.\n")
+            elif top == "handoff":
+                hfm = parse_frontmatter(read_text(candidate))[0] or {}
+                project = hfm.get("handoff_to") or candidate.parent.name
+                rel_path = "knowledge/" + candidate.resolve().relative_to(
+                    K.resolve()).as_posix()
+                print(f"WARNING: this is a HANDOFF note — not brain knowledge. It belongs in "
+                      f"{project}'s own records and waits to be filed there (handed off "
+                      f"{hfm.get('handoff_at')}: {hfm.get('handoff_reason')}). Close it with "
+                      f"a kind: correction starting \"Filed {rel_path}\" or \"Already "
+                      f"recorded: {rel_path}\", naming where it now lives.\n")
+                names = corrections_naming(pending_corrections(), rel_path)
+                if names:
+                    print(f"NOTE:{correction_marker(names)} — its closing correction waits "
+                          "for the next consolidation.\n")
             elif top == "archive":
                 print("WARNING: this note is ARCHIVED/superseded — HISTORY, not current. "
                       "Cite it only as 'previously…'.\n")
@@ -3663,11 +3838,13 @@ def cmd_recent(argv: list) -> int:
         # asking "what was I just working on".
         top = path.relative_to(K).parts[0]
         tag = (" [provisional — unconsolidated]" if top == "inbox"
-               else " [journal]" if top == "journal" else "")
+               else " [journal]" if top == "journal"
+               else f" [handoff — belongs in {path.parent.name}]" if top == "handoff"
+               else "")
         if pending is None:
             pending = pending_corrections()
         fm_id = None
-        if top not in ("inbox", "journal"):
+        if top not in ("inbox", "journal", "handoff"):
             fm_id = (parse_frontmatter(read_text(path))[0] or {}).get("id")
         tag += correction_marker(corrections_naming(
             pending, fm_id, str(path.relative_to(ROOT))))
@@ -5079,6 +5256,62 @@ def proposal_problems(today: str):
     return None
 
 
+def handoff_problems(today: str):
+    """The first way the staged change set breaks the handoff rules, or None. Checked as
+    code before the audit, because the keys are the filing job's interface and a handoff
+    note leaves only once it is filed:
+    - a note added under knowledge/handoff/ is a capture this pass moved out of the inbox
+      under its own file name, dated the pass's day (lint holds its place and keys);
+    - a handoff note is never edited by a pass;
+    - one is deleted only alongside a local correction, deleted in the same change set,
+      whose text starts "Filed <its path>" or "Already recorded: <its path>"."""
+    trunk = default_branch()
+    rows = git("diff", "--cached", "--no-renames", "--name-status", trunk,
+               "--", "knowledge/handoff", "knowledge/inbox")
+    added, removed, edited, gone_inbox = [], [], [], set()
+    for row in rows.splitlines():
+        status, _sep, rel = row.partition("\t")
+        rel = rel.strip()
+        if rel.startswith("knowledge/inbox/"):
+            if status.startswith("D"):
+                gone_inbox.add(rel)
+            continue
+        if not rel.endswith(".md"):
+            continue
+        (added if status.startswith("A") else removed if status.startswith("D")
+         else edited).append(rel)
+    for rel in edited:
+        return f"{one_line(rel)}: a pass never edits a handoff note"
+    for rel in added:
+        name = rel.rsplit("/", 1)[-1]
+        if f"knowledge/inbox/{name}" not in gone_inbox:
+            return (f"{one_line(rel)}: not a capture moved out of the inbox under its own "
+                    "file name")
+        shown = subprocess.run(["git", "show", f":{rel}"], cwd=ROOT, capture_output=True)
+        fm = parse_frontmatter(shown.stdout.decode("utf-8", "replace"))[0] or {}
+        if str(fm.get("handoff_at") or "") != today:
+            return (f"{one_line(rel)}: handoff_at {fm.get('handoff_at')!r}, not the pass "
+                    f"date {today}")
+    if removed:
+        closing = set()
+        for rel in gone_inbox:
+            shown = subprocess.run(["git", "show", f"{trunk}:{rel}"], cwd=ROOT,
+                                   capture_output=True)
+            text = shown.stdout.decode("utf-8", "replace")
+            fm = parse_frontmatter(text)[0] or {}
+            if fm.get("kind") != "correction" or fm.get("source") != DEFAULT_SOURCE:
+                continue
+            lead = HANDOFF_CLOSE_RE.match("\n".join(text.splitlines()[fm.get("_end_line", 0):]))
+            if lead and correction_target(lead.group(1)):
+                closing.add(correction_target(lead.group(1)))
+        for rel in removed:
+            if rel not in closing:
+                return (f"{one_line(rel)}: a handoff note deleted with no closing correction "
+                        "(\"Filed <path>\" or \"Already recorded: <path>\") removed with it "
+                        "— handoff notes are filed, never promoted or dropped by a pass")
+    return None
+
+
 def seal_pass(today: str, until: str):
     """Make the pass's final commit, carrying `Digest-until: <until>` (when the digest was
     collected; nothing when there was none). Staged work is committed as
@@ -5429,6 +5662,10 @@ def _consolidate(argv: list, result: dict) -> int:
         problem = proposal_problems(today)
         if problem:
             failure, blocked = f"proposal check: {problem}", True
+    if failure is None and changed:
+        problem = handoff_problems(today)
+        if problem:
+            failure, blocked = f"handoff check: {problem}", True
 
     # The pass's final commit, made BEFORE the audit so the audit sees what will be pushed,
     # and carrying `Digest-until:` — when the digest was collected — for the next window.
@@ -5826,7 +6063,8 @@ def cmd_template(argv: list) -> int:
 
     # Keep every canonical folder present so a fresh brain has somewhere to put
     # its first note, and git actually tracks the empty directories.
-    skeleton = list(CANONICAL) + ["inbox", "journal", "archive", "vault", "attachments"]
+    skeleton = list(CANONICAL) + ["inbox", "journal", "handoff", "archive", "vault",
+                                  "attachments"]
     for folder in skeleton:
         d = dest / "knowledge" / folder
         d.mkdir(parents=True, exist_ok=True)
@@ -6720,7 +6958,7 @@ def stats_snapshot() -> dict:
         rel = str(path.relative_to(ROOT))
         parts = path.relative_to(K).parts
         top = parts[0] if parts else ""
-        if top in ("archive", "vault"):
+        if top in ("archive", "vault", "handoff"):
             continue
         fm, _err = parse_frontmatter(read_text(path))
         if not fm:
@@ -6776,8 +7014,15 @@ def stats_snapshot() -> dict:
     # healthy, and it is also exactly what a brain that has silently STOPPED
     # being written to looks like. Only the trend tells them apart.
     def added_within(days):
+        # A move to handoff/ is the same capture in a new place, never a new note.
         return sum(1 for rel, born in birthdays.items()
-                   if (days_since(born) is not None and days_since(born) <= days))
+                   if not rel.startswith("knowledge/handoff/")
+                   and (days_since(born) is not None and days_since(born) <= days))
+
+    handoffs, closed = handoff_notes(), closed_handoffs()
+    handoff_projects = {}
+    for note in handoffs:
+        handoff_projects[note["project"]] = handoff_projects.get(note["project"], 0) + 1
 
     inbox_items = sorted(
         (rel for rel in birthdays
@@ -6824,6 +7069,11 @@ def stats_snapshot() -> dict:
         "integrity": {
             "index_stale": index_stale(),
             "duplicate_ids": len(id_of_path) - len(set(id_of_path.values())),
+        },
+        "handoff": {
+            "waiting": len(handoffs),
+            "projects": dict(sorted(handoff_projects.items())),
+            "stale": sum(1 for n in handoffs if handoff_stale(n, closed, today)),
         },
     }
 
@@ -6982,6 +7232,14 @@ def cmd_stats(argv: list) -> int:
     if cap["inbox_waiting"]:
         print(f"             {cap['inbox_waiting']} in inbox, oldest "
               f"{cap['inbox_oldest_days']}d")
+    hand = snap["handoff"]
+    if hand["waiting"]:
+        listing = ", ".join(f"{p} {n}" for p, n in hand["projects"].items())
+        print(f"\n  handoff    {hand['waiting']} waiting to be filed in a project's own "
+              f"records ({listing})")
+        if hand["stale"]:
+            print(f"             [RED] {hand['stale']} older than {HANDOFF_STALE_DAYS} days "
+                  "with no closing correction — the filing job is not running")
 
     checked = find["checked"]
     missed = len(find["unfindable"])
@@ -7429,6 +7687,24 @@ def cmd_doctor() -> int:
         else:
             print(f"  [ok ] {proposals} session-mining proposal(s) in the inbox, none past "
                   "its expiry")
+    # Captures consolidation handed off to a project's own records. A filing job moves
+    # them there and closes each with a correction; one waiting past HANDOFF_STALE_DAYS
+    # with no closing correction means that job is not running.
+    handoffs = handoff_notes()
+    if handoffs:
+        closed = closed_handoffs()
+        per = {}
+        for note in handoffs:
+            per[note["project"]] = per.get(note["project"], 0) + 1
+        stale = [n for n in handoffs if handoff_stale(n, closed)]
+        listing = ", ".join(f"{p} {n}" for p, n in sorted(per.items()))
+        if stale:
+            ok = False
+            print(f"  [RED] handoff: {len(handoffs)} note(s) waiting to be filed ({listing}); "
+                  f"{len(stale)} older than {HANDOFF_STALE_DAYS} days with no closing "
+                  "correction — the filing job is not running")
+        else:
+            print(f"  [ok ] handoff: {len(handoffs)} note(s) waiting to be filed ({listing})")
 
     # An empty inbox is ambiguous in the worst possible way: it is what a
     # healthy, freshly-drained brain looks like, and it is ALSO exactly what a

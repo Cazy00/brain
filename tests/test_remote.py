@@ -565,6 +565,30 @@ class CaptureTests(RemoteTestCase):
         self.assertIn("aardvark", text.lower())
         self.assertIn("[provisional — unconsolidated]", text)
 
+    def test_handoff_notes_are_listed_under_scope_handoff_only(self):
+        """Handoff notes are not brain knowledge: the remote front end lists them under
+        `scope: handoff` (an empty query lists them all) and never under `all`."""
+        rel = "knowledge/handoff/acme/2026-10-15-120000-aardvark.md"
+        path = self.brain.data_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\ncreated: 2026-10-15\nsource: local\nstatus: draft\n"
+                        "handoff_to: acme\nhandoff_at: 2026-10-18\n"
+                        "handoff_reason: pending work for acme\n---\n\n"
+                        "Aardvark migration still needs its rollback drill.\n",
+                        encoding="utf-8")
+        for args in (["add", "-A"], ["commit", "-q", "-m", "handoff"]):
+            subprocess.run(["git", *args], cwd=self.brain.data_root, check=True,
+                           capture_output=True)
+        _status, body = self.brain.call("brain_search", {"query": "aardvark", "scope": "all"})
+        self.assertNotIn("knowledge/handoff/", self.brain.text_of(body))
+        _status, body = self.brain.call("brain_search", {"query": "", "scope": "handoff"})
+        text = self.brain.text_of(body)
+        self.assertFalse(body["result"]["isError"], text)
+        self.assertIn(rel, text)
+        self.assertIn("[handoff — belongs in acme]", text)
+        _status, body = self.brain.call("brain_read", {"id_or_path": rel})
+        self.assertIn("HANDOFF", self.brain.text_of(body))
+
     def test_a_credential_is_refused_without_touching_disk(self):
         # Assembled at runtime, never written out. A credential-shaped literal
         # here would be caught by the very gate this test exists to prove —

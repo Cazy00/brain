@@ -50,9 +50,12 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Lexical search query."},
-                "scope": {"type": "string", "enum": ["canonical", "all"],
+                "scope": {"type": "string", "enum": ["canonical", "all", "handoff"],
                           "description": "'all' additionally searches the journal and the "
-                                         "unprocessed inbox (results tagged provisional)."},
+                                         "unprocessed inbox (results tagged provisional). "
+                                         "'handoff' lists only notes waiting to be filed in a "
+                                         "project's own records — not brain knowledge; the query "
+                                         "may be empty or a project slug."},
                 "limit": {"type": "integer", "description": "Max hits (default 8)."},
             },
             "required": ["query"],
@@ -196,9 +199,11 @@ def validate_args(name, args):
     props = schema.get("properties", {})
     if not isinstance(args, dict):
         return None, "arguments must be a JSON object"
+    args = mcpcore.handoff_listing(name, args)
     for field in schema.get("required", []):
         if field not in args or args[field] is None \
-                or (isinstance(args[field], str) and not args[field].strip()):
+                or (isinstance(args[field], str) and not args[field].strip()
+                    and not mcpcore.blank_allowed(name, field, args)):
             return None, f"missing required argument {field!r}"
     clean = {}
     required = set(schema.get("required", []))
@@ -326,8 +331,8 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
                 "isError": True}
     if name == "brain_search":
         cli = ["search", "--limit", str(args.get("limit", 8))]
-        if args.get("scope") == "all":
-            cli += ["--scope", "all"]
+        if args.get("scope") in ("all", "handoff"):
+            cli += ["--scope", args["scope"]]
         cli += ["--", args["query"]]      # query text, never parsed as flags
     elif name == "brain_read":
         cli = ["read", args["id_or_path"]]

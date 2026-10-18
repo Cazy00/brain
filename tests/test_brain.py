@@ -1554,6 +1554,70 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(self.result_of(good)["status"], "committed", good.stdout)
         self.assertTrue(audited.exists())
 
+    def handoff_move(self, name="2026-10-15-120000-seed.md", project="acme", at=None,
+                     drop=""):
+        """Shell that moves an inbox capture to handoff/<project>/ and adds the three keys
+        (`drop` names one to leave out), as a pass is told to."""
+        at = at or datetime.now().date().isoformat()
+        keys = {"handoff_to": project, "handoff_at": at,
+                "handoff_reason": "pending work that belongs in the project's records"}
+        extra = "".join(f"{k}: {v}\\n" for k, v in keys.items() if k != drop)
+        return (f"mkdir -p knowledge/handoff/{project}\n"
+                f"rm knowledge/inbox/{name}\n"
+                f'printf -- "---\\ncreated: 2026-10-15\\nsource: local\\nstatus: draft\\n'
+                f'{extra}---\\n\\nA capture.\\n" > knowledge/handoff/{project}/{name}\n')
+
+    def audited_stub(self, body):
+        audited = Path(self.tmp.name) / "audited"
+        if audited.exists():
+            audited.unlink()
+        self.stub_claude(f'case "$*" in *--tools*) touch {audited}; echo "VERDICT: PASS";'
+                         f' exit 0;; esac\n{body}exit 0')
+        return audited
+
+    def test_a_handoff_move_is_committed_and_audited(self):
+        audited = self.audited_stub(self.handoff_move())
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+        self.assertTrue(audited.exists())
+
+    def test_handoff_moves_are_checked_before_the_audit(self):
+        """The handoff keys are the filing job's interface and a handoff note leaves only
+        when it is filed, so code checks both before any auditor is spent."""
+        held = handoff_note("acme", "2026-10-10-100000-held.md",
+                            datetime.now().date().isoformat())
+        commit_at(self.repo, "a handoff waiting", iso_ago(0), held)
+        cases = {
+            "dated another day": self.handoff_move(at="2026-01-01"),
+            "not moved out of the inbox": self.handoff_move(name="2026-10-15-120000-seed.md")
+                .replace("rm knowledge/inbox/2026-10-15-120000-seed.md\n", "")
+                .replace("acme/2026-10-15-120000-seed.md", "acme/2026-10-15-120000-other.md"),
+            "an edited handoff note": f"echo more >> {held[0]}\n",
+            "a handoff dropped without a closing correction": f"rm {held[0]}\n",
+        }
+        for label, body in cases.items():
+            with self.subTest(label):
+                audited = self.audited_stub(body)
+                result = self.consolidate()
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("handoff check", result.stdout)
+                self.assertEqual(self.result_of(result)["status"], "blocked")
+                self.assertFalse(audited.exists(), "the auditor was spent on it")
+                self.back_to_trunk()
+
+    def test_a_filed_handoff_leaves_with_its_closing_correction(self):
+        held = handoff_note("acme", "2026-10-10-100000-held.md",
+                            datetime.now().date().isoformat())
+        closing = ("knowledge/inbox/2026-10-18-070000-filed.md",
+                   "---\ncreated: 2026-10-18\nsource: local\nkind: correction\nstatus: draft\n"
+                   f"---\n\nFiled {held[0]} to github.com/example/acme docs/backlog.md B7 "
+                   "(PR #12).\n")
+        commit_at(self.repo, "a handoff and its closing correction", iso_ago(0), held, closing)
+        audited = self.audited_stub(f"rm {held[0]} {closing[0]}\n")
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+        self.assertTrue(audited.exists())
+
     def test_an_idle_pass_over_a_dirty_tree_is_refused(self):
         """S7: an uncommitted journal entry is work nothing else sees."""
         self.drain_seed()
@@ -2690,6 +2754,275 @@ class PendingCorrectionTests(unittest.TestCase):
         # Without the lead, the links and paths the text names are the targets.
         self.assertEqual(targets("The note [[vendor-limits]] is wrong: 800."),
                          ["vendor-limits"])
+
+
+def handoff_note(project, name, at, reason="pending work that belongs in the project's records",
+                 body="The staging smoke test still needs a re-run.", folder=None, **fm):
+    """(rel, text) for a handoff note: the original capture's frontmatter plus the three
+    keys consolidation adds. A key passed as None is left out."""
+    head = {"created": "2026-10-15", "source": "local", "kind": "fact", "basis": "owner-said",
+            "status": "draft", "handoff_to": project, "handoff_at": at,
+            "handoff_reason": reason, **fm}
+    text = ("---\n" + "".join(f"{k}: {v}\n" for k, v in head.items() if v is not None)
+            + f"---\n\n{body}\n")
+    return (f"knowledge/handoff/{folder or project}/{name}", text)
+
+
+class HandoffLintTests(unittest.TestCase):
+    """knowledge/handoff/<project>/ holds captures that belong in a project's own records,
+    waiting to be filed there. Relaxed like the inbox, never canonical — but the three keys
+    are the interface the filing job reads, so lint holds them exactly."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+
+    def put(self, rel_text):
+        rel, text = rel_text
+        path = self.repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def lint(self):
+        return run_brain("lint", repo=self.repo)
+
+    def test_a_handoff_note_with_its_three_keys_is_clean(self):
+        self.put(handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18"))
+        out = self.lint()
+        self.assertEqual(out.returncode, 0, out.stdout)
+
+    def test_each_key_is_required_and_agrees_with_its_folder(self):
+        cases = {"no handoff_to": {"project": None, "folder": "acme"},
+                 "another project": {"project": "beta", "folder": "acme"},
+                 "no handoff_at": {"at": None},
+                 "not a date": {"at": "2026-13-01"},
+                 "no reason": {"reason": None}}
+        for label, change in cases.items():
+            with self.subTest(label):
+                args = {"project": "acme", "at": "2026-10-18", **change}
+                path = self.put(handoff_note(args.pop("project"), "2026-10-15-120000-smoke.md",
+                                             args.pop("at"), **args))
+                out = self.lint()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn("handoff", out.stdout)
+                path.unlink()
+
+    def test_a_handoff_note_lives_in_a_project_slug_folder(self):
+        for rel in ("knowledge/handoff/x.md", "knowledge/handoff/Acme_Co/x.md",
+                    "knowledge/handoff/acme/deeper/x.md",
+                    "knowledge/handoff/" + "a" * 64 + "/x.md"):
+            with self.subTest(rel):
+                project = rel.split("/")[2] if rel.count("/") >= 3 else "acme"
+                path = self.put((rel, handoff_note(project, "x.md", "2026-10-18")[1]))
+                out = self.lint()
+                self.assertEqual(out.returncode, 1, out.stdout)
+                self.assertIn("handoff", out.stdout)
+                path.unlink()
+
+    def test_an_unknown_project_is_only_a_warning(self):
+        self.put(handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18"))
+        out = self.lint()
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("knowledge/projects/acme", out.stdout)
+
+    def test_private_material_is_refused_here_as_everywhere(self):
+        self.put(handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18",
+                              sensitivity="private"))
+        self.assertEqual(self.lint().returncode, 1)
+
+
+class HandoffReadTests(unittest.TestCase):
+    """Handoff notes are not brain knowledge: default and `all` search never return them.
+    `--scope handoff` lists them for the filing job, a query may be empty or a project slug,
+    and read and recent say plainly what they are."""
+
+    A = "knowledge/handoff/acme/2026-10-15-120000-smoke.md"
+    B = "knowledge/handoff/beta/2026-10-16-090000-rotate.md"
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        for rel, text in (handoff_note("acme", "2026-10-15-120000-smoke.md", "2026-10-18"),
+                          handoff_note("beta", "2026-10-16-090000-rotate.md", "2026-10-18",
+                                       body="The staging smoke test waits on a rotated "
+                                            "credential.")):
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / rel).write_text(text, encoding="utf-8")
+        ref = self.repo / "knowledge" / "reference"
+        ref.mkdir(parents=True, exist_ok=True)
+        (ref / "smoke-tests.md").write_text(
+            "---\nid: smoke-tests\nkind: reference\ntitle: Smoke tests\ntopics: [brain]\n"
+            "aliases: [smoke]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+            "Every staging smoke test runs from the deploy job.\n", encoding="utf-8")
+
+    def search(self, *args):
+        out = run_brain("search", *args, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout
+
+    def test_default_and_all_search_never_return_handoff_notes(self):
+        for extra in ((), ("--scope", "all")):
+            text = self.search("staging smoke test", *extra)
+            self.assertIn("smoke-tests", text, "precondition: the canonical note ranks")
+            self.assertNotIn("knowledge/handoff/", text, extra)
+
+    def test_scope_handoff_lists_every_note_for_an_empty_query(self):
+        text = self.search("--scope", "handoff")
+        for path, project in ((self.A, "acme"), (self.B, "beta")):
+            rows = [l for l in text.splitlines() if path in l]
+            self.assertTrue(rows, text)
+            self.assertIn(f"[handoff — belongs in {project}]", rows[0])
+        self.assertNotIn("smoke-tests", text, "scope handoff returned brain knowledge")
+
+    def test_a_project_slug_in_the_query_filters_by_handoff_to(self):
+        text = self.search("--scope", "handoff", "acme")
+        self.assertIn(self.A, text)
+        self.assertNotIn(self.B, text)
+
+    def test_other_words_filter_by_the_notes_text(self):
+        text = self.search("--scope", "handoff", "credential")
+        self.assertIn(self.B, text)
+        self.assertNotIn(self.A, text)
+
+    def test_scope_handoff_json_carries_the_interface_keys(self):
+        out = run_brain("search", "--scope", "handoff", "--json", repo=self.repo)
+        hits = {h["path"]: h for h in json_payload(out.stdout)["hits"]}
+        self.assertEqual(set(hits), {self.A, self.B})
+        hit = hits[self.A]
+        self.assertEqual((hit["handoff_to"], hit["handoff_at"], hit["folder"]),
+                         ("acme", "2026-10-18", "handoff"))
+        self.assertTrue(hit["handoff_reason"])
+
+    def test_read_shows_a_handoff_banner(self):
+        out = run_brain("read", self.A, repo=self.repo)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("HANDOFF", out.stdout)
+        self.assertIn("belongs in acme", out.stdout)
+        self.assertIn("not brain knowledge", out.stdout)
+        self.assertIn("pending work that belongs in the project's records", out.stdout)
+
+    def test_recent_tags_handoff_rows(self):
+        out = run_brain("recent", "--days", "2", repo=self.repo)
+        rows = [l for l in out.stdout.splitlines() if self.A in l]
+        self.assertTrue(rows, out.stdout)
+        self.assertIn("[handoff — belongs in acme]", rows[0])
+
+    def test_a_closing_correction_marks_the_handoff_note(self):
+        inbox = self.repo / "knowledge" / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "2026-10-18-0700-filed.md").write_text(
+            "---\ncreated: 2026-10-18\nsource: local\nkind: correction\nbasis: agent-found\n"
+            f"status: draft\n---\n\nFiled {self.A} to github.com/example/acme docs/backlog.md "
+            "B7 (PR #12).\n", encoding="utf-8")
+        rows = [l for l in self.search("--scope", "handoff").splitlines() if self.A in l]
+        self.assertIn("[correction pending — knowledge/inbox/2026-10-18-0700-filed.md]", rows[0])
+
+    def test_the_closing_leads_name_the_handoff_path(self):
+        targets = load_brain_module().correction_targets
+        self.assertEqual(targets(f"Filed {self.A} to github.com/example/acme issue #3."),
+                         [self.A])
+        self.assertEqual(targets(f"Already recorded: {self.A} — github.com/example/acme "
+                                 "docs/backlog.md B2 (commit 1a2b3c4)."), [self.A])
+
+
+class HandoffMcpTests(unittest.TestCase):
+    """Both front ends offer `scope: handoff`, pass it through, and tell a client how a
+    handoff note is closed."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "bin"))
+        from brainlib import mcp, mcpcore
+        self.mcp, self.mcpcore = mcp, mcpcore
+        self.remote = {t["name"]: t for t in mcpcore.tool_table("remote")}
+
+    def test_both_front_ends_offer_scope_handoff(self):
+        for tool in (self.mcp.TOOLS_BY_NAME["brain_search"], self.remote["brain_search"]):
+            scope = tool["inputSchema"]["properties"]["scope"]
+            self.assertEqual(scope["enum"], ["canonical", "all", "handoff"])
+            self.assertIn("handoff", scope["description"])
+            self.assertIn("not brain knowledge", scope["description"])
+
+    def test_both_front_ends_pass_scope_handoff_to_the_cli(self):
+        self.assertEqual(self.mcpcore.cli_for("brain_search", {"query": "", "scope": "handoff"}),
+                         ["search", "--limit", "8", "--scope", "handoff", "--", ""])
+        answer = self.mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "brain_search",
+                                             "arguments": {"query": "", "scope": "handoff"}}})
+        result = answer["result"]
+        self.assertFalse(result.get("isError"), result)
+        self.assertIn("handoff", result["content"][0]["text"])
+
+    def test_both_capture_descriptions_say_how_a_handoff_is_closed(self):
+        for tool in (self.mcp.TOOLS_BY_NAME["brain_capture"], self.remote["brain_capture"]):
+            self.assertIn("Filed <path>", tool["description"])
+            self.assertIn("Already recorded: <path>", tool["description"])
+            self.assertLessEqual(len(tool["description"]), 1600)
+
+
+class HandoffHealthTests(unittest.TestCase):
+    """doctor and stats count handoff notes per project. One older than 14 days with no
+    closing correction turns doctor RED: the filing job is not running."""
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.today = date_today()
+
+    def ago(self, days):
+        return (self.today - timedelta(days=days)).isoformat()
+
+    def handoff_lines(self):
+        out = run_brain("doctor", repo=self.repo)
+        return [l for l in out.stdout.splitlines() if "handoff" in l]
+
+    def test_doctor_counts_handoff_notes_per_project(self):
+        commit_at(self.repo, "handoffs", iso_ago(0),
+                  handoff_note("acme", "a1.md", self.ago(0)),
+                  handoff_note("acme", "a2.md", self.ago(1)),
+                  handoff_note("beta", "b1.md", self.ago(2)))
+        lines = self.handoff_lines()
+        self.assertTrue([l for l in lines if "[ok ]" in l and "3 note(s)" in l
+                         and "acme 2" in l and "beta 1" in l], lines)
+
+    def test_an_old_handoff_with_no_closing_correction_turns_doctor_red(self):
+        commit_at(self.repo, "handoff", iso_ago(0), handoff_note("acme", "a1.md", self.ago(15)))
+        lines = self.handoff_lines()
+        self.assertTrue([l for l in lines if "[RED]" in l
+                         and "the filing job is not running" in l], lines)
+
+    def test_a_closing_correction_keeps_an_old_handoff_green(self):
+        rel, text = handoff_note("acme", "a1.md", self.ago(15))
+        commit_at(self.repo, "handoff", iso_ago(0), (rel, text),
+                  ("knowledge/inbox/2026-10-18-0700-filed.md",
+                   "---\ncreated: 2026-10-18\nsource: local\nkind: correction\n"
+                   f"status: draft\n---\n\nAlready recorded: {rel} — github.com/example/acme "
+                   "docs/backlog.md B2.\n"))
+        lines = self.handoff_lines()
+        self.assertFalse([l for l in lines if "[RED]" in l], lines)
+
+    def test_stats_counts_handoff_apart_from_the_corpus(self):
+        commit_at(self.repo, "handoffs", iso_ago(0),
+                  handoff_note("acme", "a1.md", self.ago(0)),
+                  handoff_note("acme", "a2.md", self.ago(20)),
+                  handoff_note("beta", "b1.md", self.ago(0)))
+        snap = json_payload(run_brain("stats", "--json", repo=self.repo).stdout)
+        self.assertEqual(snap["handoff"], {"waiting": 3, "projects": {"acme": 2, "beta": 1},
+                                           "stale": 1})
+        self.assertNotIn("handoff", snap["corpus"])
+
+    def test_a_move_to_handoff_is_not_a_second_capture(self):
+        name = "2026-10-17-080000-smoke.md"
+        commit_at(self.repo, "capture", iso_ago(1),
+                  (f"knowledge/inbox/{name}", inbox_note(source="local")))
+        commit_at(self.repo, "consolidate: handoff", iso_ago(0),
+                  (f"knowledge/inbox/{name}", None),
+                  handoff_note("acme", name, self.ago(0)))
+        out = run_brain("stats", "--captures", "--since", iso_ago(3), "--json", repo=self.repo)
+        self.assertEqual(json_payload(out.stdout)["total"], 1, out.stdout)
 
 
 class LintIntegrityTests(unittest.TestCase):
