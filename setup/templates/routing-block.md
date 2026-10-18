@@ -16,5 +16,8 @@ and the reasoning is the whole point. Capture the WHY, not the what.
 Never capture a named person's private life, health, finances or relationships
 without asking me first — the repo is private, but a capture is auto-pushed
 unreviewed and git history is permanent, and they never got a say. Skip
-anything derivable from code or public docs, transient state, and credentials.
+anything derivable from code or public docs, transient state, and credentials;
+open to-dos belong in the project's own records, not the brain. Asked to change
+or delete a note, never say you cannot: capture a correction that names its id
+or path and quotes the wrong line, and the next consolidation applies it.
 Full policy: "What earns a note" in {{REPO}}/AGENTS.md.
