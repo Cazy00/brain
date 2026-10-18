@@ -293,20 +293,27 @@ own.
 
 What a pass does with it, and what it reports:
 
-- **Window.** The digest holds the entries since the last `consolidate:`
-  commit on the trunk, 8 days at most, so daily passes do not re-mine the same
-  week. A scheduler that knows when its last good pass started (one that
-  changed nothing leaves no commit) passes `--digest-since <UTC instant, Z>`
-  instead, still capped at 8 days. `consolidate --digest-from DIR` adds the
-  digest.v1 files in DIR and one level below it to this account's own
-  transcripts.
+- **Window.** The digest holds the entries in (start, collection instant].
+  The start is the last consolidation on the trunk (merge commits never
+  count): its `Digest-until:` trailer, which the pass writes on its own final
+  commit as the instant it collected its digest, else that commit's author
+  date. It is 8 days back at most, so daily passes neither re-mine the same
+  week nor lose a turn typed while the model ran. A scheduler that knows when
+  its last good pass started (one that changed nothing leaves no commit) passes
+  `--digest-since <UTC instant, Z>` instead, still capped at 8 days.
+  `consolidate --digest-from DIR` adds the digest.v1 files in DIR and one
+  level below it to this account's own transcripts.
 - **Proposals.** Mining writes at most 3 per pass, as inbox notes with
-  `source: session-mining` and `expires:` 7 days after `created:`. A later
+  `source: session-mining`, `basis: owner-said`, a kind, `status: draft`,
+  `created:` the pass date and `expires:` exactly 7 days later; the engine
+  checks all of that before the audit and blocks the pass otherwise. A later
   pass promotes one only once something corroborates it, and deletes it once
-  it expires; `doctor` goes red when one is more than 2 days past its expiry.
+  it expires; `doctor` goes red when one is more than 2 days past its expiry
+  or has none.
 - **Idle.** With no captures, no digest entries, no journal entries since the
   last consolidation and no `review_by` debt, a pass makes no model call and
-  cuts no branch; a proposal inside its expiry is no work on its own.
+  cuts no branch; a proposal inside its expiry is no work on its own. The
+  decision is made under the repository lock and only over a clean tree.
   `consolidate --dry-run` prints what it would decide.
 - **Result.** Every pass ends on one line, `consolidate-result: {json}`:
   `{"v":1, "status": "idle|committed|no_changes|blocked|failed", "idle",
@@ -315,6 +322,9 @@ What a pass does with it, and what it reports:
   runner's `--output-format json` answer, and `null` when it answers in plain
   text. `brain audit-branch` ends the same way, on `audit-result: {"v":1,
   "verdict": "pass|block|error", "cost_microusd", "tokens_in", "tokens_out"}`.
+  Those lines are reserved: anything the runner or a file name supplies is
+  printed behind `  | ` or folded onto one line, so only the engine's own
+  result line starts at column 0.
 - **Known limit.** In a split layout with `BRAIN_STATE_DIR` outside both the
   data root and the engine, the pass is told the digest's real path but its
   runner line grants no read access there (`--add-dir` names the engine only),
@@ -338,8 +348,11 @@ another tool follows it, and nothing in consolidation changes.
   `brain sessions --jsonl --out FILE [--days N]` is the Claude Code producer;
   it needs no brain, so the transcripts' owner can run it from an engine it
   cannot write, and it writes FILE (and a temporary file beside it) only.
-- The reader skips a line that breaks the contract and counts it; unknown
-  keys are ignored. It reads regular files under 2 MB and refuses symlinks.
+- The reader skips a line that breaks the contract and counts it (a string
+  that is not valid UTF-8, or an `at` more than 5 minutes after it collected,
+  included); unknown keys are ignored. It reads regular files under 2 MB,
+  opens every directory and file without following a symlink, and refuses a
+  symlinked DIR.
 
 ## Hard rules
 
