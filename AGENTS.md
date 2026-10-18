@@ -28,16 +28,17 @@ knowledge/
   reference/      durable how-tos and facts
   journal/YYYY/   one file per day (YYYY-MM-DD.md), free-form
   vault/          age-ENCRYPTED sensitive notes (.age only, never plaintext)
-  archive/        superseded notes, mirror tree — OUT of default search
+  archive/        superseded and retracted notes, mirror tree — OUT of
+                  default search
   attachments/    small binaries, 1MB hard cap per file
 setup/            templates, runbooks (this system's own docs)
                   consolidate-prompt.md writes notes; audit-prompt.md is the
                   independent, digest-blind, write-less check on that work
                   consolidator.conf names the ONE agent allowed to run them
 bin/brain         toolbelt: setup | connect | new | capture | search | read |
-                  links | recent | supersede | index | sessions | consolidate |
-                  schedule | template | publish | plugin | lint | doctor |
-                  logs | stats | reset
+                  links | recent | supersede | retract | index | sessions |
+                  consolidate | schedule | template | publish | plugin | lint |
+                  doctor | logs | stats | reset
                   (`bin/brain --help` is authoritative; doctor reports whether
                   the machinery works, stats whether the KNOWLEDGE still does,
                   and logs what `brain serve` recorded — machine-local, outside
@@ -65,10 +66,11 @@ status:   current   (canonical folders hold current notes ONLY)
 ```
 
 Optional: `valid_from`, `review_by` (date to re-verify perishable facts),
-`supersedes`, `superseded_by`, `sensitivity` (required in people/ and life/:
-normal | personal; `private` content goes to vault/, never plaintext),
-`visibility` (public | private — see below), and on inbox notes the
-provenance keys below.
+`supersedes`, `superseded_by`, `retracted` (the date a note was withdrawn;
+`brain retract` sets it, in archive/ only), `sensitivity` (required in
+people/ and life/: normal | personal; `private` content goes to vault/, never
+plaintext), `visibility` (public | private — see below), and on inbox notes
+the provenance keys below.
 
 **Inbox provenance.** `brain capture` writes these flat keys, in this order,
 leaving out any it was not given:
@@ -163,6 +165,20 @@ lesson inside it, rewritten as one. A canonical note never states the open or
 pending status of work: that status goes stale the day the work is done, and
 a stale "still open" is read back as true.
 
+**Asked to change or delete a note, never answer that you cannot.** Find it
+with `brain search` (`--scope all` reaches the inbox) or `brain recent` — an
+inbox note has only a path, a canonical note an id — and capture a
+`kind: correction` (`basis: owner-said` when the request is the user's) that
+names that id or path and quotes the wrong line, in one of two forms:
+`Correction to <id or path>: <what is true now>`, or
+`Retract <id or path>: it should not be in the brain — <the reason>`.
+Tell the user in one line that the next consolidation applies it (see
+Retracting, below); until then search and read mark the note
+`[correction pending — <inbox path>]`. If what must go is a credential or a
+named person's private details, say too that git history keeps it until a
+purge: rewriting history is a permanent deletion, so it is the owner's call,
+and no agent tool does it.
+
 Offer, don't nag. When something above passes the bar mid-conversation, say so
 in one line and carry on — do not save the offer for the end of the session,
 because by then the reasoning is already gone. "Remember this" from you
@@ -232,6 +248,26 @@ blocks a half-done supersede.)
 This is why retrieval stays precise: superseded notes physically leave the
 default search scope.
 
+## Retracting — when a note should not exist
+
+A note saved by mistake — never true, or never the brain's to hold — has no
+successor, so it is retracted, not superseded:
+
+```
+bin/brain retract <id> "<one-line reason>"
+```
+
+sets `status: retracted` and `retracted: <date>`, stamps
+`> RETRACTED <date> — <reason>`, drops `visibility` and moves the note to
+`archive/`, out of default search; `brain read` still shows it, behind a
+RETRACTED warning. It names the notes still linking to it: remove those links
+(lint warns about each), lint, commit. Consolidation retracts only on a
+`kind: correction` from `source: local` with `basis: owner-said`, and never
+an inbox capture, which it deletes instead. Retracting does not erase: git
+history keeps the text. A credential or a named person's private details saved
+by mistake also need a purge of that history, which is a permanent deletion
+and the owner's decision alone — no tool here does it.
+
 ## Searching — tier protocol
 
 **Retrieve through the tools below, never through your own file index.** Every
@@ -270,7 +306,13 @@ as the reason the rule is satisfied.
    `bin/brain search --scope all`. Never present an inbox item as settled.
 6. `archive/` is opt-in — search it only for history questions ("what did I
    previously decide", "why did this change"). Never present archived content
-   as current; always mention it was superseded and by what.
+   as current; always mention it was superseded and by what, or retracted and
+   why.
+6b. A note that a correction still waiting in the inbox names is marked
+   `[correction pending — <inbox path>]` by search, read and recent (computed
+   from the inbox at query time; only a `source: local` correction counts).
+   Read the correction before answering from the note, and never present the
+   note as settled.
 7. When you answer from a note, cite it by path so the answer is auditable.
 
 ## Consolidation — the one pinned runner
@@ -313,6 +355,13 @@ What a pass does with it, and what it reports:
   `--digest-since <UTC instant, Z>` instead, still capped at 8 days.
   `consolidate --digest-from DIR` adds the digest.v1 files in DIR and one
   level below it to this account's own transcripts.
+- **Corrections first.** The pass reads the WHOLE inbox for `kind: correction`
+  notes and applies them before draining the oldest 20 (they do not count
+  toward that cap), so an original is never promoted while its correction
+  waits. A correction to a canonical note supersedes it, a retraction archives
+  it with `brain retract`, and one to an inbox note drains both. Each
+  consolidate commit names every drained inbox path and what it became, which
+  is how a later correction finds a target that has moved.
 - **Proposals.** Mining writes at most 3 per pass, as inbox notes with
   `source: session-mining`, `basis: owner-said`, a kind, `status: draft`,
   `created:` the pass date and `expires:` exactly 7 days later; the engine

@@ -5899,6 +5899,26 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
                        "whole inbox"):
             self.assertIn(phrase, text)
 
+    def test_the_protocol_fixes_a_note_instead_of_refusing_to(self):
+        """AGENTS.md carries the whole correction rule: what an agent captures when asked
+        to change or delete a note, what search shows meanwhile, and how a pass retracts."""
+        text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+        policy = text[text.index("## What earns a note"):text.index("## Work that lives elsewhere")]
+        for phrase in ("never answer that you cannot", "`--scope all`", "`brain recent`",
+                       "`Correction to <id or path>: <what is true now>`",
+                       "`Retract <id or path>: it should not be in the brain — <the reason>`",
+                       "quotes the wrong line", "`basis: owner-said`", "the next consolidation",
+                       "`[correction pending — <inbox path>]`", "until a purge"):
+            self.assertIn(phrase, policy)
+        retract = text[text.index("## Retracting"):text.index("## Searching")]
+        for phrase in ("bin/brain retract <id>", "`status: retracted`", "`retracted:",
+                       "no successor", "RETRACTED", "`basis: owner-said`", "purge"):
+            self.assertIn(phrase, retract)
+        search = text[text.index("## Searching"):text.index("## Consolidation")]
+        self.assertIn("[correction pending — <inbox path>]", search)
+        passes = text[text.index("## Consolidation"):text.index("### Session digest")]
+        self.assertIn("Corrections first", passes)
+
     def test_the_protocol_keeps_pending_work_out_and_never_promotes_its_status(self):
         """AGENTS.md is the bar every pass is told to apply, so the rule lives there too."""
         text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
