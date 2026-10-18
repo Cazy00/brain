@@ -83,6 +83,16 @@ records, and a status goes stale the day the work is done. A decision or
 lesson about the work, phrased as one, passes; this is a check on what the
 note asserts, not on whether it was worth writing.
 
+**HANDOFF.** A capture that belongs in a project's own records is moved to
+knowledge/handoff/<project>/, never promoted. Block if a note the change set
+adds there lacks `handoff_to` (the same as its folder, a valid slug: lowercase
+letters, digits and hyphens, 1-63), `handoff_at` or `handoff_reason`; if the
+change set promotes, or merges into a canonical note, the content of a note in
+knowledge/handoff/; or if it deletes a handoff note with no closing correction
+removed alongside it (`source: local`, its text starting `Filed <path>` or
+`Already recorded: <path>`). The engine checks the keys and the deletions
+before you; you check that no handoff content reached a canonical note.
+
 ## What you must NOT do
 
 **Do not judge whether anything was WORTH capturing.** You cannot see the

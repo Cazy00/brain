@@ -30,6 +30,8 @@ knowledge/
   vault/          age-ENCRYPTED sensitive notes (.age only, never plaintext)
   archive/        superseded and retracted notes, mirror tree — OUT of
                   default search
+  handoff/        captures that belong in a project's own records, waiting to
+                  be filed there — not brain knowledge, OUT of default search
   attachments/    small binaries, 1MB hard cap per file
 setup/            templates, runbooks (this system's own docs)
                   consolidate-prompt.md writes notes; audit-prompt.md is the
@@ -159,11 +161,12 @@ Ask first, every single time — never silently:
 Promotion bar (inbox → canonical, applied by consolidation): would you
 search for this, and would a stale version of it mislead you? If it is not
 worth maintaining for ten years, delete it instead of promoting it.
-A capture that records pending work is deleted, not promoted, when that work
-is in a project's records or obviously belongs there; keep only a decision or
-lesson inside it, rewritten as one. A canonical note never states the open or
-pending status of work: that status goes stale the day the work is done, and
-a stale "still open" is read back as true.
+A capture that records pending work is never promoted: it is deleted, not
+promoted, when it says the work is already tracked in a project's records, and
+otherwise handed off to that project (see Handoff, below); keep only a
+decision or lesson inside it, rewritten as one. A canonical note never states
+the open or pending status of work: that status goes stale the day the work is
+done, and a stale "still open" is read back as true.
 
 **Asked to change or delete a note, never answer that you cannot.** Find it
 with `brain search` (`--scope all` reaches the inbox) or `brain recent` — an
@@ -267,6 +270,37 @@ an inbox capture, which it deletes instead. Retracting does not erase: git
 history keeps the text. A credential or a named person's private details saved
 by mistake also need a purge of that history, which is a permanent deletion
 and the owner's decision alone — no tool here does it.
+
+## Handoff — what belongs in a project's own records
+
+Some captures are not brain knowledge at all: pending work, a project's own
+decision or status, a task or milestone fact. They belong in that project's
+own records (its backlog, issues, milestones), and consolidation never promotes
+one. If the capture says the work is already tracked there, it is deleted;
+otherwise it is moved to `knowledge/handoff/<project-slug>/`, a holding area
+outside default search and outside the brain proper — not brain knowledge —
+to be filed there. A decision or lesson inside it that outlives the project is
+still promoted as its own note.
+
+A handoff note keeps the original capture's frontmatter and body under the
+original inbox file name, and adds `handoff_to: <project-slug>` (lowercase
+letters, digits and hyphens, 1-63; the same as its folder),
+`handoff_at: YYYY-MM-DD` (the day it was moved) and
+`handoff_reason: <one line>`. Lint holds its place and keys, and the engine
+checks every move before the audit. `bin/brain search` with `--scope handoff`
+(MCP: `brain_search` with `scope: "handoff"`; an empty query lists them all, a
+project slug filters by `handoff_to`) returns handoff notes only, each marked
+`[handoff — belongs in <project>]`; `--scope all` never includes them.
+`brain read <handoff path>` shows one behind a HANDOFF banner.
+
+A filing job files each note in its project's records, then closes it with a
+`kind: correction` from an owner endpoint whose text starts
+`Filed <handoff path>` or `Already recorded: <handoff path>`, naming where it
+now lives (repository and record path, and the PR or commit). The next pass
+deletes the handoff note and drains the correction, before the inbox cap. A
+handoff note older than 14 days with no closing correction stays, and `doctor`
+goes RED: the filing job is not running. `doctor` and `stats` count handoff
+notes per project.
 
 ## Searching — tier protocol
 

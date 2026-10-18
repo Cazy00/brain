@@ -6187,7 +6187,7 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         text = self.flat("consolidate-prompt.md")
         drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
         rule = drain[drain.index("PENDING WORK"):drain.index("Proposals an earlier pass wrote")]
-        for phrase in ("deleted, not promoted", "a project's records", "obviously belongs there",
+        for phrase in ("deleted, not promoted", "a project's own records", "already tracked",
                        "decision or a lesson", "rewritten as one",
                        "never states the open or pending status of work"):
             self.assertIn(phrase, rule)
@@ -6251,6 +6251,42 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         self.assertIn("[correction pending — <inbox path>]", search)
         passes = text[text.index("## Consolidation"):text.index("### Session digest")]
         self.assertIn("Corrections first", passes)
+
+    def test_the_drain_hands_off_what_belongs_in_a_projects_records(self):
+        text = self.flat("consolidate-prompt.md")
+        drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
+        rule = drain[drain.index("HANDOFF —"):drain.index("PROVENANCE —")]
+        for phrase in ("not promoted", "already tracked", "delete it",
+                       "knowledge/handoff/<project>/", "the same file name",
+                       "`handoff_to: <project>`", "`handoff_at: <today>`",
+                       "`handoff_reason: <one line>`",
+                       "a decision or lesson inside it", "Unknown project",
+                       "leave it in the inbox and say so in the commit message",
+                       "do not count toward the 20", "never promote"):
+            self.assertIn(phrase, rule)
+        corrections = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
+        for phrase in ("`Filed <handoff path>`", "`Already recorded: <handoff path>`",
+                       "delete that handoff note"):
+            self.assertIn(phrase, corrections)
+
+    def test_the_auditor_checks_handoff_moves(self):
+        text = self.flat("audit-prompt.md")
+        rule = text[text.index("**HANDOFF.**"):text.index("## What you must NOT do")]
+        for phrase in ("knowledge/handoff/", "`handoff_to`", "`handoff_at`", "`handoff_reason`",
+                       "valid slug", "promotes", "closing correction"):
+            self.assertIn(phrase, rule)
+
+    def test_the_protocol_documents_the_handoff_area(self):
+        text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+        handoff = text[text.index("## Handoff"):text.index("## Searching")]
+        for phrase in ("knowledge/handoff/<project-slug>/", "not brain knowledge",
+                       "`handoff_to: <project-slug>`", "`handoff_at: YYYY-MM-DD`",
+                       "`handoff_reason: <one line>`", "the original inbox file name",
+                       "`--scope handoff`", "`Filed <handoff path>`",
+                       "`Already recorded: <handoff path>`", "14 days", "doctor",
+                       "[handoff — belongs in <project>]"):
+            self.assertIn(phrase, handoff)
+        self.assertIn("handoff/", text[text.index("## Layout"):text.index("## Note contract")])
 
     def test_the_protocol_keeps_pending_work_out_and_never_promotes_its_status(self):
         """AGENTS.md is the bar every pass is told to apply, so the rule lives there too."""

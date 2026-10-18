@@ -24,11 +24,25 @@ Do these in order, respecting every cap:
    existing note. Then delete the inbox file. If an item is not actionable
    knowledge (noise), delete it and note that in the commit message.
    PENDING WORK — a capture that records pending work (a to-do, an open step,
-   "X still needs Y", "next session must…") is deleted, not promoted, when that
-   work is in a project's records or obviously belongs there; say so in the
-   commit message. If it carries a decision or a lesson, keep only that,
-   rewritten as one. A canonical note you create or merge into never states the
-   open or pending status of work.
+   "X still needs Y", "next session must…") belongs in a project's own
+   records, as does that project's own decision, its status, or a task or
+   milestone fact. If it carries a decision or a lesson that outlives the
+   project, keep only that, rewritten as one. A canonical note you create or
+   merge into never states the open or pending status of work.
+   HANDOFF — such a capture is not promoted. If the capture itself says the
+   work is already tracked (it names a backlog item, an issue, a milestone or
+   a record), it is deleted, not promoted: delete it and say so in the commit
+   message. Otherwise move it to knowledge/handoff/<project>/ under the same
+   file name, keeping its frontmatter and body, and add
+   `handoff_to: <project>`, `handoff_at: <today>` and
+   `handoff_reason: <one line>` to its frontmatter. <project> is the slug of
+   a project the brain knows (a knowledge/projects/<project>/ overview): the
+   capture's `project:`, or the project it plainly concerns. Unknown project:
+   leave it in the inbox and say so in the commit message. Handoffs do not
+   count toward the 20, and a decision or lesson inside it that outlives the
+   project is still promoted as its own note. You never promote, merge or edit
+   a note in knowledge/handoff/: a filing job files it in the project's
+   records and closes it with a correction (CORRECTIONS).
    Proposals an earlier pass wrote (`source: session-mining`) follow PROPOSALS
    below and do not count toward the 20.
    PROVENANCE — every capture carries `source:`, stamped by the endpoint that
@@ -92,6 +106,10 @@ Do these in order, respecting every cap:
      drained inbox path and what it became) and by searching the quoted
      line, and apply it there. If you cannot find it, leave the correction in
      the inbox and say so in the commit message.
+   A correction whose text starts `Filed <handoff path>` or `Already
+   recorded: <handoff path>` (naming where the note now lives) closes a
+   handoff: with `source: local`, delete that handoff note and the correction,
+   before the cap like any other correction.
    PROPOSALS — for each `source: session-mining` note from an earlier pass:
    promote it only if it is corroborated — by another capture, a canonical
    note, or a later digest entry where the user says it again — and name what
@@ -155,15 +173,17 @@ Do these in order, respecting every cap:
 
 Hard caps: modify at most 15 canonical files total, plus at most 3 new inbox
 proposals from step 3. If the inbox has more than 20 items (proposals from
-earlier passes and corrections not counted), process the oldest 20 and stop —
+earlier passes, handoffs and corrections not counted), process the oldest 20
+and stop —
 the rest wait for the next pass.
 
 Finish: run bin/brain lint and fix every error until it exits clean. Commit
 everything as "consolidate: <today's date>" with a body listing what was
-drained, promoted, proposed, reviewed, superseded and retracted, which
-corrections were applied or left (and why), and which proposals were
+drained, promoted, handed off, proposed, reviewed, superseded and retracted,
+which corrections were applied or left (and why), and which proposals were
 promoted, deleted as expired, or left. Name each drained inbox note by its
-path and what it became (the note id it created or merged into, or
-deleted): a later correction finds its target by that line. Do not push, do not
+path and what it became (the note id it created or merged into, the handoff
+path it moved to, or deleted): a later correction finds its target by that
+line. Do not push, do not
 merge, do not switch branches — the wrapper audits your work and pushes the
 branch itself only if the audit passes.
