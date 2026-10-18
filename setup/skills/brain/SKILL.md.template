@@ -50,6 +50,8 @@ the reasoning is already gone.
 
 - Quick fact or thought: `brain_capture` tool, or
   `bin/brain capture "..." --commit` — lands in inbox/, committed and pushed.
+  Fill its `kind` and `basis` (owner-said / agent-found / agent-inferred), and
+  `project`, `job` and `model` when known; the endpoint stamps the rest.
 - Structured note: `bin/brain new <kind> "<title>" --topics a,b`, fill body
   and aliases, then `bin/brain lint` and commit.
 - A fact CHANGED: follow the supersede protocol in the repo's AGENTS.md —

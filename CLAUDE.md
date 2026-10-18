@@ -32,9 +32,9 @@ tools every other agent gets.
   names — the Claude CLI by default, on a pinned model. See "Consolidation" in
   AGENTS.md; the runner is config, not code.
 - **Session mining** (`bin/brain sessions`, and the digest consolidation reads)
-  parses Claude Code's own transcripts under `~/.claude/projects`. It exists
-  only for Claude Code today; every other agent simply gets no digest, which
-  consolidation already handles as a normal, non-fatal case.
+  parses Claude Code's own transcripts under `~/.claude/projects`, keeping the
+  user turns whose `turnOrigin` is `human` (or that predate the field). Other
+  tools reach consolidation only as digest.v1 files (AGENTS.md).
 
 ## Global routing
 

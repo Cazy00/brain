@@ -18,15 +18,19 @@ this one. `allow=None` — every tool — stays the default, because that is wha
 stdio is: a subprocess a client spawned on the machine the user is already
 sitting at.
 
-Two more properties of the ENDPOINT travel the same way, never through the
-message: `source` (what provenance a write is stamped with) and `cap` (how
-much this endpoint may write today). A caller must not be able to set either,
-so neither is a tool argument.
+More properties of the ENDPOINT travel the same way, never through the
+message: `source` (what trust class a write is stamped with), `via` (the
+transport it arrived through) and `cap` (how much this endpoint may write
+today). A caller must not be able to set any of them, so none is a tool
+argument. `client` is stamped from the client's own clientInfo, which is
+self-reported and said to be.
 """
 import json
 import subprocess
 import sys
 from pathlib import Path
+
+from . import mcpcore, provenance
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 BRAIN = str(ROOT / "bin" / "brain")
@@ -103,12 +107,9 @@ TOOLS = [
     },
     {
         "name": "brain_capture",
-        "description": (
-            "Save a thought, fact, or decision into the brain's inbox, committed and "
-            "auto-backed-up to GitHub immediately. Use when the user says 'remember this' "
-            "or states something durable worth keeping. Text should be self-contained "
-            "with absolute dates."
-        ),
+        # The one capture policy, shared with brain-http (mcpcore.py), so every
+        # client of every transport is told the same thing about what to save.
+        "description": mcpcore.LOCAL_CAPTURE_DESCRIPTION,
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -122,6 +123,10 @@ TOOLS = [
                         "credentials either way."
                     ),
                 },
+                # What a caller may declare about the note, identical on every
+                # front end. What the endpoint stamps (source, via, client) is
+                # never offered here; see call_tool.
+                **provenance.declared_schema(),
             },
             "required": ["text"],
         },
@@ -285,7 +290,8 @@ def drop_box_reply(run):
                          "text": f"captured {note_id}".strip()}], "isError": False}
 
 
-def call_tool(name, args, allow=None, source=None, cap=None, log=None):
+def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
+              client=None):
     # isinstance first: a non-string name (dict/list) is unhashable and would
     # raise on the membership test instead of reporting an unknown tool.
     if not isinstance(name, str) or name not in TOOLS_BY_NAME:
@@ -308,6 +314,12 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None):
                              "property of how it was started, not a permission to retry "
                              "into."}],
                 "isError": True}
+    declared, ignored = {}, []
+    if name == "brain_capture":
+        # The caller's declared fields are DROPPED when bad, never refused — a
+        # note is worth more than its label — so they are taken out before the
+        # strict validator, which would refuse the whole call over a bad enum.
+        args, declared, ignored = provenance.take_declared(args)
     args, problem = validate_args(name, args)
     if problem:
         return {"content": [{"type": "text", "text": f"invalid arguments for {name}: {problem}"}],
@@ -328,7 +340,7 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None):
         # uncommitted note dirties the tree, which blocks the consolidation pass
         # that is the inbox's only drain. The flag exists so a caller CAN hold a
         # capture back from the remote deliberately.
-        cli = ["capture", args["text"]]
+        cli = ["capture"]
         if args.get("commit", True):
             cli.append("--commit")
         if source:
@@ -344,6 +356,14 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None):
             # which calls it `local`. Two spellings of the default would be
             # two things to keep in step.
             cli += ["--source", source]
+        # `via` and `client` are stamped the same way: `via` from how this
+        # server was started, `client` from the client's own self-reported
+        # clientInfo. Neither is in the schema, so neither can come from the
+        # request arguments. The declared fields follow, already cleaned, and
+        # the text goes LAST, so a note whose whole text is "--kind" never
+        # finds a value after it to swallow.
+        cli += provenance.cli_flags({"via": via, "client": client, **declared})
+        cli.append(args["text"])
         if cap is not None:
             # Checked BEFORE the CLI runs: nothing reaches disk either way, and
             # a refusal that still forked a subprocess would be a cheap way to
@@ -380,10 +400,45 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None):
     if name == "brain_capture" and source:
         return drop_box_reply(run)
     text = (run.stdout + ("\n" + run.stderr if run.stderr.strip() else "")).strip() or "(no output)"
+    if ignored:
+        text = provenance.ignored_line(ignored) + "\n" + text
     return {"content": [{"type": "text", "text": text}], "isError": run.returncode != 0}
 
 
-def handle(msg, allow=None, source=None, cap=None, log=None):
+# Where a 2026-07-28 client names itself on every request (see httpmcp.py).
+META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+
+
+def _instructions(allow) -> str:
+    """What `initialize` tells a client, from what this endpoint serves.
+
+    Everything, or reads plus capture: the full policy. Reads only: the
+    read-only sentence. No reads at all — a drop box — gets nothing: telling
+    a caller that cannot read to search first is an instruction it cannot
+    follow, and the drop box answers a write and says nothing else."""
+    served = TOOLS_BY_NAME if allow is None else allow
+    if not any(name in served for name in READ_ONLY_TOOLS):
+        return ""
+    return mcpcore.instructions("capture" if "brain_capture" in served else "read")
+
+
+def _client_of(info, announce: bool = False):
+    """`name/version` from a clientInfo object, or None. Self-reported: it
+    says which program asked, and nothing may treat it as who."""
+    if not isinstance(info, dict):
+        return None
+    label = provenance.client_label(info.get("name"), info.get("version"))
+    if label is None and announce and info.get("name"):
+        # The client's own spelling is not repeated: it is text somebody else
+        # chose, and the operator needs to know only that captures will carry
+        # no client.
+        sys.stderr.write("brain-mcp: the client's self-reported name is not a valid "
+                         "label; its captures will carry no `client`\n")
+        sys.stderr.flush()
+    return label
+
+
+def handle(msg, allow=None, source=None, cap=None, log=None, via=None, session=None):
     """One JSON-RPC message in, one reply out — or None for a notification.
 
     Returns rather than writes, which is the whole reason a second transport is
@@ -401,6 +456,13 @@ def handle(msg, allow=None, source=None, cap=None, log=None):
     write; None means uncapped. Both travel the same way `allow` does — from
     how the server was started, past the message entirely — for the same
     reason: a property of the deployment must not be settable by the caller.
+
+    `via` is the same kind of property: what this endpoint stamps as the
+    transport a capture arrived through (`stdio`, `serve`, `drop-box`), or None
+    to stamp nothing. `session` is a dict that lives as long as one client's
+    connection — stdio is exactly one — so the clientInfo a client gave at
+    `initialize` can be stamped on its later captures. Without one (sessionless
+    HTTP), a modern client's per-request clientInfo is used when it sends one.
     """
     method = msg.get("method", "")
     msg_id = msg.get("id")
@@ -408,19 +470,30 @@ def handle(msg, allow=None, source=None, cap=None, log=None):
     if not isinstance(params, dict):
         params = {}
     if method == "initialize":
-        return _reply(msg_id, {
+        if session is not None:
+            session["client"] = _client_of(params.get("clientInfo"), announce=True)
+        result = {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "brain", "version": "1.0.0"},
-        })
+        }
+        text = _instructions(allow)
+        if text:
+            result["instructions"] = text
+        return _reply(msg_id, result)
     if method == "tools/list":
         served = TOOLS if allow is None else [t for t in TOOLS if t["name"] in allow]
         return _reply(msg_id, {"tools": served})
     if method == "tools/call":
         args = params.get("arguments")
+        client = (session or {}).get("client")
+        if client is None:
+            meta = params.get("_meta")
+            client = _client_of(meta.get(META_CLIENT_INFO)) if isinstance(meta, dict) else None
         return _reply(msg_id, call_tool(params.get("name", ""),
                                         args if args is not None else {}, allow=allow,
-                                        source=source, cap=cap, log=log))
+                                        source=source, cap=cap, log=log, via=via,
+                                        client=client))
     if method == "ping":
         return _reply(msg_id, {})
     if msg_id is not None:
@@ -442,7 +515,12 @@ MAX_LINE_CHARS = 10_000_000  # a single request larger than this is not real tra
 
 
 def serve_stdio():
-    """The stdio transport: a line in, a line out. Unchanged in behaviour."""
+    """The stdio transport: a line in, a line out.
+
+    One process is one client's session, so what it said at `initialize` is
+    remembered for the captures it makes, and every capture is stamped
+    `via: stdio`."""
+    session = {}
     for line in sys.stdin:
         line = line.strip()
         if not line or len(line) > MAX_LINE_CHARS:
@@ -460,7 +538,7 @@ def serve_stdio():
         # Top-level containment: one malformed request must never take the
         # server down with it — every other session is sharing it.
         try:
-            out = handle(msg)
+            out = handle(msg, via="stdio", session=session)
         except Exception as exc:
             msg_id = msg.get("id")
             if msg_id is None:

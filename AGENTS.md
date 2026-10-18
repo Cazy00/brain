@@ -67,8 +67,30 @@ status:   current   (canonical folders hold current notes ONLY)
 Optional: `valid_from`, `review_by` (date to re-verify perishable facts),
 `supersedes`, `superseded_by`, `sensitivity` (required in people/ and life/:
 normal | personal; `private` content goes to vault/, never plaintext),
-`visibility` (public | private — see below), `source` (which endpoint accepted
-a capture; on inbox notes).
+`visibility` (public | private — see below), and on inbox notes the
+provenance keys below.
+
+**Inbox provenance.** `brain capture` writes these flat keys, in this order,
+leaving out any it was not given:
+
+| Key | Set by | Value |
+|---|---|---|
+| `created` | always | the deployment's local date (`TZ`) |
+| `captured_at` | always | UTC instant, `2026-10-18T05:12:09Z` |
+| `source` | the endpoint | its trust class; `local` by default |
+| `via` | the endpoint | how it arrived: the operator's label for the verified credential (else `service` / `interactive`), `stdio`, `serve` or `drop-box`; absent from the CLI |
+| `client` | the endpoint | the client program's own `name/version`, self-reported |
+| `kind` | the caller | decision \| preference \| fact \| lesson \| idea \| correction \| other |
+| `basis` | the caller | owner-said \| agent-found \| agent-inferred |
+| `project`, `job`, `model` | the caller | slugs |
+| `status` | always | `draft` |
+
+Endpoint keys record what the server verified or was told; no tool argument
+reaches them. Caller keys are **claims**: consolidation weighs them against
+everything else it knows, and none of them promotes or supersedes a note by
+itself. A value that fails validation is dropped and named back to the
+caller, and the note is kept. An inbox `kind` is the declared kind, not a
+canonical one: search lists the note as `inbox` whatever it says.
 
 **`visibility` decides what may leave this brain**, and it has THREE states.
 `public` means a human approved this note for readers outside — customers,
@@ -263,9 +285,74 @@ does not distinguish them — read-only-ness is a property of the specific tool,
 not something a command string carries with it, so swapping runners means
 re-establishing it and writing down how.
 
-Session mining (`bin/brain sessions`) reads Claude Code transcripts only. Every
-other runner simply gets no digest, which the consolidation prompt already
-handles as a normal case — the inbox drain is worth doing on its own.
+Session mining (`bin/brain sessions`) reads Claude Code transcripts, and only
+the turns a person typed: automation, peer and notification turns are dropped.
+Any other tool's sessions reach consolidation as digest.v1 files (below);
+without a digest the pass simply drains the inbox, which is worth doing on its
+own.
+
+What a pass does with it, and what it reports:
+
+- **Window.** The digest holds the entries in (start, collection instant].
+  The start is the last consolidation on the trunk (merge commits never
+  count): its `Digest-until:` trailer, which the pass writes on its own final
+  commit as the instant it collected its digest, else that commit's author
+  date. It is 8 days back at most, so daily passes neither re-mine the same
+  week nor lose a turn typed while the model ran. A scheduler that knows when
+  its last good pass started (one that changed nothing leaves no commit) passes
+  `--digest-since <UTC instant, Z>` instead, still capped at 8 days.
+  `consolidate --digest-from DIR` adds the digest.v1 files in DIR and one
+  level below it to this account's own transcripts.
+- **Proposals.** Mining writes at most 3 per pass, as inbox notes with
+  `source: session-mining`, `basis: owner-said`, a kind, `status: draft`,
+  `created:` the pass date and `expires:` exactly 7 days later; the engine
+  checks all of that before the audit and blocks the pass otherwise. A later
+  pass promotes one only once something corroborates it, and deletes it once
+  it expires; `doctor` goes red when one is more than 2 days past its expiry
+  or has none.
+- **Idle.** With no captures, no digest entries, no journal entries since the
+  last consolidation and no `review_by` debt, a pass makes no model call and
+  cuts no branch; a proposal inside its expiry is no work on its own. The
+  decision is made under the repository lock and only over a clean tree.
+  `consolidate --dry-run` prints what it would decide.
+- **Result.** Every pass ends on one line, `consolidate-result: {json}`:
+  `{"v":1, "status": "idle|committed|no_changes|blocked|failed", "idle",
+  "cost_microusd", "tokens_in", "tokens_out", "digest_entries",
+  "inbox_before"}`. Cost and tokens are propose plus audit, read from the
+  runner's `--output-format json` answer, and `null` when it answers in plain
+  text. `brain audit-branch` ends the same way, on `audit-result: {"v":1,
+  "verdict": "pass|block|error", "cost_microusd", "tokens_in", "tokens_out"}`.
+  Those lines are reserved: anything the runner or a file name supplies is
+  printed behind `  | ` or folded onto one line, so only the engine's own
+  result line starts at column 0.
+- **Known limit.** In a split layout with `BRAIN_STATE_DIR` outside both the
+  data root and the engine, the pass is told the digest's real path but its
+  runner line grants no read access there (`--add-dir` names the engine only),
+  so it may be unable to read the digest.
+
+### Session digest: digest.v1
+
+The contract between a transcript reader and consolidation. A reader for
+another tool follows it, and nothing in consolidation changes.
+
+- One JSON object per line, one line per turn a person typed:
+  `{"v": 1, "at": "2026-10-18T05:12:09Z", "tool": "claude-code", "project":
+  "brain", "text": "…"}`.
+- `at` is the UTC instant, to the second, with `Z`. `tool` is a lowercase
+  slug naming the reader. `project` is the basename of the working directory,
+  or empty. `text` is the turn as typed, never assistant output.
+- Oldest line first; one line per distinct text (its latest); about 120,000
+  characters of text at most, the oldest dropped first.
+- The file is replaced atomically and created mode 0640, so its owner and
+  group are the only readers; give the group to the consolidating account.
+  `brain sessions --jsonl --out FILE [--days N]` is the Claude Code producer;
+  it needs no brain, so the transcripts' owner can run it from an engine it
+  cannot write, and it writes FILE (and a temporary file beside it) only.
+- The reader skips a line that breaks the contract and counts it (a string
+  that is not valid UTF-8, or an `at` more than 5 minutes after it collected,
+  included); unknown keys are ignored. It reads regular files under 2 MB,
+  opens every directory and file without following a symlink, and refuses a
+  symlinked DIR.
 
 ## Hard rules
 

@@ -32,8 +32,39 @@ Read them. A second current note asserting the opposite of an existing one is
 a block — the brain would then serve both as true.
 
 Also block if the change set plainly violates the pass's own caps (more than 15
-modified canonical files, or more than 7 new inbox proposals), or if a note was
+modified canonical files, or more than 3 new inbox proposals), or if a note was
 moved into archive/ without a successor carrying its knowledge forward.
+
+**PROVENANCE.** Inbox notes carry `source:` and, where the capturing agent
+declared it, `basis:` — `owner-said`, `agent-found` or `agent-inferred`. A
+deleted inbox note in the diff shows what a canonical change was made from.
+Block if the change set:
+
+- promotes an `agent-inferred` capture into a canonical note as settled fact,
+  when nothing else in the change set or the brain corroborates it (written up
+  plainly as the agent's conclusion, it may pass), or lets one supersede a
+  canonical note whose `## Sources` are the owner's (or that has no
+  `## Sources`, which predates them);
+- promotes, or supersedes a canonical note on the strength of, an input whose
+  `source:` is not `local` — a drop box, `session-mining` — whatever `basis:`
+  it declares (a `kind: correction` included), unless an independent trusted
+  input corroborates it: a `source: local` capture or a canonical note, which
+  you can read and must check, or — for `session-mining` only — a later digest
+  entry its `## Sources` line names, which you cannot see (accept that claim;
+  do not block on it);
+- adds more than 3 new inbox notes with `source: session-mining`, or adds one
+  without an `expires:` date;
+- creates a canonical note, or merges an input into one, with no `## Sources`
+  line for an input at all.
+
+The Sources lines the pass writes are, one per input: for a capture that
+declares `basis:`, its basis and date (`- Owner, <date> (via <via>)`,
+`- Agent-found, <date>, from <where>`, `- Agent-inferred, <date>
+(<client>)`); for a capture with no `basis:`,
+`- Capture, <date> (basis not declared, via <via or source>)`; for a journal
+entry, `- Journal, <date>`; for a promoted session-mining proposal,
+`- Session mining, <date>, corroborated by <what>`. All of these pass; only
+an input with no `## Sources` line for an input at all is a block.
 
 ## What you must NOT do
 

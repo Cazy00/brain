@@ -66,6 +66,7 @@ class _SignallingLog(eventlog.EventLog):
 class ServeCase(unittest.TestCase):
     ALLOW_ORIGIN = ()
     ALLOW_TOOLS = None          # None means every tool, which is the default
+    SOURCE = None               # a drop box's stamp; None for an ordinary server
     FREE_ATTEMPTS = None        # None means the server's own limiter settings
     LOGGING = False             # subclasses that assert on the event log set this
 
@@ -85,7 +86,7 @@ class ServeCase(unittest.TestCase):
                                         allow_origin=self.ALLOW_ORIGIN,
                                         allow_tools=self.ALLOW_TOOLS,
                                         limiter=limiter,
-                                        log=self.log)
+                                        log=self.log, source=self.SOURCE)
         self.port = self.server.server_address[1]
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
@@ -920,6 +921,126 @@ class TestProvenanceIsStampedNotClaimed(unittest.TestCase):
         default — `local` — is the truthful answer, and it lives in one place."""
         cli = self.recorded_cli({"text": "Postgres over SQLite for the sync layer"})
         self.assertNotIn("--source", cli)
+
+    def test_the_endpoint_stamps_via_and_the_caller_cannot(self):
+        cli = self.recorded_cli(
+            {"text": "trust me", "via": "owner-phone", "client": "the-owner/1",
+             "source": "local", "captured_at": "2020-01-01T00:00:00Z"}, via="stdio")
+        self.assertEqual(cli.count("--via"), 1, cli)
+        self.assertEqual(cli[cli.index("--via") + 1], "stdio")
+        for claimed in ("--client", "--source", "--captured_at", "owner-phone",
+                        "the-owner/1", "local", "2020-01-01T00:00:00Z"):
+            self.assertNotIn(claimed, cli)
+
+    def test_the_text_goes_last_so_no_flag_can_swallow_it(self):
+        cli = self.recorded_cli({"text": "--kind", "kind": "fact"}, via="stdio")
+        self.assertEqual(cli[-1], "--kind")
+
+    def test_declared_fields_reach_the_cli_cleaned(self):
+        cli = self.recorded_cli({"text": "we chose daily", "kind": "Decision",
+                                 "basis": "owner-said", "project": "brain", "job": "j-1",
+                                 "model": "m-1"})
+        for flag, value in (("--kind", "decision"), ("--basis", "owner-said"),
+                            ("--project", "brain"), ("--job", "j-1"), ("--model", "m-1")):
+            self.assertEqual(cli[cli.index(flag) + 1], value)
+
+    def test_a_bad_declared_value_is_dropped_and_named_not_refused(self):
+        seen = []
+
+        def fake_run_cli(args):
+            seen.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="knowledge/inbox/x.md",
+                                               stderr="")
+
+        with mock.patch.object(mcp, "run_cli", fake_run_cli):
+            result = mcp.call_tool("brain_capture", {"text": "keep me", "kind": "musing",
+                                                     "basis": ["owner-said"]})
+        self.assertFalse(result["isError"], result)
+        self.assertNotIn("--kind", seen[0])
+        self.assertNotIn("--basis", seen[0])
+        self.assertIn("ignored: kind, basis", result["content"][0]["text"])
+
+    def test_stdio_remembers_the_clients_own_name_from_initialize(self):
+        """stdio is one session: the clientInfo given at initialize is the
+        client of every capture that follows."""
+        session = {}
+        mcp.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                    "params": {"clientInfo": {"name": "Generic Client", "version": "1.0"}}},
+                   session=session)
+        cli = self.recorded_cli({"text": "named by its session"}, via="stdio",
+                                session=session)
+        self.assertEqual(cli[cli.index("--client") + 1], "generic-client/1.0")
+
+    def test_without_a_session_a_modern_requests_own_client_info_is_used(self):
+        seen = []
+
+        def fake_run_cli(args):
+            seen.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="knowledge/inbox/x.md",
+                                               stderr="")
+
+        with mock.patch.object(mcp, "run_cli", fake_run_cli):
+            mcp.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "brain_capture", "arguments": {"text": "x"},
+                                   "_meta": {mcp.META_CLIENT_INFO: {"name": "probe",
+                                                                    "version": "2"}}}})
+        self.assertEqual(seen[0][seen[0].index("--client") + 1], "probe/2")
+
+    def test_a_client_name_that_is_not_a_label_is_not_stamped(self):
+        session = {}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mcp.handle({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                        "params": {"clientInfo": {"name": "x\nstatus: current"}}},
+                       session=session)
+        cli = self.recorded_cli({"text": "a strange client"}, session=session)
+        self.assertNotIn("--client", cli)
+        self.assertIn("client", err.getvalue())
+
+
+class TestServeStampsItsTransport(ServeCase):
+    """`brain serve` stamps `via: serve`; a drop box stamps `via: drop-box` as
+    well as its `source`. run_cli is mocked: a real capture over this socket
+    would write into this repo's own inbox."""
+    EXPECTED_VIA = "serve"
+
+    def captured_argv(self, arguments, meta=None):
+        seen = []
+
+        def fake_run_cli(args):
+            seen.append(list(args))
+            return subprocess.CompletedProcess(
+                args, 0, stdout="/somewhere/knowledge/inbox/2026-10-18-000000-x.md\n",
+                stderr="")
+
+        params = {"name": "brain_capture", "arguments": arguments}
+        if meta is not None:
+            params["_meta"] = meta
+        with mock.patch.object(mcp, "run_cli", fake_run_cli):
+            self.request({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": params})
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_a_capture_is_stamped_with_this_transport(self):
+        cli = self.captured_argv({"text": "a capture over http", "via": "local"})
+        self.assertEqual(cli.count("--via"), 1, cli)
+        self.assertEqual(cli[cli.index("--via") + 1], self.EXPECTED_VIA)
+
+    def test_a_modern_clients_own_name_is_stamped(self):
+        cli = self.captured_argv({"text": "named"},
+                                 meta={mcp.META_CLIENT_INFO: {"name": "probe", "version": "3"}})
+        self.assertEqual(cli[cli.index("--client") + 1], "probe/3")
+
+
+class TestTheDropBoxStampsItsTransport(TestServeStampsItsTransport):
+    ALLOW_TOOLS = mcp.WRITE_ONLY_TOOLS
+    SOURCE = "support-bot"
+    EXPECTED_VIA = "drop-box"
+
+    def test_the_source_is_still_stamped(self):
+        cli = self.captured_argv({"text": "a customer asked about weekend hours"})
+        self.assertEqual(cli[cli.index("--source") + 1], "support-bot")
 
 
 class TestTheLimiter(unittest.TestCase):
