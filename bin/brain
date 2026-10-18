@@ -3729,7 +3729,9 @@ def _human_turns(path: Path, max_turn: int = 2000) -> tuple:
         if not isinstance(content, str):
             continue                       # list content == tool results
         cwd = cwd or str(rec.get("cwd") or "")
-        text = _REMINDER_RE.sub("", content).strip()
+        # A lone surrogate (an escaped "\ud800" in the JSON) cannot be encoded, hashed or
+        # written; it is the user's own turn, so it is kept with the character replaced.
+        text = _REMINDER_RE.sub("", content).strip().encode("utf-8", "replace").decode("utf-8")
         if not text or text.startswith(_NOISE_PREFIXES):
             continue
         if len(text) > max_turn:
@@ -3770,14 +3772,17 @@ def local_digest_entries(since: str) -> list:
     return entries
 
 
-def select_digest_entries(entries: list, since: str, max_chars: int = DIGEST_MAX_CHARS) -> tuple:
-    """(kept, dropped): the entries later than `since`, oldest first, one per distinct text.
+def select_digest_entries(entries: list, since: str, max_chars: int = DIGEST_MAX_CHARS,
+                          until: str = "") -> tuple:
+    """(kept, dropped): the entries in (since, until], oldest first, one per distinct text.
+    With no `until`, everything later than `since`.
 
     Deduplicated on the text's hash, keeping its LATEST occurrence: a resumed session replays
     its earlier turns into a new transcript, and the copy that matters is the newest — a
     repeat after the last pass is the user saying it again. Past `max_chars` of turn text the
     OLDEST entries are dropped first, and `dropped` counts them."""
-    ordered = sorted((e for e in entries if e["at"] > since), key=lambda e: e["at"])
+    ordered = sorted((e for e in entries if e["at"] > since and (not until or e["at"] <= until)),
+                     key=lambda e: e["at"])
     last = {hashlib.sha256(e["text"].encode("utf-8")).hexdigest(): i
             for i, e in enumerate(ordered)}
     unique = [ordered[i] for i in sorted(last.values())]
@@ -3852,7 +3857,8 @@ def write_digest_jsonl(path: Path, entries: list) -> None:
 
 
 DIGEST_FILE_MAX_BYTES = 2 * 1024 * 1024
-_DIGEST_TOOL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_DIGEST_TOOL_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+DIGEST_FUTURE_SKEW = 300        # seconds an imported `at` may run ahead of the collection
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -3867,13 +3873,22 @@ def digest_v1_entry(obj):
     if type(obj.get("v")) is not int or obj["v"] != DIGEST_VERSION:
         return None
     at, tool, project, text = (obj.get(k) for k in ("at", "tool", "project", "text"))
-    if not isinstance(at, str) or not DIGEST_AT_RE.match(at) or utc_instant(at) != at:
+    # fullmatch, never match: `$` also matches before a trailing newline, and a tool name
+    # carrying one would break the digest's group heading.
+    if not isinstance(at, str) or not DIGEST_AT_RE.fullmatch(at) or utc_instant(at) != at:
         return None
-    if not isinstance(tool, str) or not _DIGEST_TOOL_RE.match(tool):
+    if not isinstance(tool, str) or not _DIGEST_TOOL_RE.fullmatch(tool):
         return None
     if not isinstance(project, str) or len(project) > 200 or _CONTROL_RE.search(project):
         return None
     if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        # JSON can carry a lone surrogate ("\ud800"), which no UTF-8 writer accepts: the
+        # entry is invalid, and it must not take the rest of the digest down with it.
+        project.encode("utf-8")
+        text.encode("utf-8")
+    except UnicodeEncodeError:
         return None
     text = text.strip()
     if len(text) > DIGEST_MAX_TURN:
@@ -3881,64 +3896,39 @@ def digest_v1_entry(obj):
     return {"v": DIGEST_VERSION, "at": at, "tool": tool, "project": project, "text": text}
 
 
-def read_digest_dir(directory: Path) -> tuple:
+def _printable(name: str) -> str:
+    """A file name as it may be printed: control characters (a newline would start a line
+    of its own in the pass's output) replaced."""
+    return _CONTROL_RE.sub("?", name)
+
+
+def read_digest_dir(directory: Path, until: str = "") -> tuple:
     """(entries, report) from every `*.jsonl` directly in `directory` and in its immediate
     subdirectories — one per producing account, typically.
 
-    Another account writes these files, so they are read as untrusted: regular files only
-    (opened without following a symlink, checked again on the open descriptor), at most
-    DIGEST_FILE_MAX_BYTES each, hidden files skipped (a producer's temporary file). report:
-    {"files": read, "invalid": lines skipped, "refused": ["name: why"], "error": str|None}."""
+    Another account writes these files, so they are read as untrusted. The directory and
+    each subdirectory are opened without following a symlink and listed through that
+    descriptor, and each file is opened relative to it, also without following one — so
+    swapping a directory or a file for a symlink mid-read reaches nothing outside. A
+    symlinked `directory` is refused. Regular files only, at most DIGEST_FILE_MAX_BYTES
+    each, hidden files skipped (a producer's temporary file). An entry dated more than
+    DIGEST_FUTURE_SKEW seconds after `until` (the collection instant) is invalid: it would
+    otherwise stay eligible on every pass and crowd real turns out at the size cap.
+    report: {"files": read, "invalid": entries skipped, "refused": ["name: why"],
+    "error": str|None}."""
     import stat
 
     report = {"files": 0, "invalid": 0, "refused": [], "error": None}
-    entries, candidates = [], []
+    entries = []
+    latest = ""
+    if until:
+        latest = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                               time.gmtime(_utc_epoch(until) + DIGEST_FUTURE_SKEW))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    by_fd = (hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd
+             and os.scandir in os.supports_fd)
 
-    def scan(folder: Path, depth: int) -> None:
-        with os.scandir(folder) as listing:
-            items = sorted(listing, key=lambda item: item.name)
-        for item in items:
-            if item.name.startswith("."):
-                continue
-            rel = os.path.relpath(item.path, directory)
-            if item.is_symlink():
-                if item.name.endswith(".jsonl") or depth == 0:
-                    report["refused"].append(f"{rel}: a symlink")
-                continue
-            if item.is_dir(follow_symlinks=False):
-                if depth == 0:
-                    try:
-                        scan(Path(item.path), 1)
-                    except OSError as exc:
-                        report["refused"].append(f"{rel}: unreadable ({exc.strerror or exc})")
-                continue
-            if item.name.endswith(".jsonl"):
-                candidates.append((Path(item.path), rel))
-
-    try:
-        scan(Path(directory), 0)
-    except OSError as exc:
-        report["error"] = f"cannot read {directory}: {exc.strerror or exc}"
-        return [], report
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    for path, rel in candidates:
-        try:
-            fd = os.open(str(path), flags)
-        except OSError as exc:
-            report["refused"].append(f"{rel}: unreadable ({exc.strerror or exc})")
-            continue
-        with os.fdopen(fd, "rb") as handle:
-            info = os.fstat(handle.fileno())
-            if not stat.S_ISREG(info.st_mode):
-                report["refused"].append(f"{rel}: not a regular file")
-                continue
-            if info.st_size > DIGEST_FILE_MAX_BYTES:
-                report["refused"].append(f"{rel}: larger than {DIGEST_FILE_MAX_BYTES} bytes")
-                continue
-            raw = handle.read(DIGEST_FILE_MAX_BYTES + 1)
-        if len(raw) > DIGEST_FILE_MAX_BYTES:
-            report["refused"].append(f"{rel}: larger than {DIGEST_FILE_MAX_BYTES} bytes")
-            continue
+    def take(raw: bytes) -> None:
         report["files"] += 1
         for line in raw.split(b"\n"):
             if not line.strip():
@@ -3947,31 +3937,129 @@ def read_digest_dir(directory: Path) -> tuple:
                 entry = digest_v1_entry(json.loads(line.decode("utf-8")))
             except (UnicodeDecodeError, ValueError, RecursionError):
                 entry = None
-            if entry is None:
+            if entry is None or (latest and entry["at"] > latest):
                 report["invalid"] += 1
             else:
                 entries.append(entry)
+
+    def read_file(name: str, rel: str, dir_fd) -> None:
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(name, flags, dir_fd=dir_fd) if dir_fd is not None else os.open(name, flags)
+        except OSError as exc:
+            report["refused"].append(f"{rel}: unreadable ({exc.strerror or exc})")
+            return
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                report["refused"].append(f"{rel}: not a regular file")
+                return
+            if info.st_size > DIGEST_FILE_MAX_BYTES:
+                report["refused"].append(f"{rel}: larger than {DIGEST_FILE_MAX_BYTES} bytes")
+                return
+            raw = handle.read(DIGEST_FILE_MAX_BYTES + 1)
+        if len(raw) > DIGEST_FILE_MAX_BYTES:
+            report["refused"].append(f"{rel}: larger than {DIGEST_FILE_MAX_BYTES} bytes")
+            return
+        take(raw)
+
+    def scan(listing_of, open_dir, close_dir, here, prefix: str, depth: int) -> None:
+        for item in sorted(listing_of(here), key=lambda item: item.name):
+            if item.name.startswith("."):
+                continue
+            rel = _printable(prefix + item.name)
+            if item.is_symlink():
+                if item.name.endswith(".jsonl") or depth == 0:
+                    report["refused"].append(f"{rel}: a symlink")
+                continue
+            if item.is_dir(follow_symlinks=False):
+                if depth == 0:
+                    try:
+                        sub = open_dir(item.name, here)
+                    except OSError as exc:
+                        report["refused"].append(f"{rel}: unreadable ({exc.strerror or exc})")
+                        continue
+                    try:
+                        scan(listing_of, open_dir, close_dir, sub, rel + "/", 1)
+                    except OSError as exc:
+                        report["refused"].append(f"{rel}: unreadable ({exc.strerror or exc})")
+                    finally:
+                        close_dir(sub)
+                continue
+            if item.name.endswith(".jsonl"):
+                if by_fd:
+                    read_file(item.name, rel, here)
+                else:
+                    read_file(item.path, rel, None)
+
+    directory = Path(directory)
+    if directory.is_symlink():
+        report["error"] = f"refusing {_printable(str(directory))}: it is a symlink"
+        return [], report
+    try:
+        if by_fd:
+            dir_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+            root = os.open(str(directory), dir_flags)
+
+            def listing_of(fd):
+                with os.scandir(fd) as it:
+                    return list(it)
+
+            try:
+                scan(listing_of, lambda name, fd: os.open(name, dir_flags, dir_fd=fd),
+                     os.close, root, "", 0)
+            finally:
+                os.close(root)
+        else:
+            def listing_of(path):
+                with os.scandir(path) as it:
+                    return list(it)
+
+            scan(listing_of, lambda name, path: os.path.join(path, name), lambda _p: None,
+                 str(directory), "", 0)
+    except OSError as exc:
+        report["error"] = f"cannot read {_printable(str(directory))}: {exc.strerror or exc}"
+        return [], report
     return entries, report
 
 
+DIGEST_UNTIL = "Digest-until"
+_DIGEST_UNTIL_RE = re.compile(r"(?im)^%s:[ \t]*(\S+)[ \t]*$" % DIGEST_UNTIL)
+
+
 def last_consolidation(trunk: str = "") -> tuple:
-    """(commit, UTC instant) of the newest `consolidate:` commit on the trunk, or ("", "").
+    """(commit, UTC instant, ref) of the newest consolidation commit on the trunk, or
+    ("", "", "").
 
     The trunk, local and as last fetched, never --all: a pass that was blocked or is still
-    waiting for its merge did not land, so what it read has not been consolidated. The
-    committer date, because that is when the pass made it."""
+    waiting for its merge did not land, so what it read has not been consolidated. Merge
+    commits never count (`--grep` matches any line, so a merge whose body lists
+    `consolidate: ...` would), and the subject itself must start `consolidate:`.
+
+    The instant is the commit's `Digest-until:` trailer — when the pass COLLECTED its
+    digest, so a turn typed while the model ran falls in the next window — else the author
+    date, when the pass made the commit (a rebase or a squash restamps only the committer
+    date). A trailer in the future is clamped to now."""
     trunk = trunk or default_branch()
-    best = ("", "")
+    best = ("", "", "")
+    now = utc_now_minus(0)
     for ref in (f"refs/heads/{trunk}", f"refs/remotes/origin/{trunk}"):
         if not git("rev-parse", "--verify", "--quiet", ref):
             continue
-        line = git("log", "-1", "--format=%H %cI", "--grep=^consolidate:",
-                   "--regexp-ignore-case", ref, "--")
-        if " " in line:
-            commit, when = line.split(" ", 1)
-            at = utc_instant(when)
-            if at > best[1]:
-                best = (commit, at)
+        out = git("log", "-n", "50", "--no-merges", "--format=%H%x1f%aI%x1f%B%x1e",
+                  "--grep=^consolidate:", "--regexp-ignore-case", ref, "--")
+        for record in out.split("\x1e"):
+            parts = record.lstrip("\n").split("\x1f")
+            if len(parts) != 3 or not parts[2].lstrip().lower().startswith("consolidate:"):
+                continue
+            commit, when, body = parts
+            # A trailer is in the message's last paragraph, and nowhere else.
+            marks = [m for m in _DIGEST_UNTIL_RE.findall(body.rstrip().split("\n\n")[-1])
+                     if DIGEST_AT_RE.fullmatch(m) and utc_instant(m) == m]
+            at = min(marks[-1], now) if marks else utc_instant(when)
+            if at and at > best[1]:
+                best = (commit.strip(), at, ref)
+            break                     # the newest consolidation on this ref
     return best
 
 
@@ -3985,15 +4073,18 @@ def digest_window_start(since: str = "") -> str:
 
 
 def consolidation_digest(digest_from: str = "", since: str = "") -> tuple:
-    """(markdown, entry_count, notes) for one consolidation pass: this account's transcripts
+    """(markdown, entry_count, notes, until) for one pass: this account's transcripts
     plus any digest.v1 files under `digest_from`, after the window, deduplicated and capped.
     notes are lines for the pass's output; an unreadable `digest_from` is one of them, never
     a failure — the inbox drain is worth doing without it. `since` is --digest-since."""
     start = since
     since = digest_window_start(since)
+    # The collection instant: the window is (since, until], and the pass records `until` on
+    # its commit, so the next window starts exactly where this one stopped.
+    until = utc_now_minus(0)
     entries, notes = local_digest_entries(since), []
     if digest_from:
-        imported, report = read_digest_dir(Path(digest_from).expanduser())
+        imported, report = read_digest_dir(Path(digest_from).expanduser(), until=until)
         if report["error"]:
             notes.append(f"WARNING: --digest-from {report['error']} — continuing without it")
         else:
@@ -4003,11 +4094,11 @@ def consolidation_digest(digest_from: str = "", since: str = "") -> tuple:
             for refusal in report["refused"][:20]:
                 notes.append(f"WARNING: --digest-from refused {refusal}")
         entries += imported
-    kept, dropped = select_digest_entries(entries, since)
+    kept, dropped = select_digest_entries(entries, since, until=until)
     origin = "--digest-since" if start else "the last consolidation on the trunk"
-    text = render_digest(kept, f"since {since} ({origin}, {DIGEST_DAYS} days at most)",
-                         dropped)
-    return text, len(kept), notes
+    text = render_digest(kept, f"since {since} ({origin}, {DIGEST_DAYS} days at most), "
+                               f"until {until}", dropped)
+    return text, len(kept), notes, until
 
 
 def cmd_sessions(argv: list) -> int:
@@ -4024,7 +4115,12 @@ def cmd_sessions(argv: list) -> int:
         if not out or out.startswith("--"):
             print("usage: brain sessions --jsonl --out FILE [--days N]")
             return 2
-        target = Path(out).expanduser().resolve()
+        raw = Path(out).expanduser()
+        if raw.is_symlink():
+            # Replacing a symlink's target would write wherever the link points.
+            print(f"refused: --out {one_line(raw)} is a symlink")
+            return 2
+        target = raw.parent.resolve() / raw.name
         root, state = ROOT.resolve(), state_dir().resolve()
         if (target == root or root in target.parents) and state not in target.parents:
             # Mined prompts where git can see them are one `git add -A` from history.
@@ -4598,14 +4694,14 @@ def open_pull_request(branch: str, trunk: str, title: str, body: str,
     except (OSError, subprocess.SubprocessError) as exc:
         error = repr(exc)
     if error is None:
-        print(f"pull request: {(pr.stdout or '').strip()}")
+        print(f"pull request: {one_line(pr.stdout or '')}")
         return 0
-    print(f"PULL REQUEST NOT OPENED: {error}")
+    print(f"PULL REQUEST NOT OPENED: {one_line(error)}")
     print("  open it with: " + shlex.join(cmd))
     return 1
 
 
-def propose_prompt(text: str) -> str:
+def propose_prompt(text: str, today: str = "") -> str:
     """In a split layout the working directory holds only the notes; the protocol (AGENTS.md)
     and the toolbelt (bin/brain) live in the engine. Say where, so the pass can follow them.
 
@@ -4615,6 +4711,10 @@ def propose_prompt(text: str) -> str:
     digest = digest_path()
     if digest != ROOT / ".cache" / "session-digest.md":
         text = text.replace(".cache/session-digest.md", str(digest))
+    if today:
+        # The date the engine checks proposals against (proposal_problems), said outright.
+        text = (f"Today's date for this pass is {today}: use it for `created:`, for "
+                f"`expires:` ({PROPOSAL_DAYS} days later) and in the commit.\n\n" + text)
     if ROOT == ENGINE:
         return text
     return (f"Where things are: the working directory holds this brain's notes. The engine is at "
@@ -4661,7 +4761,7 @@ def _audit_branch(argv: list, result: dict) -> int:
     try:
         runner = load_consolidator()
     except ConsolidatorConfigError as exc:
-        print(f"  audit: refused — {exc}")
+        print(f"  audit: refused — {one_line(exc)}")
         return 1
     scratch = tempfile.mkdtemp(prefix="brain-audit-index-")
     previous = os.environ.get("GIT_INDEX_FILE")
@@ -4669,7 +4769,7 @@ def _audit_branch(argv: list, result: dict) -> int:
     try:
         loaded = subprocess.run(["git", "read-tree", ref], cwd=ROOT, capture_output=True, text=True)
         if loaded.returncode != 0:
-            print(f"  audit: could not read {argv[1]!r}: {(loaded.stderr or '').strip()[-200:]}")
+            print(f"  audit: could not read {argv[1]!r}: {one_line(loaded.stderr or '')[-200:]}")
             return 1
         verdict, detail = audit_changes(runner, usage=result)
         result["verdict"] = verdict
@@ -4679,11 +4779,103 @@ def _audit_branch(argv: list, result: dict) -> int:
         else:
             os.environ["GIT_INDEX_FILE"] = previous
         shutil.rmtree(scratch, ignore_errors=True)
-    print(f"  audit: {detail}")
+    print(f"  audit: {one_line(detail)}")
     return 0 if verdict == "pass" else 1
 
 
 CONSOLIDATE_RESULT = "consolidate-result: "
+_LINE_BREAKS_RE = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]+")
+_UNPRINTABLE_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def one_line(text) -> str:
+    """Text from outside the engine (a runner's stderr, an auditor's reason, a file name) as
+    ONE line: line breaks and control characters become spaces, so nothing it holds can
+    begin a line of the engine's output — where `consolidate-result:` and `audit-result:`
+    lines are reserved for the engine."""
+    return _LINE_BREAKS_RE.sub(" ", str(text)).strip()
+
+
+def quoted(text) -> str:
+    """A block of outside text, every line behind "  | ". Split as a reader would split it
+    (str.splitlines breaks on carriage returns and the Unicode separators too), so no piece
+    of it lands at column 0."""
+    lines = str(text).splitlines() or [""]
+    return "\n".join("  | " + _UNPRINTABLE_RE.sub("", line) for line in lines)
+
+
+MINED_KINDS = ("decision", "preference", "fact", "lesson", "idea")
+MAX_PROPOSALS = 3
+PROPOSAL_DAYS = 7
+
+
+def proposal_problems(today: str):
+    """The first way the staged change set breaks the session-mining proposal rules, or
+    None. Checked as code before the audit: at most MAX_PROPOSALS new inbox notes with
+    `source: session-mining`, each created on the pass's date, expiring exactly
+    PROPOSAL_DAYS later, `basis: owner-said`, a mined kind and `status: draft`. A proposal
+    dated to expire years out would otherwise sit outside the idle rule and keep doctor
+    green for as long."""
+    names = git("diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A",
+                default_branch(), "--", "knowledge/inbox")
+    proposals = []
+    for rel in names.splitlines():
+        rel = rel.strip()
+        if not re.fullmatch(r"knowledge/inbox/[^/]+\.md", rel):
+            continue
+        shown = subprocess.run(["git", "show", f":{rel}"], cwd=ROOT, capture_output=True)
+        fm = parse_frontmatter(shown.stdout.decode("utf-8", "replace"))[0] or {}
+        if str(fm.get("source") or "") == "session-mining":
+            proposals.append((one_line(rel), fm))
+    if len(proposals) > MAX_PROPOSALS:
+        return (f"{len(proposals)} new session-mining proposals, more than "
+                f"{MAX_PROPOSALS} per pass")
+    for rel, fm in proposals:
+        created, expires = str(fm.get("created") or ""), str(fm.get("expires") or "")
+        if created != today:
+            return f"{rel}: created {created!r}, not the pass date {today}"
+        if not (valid_date(expires) and date.fromisoformat(expires)
+                == date.fromisoformat(created) + timedelta(days=PROPOSAL_DAYS)):
+            return f"{rel}: expires {expires!r}, not {PROPOSAL_DAYS} days after {created}"
+        if fm.get("basis") != "owner-said":
+            return f"{rel}: basis {fm.get('basis')!r}, not 'owner-said'"
+        if fm.get("kind") not in MINED_KINDS:
+            return f"{rel}: kind {fm.get('kind')!r}, not one of {', '.join(MINED_KINDS)}"
+        if fm.get("status") != "draft":
+            return f"{rel}: status {fm.get('status')!r}, not 'draft'"
+    return None
+
+
+def seal_pass(today: str, until: str):
+    """Make the pass's final commit, carrying `Digest-until: <until>` (when the digest was
+    collected; nothing when there was none). Staged work is committed as
+    `consolidate: <today>`; when the proposer committed everything itself, its last commit
+    is amended to carry the trailer (the tree is unchanged), or, if that commit is not a
+    consolidation commit, an empty one is added. Returns an error, or None."""
+    trailer = f"{DIGEST_UNTIL}: {until}" if until else ""
+    fresh = f"consolidate: {today}" + (f"\n\n{trailer}" if trailer else "")
+    with repo_lock():
+        if git("diff", "--cached", "--name-only").strip():
+            args = ["commit", "-m", fresh]
+        elif not trailer:
+            return None
+        elif git("log", "-1", "--format=%s").lower().startswith("consolidate:"):
+            tagged = subprocess.run(
+                ["git", "interpret-trailers", "--if-exists", "replace", "--trailer", trailer],
+                cwd=ROOT, capture_output=True, text=True,
+                input=git("log", "-1", "--format=%B") + "\n")
+            if tagged.returncode != 0:
+                return one_line(tagged.stderr)[-300:] or "could not add the trailer"
+            args = ["commit", "--amend", "-m", tagged.stdout]
+        else:
+            args = ["commit", "--allow-empty", "-m", fresh]
+        done = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
+    if done.returncode == 0:
+        return None
+    return one_line(done.stderr or done.stdout)[-300:] or "unknown"
+
+
+MAX_REPORTED_COST_USD = 1000
 
 
 def runner_output(stdout: str) -> tuple:
@@ -4694,6 +4886,8 @@ def runner_output(stdout: str) -> tuple:
     `usage` say what the call cost. Anything that is not a JSON object is the text itself,
     exactly as before the flag, and usage is None. usage: {"cost_microusd", "tokens_in",
     "tokens_out"}, each an int or None; input tokens include cache reads and writes."""
+    import math
+
     raw = stdout or ""
     try:
         data = json.loads(raw) if raw.strip().startswith("{") else None
@@ -4707,15 +4901,19 @@ def runner_output(stdout: str) -> tuple:
             else None
 
     cost = data.get("total_cost_usd")
+    # Infinity, NaN or an absurd figure is not a cost anyone was charged: unreported.
     cost = (int(round(cost * 1_000_000)) if isinstance(cost, (int, float))
-            and not isinstance(cost, bool) and cost >= 0 else None)
+            and not isinstance(cost, bool) and math.isfinite(cost)
+            and 0 <= cost <= MAX_REPORTED_COST_USD else None)
     tokens = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     parts = [count(tokens.get(k)) for k in ("input_tokens", "cache_read_input_tokens",
                                             "cache_creation_input_tokens")]
     known = [n for n in parts if n is not None]
     usage = {"cost_microusd": cost, "tokens_in": sum(known) if known else None,
              "tokens_out": count(tokens.get("output_tokens"))}
-    text = data["result"] if isinstance(data.get("result"), str) else raw
+    # A JSON answer's text is its `result`, and only that: an object without one (an error
+    # object) has no text, so a VERDICT line elsewhere in it counts for nothing.
+    text = data["result"] if isinstance(data.get("result"), str) else ""
     return text, usage
 
 
@@ -4729,12 +4927,17 @@ def add_usage(total: dict, part) -> None:
 
 def journal_changes_since_consolidation() -> list:
     """Journal files added or changed in commits the last consolidation on the trunk had not
-    seen; with no consolidation yet, those of the last DIGEST_DAYS."""
-    commit, _at = last_consolidation()
-    span = ([f"{commit}..HEAD"] if commit
-            else [f"--since={DIGEST_DAYS} days ago", "HEAD"])
-    out = git("log", "--format=", "--name-only", "--diff-filter=AM", *span,
-              "--", "knowledge/journal")
+    seen, counted on the same trunk ref that consolidation was found on (local or as last
+    fetched — never HEAD, which may be behind it). With no consolidation at all, every
+    journal file on the trunk counts, however old: no pass has read any of them."""
+    commit, _at, ref = last_consolidation()
+    if commit:
+        out = git("log", "--format=", "--name-only", "--diff-filter=AM", f"{commit}..{ref}",
+                  "--", "knowledge/journal")
+    else:
+        trunk = f"refs/heads/{default_branch()}"
+        ref = trunk if git("rev-parse", "--verify", "--quiet", trunk) else "HEAD"
+        out = git("ls-tree", "-r", "--name-only", ref, "--", "knowledge/journal")
     return sorted({line.strip() for line in out.splitlines() if line.strip().endswith(".md")})
 
 
@@ -4781,6 +4984,9 @@ def cmd_consolidate(argv: list) -> int:
 
 
 def _consolidate(argv: list, result: dict) -> int:
+    import contextlib
+    import io
+
     prompt_path = ENGINE / "setup" / "consolidate-prompt.md"
     if not prompt_path.exists():
         print("missing setup/consolidate-prompt.md")
@@ -4804,8 +5010,6 @@ def _consolidate(argv: list, result: dict) -> int:
                   f"2026-10-18T14:00:00Z, got {digest_since!r}")
             print(usage)
             return 2
-    inbox_items = [p for p in (K / "inbox").glob("*.md")]
-    result["inbox_before"] = len(inbox_items)
     audit_path = ENGINE / "setup" / "audit-prompt.md"
     # Resolve the runner BEFORE anything else, --dry-run included. A config that
     # would drop the audit boundary must fail here, on the ground, rather than
@@ -4813,7 +5017,7 @@ def _consolidate(argv: list, result: dict) -> int:
     try:
         runner = load_consolidator()
     except ConsolidatorConfigError as exc:
-        print(f"consolidation refused — {exc}")
+        print(f"consolidation refused — {one_line(exc)}")
         return 1
     # 2.2: never in the folder captures land in. Consolidation switches branches and
     # stages everything, so it runs in its own clone — refused here, before a branch.
@@ -4824,36 +5028,42 @@ def _consolidate(argv: list, result: dict) -> int:
               "<dir>/bin/brain consolidate there.")
         return 1
 
-    # The session digest is gathered BEFORE the branch, because whether it holds anything
-    # is part of deciding whether there is a pass to run at all. A failure here is not
-    # fatal — draining the inbox is still worth doing on its own.
-    try:
-        digest_text, digest_entries, digest_notes = consolidation_digest(digest_from,
-                                                                         digest_since)
-        digest_error = None
-    except Exception as exc:
-        digest_text, digest_entries, digest_notes, digest_error = None, 0, [], repr(exc)
-    result["digest_entries"] = digest_entries
-    # E5: a pass with nothing to do makes no model call. Work is a capture waiting, a digest
-    # entry the last pass did not see, a journal entry it did not see, or review_by debt.
-    inbox_count, waiting = inbox_work(inbox_items)
-    work = {"inbox": inbox_count, "digest": digest_entries,
-            "journal": len(journal_changes_since_consolidation()),
-            "review_by": len(review_debt())}
-    decision = (("run — " + ", ".join(f"{k} {v}" for k, v in work.items()))
-                if any(work.values()) else
-                "idle — no captures, no digest entries, no new journal entries and no "
-                "review_by debt, so no model call")
-    if waiting:
-        decision += f"; {waiting} proposal(s) waiting for corroboration"
-    for note in digest_notes:
-        print(f"  {note}")
-    if digest_error:
-        print(f"  session digest skipped: {digest_error}")
+    def assess():
+        """What this pass would do. The session digest is gathered BEFORE the branch,
+        because whether it holds anything is part of deciding whether there is a pass to
+        run at all. A failure there is not fatal — draining the inbox is worth doing on
+        its own."""
+        inbox_items = [p for p in (K / "inbox").glob("*.md")]
+        result["inbox_before"] = len(inbox_items)
+        try:
+            digest = consolidation_digest(digest_from, digest_since)
+            error = None
+        except Exception as exc:
+            digest, error = (None, 0, [], ""), repr(exc)
+        result["digest_entries"] = digest[1]
+        # E5: a pass with nothing to do makes no model call. Work is a capture waiting, a
+        # digest entry the last pass did not see, a journal entry it did not see, or
+        # review_by debt.
+        inbox_count, waiting = inbox_work(inbox_items)
+        work = {"inbox": inbox_count, "digest": digest[1],
+                "journal": len(journal_changes_since_consolidation()),
+                "review_by": len(review_debt())}
+        decision = (("run — " + ", ".join(f"{k} {v}" for k, v in work.items()))
+                    if any(work.values()) else
+                    "idle — no captures, no digest entries, no new journal entries and no "
+                    "review_by debt, so no model call")
+        if waiting:
+            decision += f"; {waiting} proposal(s) waiting for corroboration"
+        for note in digest[2]:
+            print(f"  {one_line(note)}")
+        if error:
+            print(f"  session digest skipped: {error}")
+        return inbox_items, digest, error, work, decision
 
     if "--dry-run" in argv:
+        inbox_items, digest, _error, _work, decision = assess()
         print(f"would consolidate: {len(inbox_items)} inbox item(s)")
-        print(f"would mine: {digest_entries} digest entr{'y' if digest_entries == 1 else 'ies'}"
+        print(f"would mine: {digest[1]} digest entr{'y' if digest[1] == 1 else 'ies'}"
               f" since {digest_window_start(digest_since)} "
               f"({'--digest-since' if digest_since else 'the last consolidation'}, "
               f"at most {DIGEST_DAYS} days)")
@@ -4865,25 +5075,29 @@ def _consolidate(argv: list, result: dict) -> int:
         print(f"runner: {' '.join(runner['propose'])} …  ({runner['source']})")
         print(f"        auditor runs read-only as: {' '.join(runner['audit'])} …")
         return 0
-    if not any(work.values()):
-        result.update(status="idle", idle=True)
-        print(f"brain consolidate: {decision}")
-        return 0
-    if not audit_path.exists():
-        print("missing setup/audit-prompt.md — the audit gate cannot run, and an "
-              "unaudited pass must not reach the remote")
-        return 1
     today = date.today().isoformat()
-    # Clean-tree test, branch naming and the switch are one atomic step. Split
-    # apart they were three separate races: a capture could commit between the
-    # test and the switch (dirtying a tree already declared clean), two passes
-    # could pick the same branch name, and a capture could read "main" from HEAD
-    # a moment before the switch and then commit onto the consolidation branch.
-    # The lock is NOT held across the model run below — that would stall every
-    # capture for up to half an hour, past the MCP layer's own timeout.
+    # The lock covers everything that reads the tree: the clean-tree test, the decision
+    # whether there is any work, branch naming and the switch are one atomic step. Split
+    # apart they were separate races: a capture could commit between the test and the
+    # switch (dirtying a tree already declared clean), two passes could pick the same
+    # branch name, and a capture could read "main" from HEAD a moment before the switch and
+    # then commit onto the consolidation branch. An idle pass takes it too, and reports
+    # idle only over a clean tree: an uncommitted journal entry is not "nothing to do".
+    # The lock is NOT held across the model run below — that would stall every capture for
+    # up to half an hour, past the MCP layer's own timeout.
     with repo_lock():
         if git("status", "--porcelain").strip():
             print("working tree not clean — commit or stash first, then rerun")
+            return 1
+        _inbox, digest, digest_error, work, decision = assess()
+        digest_text, digest_entries, _notes, digest_until = digest
+        if not any(work.values()):
+            result.update(status="idle", idle=True)
+            print(f"brain consolidate: {decision}")
+            return 0
+        if not audit_path.exists():
+            print("missing setup/audit-prompt.md — the audit gate cannot run, and an "
+                  "unaudited pass must not reach the remote")
             return 1
         branch = f"consolidate/{today}"
         if git("branch", "--list", branch):
@@ -4908,6 +5122,8 @@ def _consolidate(argv: list, result: dict) -> int:
             digest_path().unlink()     # never let LAST week's digest be re-mined
         except OSError:
             pass
+    # With no digest the next window must not start after turns nobody read.
+    digest_until = digest_until if digest_error is None else ""
 
     # Every stage is gated on the previous one succeeding. This used to run the
     # commit and the push from a `finally:`, so a model that crashed, timed out
@@ -4922,13 +5138,16 @@ def _consolidate(argv: list, result: dict) -> int:
     control = git_control_snapshot(git_dir)
     try:
         run = subprocess.run(
-            [*runner["propose"], propose_prompt(prompt_path.read_text(encoding="utf-8"))],
+            [*runner["propose"],
+             propose_prompt(prompt_path.read_text(encoding="utf-8"), today=today)],
             cwd=ROOT, text=True, capture_output=True, timeout=runner["propose_timeout"],
             stdin=subprocess.DEVNULL,
         )
         text, usage = runner_output(run.stdout)
         add_usage(result, usage)
-        print(text[-2000:] if text else "(no output)")
+        # The model's own words, every line behind "  | ": nothing it writes can start a
+        # line of this output, so it cannot forge the result line a scheduler reads.
+        print(quoted(text[-2000:]) if text else quoted("(no output)"))
         if run.returncode != 0:
             failure = (f"{runner_name} exited {run.returncode}: "
                        f"{(run.stderr or '').strip()[-300:] or 'no stderr'}")
@@ -4942,11 +5161,16 @@ def _consolidate(argv: list, result: dict) -> int:
                    f"they are restored and nothing lands")
 
     dirty = bool(git("status", "--porcelain").strip())
+    lint_out = io.StringIO()
     try:
-        lint_code = lint()
+        # Lint names the files the model wrote, so its report is quoted like the model's.
+        with contextlib.redirect_stdout(lint_out):
+            lint_code = lint()
     except Exception as exc:
         lint_code = 1
         failure = failure or f"lint crashed on the consolidated tree: {exc!r}"
+    if lint_out.getvalue().strip():
+        print(quoted(lint_out.getvalue()))
     if lint_code != 0 and failure is None:
         failure = "lint rejected the consolidated tree"
 
@@ -4965,27 +5189,35 @@ def _consolidate(argv: list, result: dict) -> int:
         failure = f"could not diff the branch against main: {staged_error}"
     changed = bool(staged.strip())
 
-    audit_detail, blocked = "", False
+    blocked = False
+    # The proposal rules are mechanical, so they are checked as code before any auditor is
+    # spent on them; the prompt states them too.
+    if failure is None and changed:
+        problem = proposal_problems(today)
+        if problem:
+            failure, blocked = f"proposal check: {problem}", True
+
+    # The pass's final commit, made BEFORE the audit so the audit sees what will be pushed,
+    # and carrying `Digest-until:` — when the digest was collected — for the next window.
+    committed = pushed = False
+    if failure is None and changed:
+        problem = seal_pass(today, digest_until)
+        if problem:
+            failure = f"commit rejected: {problem}"
+        else:
+            committed = True
+
+    audit_detail = ""
     if failure is None and changed:
         audit_usage = {}
         verdict, detail = audit_changes(runner, usage=audit_usage)
         add_usage(result, audit_usage)
         audit_detail = detail
-        print(f"  audit: {detail}")
+        print(f"  audit: {one_line(detail)}")
         if verdict != "pass":
             failure = f"audit {verdict}: {detail}"
             blocked = verdict == "block"
 
-    committed = pushed = False
-    uncommitted = bool(git("diff", "--cached", "--name-only").strip())
-    if failure is None and uncommitted:
-        with repo_lock():
-            commit = subprocess.run(["git", "commit", "-m", f"consolidate: {today}"],
-                                    cwd=ROOT, capture_output=True, text=True)
-        committed = commit.returncode == 0
-        if not committed:
-            failure = (f"commit rejected: "
-                       f"{(commit.stderr or commit.stdout).strip()[-300:] or 'unknown'}")
     if failure is None and changed:
         push = subprocess.run(["git", "push", "-u", "origin", branch],
                               cwd=ROOT, capture_output=True, text=True)
@@ -5001,6 +5233,7 @@ def _consolidate(argv: list, result: dict) -> int:
             remote = git("rev-parse", f"origin/{branch}")
             pushed = bool(local) and local == remote
 
+    uncommitted = bool(git("diff", "--cached", "--name-only").strip())
     # Only step off the branch when nothing would be carried along with us —
     # tested and switched under the lock, so a capture landing in the gap cannot
     # be dragged onto main (or find HEAD moving mid-commit).
@@ -5012,8 +5245,9 @@ def _consolidate(argv: list, result: dict) -> int:
     print()
     if failure:
         result["status"] = "blocked" if blocked else "failed"
-        print(f"consolidation DID NOT LAND: {failure}")
-        print(f"nothing was pushed; the work is left on {branch} for inspection")
+        print(f"consolidation DID NOT LAND: {one_line(failure)}")
+        print(f"nothing was pushed; the work is left on {branch} for inspection"
+              + (" (committed there, not pushed)" if committed else ""))
         if uncommitted:
             print("  (staged but not committed — inspect with: git diff --cached main)")
         print(f"you are on branch: {here}")
@@ -5034,7 +5268,7 @@ def _consolidate(argv: list, result: dict) -> int:
         return open_pull_request(
             branch, trunk, f"consolidate: {today}",
             f"Consolidation pass of {today}, audited before it was pushed "
-            f"({audit_detail}).\n\nReview: `git diff {trunk}...{branch}`")
+            f"({one_line(audit_detail)}).\n\nReview: `git diff {trunk}...{branch}`")
     print(f"merge:   git merge {branch} && git push")
     return 0
 
@@ -6431,7 +6665,12 @@ def capture_counts(since: str, until: str) -> dict:
 def cmd_stats_captures(argv: list) -> int:
     import json
     usage = "usage: brain stats --captures [--since ISO] [--until ISO] [--json]"
-    until = utc_instant(_arg_after(argv, "--until")) if "--until" in argv else utc_now_minus(0)
+    raw_until = _arg_after(argv, "--until").strip() if "--until" in argv else ""
+    until = utc_instant(raw_until) if "--until" in argv else utc_now_minus(0)
+    if until and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_until):
+        # A bare date means through the end of that UTC day, not its first instant: read as
+        # midnight, `--until D` left D out and `--since D --until D` was an empty window.
+        until = f"{raw_until}T23:59:59Z"
     if "--since" in argv:
         since = utc_instant(_arg_after(argv, "--since"))
     else:
@@ -6927,14 +7166,18 @@ def cmd_doctor() -> int:
         if str(fm.get("source") or "") == "session-mining":
             # A proposal consolidation wrote from the session digest. It has its own expiry
             # and a later pass deletes it once that passes, so it is no capture backlog;
-            # one left more than two days past it means consolidation stopped pruning.
+            # one left more than two days past it means consolidation stopped pruning. One
+            # with no valid expiry can never be pruned, so it counts as overdue.
             proposals += 1
             expires = str(fm.get("expires") or "")
-            if valid_date(expires) and (date.today() - date.fromisoformat(expires)).days > 2:
+            if (not valid_date(expires)
+                    or (date.today() - date.fromisoformat(expires)).days > 2):
                 overdue += 1
             continue
-        born = _born.get(rel)
-        captures.append((date.today() - date.fromisoformat(born)).days if born else 0)
+        # Not yet in git (written without --commit): its own `created:` is the best age.
+        born = _born.get(rel) or (str(fm.get("created") or "")
+                                  if valid_date(str(fm.get("created") or "")) else "")
+        captures.append(max(0, (date.today() - date.fromisoformat(born)).days) if born else 0)
     if captures:
         oldest_days = max(captures)
         state = "RED" if (len(captures) > 25 or oldest_days > 21) else "ok "
@@ -6948,7 +7191,8 @@ def cmd_doctor() -> int:
         if overdue:
             ok = False
             print(f"  [RED] {proposals} session-mining proposal(s) in the inbox, {overdue} more "
-                  "than 2 days past its expires date — consolidation has stopped pruning them")
+                  "than 2 days past its expires date or without a valid one — consolidation "
+                  "has stopped pruning them")
         else:
             print(f"  [ok ] {proposals} session-mining proposal(s) in the inbox, none past "
                   "its expiry")
