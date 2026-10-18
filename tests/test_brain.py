@@ -4171,10 +4171,20 @@ class CommitGateTests(unittest.TestCase):
         commit through the hook). The hook prints nothing on success, so the
         warnings are read from the gate itself first."""
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
-        gate = run_brain("lint", "--staged", repo=self.repo)
+        gate = self.fast_gate()
         out = subprocess.run(["git", "commit", "-m", "archive"], cwd=self.repo,
                              capture_output=True, text=True)
         return gate, out
+
+    def fast_gate(self):
+        """`lint --staged`, insisting it answered itself: the incremental gate
+        falls back to a full lint of the index on any exception, and that
+        fallback must not quietly stand in for the code under test."""
+        gate = run_brain("lint", "--staged", repo=self.repo)
+        self.assertIn("[staged:", gate.stdout,
+                      "the incremental gate fell back to the slow path:\n" + gate.stdout
+                      + gate.stderr)
+        return gate
 
     def staged_statuses(self):
         raw = subprocess.run(["git", "diff", "--cached", "--name-status"], cwd=self.repo,
@@ -4254,12 +4264,187 @@ class CommitGateTests(unittest.TestCase):
         subprocess.run(["git", "rm", "-q", "--cached",
                         "knowledge/archive/reference/link-target.md"],
                        cwd=self.repo, check=True, capture_output=True)
-        gate = run_brain("lint", "--staged", repo=self.repo)
+        gate = self.fast_gate()
         out = subprocess.run(["git", "commit", "-m", "archive"], cwd=self.repo,
                              capture_output=True, text=True)
         self.assertNotEqual(out.returncode, 0,
                             "committed a deletion whose archive copy stayed behind")
         self.assertIn("dangling wikilink [[link-target]]", gate.stdout)
+
+    # The gate's picture of the tree after the commit is the git index: what is
+    # committed, never what happens to sit in the working tree.
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.repo, check=True,
+                              capture_output=True, text=True)
+
+    def gate_then_commit(self):
+        """`lint --staged` on what is staged now (nothing added), then the commit."""
+        gate = self.fast_gate()
+        out = subprocess.run(["git", "commit", "-m", "probe"], cwd=self.repo,
+                             capture_output=True, text=True)
+        return gate, out
+
+    def assert_non_note_cannot_hold_a_deleted_id(self, rel, keep_existing):
+        """Full lint counts only Markdown notes as holding an id; a staged
+        .gitkeep or topics.yaml whose text happens to start with an id is not
+        one, so the deleted note's links still dangle."""
+        self.linked_pair()
+        self.git("rm", "-q", "knowledge/reference/link-target.md")
+        path = self.repo / "knowledge" / rel
+        old = path.read_text(encoding="utf-8") if keep_existing and path.exists() else ""
+        path.write_text("---\nid: link-target\n---\n" + old, encoding="utf-8")
+        self.git("add", str(path))
+        gate, out = self.gate_then_commit()
+        self.assertNotEqual(out.returncode, 0,
+                            f"a staged {rel} kept a deleted note's id alive:\n{gate.stdout}")
+        self.assertIn("dangling wikilink [[link-target]]", gate.stdout)
+
+    def test_gate_blocks_a_deletion_disguised_by_a_gitkeep(self):
+        self.assert_non_note_cannot_hold_a_deleted_id("reference/.gitkeep", False)
+
+    def test_gate_blocks_a_deletion_disguised_by_topics_yaml(self):
+        self.assert_non_note_cannot_hold_a_deleted_id("topics.yaml", True)
+
+    def test_gate_blocks_a_deletion_whose_link_repair_is_not_staged(self):
+        """The referrer's fix sits in the working tree only; the commit still
+        carries its link to the deleted note."""
+        self.linked_pair()
+        self.git("rm", "-q", "knowledge/reference/link-target.md")
+        refers = self.repo / "knowledge/reference/refers.md"
+        refers.write_text(refers.read_text(encoding="utf-8").replace(
+            "see [[link-target]] for detail", "no link any more"), encoding="utf-8")
+        gate, out = self.gate_then_commit()
+        self.assertNotEqual(out.returncode, 0,
+                            "committed a dangling link because the worktree looked fixed")
+        self.assertIn("dangling wikilink [[link-target]]", gate.stdout)
+
+    def test_gate_allows_a_deletion_whose_link_repair_is_staged(self):
+        """The mirror image: the staged referrer drops the link, and an unstaged
+        edit that puts it back is not part of the commit."""
+        self.linked_pair()
+        self.git("rm", "-q", "knowledge/reference/link-target.md")
+        refers = self.repo / "knowledge/reference/refers.md"
+        original = refers.read_text(encoding="utf-8")
+        refers.write_text(original.replace("see [[link-target]] for detail",
+                                           "no link any more"), encoding="utf-8")
+        self.git("add", str(refers))
+        refers.write_text(original, encoding="utf-8")     # unstaged regression
+        gate, out = self.gate_then_commit()
+        self.assertEqual(gate.returncode, 0, "the gate judged the worktree:\n" + gate.stdout)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_gate_sees_a_referrer_with_an_uppercase_md_suffix(self):
+        """Full lint reads `.MD` as a note; so must the inbound sweep."""
+        target = self.note("reference/link-target.md", "the referenced note", front=(
+            "id: link-target\nkind: reference\ntitle: T\ntopics: [brain]\n"
+            "aliases: [t]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"))
+        referrer = self.note("reference/shouting.MD", "see [[link-target]]", front=(
+            "id: shouting\nkind: reference\ntitle: S\ntopics: [brain]\n"
+            "aliases: [s]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"))
+        self.assertEqual(self.commit(target, referrer).returncode, 0, "setup was rejected")
+        self.git("rm", "-q", "knowledge/reference/link-target.md")
+        gate, out = self.gate_then_commit()
+        self.assertNotEqual(out.returncode, 0, "an uppercase .MD referrer was never read")
+        self.assertIn("dangling wikilink [[link-target]]", gate.stdout)
+
+    def assert_deleting_one_of_two_holders_is_not_a_removal(self, second_rel):
+        """Two committed notes hold one id; deleting one leaves the other, so
+        an unchanged link to the id still resolves, as full lint says."""
+        self.linked_pair()
+        twin = self.note(second_rel, "a second holder", front=(
+            "id: link-target\nkind: reference\ntitle: T2\ntopics: [brain]\n"
+            "aliases: [t2]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"))
+        self.git("add", str(twin))
+        self.git("commit", "-q", "--no-verify", "-m", "duplicate holder")
+        self.git("rm", "-q", f"knowledge/{second_rel}")
+        gate, out = self.gate_then_commit()
+        self.assertEqual(gate.returncode, 0,
+                         "removing a duplicate holder orphaned the id:\n" + gate.stdout)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_gate_allows_deleting_one_of_two_canonical_holders_of_an_id(self):
+        self.assert_deleting_one_of_two_holders_is_not_a_removal("reference/twin.md")
+
+    def test_gate_allows_deleting_an_inbox_note_that_shares_a_live_id(self):
+        self.assert_deleting_one_of_two_holders_is_not_a_removal("inbox/2026-07-01-twin.md")
+
+    def test_gate_blocks_deleting_the_inbox_note_that_held_a_linked_id(self):
+        """Full lint lets an inbox note's id satisfy a link, so deleting the
+        only note holding it orphans the link — the gate must say so too, which
+        is why departures from provisional folders are judged like any other."""
+        held = self.note("inbox/2026-07-01-held.md", "provisional",
+                         front="id: inbox-held\ncreated: 2026-07-01\nstatus: draft\n")
+        referrer = self.note("reference/refers-inbox.md", "see [[inbox-held]]", front=(
+            "id: refers-inbox\nkind: reference\ntitle: R\ntopics: [brain]\n"
+            "aliases: [r]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"))
+        self.assertEqual(self.commit(held, referrer).returncode, 0, "setup was rejected")
+        self.git("rm", "-q", "knowledge/inbox/2026-07-01-held.md")
+        gate, out = self.gate_then_commit()
+        self.assertNotEqual(out.returncode, 0, "orphaned a link full lint would reject")
+        self.assertIn("dangling wikilink [[inbox-held]]", gate.stdout)
+
+    def test_gate_blocks_a_link_to_an_untracked_archive_copy(self):
+        """A note that was never committed does not exist for the commit, even
+        when a copy of it sits untracked in archive/ and the cache lists it."""
+        stray = self.repo / "knowledge/archive/reference/draft-target.md"
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_text(
+            "---\nid: draft-target\nkind: reference\ntitle: D\ntopics: [brain]\n"
+            "aliases: [d]\ncreated: 2026-07-01\nstatus: superseded\n"
+            "superseded_by: referrer\nreview_by: null\n---\n\n"
+            "> SUPERSEDED 2026-07-02 by [[referrer]] — the claim changed\n\nold\n",
+            encoding="utf-8")
+        built = run_brain("index", repo=self.repo)       # a cache row for the stray copy
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        referrer = self.note("reference/refers.md", "see [[draft-target]]", front=(
+            "id: referrer\nkind: reference\ntitle: R\ntopics: [brain]\n"
+            "aliases: [r]\ncreated: 2026-07-01\nstatus: current\nreview_by: null\n"))
+        self.git("add", str(referrer))
+        gate, out = self.gate_then_commit()
+        self.assertNotEqual(out.returncode, 0,
+                            "an untracked file made a dangling link look valid")
+        self.assertIn("dangling wikilink [[draft-target]]", gate.stdout)
+
+    def test_gate_gives_one_verdict_per_link(self):
+        """A staged referrer is judged once, against the committed tree: never a
+        SUPERSEDED warning from an untracked copy beside a dangling error."""
+        self.linked_pair()
+        self.supersede_link_target()
+        refers = self.repo / "knowledge/reference/refers.md"
+        refers.write_text(refers.read_text(encoding="utf-8") + "\nedited\n",
+                          encoding="utf-8")
+        self.git("add", "-A")
+        self.git("rm", "-q", "--cached", "knowledge/archive/reference/link-target.md")
+        gate, out = self.gate_then_commit()
+        self.assertNotEqual(out.returncode, 0, gate.stdout)
+        lines = [l for l in gate.stdout.splitlines() if "refers.md" in l]
+        self.assertEqual(len(lines), 1, "more than one verdict on one link:\n" + gate.stdout)
+        self.assertIn("dangling wikilink [[link-target]]", lines[0])
+
+    def test_gate_reads_a_supersede_in_place_as_an_archive_move(self):
+        """The successor reuses the old path under a new id; the old id now
+        lives only in archive/, so a link to it is the SUPERSEDED warning."""
+        self.linked_pair()
+        old = self.repo / "knowledge/reference/link-target.md"
+        text = old.read_text(encoding="utf-8")
+        archived = self.repo / "knowledge/archive/reference/link-target.md"
+        archived.parent.mkdir(parents=True, exist_ok=True)
+        archived.write_text(text.replace(
+            "status: current\n", "status: superseded\nsuperseded_by: link-target-v2\n").replace(
+            "---\n\n", "---\n\n> SUPERSEDED 2026-07-02 by [[link-target-v2]] — the claim "
+            "changed\n\n", 1), encoding="utf-8")
+        old.write_text(
+            "---\nid: link-target-v2\nkind: reference\ntitle: T2\ntopics: [brain]\n"
+            "aliases: [t2]\ncreated: 2026-07-02\nstatus: current\nreview_by: null\n"
+            "supersedes: link-target\n---\n\n## What\n\nThe revised claim.\n",
+            encoding="utf-8")
+        self.git("add", "-A")
+        gate, out = self.gate_then_commit()
+        self.assertEqual(gate.returncode, 0, gate.stdout)
+        self.assertIn("wikilink [[link-target]] points at a SUPERSEDED note — repoint it at "
+                      "[[link-target-v2]]", gate.stdout)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
     def test_gate_judges_the_staged_blob_not_the_worktree(self):
         """The whole point of --staged: staging a bad blob and then fixing the

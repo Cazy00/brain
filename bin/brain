@@ -378,12 +378,21 @@ def scan_conflicts(path: Path, errors: list, text: str = None) -> None:
                        "conflict before committing; both claims are otherwise served as one note"))
 
 
+def is_note_file(path) -> bool:
+    """Is this file a Markdown note — the only kind that can hold an id?
+
+    One answer for full lint (collect_notes) and the commit gate (IndexNotes):
+    a file under knowledge/ whose suffix is .md in any case. A .gitkeep or
+    topics.yaml that happens to start with `id:` frontmatter holds nothing."""
+    return Path(path).suffix.lower() == ".md"
+
+
 def collect_notes():
     """Return {relpath: (fm_or_None, parse_error_or_None)} for every markdown note
     under knowledge/, matched case-insensitively (Foo.MD is still a note)."""
     notes = {}
     for path in sorted(K.rglob("*")):
-        if path.is_file() and path.suffix.lower() == ".md":
+        if path.is_file() and is_note_file(path):
             notes[path.relative_to(K)] = parse_frontmatter(read_text(path))
     return notes
 
@@ -995,16 +1004,20 @@ class StagedMetas:
     thing making the gate scale with the size of the brain. Nothing here is
     loaded until an id is actually consulted: staged notes come from the index
     (ground truth), everything else from a single-row cache lookup that is then
-    verified against the file it claims to live in — so a stale cache can
-    neither invent a note nor hide one."""
+    verified against the INDEX blob at the path it names — so neither a stale
+    cache row nor a file that only sits in the working tree can invent a note.
+    One it misses (a note the cache never saw) reads as absent, which can only
+    ever produce an error, and every error is re-checked against the whole
+    index before a commit is refused."""
 
     def __init__(self, index: "MetaIndex", overlay: dict, removed_rels: set, staged_rels: set,
-                 recent: dict = None):
+                 recent: dict = None, tracked: "IndexNotes" = None):
         self._index = index
         self._overlay = overlay            # id -> (rel, fm) from staged blobs
         self._removed = removed_rels       # rels this commit deletes
         self._staged = staged_rels         # rels this commit rewrites
         self._recent = recent or {}        # notes newer than the cache
+        self._tracked = tracked if tracked is not None else IndexNotes()
         self._verified: dict = {}
 
     def _incumbent(self, key):
@@ -1021,13 +1034,7 @@ class StagedMetas:
             # deleting — those are not an incumbent, they ARE the change.
             if rel in self._removed or rel in self._staged:
                 continue
-            path = K / rel
-            if not path.is_file():
-                continue
-            try:
-                live, _err = parse_frontmatter(read_text(path))
-            except OSError:
-                continue
+            live = self._tracked.frontmatter(rel)    # None unless the index holds it
             if live and live.get("id") == key:
                 found = (rel, live)
                 break
@@ -1144,20 +1151,21 @@ def notes_modified_since(when: float) -> list:
     return out
 
 
-def recent_note_metas() -> dict:
-    """id -> (rel, fm) for notes newer than the cache, so the gate sees them."""
+def recent_note_metas(tracked: "IndexNotes") -> dict:
+    """id -> (rel, fm) for notes newer than the cache, so the gate sees them.
+
+    The working tree only says WHICH notes are new; what they hold is read
+    from the index, and one the index does not track is not a note at all."""
     try:
         built = INDEX_DB.stat().st_mtime if INDEX_DB.exists() else 0.0
     except OSError:
         built = 0.0
+    rels = [path.relative_to(K) for path in notes_modified_since(built)]
     recent = {}
-    for path in notes_modified_since(built):
-        try:
-            fm, _err = parse_frontmatter(read_text(path))
-        except OSError:
-            continue
+    for rel, text in tracked.texts(rels).items():
+        fm, _err = parse_frontmatter(text)
         if fm and isinstance(fm.get("id"), str) and fm["id"]:
-            recent[fm["id"]] = (path.relative_to(K), fm)
+            recent[fm["id"]] = (rel, fm)
     return recent
 
 
@@ -1173,6 +1181,8 @@ def staged_overlay(changes):
             removed_rels.add(rel)
             continue
         staged_rels.add(rel)
+        if not is_note_file(rel):
+            continue                       # only a Markdown note holds an id
         blob = staged_blob(rel_str)
         if blob is None:
             continue
@@ -1217,16 +1227,101 @@ def staged_blob(rel: str):
     return content.stdout, is_symlink
 
 
+class IndexNotes:
+    """The Markdown notes the git index holds under knowledge/: the tree the
+    commit being checked will contain, and the gate's only picture of it.
+
+    The working tree is never consulted. An untracked file is not in the
+    commit, an unstaged edit is not either, and a referrer is judged by the
+    bytes that will be committed — so a repair left unstaged cannot hide a
+    dangling link, and a regression left unstaged cannot block a valid
+    commit. The listing is one `git ls-files`; bodies are read on demand, a
+    batch at a time, through one `git cat-file --batch`."""
+
+    def __init__(self):
+        self.blobs: dict = {}               # rel (under knowledge/) -> blob id
+        self._text: dict = {}
+        listed = subprocess.run(["git", "ls-files", "--cached", "-s", "-z", "--", "knowledge"],
+                                cwd=ROOT, capture_output=True, check=True).stdout
+        for record in listed.split(b"\0"):
+            meta, _tab, name = record.partition(b"\t")
+            fields = meta.split()
+            # Stage 0 only (an unmerged path cannot be committed), and no
+            # symlinks: those are refused per file, and hold no note.
+            if len(fields) != 3 or fields[2] != b"0" or fields[0] == b"120000":
+                continue
+            parts = Path(os.fsdecode(name)).parts
+            if len(parts) < 2 or parts[0] != "knowledge" or not is_note_file(parts[-1]):
+                continue
+            self.blobs[Path(*parts[1:])] = fields[1].decode("ascii")
+
+    def __contains__(self, rel) -> bool:
+        return rel in self.blobs
+
+    def texts(self, rels) -> dict:
+        """rel -> text for each of `rels` the index holds as a note."""
+        wanted = [r for r in dict.fromkeys(rels) if r in self.blobs and r not in self._text]
+        if wanted:
+            shas = list(dict.fromkeys(self.blobs[r] for r in wanted))
+            out = subprocess.run(["git", "cat-file", "--batch"], cwd=ROOT, check=True,
+                                 capture_output=True,
+                                 input="".join(f"{sha}\n" for sha in shas).encode()).stdout
+            found, pos = {}, 0
+            while pos < len(out):
+                end = out.index(b"\n", pos)
+                header = out[pos:end].split()
+                pos = end + 1
+                if len(header) != 3:        # "<sha> missing"
+                    continue
+                size = int(header[2])
+                found[header[0].decode("ascii")] = out[pos:pos + size]
+                pos += size + 1
+            for r in wanted:
+                raw = found.get(self.blobs[r])
+                if raw is not None:
+                    self._text[r] = raw.decode("utf-8-sig", errors="replace")
+        return {r: self._text[r] for r in rels if r in self._text}
+
+    def frontmatter(self, rel):
+        text = self.texts([rel]).get(rel)
+        return parse_frontmatter(text)[0] if text is not None else None
+
+
+def index_universe(changes, tracked: IndexNotes):
+    """(id -> (rel, fm), staged ids, id -> rel of untouched notes), read from
+    the index — the authoritative universe the gate falls back to before it
+    refuses a commit. Untouched notes are captured apart from staged ones so a
+    staged note claiming a taken id collides instead of replacing it."""
+    touched = set()
+    for _status, rel_str in changes:
+        parts = Path(rel_str).parts
+        if len(parts) >= 2 and parts[0] == "knowledge":
+            touched.add(Path(*parts[1:]))
+    base, staged = {}, {}
+    for rel, text in sorted(tracked.texts(list(tracked.blobs)).items()):
+        fm, _err = parse_frontmatter(text)
+        if fm and isinstance(fm.get("id"), str) and fm["id"]:
+            (staged if rel in touched else base).setdefault(fm["id"], (rel, fm))
+    existing_ids = {nid: rel for nid, (rel, _fm) in base.items()}
+    universe = dict(base)
+    universe.update(staged)
+    return universe, set(staged), existing_ids
+
+
 def departed_note_ids(changes) -> set:
     """Ids, as HEAD has them, whose note this commit deletes, moves or re-ids.
 
-    Every [[link]] to one has to be judged again. Most stay valid: a note
-    moved into archive/ by supersede or retract keeps its id (see
-    removed_note_ids for the ones that do not)."""
+    Every [[link]] to one has to be judged again, against the tree the commit
+    leaves. Most stay valid: a note moved into archive/ (by supersede or
+    retract) or into another canonical folder keeps its id, and so does one
+    whose id another note still holds. Only an id that no note in that tree
+    holds is removed, and a link to it is dangling. Provisional folders count
+    like any other: full lint lets an inbox note's id satisfy a link, so
+    deleting the only note holding it orphans that link."""
     departed = set()
     for status, rel_str in changes:
         parts = Path(rel_str).parts
-        if not parts or parts[0] != "knowledge" or not rel_str.lower().endswith(".md"):
+        if not parts or parts[0] != "knowledge" or not is_note_file(rel_str):
             continue
         head = subprocess.run(["git", "cat-file", "blob", f"HEAD:{rel_str}"],
                               cwd=ROOT, capture_output=True)
@@ -1248,60 +1343,37 @@ def departed_note_ids(changes) -> set:
     return departed
 
 
-def removed_note_ids(departed, held_after) -> set:
-    """Ids this commit takes out of circulation: departed, and held by no note
-    the commit leaves behind. Each orphans every [[link]] pointing at it.
-
-    `held_after` is the ids of the notes this commit stages. A note moved into
-    archive/ (superseded, retracted), or anywhere else, is matched by its id
-    across the change set — never by git's rename detection, which
-    staged_changes undoes anyway, `diff.renames` can switch off, and a
-    frontmatter rewrite of a short note can defeat."""
-    return {note_id for note_id in departed if not note_id_present(note_id, held_after)}
-
-
-def flag_orphaned_inbound_links(departed: set, removed: set, changes, ctx: LintCtx) -> None:
+def flag_orphaned_inbound_links(departed: set, ctx: LintCtx, tracked: IndexNotes) -> None:
     """Judge every link left pointing at an id this commit moves or removes,
-    with the verdict `bin/brain lint` gives it.
+    with the verdict `bin/brain lint` gives it, against the same universe the
+    staged notes' own links were judged against.
 
     The incremental gate only inspects what changed, so on its own it would let
     a deletion silently break every note linking to it — the exact rot link
-    validation exists to catch. A link to a removed id is dangling, an error in
-    a canonical note. A link to an id that moved into archive/ is stale but
-    whole — the SUPERSEDED or RETRACTED warning full lint prints — because
-    refusing it would block a supersede until every inbound link is repointed
-    in the same commit, which full lint never asks for. Departures are rare,
-    so this walks the corpus only when one actually happens, and is therefore
-    exact rather than cache-dependent."""
+    validation exists to catch. A link to an id no note holds any more is
+    dangling, an error in a canonical note. A link to one that moved into
+    archive/ is stale but whole — the SUPERSEDED or RETRACTED warning full lint
+    prints — because refusing it would block a supersede until every inbound
+    link is repointed in the same commit, which full lint never asks for.
+    Referrers are the notes the index holds, read from their index blobs.
+    Departures are rare, so this reads the corpus only when one happens."""
     if not departed:
         return
-    gone = {Path(*Path(r).parts[1:]) for s, r in changes
-            if s == "D" and Path(r).parts[:1] == ("knowledge",)}
-    for path in K.rglob("*.md"):
-        rel = path.relative_to(K)
-        if rel in gone or rel.parts[0] in ("archive", "vault", "attachments"):
-            continue                       # archive is append-only history
-        try:
-            text = read_text(path)
-        except OSError:
-            continue
+    rels = sorted(rel for rel in tracked.blobs
+                  if rel.parts[0] not in ("archive", "vault", "attachments"))
+    for rel, text in tracked.texts(rels).items():   # archive is append-only history
         fm, _err = parse_frontmatter(text)
         start = (fm or {}).get("_end_line", 0)
         body = "\n".join(text.splitlines()[start:])
         provisional = rel.parts[0] in ("inbox", "journal", "handoff")
         for target in extract_links(body):
-            if target not in departed:
-                continue
-            # A removed id is judged against a universe without it: the commit
-            # holds no note with that id, whatever an untracked copy on disk or
-            # a stale cache row would have the universe say.
-            universe = {} if target in removed else ctx.metas
-            report_link(path, wikilink_finding(target, fm, universe, hard=not provisional),
-                        ctx)
+            if target in departed:
+                report_link(K / rel, wikilink_finding(target, fm, ctx.metas,
+                                                      hard=not provisional), ctx)
 
 
 def run_staged_checks(changes, metas, topics, trusted, existing_ids=None,
-                      graph_index=None) -> LintCtx:
+                      graph_index=None, tracked: IndexNotes = None) -> LintCtx:
     """Apply every rule to the staged snapshot only.
 
     `existing_ids` maps id -> rel for notes this commit does NOT touch. It must
@@ -1360,8 +1432,8 @@ def run_staged_checks(changes, metas, topics, trusted, existing_ids=None,
         check_supersede_graph_staged(ctx, list(ids_seen), graph_index)
     else:
         check_supersede_graph(ctx)
-    departed = departed_note_ids(changes)
-    flag_orphaned_inbound_links(departed, removed_note_ids(departed, ids_seen), changes, ctx)
+    flag_orphaned_inbound_links(departed_note_ids(changes), ctx,
+                                tracked if tracked is not None else IndexNotes())
     return ctx
 
 
@@ -1370,12 +1442,13 @@ def lint_staged():
 
     Returns an exit code, or None to mean "I could not do this safely — use the
     slow, certain path". Every per-file rule runs against the exact bytes in the
-    index. Cross-note rules need the whole id universe, which comes from the
-    derived cache rather than from re-reading every note; because that universe
-    is the one approximate input, ANY error triggers a second pass against a
-    freshly scanned universe before the commit is refused. A wrong block is
-    therefore impossible, and the expensive scan only happens when something is
-    already wrong.
+    index. Cross-note rules need the whole id universe — the notes the commit
+    will contain, which is the git index, never the working tree. It is looked
+    up through the derived cache rather than by re-reading every note; because
+    that lookup is the one approximate input (it can miss a note, never invent
+    one), ANY error triggers a second pass against every note the index holds
+    before the commit is refused. A wrong block is therefore impossible, and
+    the expensive read only happens when something is already wrong.
     """
     changes = staged_changes()
     if changes is None:
@@ -1385,62 +1458,31 @@ def lint_staged():
         return 0
     topics = load_topics()
 
-    def universe(authoritative: bool):
-        trusted = set()
-        if authoritative:
-            base = all_metas_scan()
-        else:
-            base = all_metas()             # cache-backed, may lag reality
-        base = dict(base)
-        for status, rel_str in changes:    # overlay what this commit does
-            parts = Path(rel_str).parts
-            if not parts or parts[0] != "knowledge" or len(parts) < 2:
-                continue
-            rel = Path(*parts[1:])
-            for nid, (r, _fm) in list(base.items()):
-                if r == rel:
-                    del base[nid]
-        # Snapshot the untouched notes' ids BEFORE overlaying, so a staged note
-        # claiming a taken id collides instead of silently replacing it.
-        existing_ids = {nid: r for nid, (r, _fm) in base.items()}
-        for status, rel_str in changes:
-            parts = Path(rel_str).parts
-            if not parts or parts[0] != "knowledge" or len(parts) < 2 or status == "D":
-                continue
-            rel = Path(*parts[1:])
-            blob = staged_blob(rel_str)
-            if blob is None:
-                continue
-            fm, _err = parse_frontmatter(blob[0].decode("utf-8-sig", errors="replace"))
-            if fm and isinstance(fm.get("id"), str) and fm["id"]:
-                base[fm["id"]] = (rel, fm)
-                trusted.add(fm["id"])
-        return base, trusted, existing_ids
-
     try:
         # Fast path: nothing but the staged blobs is read up front. Ids are
         # resolved one at a time, and only if some check actually asks.
         # require_fresh=False on purpose: the index is stale at almost every
         # commit (a capture just wrote a note), and refusing it would drop
         # straight back to an O(N) scan. Staleness is safe here because every id
-        # consulted is verified against the file it claims to live in, and
-        # anything newer than the cache is picked up by recent_note_metas().
+        # consulted is verified against the index blob at the path it claims,
+        # and anything newer than the cache is picked up by recent_note_metas().
+        tracked = IndexNotes()
         index = MetaIndex(require_fresh=False)
         try:
             overlay, removed_rels, staged_rels = staged_overlay(changes)
             lazy = StagedMetas(index, overlay, removed_rels, staged_rels,
-                               recent=recent_note_metas())
+                               recent=recent_note_metas(tracked), tracked=tracked)
             ctx = run_staged_checks(changes, lazy, topics, set(overlay),
-                                    graph_index=index)
+                                    graph_index=index, tracked=tracked)
         finally:
             index.close()
         if ctx.errors:
-            # Never refuse a commit on the word of a cache. Re-check against a
-            # universe read from the notes themselves; if the errors were an
-            # artefact of stale metadata they disappear here.
-            base, trusted, existing = universe(authoritative=True)
-            ctx = run_staged_checks(changes, dict(base), topics, trusted,
-                                    existing_ids=existing)
+            # Never refuse a commit on the word of a cache. Re-check against
+            # every note the index holds; if the errors were an artefact of
+            # stale metadata they disappear here.
+            base, trusted, existing = index_universe(changes, tracked)
+            ctx = run_staged_checks(changes, base, topics, trusted,
+                                    existing_ids=existing, tracked=tracked)
     except Exception:
         return None                        # anything unexpected: use the slow path
 
