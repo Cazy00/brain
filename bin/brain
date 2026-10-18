@@ -5114,18 +5114,27 @@ def load_consolidator() -> dict:
 
 
 GIT_CONTROL = ("config", "hooks", "info")
+# Files under those that git writes itself and never reads as settings or code. info/refs
+# is the ref listing `git update-server-info` regenerates for dumb-HTTP clients, and
+# git's own background auto-gc runs it (repack.updateServerInfo) whenever a commit just
+# before the pass set one off: counting it as tampering failed honest passes (CI, PR #9).
+GIT_GENERATED = ("info/refs",)
 
 
 def git_control_snapshot(git_dir: Path) -> dict:
     """Every file under the repository's own config, hooks and info, by path: what git reads
-    settings and runnable code from inside a checkout (Harbor Phase 3 final review)."""
+    settings and runnable code from inside a checkout (Harbor Phase 3 final review), less
+    the listings git generates itself (GIT_GENERATED)."""
     snap = {}
+    generated = {git_dir / rel for rel in GIT_GENERATED}
     for name in GIT_CONTROL:
         top = git_dir / name
         paths = [top] if (top.is_file() or top.is_symlink()) else (
             sorted(p for p in top.rglob("*") if p.is_file() or p.is_symlink())
             if top.is_dir() else [])
         for path in paths:
+            if path in generated and not path.is_symlink():
+                continue
             snap[path] = (("link", os.readlink(path)) if path.is_symlink()
                           else ("file", path.read_bytes(), path.stat().st_mode & 0o777))
     return snap

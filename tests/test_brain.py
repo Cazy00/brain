@@ -1203,6 +1203,26 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual((self.repo / ".git" / "config").read_text(), before)
         self.assertFalse((self.repo / ".git" / "hooks" / "pre-commit").exists())
 
+    def test_gits_own_server_info_is_not_proposer_tampering(self):
+        """CI, PR #9: a commit just before the pass started git's background auto-gc, whose
+        repack ran update-server-info and rewrote .git/info/refs while the proposer ran. That
+        file is a listing git generates for dumb-HTTP clients, never settings or code, so it
+        must not fail the pass; a planted info/attributes still must."""
+        audited = self.audited_stub(
+            f"{self.toolbelt('drain', self.SEED).strip()}\n"
+            "git update-server-info\n"
+            "printf 'stale\\n' >> .git/info/refs\n")
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+        self.assertTrue(audited.exists())
+        self.back_to_trunk()
+        commit_at(self.repo, "another capture", iso_ago(0),
+                  ("knowledge/inbox/2026-10-16-000000-two.md", inbox_note(source="local")))
+        self.audited_stub("printf '* filter=evil\\n' > .git/info/attributes\n")
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "failed", result.stdout)
+        self.assertIn("git control files (info/attributes)", result.stdout)
+
     # -- Harbor Phase 5 (5.4): `audit-branch`, for an auditor that may not write the checkout --
 
     def audit_branch(self, *args, env_extra=None):
