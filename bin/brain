@@ -420,6 +420,52 @@ class Blob:
         return cls(path.read_bytes())
 
 
+def note_id_present(note_id, metas) -> bool:
+    """Does a note hold this id — in a canonical folder OR in archive/?
+
+    The one presence question both link checks ask. A superseded or retracted
+    note leaves default search but keeps its id, so a link to it is stale
+    (a warning), never dangling (an error). `bin/brain lint` asks it of the
+    whole tree; the commit gate asks it of the notes the commit stages, to
+    tell a note that moved from one that is gone. The answers must agree, or
+    the gate refuses a commit that full lint accepts."""
+    return note_id in metas
+
+
+def wikilink_finding(target, fm, metas, hard: bool = True):
+    """The verdict on one [[target]] link from a note with frontmatter `fm`:
+    None, or (is_error, message). Shared by full lint and the commit gate, so
+    the two cannot disagree about what a link to an archived note is."""
+    if not note_id_present(target, metas):
+        return (hard, f"dangling wikilink [[{target}]] — no note has that id "
+                "(typo, or the note was deleted rather than superseded)")
+    # A successor legitimately cites the note it replaced ("Supersedes
+    # [[old-id]]" is exactly what the supersede protocol writes), so that
+    # one back-reference is never stale.
+    if target == (fm or {}).get("supersedes"):
+        return None
+    t_rel, t_fm = metas[target]
+    if t_rel.parts[0] != "archive":
+        return None
+    if chain_ends_retracted(target, metas):
+        return (False, f"wikilink [[{target}]] points at a RETRACTED note "
+                "(or a supersede chain that ends in one) — it was withdrawn "
+                "with no successor; remove the link")
+    successor = t_fm.get("superseded_by")
+    return (False, f"wikilink [[{target}]] points at a SUPERSEDED note"
+            + (f" — repoint it at [[{successor}]]" if successor else
+               " with no recorded successor"))
+
+
+def report_link(path, finding, ctx: LintCtx) -> None:
+    if finding is None:
+        return
+    is_error, message = finding
+    bucket = ctx.errors if is_error else ctx.warnings
+    if (path, message) not in bucket:      # a note the gate reaches twice says it once
+        bucket.append((path, message))
+
+
 def check_links(path, text, fm, ctx: LintCtx, hard: bool = True) -> None:
     """Validate every [[wikilink]] in a body against the real note set.
 
@@ -432,28 +478,8 @@ def check_links(path, text, fm, ctx: LintCtx, hard: bool = True) -> None:
     """
     start = (fm or {}).get("_end_line", 0)
     body = "\n".join(text.splitlines()[start:])
-    # A successor legitimately cites the note it replaced ("Supersedes
-    # [[old-id]]" is exactly what the supersede protocol writes), so that
-    # one back-reference is never stale.
-    predecessor = (fm or {}).get("supersedes")
     for target in extract_links(body):
-        if target not in ctx.metas:
-            bucket = ctx.errors if hard else ctx.warnings
-            bucket.append((path, f"dangling wikilink [[{target}]] — no note has that id "
-                           "(typo, or the note was deleted rather than superseded)"))
-            continue
-        if target == predecessor:
-            continue
-        t_rel, t_fm = ctx.metas[target]
-        if t_rel.parts[0] == "archive" and chain_ends_retracted(target, ctx.metas):
-            ctx.warnings.append((path, f"wikilink [[{target}]] points at a RETRACTED note "
-                                 "(or a supersede chain that ends in one) — it was withdrawn "
-                                 "with no successor; remove the link"))
-        elif t_rel.parts[0] == "archive":
-            successor = t_fm.get("superseded_by")
-            ctx.warnings.append((path, f"wikilink [[{target}]] points at a SUPERSEDED note"
-                                 + (f" — repoint it at [[{successor}]]" if successor else
-                                    " with no recorded successor")))
+        report_link(path, wikilink_finding(target, fm, ctx.metas, hard), ctx)
 
 
 def check_retracted(path, fm, text, ctx: LintCtx) -> None:
@@ -1191,10 +1217,13 @@ def staged_blob(rel: str):
     return content.stdout, is_symlink
 
 
-def removed_note_ids(changes) -> set:
-    """Ids this commit takes out of circulation — a deleted note, or one whose
-    id was changed. Both orphan every [[link]] pointing at the old id."""
-    removed = set()
+def departed_note_ids(changes) -> set:
+    """Ids, as HEAD has them, whose note this commit deletes, moves or re-ids.
+
+    Every [[link]] to one has to be judged again. Most stay valid: a note
+    moved into archive/ by supersede or retract keeps its id (see
+    removed_note_ids for the ones that do not)."""
+    departed = set()
     for status, rel_str in changes:
         parts = Path(rel_str).parts
         if not parts or parts[0] != "knowledge" or not rel_str.lower().endswith(".md"):
@@ -1208,26 +1237,43 @@ def removed_note_ids(changes) -> set:
         if not isinstance(old_id, str) or not old_id:
             continue
         if status == "D":
-            removed.add(old_id)
+            departed.add(old_id)
             continue
         blob = staged_blob(rel_str)
         if blob is None:
             continue
         now, _err = parse_frontmatter(blob[0].decode("utf-8-sig", errors="replace"))
         if (now or {}).get("id") != old_id:
-            removed.add(old_id)
-    return removed
+            departed.add(old_id)
+    return departed
 
 
-def flag_orphaned_inbound_links(removed: set, changes, ctx: LintCtx) -> None:
-    """Report notes left pointing at an id this commit removes.
+def removed_note_ids(departed, held_after) -> set:
+    """Ids this commit takes out of circulation: departed, and held by no note
+    the commit leaves behind. Each orphans every [[link]] pointing at it.
+
+    `held_after` is the ids of the notes this commit stages. A note moved into
+    archive/ (superseded, retracted), or anywhere else, is matched by its id
+    across the change set — never by git's rename detection, which
+    staged_changes undoes anyway, `diff.renames` can switch off, and a
+    frontmatter rewrite of a short note can defeat."""
+    return {note_id for note_id in departed if not note_id_present(note_id, held_after)}
+
+
+def flag_orphaned_inbound_links(departed: set, removed: set, changes, ctx: LintCtx) -> None:
+    """Judge every link left pointing at an id this commit moves or removes,
+    with the verdict `bin/brain lint` gives it.
 
     The incremental gate only inspects what changed, so on its own it would let
     a deletion silently break every note linking to it — the exact rot link
-    validation exists to catch. Deletions are rare, so this walks the corpus
-    only when one actually happens, and is therefore exact rather than
-    cache-dependent."""
-    if not removed:
+    validation exists to catch. A link to a removed id is dangling, an error in
+    a canonical note. A link to an id that moved into archive/ is stale but
+    whole — the SUPERSEDED or RETRACTED warning full lint prints — because
+    refusing it would block a supersede until every inbound link is repointed
+    in the same commit, which full lint never asks for. Departures are rare,
+    so this walks the corpus only when one actually happens, and is therefore
+    exact rather than cache-dependent."""
+    if not departed:
         return
     gone = {Path(*Path(r).parts[1:]) for s, r in changes
             if s == "D" and Path(r).parts[:1] == ("knowledge",)}
@@ -1244,10 +1290,14 @@ def flag_orphaned_inbound_links(removed: set, changes, ctx: LintCtx) -> None:
         body = "\n".join(text.splitlines()[start:])
         provisional = rel.parts[0] in ("inbox", "journal", "handoff")
         for target in extract_links(body):
-            if target in removed and target != (fm or {}).get("supersedes"):
-                bucket = ctx.warnings if provisional else ctx.errors
-                bucket.append((path, f"dangling wikilink [[{target}]] — no note has that id "
-                               "(typo, or the note was deleted rather than superseded)"))
+            if target not in departed:
+                continue
+            # A removed id is judged against a universe without it: the commit
+            # holds no note with that id, whatever an untracked copy on disk or
+            # a stale cache row would have the universe say.
+            universe = {} if target in removed else ctx.metas
+            report_link(path, wikilink_finding(target, fm, universe, hard=not provisional),
+                        ctx)
 
 
 def run_staged_checks(changes, metas, topics, trusted, existing_ids=None,
@@ -1310,7 +1360,8 @@ def run_staged_checks(changes, metas, topics, trusted, existing_ids=None,
         check_supersede_graph_staged(ctx, list(ids_seen), graph_index)
     else:
         check_supersede_graph(ctx)
-    flag_orphaned_inbound_links(removed_note_ids(changes), changes, ctx)
+    departed = departed_note_ids(changes)
+    flag_orphaned_inbound_links(departed, removed_note_ids(departed, ids_seen), changes, ctx)
     return ctx
 
 
