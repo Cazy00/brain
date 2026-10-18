@@ -5516,6 +5516,18 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         audit = self.flat("audit-prompt.md")
         self.assertIn("no `## Sources` line for an input at all", audit)
 
+    def test_the_protocol_keeps_pending_work_out_and_never_promotes_its_status(self):
+        """AGENTS.md is the bar every pass is told to apply, so the rule lives there too."""
+        text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
+        never = text[text.index("Never capture:"):text.index("Ask first, every single time")]
+        for phrase in ("pending work", "still needs", "the project's own records",
+                       "never here", "decision or a lesson", "not as a status"):
+            self.assertIn(phrase, never)
+        bar = text[text.index("Promotion bar"):text.index("Offer, don't nag")]
+        for phrase in ("records pending work", "deleted, not promoted", "rewritten as one",
+                       "never states the open or pending status of work"):
+            self.assertIn(phrase, bar)
+
 
 class OpenPullRequestTests(unittest.TestCase):
     """--open-pr opens the consolidation's PR with gh, or prints the command."""

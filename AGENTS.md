@@ -136,6 +136,11 @@ Never capture:
 
 - anything derivable from the code, this repo, or public docs — link, don't copy
 - transient state ("the build is failing", "waiting on their reply")
+- pending work — a to-do, an open step, "X still needs Y", "next session
+  must…". It belongs in the project's own records (its backlog, issues list,
+  milestone or task), never here. If it carries a decision or a lesson (why it
+  should be done, what was decided about it), capture only that, phrased as a
+  decision or lesson, not as a status
 - credentials of any kind (hard rule below)
 - praise, chatter, or a restatement of what was just done
 
@@ -152,6 +157,11 @@ Ask first, every single time — never silently:
 Promotion bar (inbox → canonical, applied by consolidation): would you
 search for this, and would a stale version of it mislead you? If it is not
 worth maintaining for ten years, delete it instead of promoting it.
+A capture that records pending work is deleted, not promoted, when that work
+is in a project's records or obviously belongs there; keep only a decision or
+lesson inside it, rewritten as one. A canonical note never states the open or
+pending status of work: that status goes stale the day the work is done, and
+a stale "still open" is read back as true.
 
 Offer, don't nag. When something above passes the bar mid-conversation, say so
 in one line and carry on — do not save the offer for the end of the session,
