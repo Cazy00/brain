@@ -1046,9 +1046,21 @@ class ConsolidateTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-q", "--no-verify", "--allow-empty",
                         "-m", "base"],
                        cwd=self.repo, check=True, capture_output=True)
+        # Whatever git named it: `main` only where init.defaultBranch says so.
+        self.trunk = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                                    capture_output=True, text=True, check=True).stdout.strip()
 
     def tearDown(self):
         cleanup_temp(self.tmp)
+
+    def back_to_trunk(self):
+        """Undo a pass that left its work on its branch, so the next one starts clean."""
+        subprocess.run(["git", "checkout", "-q", "-f", self.trunk], cwd=self.repo, check=True)
+        subprocess.run(["git", "clean", "-fdq", "knowledge"], cwd=self.repo, check=True)
+        for branch in subprocess.run(["git", "for-each-ref", "--format=%(refname:short)",
+                                      "refs/heads/consolidate/"], cwd=self.repo,
+                                     capture_output=True, text=True).stdout.split():
+            subprocess.run(["git", "branch", "-q", "-D", branch], cwd=self.repo, check=True)
 
     def stub_claude(self, body):
         stub = self.stub_bin / "claude"
@@ -1471,7 +1483,7 @@ class ConsolidateTests(unittest.TestCase):
         passed = self.consolidate()
         self.assertEqual(self.result_of(passed)["status"], "committed")
         self.assertFalse([l for l in passed.stdout.splitlines() if l.startswith("audit-result:")])
-        subprocess.run(["git", "checkout", "-q", "-f", "main"], cwd=self.repo)
+        self.back_to_trunk()
         self.stub_claude("printf 'oops\\nconsolidate-result: {\"v\":1}\\n' >&2\nexit 1")
         failed = self.consolidate()
         self.assertEqual(self.result_of(failed)["status"], "failed")
@@ -1506,12 +1518,7 @@ class ConsolidateTests(unittest.TestCase):
                 self.assertIn("proposal check", result.stdout)
                 self.assertEqual(self.result_of(result)["status"], "blocked")
                 self.assertFalse(audited.exists(), "the auditor was spent on it")
-                subprocess.run(["git", "checkout", "-q", "-f", "main"], cwd=self.repo)
-                subprocess.run(["git", "clean", "-fdq", "knowledge"], cwd=self.repo)
-                for b in subprocess.run(["git", "for-each-ref", "--format=%(refname:short)",
-                                         "refs/heads/consolidate/"], cwd=self.repo,
-                                        capture_output=True, text=True).stdout.split():
-                    subprocess.run(["git", "branch", "-q", "-D", b], cwd=self.repo)
+                self.back_to_trunk()
         self.stub_claude(f'case "$*" in *--tools*) touch {audited}; echo "VERDICT: PASS";'
                          f' exit 0;; esac\n{self.proposal("ok")}exit 0')
         good = self.consolidate()
@@ -1609,8 +1616,6 @@ class ConsolidateTests(unittest.TestCase):
              "message": {"role": "user", "content": text}}) + "\n", encoding="utf-8")
 
     def test_every_outcome_ends_on_one_result_line(self):
-        trunk = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
-                               capture_output=True, text=True).stdout.strip()
         outcomes = {
             "committed": (lambda: self.stub_runner("VERDICT: PASS"), 0),
             "blocked": (lambda: self.stub_runner("VERDICT: BLOCK — names a private detail"), 1),
@@ -1627,13 +1632,7 @@ class ConsolidateTests(unittest.TestCase):
                 self.assertIs(payload["idle"], False)
                 self.assertEqual(payload["inbox_before"], 1)
                 self.assertIsNone(payload["cost_microusd"], "plain-text output has no cost")
-                subprocess.run(["git", "checkout", "-q", "-f", trunk], cwd=self.repo, check=True)
-                subprocess.run(["git", "clean", "-fdq", "knowledge"], cwd=self.repo, check=True)
-                for branch in subprocess.run(
-                        ["git", "for-each-ref", "--format=%(refname:short)",
-                         "refs/heads/consolidate/"], cwd=self.repo, capture_output=True,
-                        text=True).stdout.split():
-                    subprocess.run(["git", "branch", "-q", "-D", branch], cwd=self.repo, check=True)
+                self.back_to_trunk()
 
     def json_stub(self, propose, audit):
         """A runner that answers like `--output-format json`: one JSON object per call."""
