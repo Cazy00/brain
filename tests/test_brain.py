@@ -2791,7 +2791,9 @@ class RetractTests(unittest.TestCase):
 
     def test_retract_takes_the_documented_place_in_the_toolbelt(self):
         out = run_brain("--help", repo=self.repo)
-        self.assertIn("brain retract <id>", out.stdout)
+        for usage in ("brain retract <id-or-path>", "brain handoff <inbox-path> <project>",
+                      "brain handoff --close <handoff-path>", "brain drain <inbox-path>"):
+            self.assertIn(usage, out.stdout)
 
 
 class RetractedLintTests(unittest.TestCase):
