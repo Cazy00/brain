@@ -22,6 +22,12 @@ Do these in order, respecting every cap:
    proper frontmatter, aliases, topics from topics.yaml) or a merge into an
    existing note. Then delete the inbox file. If an item is not actionable
    knowledge (noise), delete it and note that in the commit message.
+   PENDING WORK — a capture that records pending work (a to-do, an open step,
+   "X still needs Y", "next session must…") is deleted, not promoted, when that
+   work is in a project's records or obviously belongs there; say so in the
+   commit message. If it carries a decision or a lesson, keep only that,
+   rewritten as one. A canonical note you create or merge into never states the
+   open or pending status of work.
    Proposals an earlier pass wrote (`source: session-mining`) follow PROPOSALS
    below and do not count toward the 20.
    PROVENANCE — every capture carries `source:`, stamped by the endpoint that

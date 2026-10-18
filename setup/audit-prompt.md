@@ -66,6 +66,13 @@ entry, `- Journal, <date>`; for a promoted session-mining proposal,
 `- Session mining, <date>, corroborated by <what>`. All of these pass; only
 an input with no `## Sources` line for an input at all is a block.
 
+**STATUS.** Block if the change set writes, into a canonical note it creates
+or merges into, the pending or open status of work: a to-do, an open step,
+"X still needs Y", "not done yet". Pending work belongs in a project's own
+records, and a status goes stale the day the work is done. A decision or
+lesson about the work, phrased as one, passes; this is a check on what the
+note asserts, not on whether it was worth writing.
+
 ## What you must NOT do
 
 **Do not judge whether anything was WORTH capturing.** You cannot see the

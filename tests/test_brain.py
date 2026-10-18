@@ -5516,6 +5516,25 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         audit = self.flat("audit-prompt.md")
         self.assertIn("no `## Sources` line for an input at all", audit)
 
+    def test_the_drain_deletes_pending_work_instead_of_promoting_it(self):
+        """A capture of pending work copies a project's record and goes stale once the work
+        is done; promoted, its "still open" is read back as true. Step 1 deletes it and keeps
+        only a decision or lesson inside it, and no canonical note states open status."""
+        text = self.flat("consolidate-prompt.md")
+        drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
+        rule = drain[drain.index("PENDING WORK"):drain.index("Proposals an earlier pass wrote")]
+        for phrase in ("deleted, not promoted", "a project's records", "obviously belongs there",
+                       "decision or a lesson", "rewritten as one",
+                       "never states the open or pending status of work"):
+            self.assertIn(phrase, rule)
+
+    def test_the_auditor_blocks_a_canonical_note_that_states_open_status(self):
+        text = self.flat("audit-prompt.md")
+        rule = text[text.index("**STATUS.**"):text.index("## What you must NOT do")]
+        for phrase in ("Block", "canonical note", "pending or open status of work",
+                       "a project's own records", "decision or lesson"):
+            self.assertIn(phrase, rule)
+
     def test_the_protocol_keeps_pending_work_out_and_never_promotes_its_status(self):
         """AGENTS.md is the bar every pass is told to apply, so the rule lives there too."""
         text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
