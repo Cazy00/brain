@@ -75,6 +75,11 @@ def make_sandbox(tmp):
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
     # Pre-set the hooks path so ensure_hooks() stays quiet: otherwise it prints
     # an install line ahead of --json output on the first command.
+    # No background housekeeping: an auto gc or maintenance run that git detaches after a
+    # commit keeps writing .git (maintenance.lock, info/refs) while a test reads or removes it
+    # (a macOS-only flake in InitTests, 2026-10-15 and 2026-10-18).
+    for key, value in (("gc.auto", "0"), ("maintenance.auto", "false")):
+        subprocess.run(["git", "config", key, value], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "config", "core.hooksPath", ".githooks"], cwd=repo,
                    check=True, capture_output=True)
     # Track the files. A real brain is a repo with contents in its index, and
