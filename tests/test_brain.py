@@ -1575,8 +1575,15 @@ class ConsolidateTests(unittest.TestCase):
                          f' exit 0;; esac\n{body}exit 0')
         return audited
 
+    def toolbelt(self, *args):
+        """A shell line running this checkout's bin/brain, as the proposer's allowlist does."""
+        return " ".join([shlex.quote(sys.executable), "bin/brain",
+                         *(shlex.quote(a) for a in args)]) + "\n"
+
     def test_a_handoff_move_is_committed_and_audited(self):
-        audited = self.audited_stub(self.handoff_move())
+        """Review B1: the pass hands off with the allowlisted command, not rm or mv."""
+        audited = self.audited_stub(self.toolbelt(
+            "handoff", self.SEED, "acme", "pending work that belongs in the project's records"))
         result = self.consolidate()
         self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
         self.assertTrue(audited.exists())
@@ -1613,7 +1620,8 @@ class ConsolidateTests(unittest.TestCase):
                    f"---\n\nFiled {held[0]} to github.com/example/acme docs/backlog.md B7 "
                    "(PR #12).\n")
         commit_at(self.repo, "a handoff and its closing correction", iso_ago(0), held, closing)
-        audited = self.audited_stub(f"rm {held[0]} {closing[0]}\n")
+        audited = self.audited_stub(self.toolbelt("handoff", "--close", held[0])
+                                    + self.toolbelt("drain", closing[0]))
         result = self.consolidate()
         self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
         self.assertTrue(audited.exists())
@@ -3074,6 +3082,122 @@ class HandoffReadTests(unittest.TestCase):
                          [self.A])
 
 
+class HandoffCommandTests(unittest.TestCase):
+    """Review B1: the proposer may run only allowlisted commands, and it had none that
+    moves or deletes a file. `brain handoff`, `brain handoff --close` and `brain drain` are
+    the only ways a pass moves or removes a note, each bounded to its folder."""
+
+    NAME = "2026-10-15-120000-smoke.md"
+    CAPTURE = ("---\ncreated: 2026-10-15\ncaptured_at: 2026-10-15T12:00:00Z\nsource: local\n"
+               "kind: fact\nbasis: owner-said\nproject: acme\nstatus: draft\n---\n\n"
+               "Acme's staging smoke test still needs a re-run.\n")
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.addCleanup(cleanup_temp, self.tmp)
+        self.repo = make_sandbox(self.tmp.name)
+        self.inbox = self.repo / "knowledge" / "inbox"
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        self.src = self.inbox / self.NAME
+        self.src.write_bytes(self.CAPTURE.encode("utf-8"))
+        self.dest = self.repo / "knowledge" / "handoff" / "acme" / self.NAME
+        self.today = date.today().isoformat()
+
+    def brain(self, *args):
+        return run_brain(*args, repo=self.repo)
+
+    def test_handoff_moves_a_capture_byte_for_byte_and_adds_only_the_three_keys(self):
+        out = self.brain("handoff", f"knowledge/inbox/{self.NAME}", "acme", "pending work for acme")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(self.src.exists(), "the inbox file stayed")
+        expected = self.CAPTURE.replace(
+            "status: draft\n---\n",
+            f"status: draft\nhandoff_to: acme\nhandoff_at: {self.today}\n"
+            "handoff_reason: pending work for acme\n---\n")
+        self.assertEqual(self.dest.read_bytes(), expected.encode("utf-8"))
+        lint = self.brain("lint")
+        self.assertEqual(lint.returncode, 0, lint.stdout)
+
+    def test_handoff_refuses_what_is_not_a_local_inbox_capture(self):
+        ref = self.repo / "knowledge" / "reference" / "a-note.md"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text("---\nid: a-note\nkind: reference\ntitle: A\ntopics: [brain]\n"
+                       "aliases: [a]\ncreated: 2026-07-01\nstatus: current\n---\n\nA.\n",
+                       encoding="utf-8")
+        (self.inbox / "sub").mkdir()
+        (self.inbox / "sub" / "x.md").write_text(self.CAPTURE, encoding="utf-8")
+        os.symlink(self.NAME, self.inbox / "linked.md")
+        for name, source in (("bot.md", "support-bot"), ("mined.md", "session-mining"),
+                             ("unstamped.md", None)):
+            text = self.CAPTURE if source is None else self.CAPTURE.replace(
+                "source: local", f"source: {source}")
+            if source is None:
+                text = text.replace("source: local\n", "")
+            (self.inbox / name).write_text(text, encoding="utf-8")
+        (self.inbox / "again.md").write_text(self.CAPTURE.replace(
+            "status: draft", "status: draft\nhandoff_to: acme"), encoding="utf-8")
+        cases = {
+            "a canonical note": ("knowledge/reference/a-note.md", "acme", "r"),
+            "outside the inbox": ("knowledge/inbox/../reference/a-note.md", "acme", "r"),
+            "a nested path": ("knowledge/inbox/sub/x.md", "acme", "r"),
+            "a missing file": ("knowledge/inbox/nope.md", "acme", "r"),
+            "a symlink": ("knowledge/inbox/linked.md", "acme", "r"),
+            "a drop box's capture": ("knowledge/inbox/bot.md", "acme", "r"),
+            "a session-mining proposal": ("knowledge/inbox/mined.md", "acme", "r"),
+            "no source": ("knowledge/inbox/unstamped.md", "acme", "r"),
+            "already handed off once": ("knowledge/inbox/again.md", "acme", "r"),
+            "an upper-case slug": (f"knowledge/inbox/{self.NAME}", "Acme", "r"),
+            "a long slug": (f"knowledge/inbox/{self.NAME}", "a" * 64, "r"),
+            "a path as slug": (f"knowledge/inbox/{self.NAME}", "../acme", "r"),
+            "no reason": (f"knowledge/inbox/{self.NAME}", "acme", " "),
+            "two-line reason": (f"knowledge/inbox/{self.NAME}", "acme", "one\ntwo"),
+        }
+        for label, args in cases.items():
+            with self.subTest(label):
+                out = self.brain("handoff", *args)
+                self.assertNotEqual(out.returncode, 0, out.stdout)
+                self.assertTrue(self.src.exists())
+                self.assertFalse((self.repo / "knowledge" / "handoff").exists()
+                                 and any((self.repo / "knowledge" / "handoff").rglob("*.md")),
+                                 out.stdout)
+        self.dest.parent.mkdir(parents=True)
+        self.dest.write_text("older\n", encoding="utf-8")
+        out = self.brain("handoff", f"knowledge/inbox/{self.NAME}", "acme", "r")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(self.dest.read_text(encoding="utf-8"), "older\n")
+        self.assertTrue(self.src.exists())
+
+    def test_handoff_close_removes_one_handoff_note_and_nothing_else(self):
+        self.brain("handoff", f"knowledge/inbox/{self.NAME}", "acme", "pending work for acme")
+        other = self.inbox / "2026-10-16-000000-other.md"
+        other.write_text(self.CAPTURE, encoding="utf-8")
+        for arg in (f"knowledge/inbox/{other.name}", "knowledge/reference",
+                    "knowledge/handoff/acme/nope.md", "knowledge/handoff/acme"):
+            with self.subTest(arg):
+                out = self.brain("handoff", "--close", arg)
+                self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertTrue(other.exists())
+        out = self.brain("handoff", "--close", f"knowledge/handoff/acme/{self.NAME}")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(self.dest.exists())
+
+    def test_drain_removes_inbox_notes_and_refuses_anything_else_whole(self):
+        second = self.inbox / "2026-10-16-000000-second.md"
+        second.write_text(self.CAPTURE, encoding="utf-8")
+        ref = self.repo / "knowledge" / "reference" / "a-note.md"
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text("keep\n", encoding="utf-8")
+        out = self.brain("drain", f"knowledge/inbox/{self.NAME}", "knowledge/reference/a-note.md")
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertTrue(self.src.exists(), "a refused batch drained part of itself")
+        self.assertTrue(ref.exists())
+        out = self.brain("drain", f"knowledge/inbox/{self.NAME}", f"inbox/{second.name}")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(self.src.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(self.brain("drain").returncode, 2)
+
+
 class HandoffMcpTests(unittest.TestCase):
     """Both front ends offer `scope: handoff`, pass it through, and tell a client how a
     handoff note is closed."""
@@ -3469,6 +3593,16 @@ class RepoLockCoverageTests(unittest.TestCase):
             holder.close()
         out, _ = proc.communicate(timeout=120)
         self.assertTrue((self.repo / "knowledge/archive/reference/lock-seed.md").exists(), out)
+
+    def test_handoff_and_drain_take_the_lock(self):
+        inbox = self.repo / "knowledge" / "inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "a.md").write_text("---\ncreated: 2026-10-18\nsource: local\n"
+                                    "status: draft\n---\n\nA.\n", encoding="utf-8")
+        (inbox / "b.md").write_text("---\ncreated: 2026-10-18\nsource: local\n"
+                                    "status: draft\n---\n\nB.\n", encoding="utf-8")
+        self.assert_blocks_on_repo_lock("handoff", "knowledge/inbox/a.md", "acme", "reason")
+        self.assert_blocks_on_repo_lock("drain", "knowledge/inbox/b.md")
 
     def test_retract_takes_the_lock(self):
         (self.repo / "knowledge/reference/lock-seed.md").write_text(
@@ -6463,7 +6597,7 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         text = self.flat("consolidate-prompt.md")
         drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
         rule = drain[drain.index("HANDOFF —"):drain.index("PROVENANCE —")]
-        for phrase in ("not promoted", "already tracked", "delete it",
+        for phrase in ("not promoted", "already tracked", "drain it",
                        "knowledge/handoff/<project>/", "the same file name",
                        "`handoff_to: <project>`", "`handoff_at: <today>`",
                        "`handoff_reason: <one line>`",
@@ -6473,8 +6607,16 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
             self.assertIn(phrase, rule)
         corrections = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
         for phrase in ("`Filed <handoff path>`", "`Already recorded: <handoff path>`",
-                       "delete that handoff note"):
+                       "close that handoff note"):
             self.assertIn(phrase, corrections)
+
+    def test_the_pass_moves_and_deletes_only_through_the_toolbelt(self):
+        text = self.flat("consolidate-prompt.md")
+        for phrase in ("`bin/brain drain <inbox path>`",
+                       "`bin/brain handoff <inbox path> <project> \"<one line>\"`",
+                       "`bin/brain handoff --close <handoff path>`",
+                       "Nothing else moves or deletes a file"):
+            self.assertIn(phrase, text)
 
     def test_the_auditor_checks_handoff_moves(self):
         text = self.flat("audit-prompt.md")
@@ -6599,7 +6741,7 @@ class ConsolidatorConfigTests(unittest.TestCase):
         runner = self.module.load_consolidator()
         engine = str(self.module.ENGINE)
         tools = ["lint", "lint *", "search *", "read *", "links *", "recent *", "new *",
-                 "supersede *", "retract *", "index", "index *"]
+                 "supersede *", "retract *", "handoff *", "drain *", "index", "index *"]
         self.assertEqual(runner["propose"],
                          ["claude", "--model", "claude-opus-5-5", *JSON_ARGV,
                           "--permission-mode", "acceptEdits", *ISOLATED_ARGV,
@@ -6773,13 +6915,34 @@ class ConsolidatorConfigTests(unittest.TestCase):
         propose = self.module.load_consolidator()["propose"]
         self.assertEqual(propose[propose.index("--add-dir") + 1], str(engine))
         allowed = propose[propose.index("--allowedTools") + 1:propose.index("-p")]
-        for sub in ("lint", "search", "read", "links", "recent", "new", "supersede", "retract"):
+        for sub in ("lint", "search", "read", "links", "recent", "new", "supersede", "retract",
+                    "handoff", "drain"):
             self.assertTrue([a for a in allowed if a.startswith("Bash(%s/bin/brain %s" % (engine, sub))],
                             sub)
         self.assertFalse([a for a in allowed if "rg" in a.split("(")[1].split()[0]])
         for forbidden in ("capture", "serve", "setup", "init", "schedule", "publish", "consolidate"):
             self.assertFalse([a for a in allowed if ("bin/brain %s" % forbidden) in a], forbidden)
         self.assertEqual(propose[-1], "-p")
+
+    def test_the_repos_own_settings_allow_the_same_toolbelt_as_the_proposer(self):
+        """Review B1: the toolbelt commands a pass may run, kept in step in all three places
+        — the shipped conf, the built-in defaults and the repo's own .claude/settings.json."""
+        def toolbelt(rules):
+            return sorted(r.split("bin/brain ", 1)[1].rstrip(")") for r in rules
+                          if "bin/brain " in r and not r.startswith("Bash(python3"))
+        engine = "{engine}"
+        line = self.module.CONSOLIDATOR_DEFAULTS["propose"]
+        defaults = toolbelt(re.findall(r'"(Bash\([^"]+\))"', line))
+        shipped = toolbelt(re.findall(r'"(Bash\([^"]+\))"',
+                                      (ROOT / "setup" / "consolidator.conf").read_text(
+                                          encoding="utf-8")))
+        settings = toolbelt(json.loads((ROOT / ".claude" / "settings.json").read_text(
+            encoding="utf-8"))["permissions"]["allow"])
+        self.assertEqual(defaults, shipped)
+        self.assertEqual(defaults, settings)
+        for command in ("handoff *", "drain *", "retract *"):
+            self.assertIn(command, defaults)
+        self.assertIn(engine, line)
 
     def test_an_auditor_that_is_not_the_claude_cli_is_refused(self):
         """The confinement flags are facts about the Claude CLI; carried by another

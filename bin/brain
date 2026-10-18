@@ -24,8 +24,13 @@ Commands:
   brain read <id-or-path>          full note with supersede chain resolved
   brain links <id-or-path> [--json]  wikilink graph: what links here, what it links to
   brain supersede <old-id> "<new title>"   full supersede choreography in one shot
-  brain retract <id> "<one-line reason>"   archive a note that should not exist:
-                                   status retracted, no successor
+  brain retract <id-or-path> "<one-line reason>"   archive a note that should not
+                                   exist: status retracted, no successor
+  brain handoff <inbox-path> <project> "<one-line reason>"   move a local capture to
+                                   knowledge/handoff/<project>/, byte for byte, adding
+                                   handoff_to, handoff_at and handoff_reason
+  brain handoff --close <handoff-path>   remove one handoff note once it is filed
+  brain drain <inbox-path>...      remove inbox notes (and nothing outside the inbox)
   brain recent [--days N]          recently touched notes
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
@@ -4166,6 +4171,152 @@ def cmd_retract(argv: list) -> int:
     return 0
 
 
+def named_note_file(arg: str, folder: str, depth: int):
+    """(path, None) for the note `arg` names directly under knowledge/<folder>/ at
+    `depth` path parts (inbox/<name>.md is 2, handoff/<project>/<name>.md is 3), or
+    (None, why not). Never a symlink, never outside the real folder: these are the only
+    paths the move and delete commands touch."""
+    rel = Path(arg)
+    if rel.is_absolute():
+        try:
+            rel = rel.relative_to(ROOT)
+        except ValueError:
+            return None, "outside this brain"
+    parts = rel.parts[1:] if rel.parts[:1] == ("knowledge",) else rel.parts
+    if not parts or parts[0] != folder or ".." in parts or len(parts) != depth \
+            or not parts[-1].endswith(".md"):
+        return None, f"not a note in knowledge/{folder}/"
+    root = K / folder
+    path = K.joinpath(*parts)
+    try:
+        if root.is_symlink() or any(K.joinpath(*parts[:i]).is_symlink()
+                                    for i in range(2, len(parts) + 1)):
+            return None, "a symlink — refused"
+        if not path.is_file():
+            return None, "no such note"
+        if path.resolve(strict=True).parent != root.resolve(strict=True).joinpath(
+                *parts[1:-1]):
+            return None, f"resolves outside knowledge/{folder}/"
+    except OSError as exc:
+        return None, f"unreadable ({exc.strerror or exc})"
+    return path, None
+
+
+def add_frontmatter_lines(raw: bytes, lines: list) -> bytes:
+    """`raw` with `lines` appended at the end of its frontmatter, every other byte kept.
+    Raises ValueError when there is no frontmatter block."""
+    rows = raw.split(b"\n")
+    first = rows[0].lstrip(b"\xef\xbb\xbf").rstrip(b"\r")
+    if first != b"---":
+        raise ValueError("no frontmatter")
+    end = next((i for i in range(1, len(rows)) if rows[i].rstrip(b"\r") == b"---"), None)
+    if end is None:
+        raise ValueError("no closing frontmatter line")
+    eol = b"\r" if rows[0].endswith(b"\r") else b""
+    added = [line.encode("utf-8") + eol for line in lines]
+    return b"\n".join(rows[:end] + added + rows[end:])
+
+
+def cmd_handoff(argv: list) -> int:
+    """Move one capture that belongs in a project's own records to
+    knowledge/handoff/<project>/, or remove one that has been filed.
+
+    The pass may run only allowlisted commands, so this is how a handoff happens at all,
+    and it is bounded on purpose: only a capture from an owner endpoint, only out of the
+    inbox, under its own file name, every byte kept, with exactly the three keys added. The
+    mechanical check before the audit holds the pass to the same."""
+    usage = ('usage: brain handoff <inbox-path> <project> "<one-line reason>"\n'
+             '       brain handoff --close <handoff-path>')
+    if argv[:1] == ["--close"]:
+        if len(argv) != 2 or argv[1].startswith("--"):
+            print(usage)
+            return 2
+        with repo_lock():
+            path, problem = named_note_file(argv[1], "handoff", 3)
+            if problem is None and not HANDOFF_SLUG_RE.match(path.parent.name):
+                problem = "its folder is not a project slug"
+            if problem:
+                print(f"{argv[1]!r}: {problem} — nothing was closed")
+                return 1
+            path.unlink()
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+        print(f"closed: {path.relative_to(ROOT)}")
+        return 0
+    if any(a.startswith("--") for a in argv) or len(argv) != 3:
+        print(usage)
+        return 2
+    source_arg, project, reason = argv[0], argv[1], argv[2].strip()
+    if not HANDOFF_SLUG_RE.match(project):
+        print(f"{project!r} is not a project slug (lowercase letters, digits and hyphens, "
+              "1-63) — nothing was moved")
+        return 2
+    if not reason or any(ord(c) < 32 for c in reason) or reason.startswith("["):
+        print(usage + " — the reason is required, on one line")
+        return 2
+    with repo_lock():
+        src, problem = named_note_file(source_arg, "inbox", 2)
+        if problem:
+            print(f"{source_arg!r}: {problem} — only an inbox capture is handed off")
+            return 1
+        raw = src.read_bytes()
+        fm, _err = parse_frontmatter(raw.decode("utf-8-sig", "replace"))
+        if not fm:
+            print(f"{source_arg!r} has no frontmatter — nothing was moved")
+            return 1
+        if fm.get("source") != DEFAULT_SOURCE:
+            print(f"{source_arg!r} came from {fm.get('source')!r}, not an owner endpoint "
+                  "(source: local): it is a proposal, never handed off — nothing was moved")
+            return 1
+        if any(key in fm for key in HANDOFF_KEYS):
+            print(f"{source_arg!r} already carries handoff keys — nothing was moved")
+            return 1
+        handoff_root = K / "handoff"
+        dest = handoff_root / project / src.name
+        if handoff_root.is_symlink() or (handoff_root / project).is_symlink():
+            print("knowledge/handoff/ or its project folder is a symlink — refused")
+            return 1
+        if dest.exists() or dest.is_symlink():
+            print(f"{dest.relative_to(ROOT)} already exists — nothing was moved")
+            return 1
+        try:
+            moved = add_frontmatter_lines(raw, [f"handoff_to: {project}",
+                                                f"handoff_at: {date.today().isoformat()}",
+                                                f"handoff_reason: {reason}"])
+        except ValueError as exc:
+            print(f"{source_arg!r}: {exc} — nothing was moved")
+            return 1
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(moved)
+        src.unlink()
+    print(f"handed off: {dest.relative_to(ROOT)} (from {src.relative_to(ROOT)})")
+    return 0
+
+
+def cmd_drain(argv: list) -> int:
+    """Remove inbox notes, and only inbox notes: the one way a pass deletes a capture.
+    Every path is checked before anything is removed, so a batch with one bad path
+    removes nothing."""
+    if not argv or any(a.startswith("--") for a in argv):
+        print("usage: brain drain <inbox-path>...")
+        return 2
+    with repo_lock():
+        paths = []
+        for arg in argv:
+            path, problem = named_note_file(arg, "inbox", 2)
+            if problem:
+                print(f"{arg!r}: {problem} — nothing was drained")
+                return 1
+            if path not in paths:
+                paths.append(path)
+        for path in paths:
+            path.unlink()
+    print(f"drained {len(paths)}: " + ", ".join(str(p.relative_to(ROOT)) for p in paths))
+    return 0
+
+
 TRANSCRIPT_ROOT = Path.home() / ".claude" / "projects"
 
 # Wrapper turns the CLI injects into the transcript as if they were typed.
@@ -4714,7 +4865,7 @@ CONSOLIDATOR_DEFAULTS = {
     "propose": ("claude --model {model} --output-format json --permission-mode acceptEdits "
                 "--strict-mcp-config "
                 "--mcp-config '{\"mcpServers\":{}}' --add-dir {engine} --allowedTools "
-                '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain retract *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
+                '"Bash({engine}/bin/brain lint)" "Bash({engine}/bin/brain lint *)" "Bash({engine}/bin/brain search *)" "Bash({engine}/bin/brain read *)" "Bash({engine}/bin/brain links *)" "Bash({engine}/bin/brain recent *)" "Bash({engine}/bin/brain new *)" "Bash({engine}/bin/brain supersede *)" "Bash({engine}/bin/brain retract *)" "Bash({engine}/bin/brain handoff *)" "Bash({engine}/bin/brain drain *)" "Bash({engine}/bin/brain index)" "Bash({engine}/bin/brain index *)" "Bash(git status *)" "Bash(git diff *)" "Bash(git log *)" "Bash(git rev-parse *)" -p'),
     "audit": ("claude --model {model} --output-format json -p --safe-mode --restricted "
               "--strict-mcp-config "
               "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
@@ -8101,6 +8252,10 @@ def main() -> int:
         return cmd_supersede(rest)
     if cmd == "retract":
         return cmd_retract(rest)
+    if cmd == "handoff":
+        return cmd_handoff(rest)
+    if cmd == "drain":
+        return cmd_drain(rest)
     if cmd == "sessions":
         return cmd_sessions(rest)
     if cmd == "consolidate":

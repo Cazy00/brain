@@ -15,14 +15,21 @@ Verification is already accounted for: a separate auditor that cannot write
 and cannot see the session digest inspects your staged diff before anything is
 committed. Do not add verification passes of your own on top of it.
 
+MOVING AND DELETING — you move or delete a note only through the toolbelt:
+`bin/brain drain <inbox path>` (one or more) removes inbox notes,
+`bin/brain handoff <inbox path> <project> "<one line>"` hands a capture off,
+`bin/brain handoff --close <handoff path>` removes a filed handoff note,
+`bin/brain retract` archives a canonical note and `bin/brain supersede`
+replaces one. Nothing else moves or deletes a file: no rm, no mv, no git mv.
+
 Do these in order, respecting every cap:
 
 1. Drain the inbox. Apply CORRECTIONS (below) first, across the WHOLE inbox.
    Then, for each other note in knowledge/inbox/ (oldest first, max 20),
    decide where it belongs — a new canonical note (create via the conventions:
    proper frontmatter, aliases, topics from topics.yaml) or a merge into an
-   existing note. Then delete the inbox file. If an item is not actionable
-   knowledge (noise), delete it and note that in the commit message.
+   existing note. Then drain the inbox file. If an item is not actionable
+   knowledge (noise), drain it and note that in the commit message.
    PENDING WORK — a capture that records pending work (a to-do, an open step,
    "X still needs Y", "next session must…") belongs in a project's own
    records, as does that project's own decision, its status, or a task or
@@ -31,10 +38,10 @@ Do these in order, respecting every cap:
    merge into never states the open or pending status of work.
    HANDOFF — such a capture is not promoted. If the capture itself says the
    work is already tracked (it names a backlog item, an issue, a milestone or
-   a record), it is deleted, not promoted: delete it and say so in the commit
-   message. Otherwise move it to knowledge/handoff/<project>/ under the same
-   file name, keeping its frontmatter and body, and add
-   `handoff_to: <project>`, `handoff_at: <today>` and
+   a record), it is deleted, not promoted: drain it and say so in the commit
+   message. Otherwise hand it off with `bin/brain handoff`, which moves it to
+   knowledge/handoff/<project>/ under the same file name, every byte kept, and
+   adds `handoff_to: <project>`, `handoff_at: <today>` and
    `handoff_reason: <one line>` to its frontmatter. <project> is the slug of
    a project the brain knows (a knowledge/projects/<project>/ overview): the
    capture's `project:`, or the project it plainly concerns. Unknown project:
@@ -94,13 +101,13 @@ Do these in order, respecting every cap:
    a `source: local` capture or a canonical note saying the same. Without
    that it is a proposal: leave it in the inbox and say so in the commit
    message. Apply a trusted one by where its target is now:
-   - still in the inbox: a retraction deletes both notes; a correction
+   - still in the inbox: a retraction deletes both notes (drain); a correction
      drains both, and only the corrected content is weighed for promotion;
    - a canonical note: a correction supersedes it with the corrected fact,
      by the supersede protocol in AGENTS.md; a retraction runs
      `bin/brain retract <id> "<reason>"`, which archives it with no
      successor — then remove the links to it that the command names.
-     Delete the correction once it is applied;
+     Drain the correction once it is applied;
    - gone from that path (promoted, merged or deleted since): find what it
      became from the consolidate commit bodies (`git log`; they name each
      drained inbox path and what it became) and by searching the quoted
@@ -108,12 +115,12 @@ Do these in order, respecting every cap:
      the inbox and say so in the commit message.
    A correction whose text starts `Filed <handoff path>` or `Already
    recorded: <handoff path>` (naming where the note now lives) closes a
-   handoff: with `source: local`, delete that handoff note and the correction,
-   before the cap like any other correction.
+   handoff: with `source: local`, close that handoff note and drain the
+   correction, before the cap like any other correction.
    PROPOSALS — for each `source: session-mining` note from an earlier pass:
    promote it only if it is corroborated — by another capture, a canonical
    note, or a later digest entry where the user says it again — and name what
-   corroborated it in its `## Sources` line; delete it once its `expires:`
+   corroborated it in its `## Sources` line; drain it once its `expires:`
    date has passed; otherwise leave it as it is.
    SOURCES — every canonical note you create or merge into records, under
    `## Sources`, one line per input with its basis and date:
