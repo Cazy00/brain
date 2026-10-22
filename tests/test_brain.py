@@ -6595,7 +6595,7 @@ class ConsolidationAuditTests(unittest.TestCase):
         self.module.K = self.repo / "knowledge"
         self.module.INDEX_DB = self.repo / ".cache" / "index.db"
         self.runner = self.module.load_consolidator()
-        self.calls = []
+        self.calls, self.inputs = [], []
 
     def tearDown(self):
         cleanup_temp(self.tmp)
@@ -6614,6 +6614,7 @@ class ConsolidationAuditTests(unittest.TestCase):
         def runner(cmd, *a, **kw):
             if cmd and cmd[0] == "claude":
                 test.calls.append(cmd)
+                test.inputs.append(kw.get("input"))
                 if record_digest:
                     test.digest_visible_during_audit = test.module.digest_path().exists()
                 return subprocess.CompletedProcess(cmd, returncode, stdout, "")
@@ -6765,21 +6766,49 @@ class ConsolidationAuditTests(unittest.TestCase):
         self.assertNotIn("push", calls,
                          "post-commit tried to push from a consolidate branch:\n" + calls)
 
-    def test_the_auditor_reads_nothing_from_stdin(self):
+    def test_the_auditor_reads_only_its_prompt_from_stdin(self):
         """`claude -p` reads stdin: inherited, it read whatever the caller held there (seen in a
-        by-hand run, 2026-10-15). Model runs get /dev/null."""
+        by-hand run, 2026-10-15). The auditor's stdin is a pipe carrying its prompt and nothing
+        else; argv carries no prompt (2026-10-22: a diff past 128 KiB could not be passed as
+        one argument, "Argument list too long", and the pass could not be audited)."""
         self.stage_a_change()
         seen = {}
         real_run = subprocess.run
 
         def runner(cmd, *a, **kw):
             if cmd and cmd[0] == "claude":
-                seen["stdin"] = kw.get("stdin")
+                seen.update(cmd=cmd, stdin=kw.get("stdin"), input=kw.get("input"),
+                            encoding=kw.get("encoding"))
                 return subprocess.CompletedProcess(cmd, 0, "VERDICT: PASS", "")
             return real_run(cmd, *a, **kw)
         self.module.subprocess.run = runner
         self.module.audit_changes(self.runner)
-        self.assertIs(seen["stdin"], subprocess.DEVNULL)
+        self.assertIsNone(seen["stdin"])          # input= makes the pipe; nothing is inherited
+        self.assertIn("audit-fixture.md", seen["input"])
+        self.assertEqual(seen["cmd"], list(self.runner["audit"]))
+        # UTF-8 whatever the locale: under a C locale the default would be ASCII, and the
+        # first non-ASCII note would stop the audit (review of #12).
+        self.assertEqual(seen["encoding"], "utf-8")
+
+    def test_a_diff_larger_than_one_argument_is_still_audited(self):
+        """The real spawn, with a stand-in `claude` that reports what reached it: a staged diff
+        of 300 KiB (past Linux's 128 KiB per argument, inside the 200,000-character cap's
+        truncation) is audited, not refused by the kernel."""
+        (self.repo / "knowledge" / "inbox" / "big.md").write_text(
+            "---\ncreated: 2026-10-22\nstatus: draft\n---\n\nمتين — café\n"
+            + ("a long line of text\n" * 15000), encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
+        stub = Path(self.tmp.name) / "claude"
+        # It answers only when more than one argument's worth (128 KiB) reached its stdin.
+        stub.write_text("#!/bin/sh\nn=$(wc -c)\n[ \"$n\" -gt 131072 ] || exit 3\n"
+                        "echo \"read $n bytes from stdin\"\necho \"VERDICT: PASS\"\n",
+                        encoding="utf-8")
+        stub.chmod(0o755)
+        # The stub by its absolute path, so neither PATH nor a stand-in another test left on
+        # subprocess.run (which intercepts the name `claude`) decides what runs.
+        runner = dict(self.runner, audit=[str(stub), *self.runner["audit"][1:]])
+        verdict, detail = self.module.audit_changes(runner)
+        self.assertEqual(verdict, "pass", detail)
 
     def test_auditor_gets_no_write_permission(self):
         """The proposer runs with --permission-mode acceptEdits. If the auditor
@@ -6797,7 +6826,7 @@ class ConsolidationAuditTests(unittest.TestCase):
         self.stage_a_change()
         self.module.subprocess.run = self.fake_claude("VERDICT: PASS")
         self.module.audit_changes(self.runner)
-        prompt = self.calls[0][-1]
+        prompt = self.inputs[0]
         self.assertIn("audit-fixture.md", prompt, "the staged diff was not in the prompt")
         self.assertIn("A staged change.", prompt)
 
