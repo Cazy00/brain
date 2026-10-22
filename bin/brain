@@ -5422,10 +5422,14 @@ def audit_changes(runner: dict, timeout: int = None, usage: dict = None) -> tupl
             hidden = Path(stash_dir) / "session-digest.md"
             shutil.move(str(digest), str(hidden))
         try:
+            # The prompt goes on stdin, never in argv: Linux caps one argument at 128 KiB
+            # (MAX_ARG_STRLEN), and a pass near its caps stages a larger diff than that, which
+            # then could not be audited at all (2026-10-22, a 40-note pass: "Argument list
+            # too long"). `claude -p` reads its prompt from stdin when argv has none; the
+            # pipe carries the prompt and nothing the caller holds.
             run = subprocess.run(
-                [*runner["audit"], prompt],
+                list(runner["audit"]), input=prompt,
                 cwd=str(snap), text=True, capture_output=True, timeout=timeout,
-                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             return "error", f"auditor timed out after {timeout}s"
