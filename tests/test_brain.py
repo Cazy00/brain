@@ -6794,18 +6794,14 @@ class ConsolidationAuditTests(unittest.TestCase):
             "---\ncreated: 2026-10-22\nstatus: draft\n---\n\n" + ("a long line of text\n" * 15000),
             encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
-        bindir = Path(self.tmp.name) / "fakebin"
-        bindir.mkdir(exist_ok=True)
-        (bindir / "claude").write_text(
-            "#!/bin/sh\nn=$(wc -c)\necho \"read $n bytes from stdin\"\necho \"VERDICT: PASS\"\n",
-            encoding="utf-8")
-        (bindir / "claude").chmod(0o755)
-        old_path = os.environ["PATH"]
-        os.environ["PATH"] = f"{bindir}:{old_path}"
-        try:
-            verdict, detail = self.module.audit_changes(self.runner)
-        finally:
-            os.environ["PATH"] = old_path
+        stub = Path(self.tmp.name) / "claude"
+        stub.write_text("#!/bin/sh\nn=$(wc -c)\necho \"read $n bytes from stdin\"\n"
+                        "echo \"VERDICT: PASS\"\n", encoding="utf-8")
+        stub.chmod(0o755)
+        # The stub by its absolute path, so neither PATH nor a stand-in another test left on
+        # subprocess.run (which intercepts the name `claude`) decides what runs.
+        runner = dict(self.runner, audit=[str(stub), *self.runner["audit"][1:]])
+        verdict, detail = self.module.audit_changes(runner)
         self.assertEqual(verdict, "pass", detail)
 
     def test_auditor_gets_no_write_permission(self):
