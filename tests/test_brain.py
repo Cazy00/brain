@@ -7015,14 +7015,15 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
 
     def test_the_drain_applies_corrections_first_across_the_whole_inbox(self):
         """An original promoted in the same pass as its own correction, because the
-        correction sat beyond the 20-item cap, would be served as settled. Corrections are
+        correction sat beyond the 40-item cap, would be served as settled. Corrections are
         read from the whole inbox and applied first, by where their target is now."""
         text = self.flat("consolidate-prompt.md")
         drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
         self.assertIn("Apply CORRECTIONS (below) first, across the WHOLE inbox", drain)
         rule = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
-        for phrase in ("the WHOLE inbox", "not only the oldest 20", "beyond the cap",
-                       "do not count toward the 20",
+        for phrase in ("the WHOLE inbox", "not only the oldest 40", "beyond the cap",
+                       "do not count toward the 40",
+                       "the canonical files they change count toward the 30",
                        # the target is still in the inbox
                        "still in the inbox", "a retraction deletes both notes",
                        "only the corrected content",
@@ -7079,12 +7080,42 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
                        "`handoff_reason: <one line>`",
                        "a decision or lesson inside it", "Unknown project",
                        "leave it in the inbox and say so in the commit message",
-                       "do not count toward the 20", "never promote"):
+                       "do not count toward the 40", "never promote"):
             self.assertIn(phrase, rule)
         corrections = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
         for phrase in ("`Filed <handoff path>`", "`Already recorded: <handoff path>`",
                        "close that handoff note"):
             self.assertIn(phrase, corrections)
+
+    def test_the_caps_are_40_notes_and_30_canonical_files_for_both_sides(self):
+        """Owner, 2026-10-22: 40 notes a pass. Measured 2026-10-21: the 15-file cap, not the
+        20-note cap, stopped the pass (18 notes), so the file cap doubles with it; the auditor
+        blocks on the same number, so it moves too."""
+        text = self.flat("consolidate-prompt.md")
+        caps = text[text.index("Hard caps"):text.index("Finish:")]
+        for phrase in ("at most 30 canonical files", "more than 40 items", "the oldest 40"):
+            self.assertIn(phrase, caps)
+        self.assertIn("(oldest first, max 40)", text)
+        for stale in ("max 20", "toward the 20", "oldest 20", "toward the 15", "at most 15"):
+            self.assertNotIn(stale, text)
+        audit = self.flat("audit-prompt.md")
+        self.assertIn("more than 30 modified canonical files", audit)
+        self.assertNotIn("more than 15", audit)
+
+    def test_the_drain_promotes_project_overviews_before_handing_off(self):
+        """2026-10-17 to 2026-10-21: seven project overviews and every project's own capture
+        sat in the inbox, because HANDOFF names only a project the brain knows and nothing said
+        to make one. Overviews are promoted first, into the folder HANDOFF and the filer look
+        for."""
+        text = self.flat("consolidate-prompt.md")
+        drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
+        self.assertLess(drain.index("Then promote PROJECT OVERVIEWS"), drain.index("max 40"))
+        rule = drain[drain.index("PROJECT OVERVIEWS —"):drain.index("PROVENANCE —")]
+        for phrase in ("ONE overview per project", "knowledge/projects/<project>/overview.md",
+                       "never its status", "exactly the slug",
+                       "`bin/brain new project \"<project>\" --topics <a,b>`", "merge into its overview.md",
+                       "PROVENANCE", "do not count toward the 40", "count toward the 30"):
+            self.assertIn(phrase, rule)
 
     def test_only_the_owners_own_correction_retracts(self):
         """Review B4: corroboration lets an untrusted correction supersede or promote, never

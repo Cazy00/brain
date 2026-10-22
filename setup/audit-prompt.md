@@ -31,7 +31,7 @@ routes to, and the links and `supersedes:` fields of the changed notes — then
 Read them. A second current note asserting the opposite of an existing one is
 a block — the brain would then serve both as true.
 
-Also block if the change set plainly violates the pass's own caps (more than 15
+Also block if the change set plainly violates the pass's own caps (more than 30
 modified canonical files, or more than 3 new inbox proposals), or if a note was
 moved into archive/ without a successor carrying its knowledge forward — except
 a retraction (`status: retracted`), which has none by design and is checked
