@@ -25,7 +25,9 @@ replaces one. Nothing else moves or deletes a file: no rm, no mv, no git mv.
 Do these in order, respecting every cap:
 
 1. Drain the inbox. Apply CORRECTIONS (below) first, across the WHOLE inbox.
-   Then, for each other note in knowledge/inbox/ (oldest first, max 20),
+   Then promote PROJECT OVERVIEWS (below), so the handoffs that follow can
+   name the projects they create.
+   Then, for each other note in knowledge/inbox/ (oldest first, max 40),
    decide where it belongs — a new canonical note (create via the conventions:
    proper frontmatter, aliases, topics from topics.yaml) or a merge into an
    existing note. Then drain the inbox file. If an item is not actionable
@@ -46,12 +48,25 @@ Do these in order, respecting every cap:
    a project the brain knows (a knowledge/projects/<project>/ overview): the
    capture's `project:`, or the project it plainly concerns. Unknown project:
    leave it in the inbox and say so in the commit message. Handoffs do not
-   count toward the 20, and a decision or lesson inside it that outlives the
+   count toward the 40, and a decision or lesson inside it that outlives the
    project is still promoted as its own note. You never promote, merge or edit
    a note in knowledge/handoff/: a filing job files it in the project's
    records and closes it with a correction (CORRECTIONS).
+   PROJECT OVERVIEWS — the brain keeps ONE overview per project, in
+   knowledge/projects/<project>/overview.md: what it is, who it is for, the
+   decisions that shaped it and why, where it lives (repository first) and who
+   can reach it, never its status. <project> is the project's slug (the
+   capture's `project:`, lowercase letters, digits and hyphens): HANDOFF and
+   the filing job find a project by that folder name, so it must be exactly
+   the slug. A capture that is a project's overview (it says so, or it
+   describes the project as a whole) is promoted there: when the folder does
+   not exist, create the note with `bin/brain new project "<project>"
+   --topics <a,b>` (topics from topics.yaml), then give it a readable title
+   and the overview's content; when it exists, merge into its overview.md.
+   Weigh it by PROVENANCE like any capture. Overviews do not count toward the
+   40; the files they create or change count toward the 30.
    Proposals an earlier pass wrote (`source: session-mining`) follow PROPOSALS
-   below and do not count toward the 20.
+   below and do not count toward the 40.
    PROVENANCE — every capture carries `source:`, stamped by the endpoint that
    accepted it, and you must read it before you weigh the note.
    - `local` is an owner endpoint: the owner, or an agent working for them.
@@ -85,10 +100,10 @@ Do these in order, respecting every cap:
      with a recent `created:` did not come from `brain capture` and is
      untrusted too.
    CORRECTIONS — before any other note, read the WHOLE inbox, not only the
-   oldest 20, for `kind: correction` notes, and apply each one to its target
+   oldest 40, for `kind: correction` notes, and apply each one to its target
    first, so an original is never promoted in a pass whose correction lies
-   beyond the cap. Corrections do not count toward the 20; the canonical
-   files they change count toward the 15. A correction names its target by
+   beyond the cap. Corrections do not count toward the 40; the canonical
+   files they change count toward the 30. A correction names its target by
    id (a canonical note) or by path (an inbox note, which has no id) and
    quotes the wrong line: "Correction to <target>: <what is true now>" fixes
    it, "Retract <target>: <reason>" says it should not be in the brain.
@@ -178,10 +193,10 @@ Do these in order, respecting every cap:
    properly rather than optimistically — a block costs the entire run.
 6. Enrich: add missing aliases to any note you touched.
 
-Hard caps: modify at most 15 canonical files total, plus at most 3 new inbox
-proposals from step 3. If the inbox has more than 20 items (proposals from
-earlier passes, handoffs and corrections not counted), process the oldest 20
-and stop —
+Hard caps: modify at most 30 canonical files total, plus at most 3 new inbox
+proposals from step 3. If the inbox has more than 40 items (proposals from
+earlier passes, project overviews, handoffs and corrections not counted),
+process the oldest 40 and stop —
 the rest wait for the next pass.
 
 Finish: run bin/brain lint and fix every error until it exits clean. Commit

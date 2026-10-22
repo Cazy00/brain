@@ -406,7 +406,7 @@ What a pass does with it, and what it reports:
   `consolidate --digest-from DIR` adds the digest.v1 files in DIR and one
   level below it to this account's own transcripts.
 - **Corrections first.** The pass reads the WHOLE inbox for `kind: correction`
-  notes and applies them before draining the oldest 20 (they do not count
+  notes and applies them before draining the oldest 40 (they do not count
   toward that cap), so an original is never promoted while its correction
   waits. A correction to a canonical note supersedes it, a retraction archives
   it with `brain retract`, and one to an inbox note drains both. Each
