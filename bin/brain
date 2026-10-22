@@ -5268,8 +5268,9 @@ def staged_diff_vs_main() -> tuple:
         return "", f"no trunk branch to diff against (looked for {trunk!r})"
     if git("rev-parse", "--abbrev-ref", "HEAD") == trunk:
         return "", f"refusing to audit {trunk!r} against itself"
+    # UTF-8 whatever the locale, like the auditor's prompt: notes are UTF-8.
     result = subprocess.run(["git", "diff", "--cached", trunk], cwd=ROOT,
-                            capture_output=True, text=True)
+                            capture_output=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         return "", ((result.stderr or "").strip()[-200:] or "git diff failed")
     return result.stdout, None
@@ -5426,10 +5427,12 @@ def audit_changes(runner: dict, timeout: int = None, usage: dict = None) -> tupl
             # (MAX_ARG_STRLEN), and a pass near its caps stages a larger diff than that, which
             # then could not be audited at all (2026-10-22, a 40-note pass: "Argument list
             # too long"). `claude -p` reads its prompt from stdin when argv has none; the
-            # pipe carries the prompt and nothing the caller holds.
+            # pipe carries the prompt and nothing the caller holds. UTF-8 whatever the locale:
+            # notes are UTF-8, and a C locale's ASCII would refuse the first non-ASCII line
+            # (an argv element was encoded with the filesystem encoding, UTF-8 on Linux).
             run = subprocess.run(
-                list(runner["audit"]), input=prompt,
-                cwd=str(snap), text=True, capture_output=True, timeout=timeout,
+                list(runner["audit"]), input=prompt, encoding="utf-8", errors="replace",
+                cwd=str(snap), capture_output=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             return "error", f"auditor timed out after {timeout}s"

@@ -6777,7 +6777,8 @@ class ConsolidationAuditTests(unittest.TestCase):
 
         def runner(cmd, *a, **kw):
             if cmd and cmd[0] == "claude":
-                seen.update(cmd=cmd, stdin=kw.get("stdin"), input=kw.get("input"))
+                seen.update(cmd=cmd, stdin=kw.get("stdin"), input=kw.get("input"),
+                            encoding=kw.get("encoding"))
                 return subprocess.CompletedProcess(cmd, 0, "VERDICT: PASS", "")
             return real_run(cmd, *a, **kw)
         self.module.subprocess.run = runner
@@ -6785,18 +6786,23 @@ class ConsolidationAuditTests(unittest.TestCase):
         self.assertIsNone(seen["stdin"])          # input= makes the pipe; nothing is inherited
         self.assertIn("audit-fixture.md", seen["input"])
         self.assertEqual(seen["cmd"], list(self.runner["audit"]))
+        # UTF-8 whatever the locale: under a C locale the default would be ASCII, and the
+        # first non-ASCII note would stop the audit (review of #12).
+        self.assertEqual(seen["encoding"], "utf-8")
 
     def test_a_diff_larger_than_one_argument_is_still_audited(self):
         """The real spawn, with a stand-in `claude` that reports what reached it: a staged diff
         of 300 KiB (past Linux's 128 KiB per argument, inside the 200,000-character cap's
         truncation) is audited, not refused by the kernel."""
         (self.repo / "knowledge" / "inbox" / "big.md").write_text(
-            "---\ncreated: 2026-10-22\nstatus: draft\n---\n\n" + ("a long line of text\n" * 15000),
-            encoding="utf-8")
+            "---\ncreated: 2026-10-22\nstatus: draft\n---\n\nمتين — café\n"
+            + ("a long line of text\n" * 15000), encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
         stub = Path(self.tmp.name) / "claude"
-        stub.write_text("#!/bin/sh\nn=$(wc -c)\necho \"read $n bytes from stdin\"\n"
-                        "echo \"VERDICT: PASS\"\n", encoding="utf-8")
+        # It answers only when more than one argument's worth (128 KiB) reached its stdin.
+        stub.write_text("#!/bin/sh\nn=$(wc -c)\n[ \"$n\" -gt 131072 ] || exit 3\n"
+                        "echo \"read $n bytes from stdin\"\necho \"VERDICT: PASS\"\n",
+                        encoding="utf-8")
         stub.chmod(0o755)
         # The stub by its absolute path, so neither PATH nor a stand-in another test left on
         # subprocess.run (which intercepts the name `claude`) decides what runs.
