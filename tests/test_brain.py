@@ -7180,11 +7180,14 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         audit = self.flat("audit-prompt.md")
         rule = audit[audit.index("**HANDOFF.**"):audit.index("## What you must NOT do")]
         for phrase in ("wholesale", "its project's own records", "status, pending work",
+                       "anywhere but that project's own overview",
                        "a decision or lesson that outlives the project",
-                       "`## Sources` names the capture",
+                       "a `## Sources` line for that capture in one of the forms given under "
+                       "PROVENANCE",
                        "knowledge/projects/<project>/overview.md",
                        "the decisions that shaped it", "never its status",
-                       "STATUS still applies"):
+                       "They pass HANDOFF; SAFETY, CONFLICT, PROVENANCE and STATUS apply to them "
+                       "as to any other change"):
             self.assertIn(phrase, rule)
         drain = self.flat("consolidate-prompt.md")
         self.assertIn("a decision or lesson inside it that outlives the project is still "
