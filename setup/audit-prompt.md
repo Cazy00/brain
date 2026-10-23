@@ -92,11 +92,23 @@ note asserts, not on whether it was worth writing.
 knowledge/handoff/<project>/, never promoted. Block if a note the change set
 adds there lacks `handoff_to` (the same as its folder, a valid slug: lowercase
 letters, digits and hyphens, 1-63), `handoff_at` or `handoff_reason`; if the
-change set promotes, or merges into a canonical note, the content of a note in
-knowledge/handoff/; or if it deletes a handoff note with no closing correction
-removed alongside it (`source: local`, its text starting `Filed <path>` or
-`Already recorded: <path>`). The engine checks the keys and the deletions
-before you; you check that no handoff content reached a canonical note.
+change set promotes a handoff note's content wholesale, or merges into a
+canonical note its project's own records (the project's status, pending work,
+tasks, milestones, or a decision that matters only inside that project,
+anywhere but that project's own overview); or if it deletes a handoff note
+with no closing correction removed alongside it (`source: local`, its text
+starting `Filed <path>` or `Already recorded: <path>`). Two things may come
+from a capture the same pass hands off, because the consolidation rules ask
+for them. They pass HANDOFF; SAFETY, CONFLICT, PROVENANCE and STATUS apply to
+them as to any other change:
+- a decision or lesson that outlives the project, rewritten as one in its own
+  canonical note (or merged into one), with a `## Sources` line for that
+  capture in one of the forms given under PROVENANCE;
+- the project's overview, knowledge/projects/<project>/overview.md: what the
+  project is, who it is for, the decisions that shaped it and why, where it
+  lives and who can reach it, never its status.
+The engine checks the keys and the deletions before you; you check that
+nothing else of a handoff note reached a canonical note.
 
 ## What you must NOT do
 

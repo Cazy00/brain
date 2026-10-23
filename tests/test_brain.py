@@ -7170,6 +7170,30 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
                        "valid slug", "promotes", "closing correction"):
             self.assertIn(phrase, rule)
 
+    def test_the_auditor_passes_what_the_drain_may_take_from_a_handoff(self):
+        """2026-10-22: a live pass handed the 2026-10-15 retirement decision off to its
+        project and, as the drain asks, put the decision that shaped the project into its new
+        overview and promoted a lesson that outlives it. The auditor blocked "handoff content
+        merged into canonical notes": the two prompts disagreed, and every pass that met those
+        captures was blocked. The auditor now passes exactly what the drain may take, and still
+        blocks a project's own records and wholesale copies."""
+        audit = self.flat("audit-prompt.md")
+        rule = audit[audit.index("**HANDOFF.**"):audit.index("## What you must NOT do")]
+        for phrase in ("wholesale", "its project's own records", "status, pending work",
+                       "anywhere but that project's own overview",
+                       "a decision or lesson that outlives the project",
+                       "a `## Sources` line for that capture in one of the forms given under "
+                       "PROVENANCE",
+                       "knowledge/projects/<project>/overview.md",
+                       "the decisions that shaped it", "never its status",
+                       "They pass HANDOFF; SAFETY, CONFLICT, PROVENANCE and STATUS apply to them "
+                       "as to any other change"):
+            self.assertIn(phrase, rule)
+        drain = self.flat("consolidate-prompt.md")
+        self.assertIn("a decision or lesson inside it that outlives the project is still "
+                      "promoted as its own note", drain)
+        self.assertIn("the decisions that shaped it and why", drain)
+
     def test_the_protocol_documents_the_handoff_area(self):
         text = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
         handoff = text[text.index("## Handoff"):text.index("## Searching")]
