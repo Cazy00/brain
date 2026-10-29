@@ -645,7 +645,7 @@ def call_verb(name: str, args, transport: str = "local", remote: bool = False,
     """One memory-verb call, already past the profile check. Every outcome is a
     verb response or the verb error envelope; nothing here raises.
 
-    `write(text=, declared=, flags=, request_id=, allow_duplicate=)` lands a capture
+    `write(text=, declared=, flags=, request_id=, allow_duplicate=, dedupe_text=)` lands a capture
     and returns the capture outcome (`capture.Capturer.capture`'s shape). The
     transport owns it because the transports differ in who the principal is, what
     is stamped (`via`, `client`) and whether a push queue exists."""
@@ -685,7 +685,8 @@ def call_verb(name: str, args, transport: str = "local", remote: bool = False,
             outcome = write(text=request["text"],
                             declared={**declared, "kind": request["note_kind"]},
                             flags=request["flags"], request_id=request["request_id"],
-                            allow_duplicate=request["allow_duplicate"])
+                            allow_duplicate=request["allow_duplicate"],
+                            dedupe_text=request["dedupe_text"])
             if not outcome.get("ok"):
                 return verbs.result(verbs.write_error(outcome))
             # A declared field dropped by the capture itself is named as well.

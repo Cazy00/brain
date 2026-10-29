@@ -322,11 +322,17 @@ def prepare_remember(args: dict, now: datetime):
     if valid_until is not None:
         flags += ["--expires", iso_ms(valid_until)]
     if valid_from is not None:
-        flags += ["--valid-from", iso_ms(valid_from)]
+        # A date stays a date: that is the form the note contract gives `valid_from`
+        # on a canonical note, and a capture is what gets promoted into one.
+        given = args["valid_from"].strip()
+        flags += ["--valid-from", given if re.fullmatch(r"\d{4}-\d{2}-\d{2}", given)
+                  else iso_ms(valid_from)]
     if args.get("visibility") == "private":
         flags += ["--visibility", "private"]
     return {"text": args["fact"], "note_kind": note_kind, "flags": flags,
             "entity": args.get("entity"),
+            # The same sentence filed under another entity is another fact.
+            "dedupe_text": args["fact"] + "\x1f" + (args.get("entity") or ""),
             "valid_until": iso_ms(valid_until) if valid_until is not None else None,
             "request_id": args.get("request_id"),
             "allow_duplicate": bool(args.get("allow_duplicate", False))}, None
@@ -613,6 +619,12 @@ def visible_facts(captures, now_ms: int, remote: bool, entity=None):
     return out
 
 
+def _instant(value):
+    """A stored date or instant as ISO 8601 UTC with milliseconds, or None."""
+    stamp = parse_iso(value) if value else None
+    return iso_ms(stamp) if stamp is not None else None
+
+
 def fact_record(cap: Capture, pending: dict) -> dict:
     note_kind = cap.get("kind")
     created = from_ms(cap.at_ms)
@@ -625,7 +637,7 @@ def fact_record(cap: Capture, pending: dict) -> dict:
            "entity": cap.get("entity"),
            "provenance": cap.get("provenance") or "unrecorded",
            "visibility": "private" if cap.get("visibility") == "private" else "world",
-           "valid_from": cap.get("valid_from") or iso_ms(created),
+           "valid_from": _instant(cap.get("valid_from")) or iso_ms(created),
            "valid_until": cap.get("expires"),
            "created_at": iso_ms(created), "path": cap.path,
            "trust": "provisional", "markers": markers}

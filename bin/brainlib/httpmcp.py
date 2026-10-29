@@ -678,12 +678,12 @@ class Handler(BaseHTTPRequestHandler):
             self.service.record("provenance_dropped", cid=cid, principal=principal.stable_id,
                                 reason="client")
 
-        def write(text, declared, flags, request_id, allow_duplicate):
+        def write(text, declared, flags, request_id, allow_duplicate, dedupe_text=None):
             return capturer.capture(
                 text, principal.profile, principal.stable_id, cid,
                 client_request_id=request_id, allow_duplicate=allow_duplicate,
                 via=principal.label or principal.mode, client=client, declared=declared,
-                extra_flags=flags)
+                extra_flags=flags, dedupe_text=dedupe_text)
         return write
 
     def _capture(self, args, principal, cid, client_name=None, client_version=None) -> dict:

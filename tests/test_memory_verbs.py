@@ -207,6 +207,34 @@ class RememberTests(CorpusCase):
         self.assertEqual(body["error"], "not_found")
         self.assertIn("correction", body["suggestion"])
 
+    def test_a_secret_in_the_fact_itself_is_refused_without_repeating_it(self):
+        key = "AK" + "IA" + "IOSFODNN7EXAMPLE"
+        before = inbox_files(self.corpus)
+        is_error, body = verb("remember", fact="the key is " + key, provenance="p")
+        self.assertTrue(is_error)
+        self.assertEqual(body["error"], "invalid_params")
+        self.assertNotIn(key, json.dumps(body))
+        self.assertEqual(inbox_files(self.corpus), before)
+
+    def test_the_same_sentence_under_another_entity_is_another_fact(self):
+        _e, first = verb("remember", fact="Shared sentence.", provenance="p", entity="a/one")
+        _e, second = verb("remember", fact="Shared sentence.", provenance="p", entity="a/two")
+        self.assertEqual((first["status"], second["status"]), ("inserted", "inserted"))
+        self.assertNotEqual(first["id"], second["id"])
+        _e, third = verb("remember", fact="Shared sentence.", provenance="p", entity="a/two")
+        self.assertEqual((third["status"], third["id"]), ("duplicate", second["id"]))
+
+    def test_a_valid_from_date_stays_a_date_on_the_note(self):
+        _e, saved = verb("remember", fact="Dated fact.", provenance="p", valid_from="2026-10-01")
+        fm, _x = parse_frontmatter((self.corpus.root / saved["path"]).read_text())
+        self.assertEqual(fm["valid_from"], "2026-10-01")
+        _e, stamped = verb("remember", fact="Instant fact.", provenance="p",
+                           valid_from="2026-10-01T08:00:00+04:00", entity="a/b")
+        fm, _x = parse_frontmatter((self.corpus.root / stamped["path"]).read_text())
+        self.assertEqual(fm["valid_from"], "2026-10-01T04:00:00.000Z")
+        _e, found = verb("recall", entity="a/b")
+        self.assertEqual(found["facts"][0]["valid_from"], "2026-10-01T04:00:00.000Z")
+
     def test_the_tool_description_carries_the_capture_policy(self):
         remember = next(t for t in mcpcore.tool_table("remote") if t["name"] == "remember")
         self.assertIn(mcpcore.CAPTURE_POLICY, remember["description"])

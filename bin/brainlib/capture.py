@@ -373,7 +373,8 @@ class Capturer(object):
 
     def capture(self, text: str, profile: str, principal: str, cid: str,
                 client_request_id=None, allow_duplicate: bool = False,
-                via=None, client=None, declared=None, extra_flags=()) -> dict:
+                via=None, client=None, declared=None, extra_flags=(),
+                dedupe_text=None) -> dict:
         """`via` and `client` are what the endpoint stamps; `declared` is the
         caller's cleaned declared fields (provenance.take_declared). None of
         them is part of either fingerprint: "have I seen this request" and
@@ -382,7 +383,10 @@ class Capturer(object):
 
         `extra_flags` are further `brain capture` flags the caller has already
         validated (the memory verbs' provenance, entity, expiry): they travel with
-        the write and, like the labels, are no part of either fingerprint."""
+        the write and, like the labels, are no part of either fingerprint.
+
+        `dedupe_text` is what the content fingerprint is taken of, when that is more
+        than the note's text: the same sentence filed under two entities is two facts."""
         if client_request_id:
             previous = self.ledger.lookup("request", profile, client_request_id)
             if previous is not None:
@@ -392,8 +396,9 @@ class Capturer(object):
                     self._log.record("capture_deduplicated", cid=cid, profile=profile,
                                      principal=principal, outcome="deduplicated")
                 return self._replay(previous, "request")
+        fingerprint = text if dedupe_text is None else dedupe_text
         if not allow_duplicate:
-            previous = self.ledger.lookup("content", profile, text)
+            previous = self.ledger.lookup("content", profile, fingerprint)
             if previous is not None:
                 if self._log:
                     self._log.record("capture_deduplicated", cid=cid, profile=profile,
@@ -425,7 +430,7 @@ class Capturer(object):
         # success — and the note would never be written at all.
         if client_request_id:
             self.ledger.remember("request", profile, client_request_id, result)
-        self.ledger.remember("content", profile, text, result)
+        self.ledger.remember("content", profile, fingerprint, result)
         if self._log:
             self._log.record("capture_accepted", cid=cid, profile=profile,
                              principal=principal, outcome="ok",

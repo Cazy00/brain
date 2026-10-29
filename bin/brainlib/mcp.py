@@ -12,7 +12,7 @@ behaviour identical on the CLI, over stdio, and over HTTP — the ranking and th
 trust signals are deterministic code, not model judgement.
 
 One table, but not always all of it: `handle` and `call_tool` take an `allow`
-set, which is how `brain serve --read-only` exposes four tools instead of five,
+set, which is how `brain serve --read-only` exposes the read tools and no others,
 and `--drop-box` exactly one, without a second table to drift out of sync with
 this one. `allow=None` — every tool — stays the default, because that is what
 stdio is: a subprocess a client spawned on the machine the user is already
@@ -173,11 +173,11 @@ def _verb_writer(via, client, source):
     if source:
         return None
 
-    def write(text, declared, flags, request_id, allow_duplicate):
+    def write(text, declared, flags, request_id, allow_duplicate, dedupe_text=None):
         return local_capturer().capture(
             text, "local", via or "stdio", "-", client_request_id=request_id,
             allow_duplicate=allow_duplicate, via=via, client=client, declared=declared,
-            extra_flags=flags)
+            extra_flags=flags, dedupe_text=dedupe_text)
     return write
 
 
