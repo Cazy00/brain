@@ -38,6 +38,7 @@ the oldest failure started, which is the one question git cannot answer.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -119,10 +120,18 @@ class Ledger(object):
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             db.execute("VACUUM")
 
+    @contextlib.contextmanager
     def _connect(self):
+        """A connection that commits on success, rolls back on failure and is CLOSED
+        either way (sqlite3's own `with` commits but leaves the connection open, and a
+        ledger asked a few thousand questions left that many open files behind)."""
         db = sqlite3.connect(self.path, timeout=10)
-        db.execute("PRAGMA journal_mode=WAL")
-        return db
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def fingerprint(self, kind: str, profile: str, value: str) -> str:
         """One-way, keyed, and scoped.

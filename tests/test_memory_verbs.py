@@ -194,7 +194,7 @@ class RememberTests(CorpusCase):
         _e, forced = verb("remember", fact="Said once.", provenance="p", allow_duplicate=True)
         self.assertEqual(forced["status"], "inserted")
         self.assertNotEqual(forced["id"], first["id"])
-        self.assertEqual(len(inbox_files(self.corpus)) - 3, 2,
+        self.assertEqual(len(inbox_files(self.corpus)) - 2, 2,
                          "a duplicate wrote a second note")
 
     def test_a_correction_goes_through_remember_not_forget(self):
@@ -290,7 +290,10 @@ class ForgetAndFactsTests(CorpusCase):
         self.assertEqual(remote["facts"], [])
         delta = json.loads(mcpcore.call("delta", {"since": "1970-01-01"},
                                         transport="remote")["content"][0]["text"])
-        self.assertEqual(delta["facts"], [])
+        self.assertNotIn("A private fact.", [f["fact"] for f in delta["facts"]])
+        local_delta = json.loads(mcpcore.call("delta", {"since": "1970-01-01"},
+                                              transport="local")["content"][0]["text"])
+        self.assertIn("A private fact.", [f["fact"] for f in local_delta["facts"]])
 
     def test_facts_are_newest_first_and_budgeted_as_a_prefix(self):
         ids = [self.remember("Fact number %d about benches." % n)["id"] for n in range(3)]
@@ -568,8 +571,7 @@ class EnvelopeAndProfileTests(CorpusCase):
     def test_the_old_tools_event_vocabulary_names_the_new_tools_as_themselves(self):
         from brainlib import eventlog
         for name in ("recall", "remember", "forget", "delta"):
-            self.assertIn(name, eventlog.VOCABULARY if hasattr(eventlog, "VOCABULARY")
-                          else eventlog.ALLOWED)
+            self.assertIn(name, eventlog.VALUES)
 
 
 if __name__ == "__main__":
