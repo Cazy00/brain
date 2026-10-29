@@ -240,7 +240,7 @@ with the PKCE verifier — and comes back as:
 ```
 
 **7. The token reads the brain**, and — because this one asked for `brain:read`
-only — `tools/list` returns four tools, and `brain_capture` called **by name**
+only — `tools/list` returns the six read tools, and `brain_capture` called **by name**
 is refused:
 
 ```
@@ -331,8 +331,8 @@ default:
 ones, which are committed and pushed automatically.** That is the whole tool
 surface. The consent page says so in words before you type anything.
 
-If that is more than you want, `--read-only` serves the four read tools and
-refuses `brain_capture` — server-side, so a client that calls it by name is
+If that is more than you want, `--read-only` serves the read tools and
+refuses `brain_capture`, `remember` and `forget` — server-side, so a client that calls it by name is
 refused too. Run the writable one on loopback where you already are.
 
 ### Residual risks, named rather than implied

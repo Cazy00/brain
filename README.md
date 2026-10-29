@@ -36,7 +36,7 @@ flowchart LR
     C -->|"no"| D["deleted"]
     C -->|"yes"| E["canonical note<br/><i>decisions / reference / …</i>"]
     E -->|"a fact changes"| F["archive/<br/><i>out of search, kept forever</i>"]
-    E -->|"brain_search<br/>brain_read<br/>brain_links"| G["answers, with<br/>trust signals"]
+    E -->|"recall · brain_search<br/>brain_read<br/>brain_links"| G["answers, with<br/>trust signals"]
     G --> A
 ```
 
@@ -147,6 +147,33 @@ in the plugin directory.
 Full guide, including schedules, the encrypted vault and a second machine:
 **[SETUP.md](SETUP.md)**. The rules notes are held to: **[AGENTS.md](AGENTS.md)**.
 
+## The memory verbs
+
+Since 0.5.0 the brain also speaks four verbs besides the three tools above:
+`recall` (search, plus saved facts), `remember` (save one fact, with the source it
+came from), `forget` (retract a saved fact) and `delta` (what changed since a
+moment, paged by a cursor). They are the memory protocol MEMORY_VERBS v1 of
+[garrytan/gbrain](https://github.com/garrytan/gbrain) (MIT, pinned to commit
+`fd22a75`), without its `entity`, `context_pack` and `synthesize`, which this
+brain answers as `unavailable` and never lists. The interface is written down as
+the contract **`brain-verbs.v1`**: a document and a machine-readable schema file,
+`docs/contracts/brain-verbs.v1.md` and `.json`, kept in the owner's private
+workspace repository (it is not in this one). The engine's side of the bargain is
+tested here: `tests/test_memory_verbs_conformance.py` runs gbrain's 24 conformance
+cases (vendored under `tests/fixtures/memory-verbs/`, with their licence) — 16 apply,
+and the 8 that do not are replaced by a check that the three verbs are unlisted and
+unavailable — and `tests/test_golden.py` holds the output of `brain_search`,
+`brain_recent` and `brain_capture` byte for byte against 0.4.5, because they stay
+served, unchanged, until every client has moved. They retire in 1.0.0.
+
+What differs from gbrain, on purpose: a plain `recall` query returns no facts (a
+fact is an unconsolidated capture, and an inbox note is met only by asking for it,
+with `entity` or `scope: "all"`); `forget` takes fact ids only; `remember` refuses a
+credential, a line break or a bad label in `provenance` and `entity` before anything
+reaches git. `initialize` carries `_meta["brain-verbs"]` saying which verbs an
+endpoint serves; the read-only endpoint serves `recall`, `delta`, `brain_read` and
+`brain_links`.
+
 ## How it stays true
 
 | Mechanism | What it prevents |
@@ -246,7 +273,8 @@ trusting.
   deprecates it); `serve --new-client` covers anything that needs a client id.
   See [`setup/runbooks/remote-oauth.md`](setup/runbooks/remote-oauth.md), which
   is honest about the two things in it that have not been verified.
-  `--read-only` serves the four read tools and refuses `brain_capture`,
+  `--read-only` serves the read tools (the four above and the verbs `recall` and
+  `delta`) and refuses `brain_capture`, `remember` and `forget`,
   which limits what a holder of the token can *change* — every note is still
   readable. Read-only is a property of the process; a `brain:read` OAuth token
   is the same question asked of one credential rather than one server.

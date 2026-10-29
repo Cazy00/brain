@@ -338,7 +338,9 @@ as the reason the rule is satisfied.
    folder-weighted ranking (index auto-rebuilds when stale). `--scope all`
    adds journal + inbox, tagged provisional. The same tools reach any
    MCP-capable agent over `bin/brain-mcp`, under the same names:
-   brain_search / brain_read / brain_links / brain_recent / brain_capture.
+   brain_search / brain_read / brain_links / brain_recent / brain_capture, and the
+   memory verbs recall / remember / forget / delta (contract `brain-verbs.v1`, see
+   the README), which `recall` in keyword mode answers with the same ranking.
 3. Before declaring a miss, rewrite the query into 2-3 lexical variants
    (synonyms, singular/plural, the term you'd have used when writing it).
 4. `bin/brain read <id-or-path>` resolves supersede chains — use it whenever
