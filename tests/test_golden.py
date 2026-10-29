@@ -54,7 +54,9 @@ CAPTURE_TEXT = "Golden probe: the widget line gets a second sprocket supplier."
 
 
 def normalise(text: str, root: Path) -> str:
-    text = text.replace(str(root), "<data>")
+    # macOS reports /var/... as /private/var/...: strip the resolved form first.
+    for form in (os.path.realpath(root), str(root)):
+        text = text.replace(form, "<data>")
     return re.sub(r"\d{4}-\d{2}-\d{2}-\d{6}-", "<date>-<hhmmss>-", text)
 
 

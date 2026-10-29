@@ -105,7 +105,10 @@ class Corpus(object):
     """A fixture corpus bound into the environment for the life of the object."""
 
     def __init__(self):
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        try:
+            self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        except TypeError:                  # Python 3.9 has no such argument
+            self.tmp = tempfile.TemporaryDirectory()
         self.root = make_corpus(self.tmp.name)
         self.state = Path(self.tmp.name) / "state"
         self.state.mkdir()
