@@ -26,126 +26,21 @@ argument. `client` is stamped from the client's own clientInfo, which is
 self-reported and said to be.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-from . import mcpcore, provenance
+from . import capture, mcpcore, osbackend, provenance, verbs, version
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 BRAIN = str(ROOT / "bin" / "brain")
 
-TOOLS = [
-    {
-        "name": "brain_search",
-        "description": (
-            "Search the user's permanent second brain — their decisions, projects, people, "
-            "reference notes, and life context. Use this BEFORE answering any question "
-            "about the user's past decisions, preferences, projects, or personal history. "
-            "Returns CURRENT knowledge only (superseded notes are structurally excluded). "
-            "If a query misses, retry with 2-3 lexical variants before concluding the "
-            "brain has nothing."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Lexical search query."},
-                "scope": {"type": "string", "enum": ["canonical", "all", "handoff"],
-                          "description": "'all' additionally searches the journal and the "
-                                         "unprocessed inbox (results tagged provisional). "
-                                         "'handoff' lists only notes waiting to be filed in a "
-                                         "project's own records — not brain knowledge; the query "
-                                         "may be empty or a project slug."},
-                "limit": {"type": "integer", "description": "Max hits (default 8)."},
-                "offset": {"type": "integer", "minimum": 0,
-                           "description": "Scope handoff only: skip this many hits, to page "
-                                          "(stable order: handoff_at, then path)."},
-            },
-            "required": ["query"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "brain_read",
-        "description": (
-            "Read one note from the brain in full, by id or repo-relative path, with its "
-            "supersede history resolved — if the note was replaced, the CURRENT version is "
-            "returned along with the chain of what replaced what."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id_or_path": {"type": "string",
-                               "description": "Note id (frontmatter) or path like "
-                                              "knowledge/decisions/2026-07-22-x.md"},
-            },
-            "required": ["id_or_path"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "brain_links",
-        "description": (
-            "Show the [[wikilink]] graph around one note: which notes REFER TO it "
-            "(backlinks) and which it points at. Use this to answer 'what else is "
-            "connected to X' or to gather everything the brain knows around a subject — "
-            "search finds notes by wording, this finds them by relationship, including "
-            "notes that never repeat the search term."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id_or_path": {"type": "string",
-                               "description": "Note id (frontmatter) or repo-relative path."},
-            },
-            "required": ["id_or_path"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "brain_recent",
-        "description": "List notes recently added or touched in the brain (default: last 7 days).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"days": {"type": "integer", "description": "Look-back window in days."}},
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "brain_capture",
-        # The one capture policy, shared with brain-http (mcpcore.py), so every
-        # client of every transport is told the same thing about what to save.
-        "description": mcpcore.LOCAL_CAPTURE_DESCRIPTION,
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "The content to save."},
-                "commit": {
-                    "type": "boolean",
-                    "description": (
-                        "Commit and auto-push the capture (default true). Pass false to "
-                        "write it to inbox/ only, leaving it on this machine for review "
-                        "before it reaches the remote. The text is scanned for "
-                        "credentials either way."
-                    ),
-                },
-                # What a caller may declare about the note, identical on every
-                # front end. What the endpoint stamps (source, via, client) is
-                # never offered here; see call_tool.
-                **provenance.declared_schema(),
-            },
-            "required": ["text"],
-        },
-        # The one tool that is not read-only, and the reason --read-only exists.
-        # destructiveHint is false because a capture only ever appends: it adds
-        # a note to inbox/, it cannot edit or delete an existing one.
-        "annotations": {"readOnlyHint": False, "destructiveHint": False},
-    },
-]
-
-
+# The one table is mcpcore's. This module used to carry a copy of it for stdio, which is
+# how two transports come to disagree about a tool; it now reads the same table the
+# remote endpoint does, with the local transport's limits.
+TOOLS = mcpcore.tool_table("local")
 TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
-MAX_ARG_CHARS = 100_000  # a note or query longer than this is a bug or an abuse
 
 
 def _named_by_hint(hint: bool, tools=None) -> tuple:
@@ -182,72 +77,17 @@ def write_only_names(tools=None) -> tuple:
 
 
 READ_ONLY_TOOLS = read_only_names()
+# Every tool that writes: what the `write` OAuth scope opens.
 WRITE_ONLY_TOOLS = write_only_names()
+# What a drop box serves: `brain_capture` and nothing else. It is a slot, not a small
+# brain; `remember` and `forget` are for an endpoint whose caller may also read.
+DROP_BOX_TOOLS = ("brain_capture",)
 
 
 def run_cli(args):
     return subprocess.run(
         [sys.executable, BRAIN, *args], capture_output=True, text=True, cwd=ROOT, timeout=120
     )
-
-
-def validate_args(name, args):
-    """Check args against the tool's declared inputSchema BEFORE using them.
-
-    A malformed call must come back as a tool error the model can read and
-    retry — never as an exception that kills the server for every other
-    session sharing it. Returns (clean_args, None) or (None, message).
-    """
-    schema = TOOLS_BY_NAME[name].get("inputSchema", {})
-    props = schema.get("properties", {})
-    if not isinstance(args, dict):
-        return None, "arguments must be a JSON object"
-    args = mcpcore.handoff_listing(name, args)
-    for field in schema.get("required", []):
-        if field not in args or args[field] is None \
-                or (isinstance(args[field], str) and not args[field].strip()
-                    and not mcpcore.blank_allowed(name, field, args)):
-            return None, f"missing required argument {field!r}"
-    clean = {}
-    required = set(schema.get("required", []))
-    for field, spec in props.items():
-        if field not in args:
-            continue
-        value = args[field]
-        # An explicit null on an OPTIONAL argument means "not supplied" — fall
-        # back to the default rather than failing a whole search over it.
-        if value is None and field not in required:
-            continue
-        expected = spec.get("type")
-        if expected == "string":
-            if not isinstance(value, str):
-                return None, f"argument {field!r} must be a string, got {type(value).__name__}"
-            if len(value) > MAX_ARG_CHARS:
-                return None, (f"argument {field!r} is {len(value)} chars — the cap is "
-                              f"{MAX_ARG_CHARS}")
-        elif expected == "integer":
-            # Models routinely send "8" for a number; accept the digit string
-            # rather than refusing to search over a formatting nit.
-            if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
-                value = int(value)
-            # bool is an int subclass in Python; a JSON true is not a count.
-            if isinstance(value, bool) or not isinstance(value, int):
-                return None, f"argument {field!r} must be an integer, got {type(value).__name__}"
-        elif expected == "boolean":
-            # Same tolerance as the integer branch, and for the same reason:
-            # models send "false" as a string. Coerce the unambiguous spellings
-            # and refuse the rest — silently accepting a truthy "false" would
-            # commit and push a capture the caller asked to hold back.
-            if isinstance(value, str):
-                lowered = value.strip().lower()
-                if lowered in ("true", "false"):
-                    value = lowered == "true"
-            if not isinstance(value, bool):
-                return None, f"argument {field!r} must be a boolean, got {type(value).__name__}"
-        if "enum" in spec and value not in spec["enum"]:
-            return None, f"argument {field!r} must be one of {spec['enum']}"
-        clean[field] = value
-    return clean, None
 
 
 def _error(text):
@@ -298,12 +138,60 @@ def drop_box_reply(run):
                          "text": f"captured {note_id}".strip()}], "isError": False}
 
 
+_CAPTURERS = {}
+
+
+def data_root() -> Path:
+    """Where the notes live: BRAIN_DATA_ROOT, else the engine's own folder. The same
+    rule `bin/brain` applies, because the verbs' writes run it with this as the cwd."""
+    raw = os.environ.get("BRAIN_DATA_ROOT", "").strip()
+    return Path(raw).expanduser().resolve() if raw else ROOT
+
+
+def local_capturer(root=None):
+    """The write path of `remember` and `forget` on stdio and `brain serve`.
+
+    The same transaction the remote endpoint runs (brainlib/capture.py), so a
+    `request_id` means the same thing on every transport: a retry within 24 hours
+    returns the original instead of a second note. There is no push queue: the
+    post-commit hook pushes, as it does for `brain_capture` on this machine. The
+    ledger sits with the rest of the machine-local state, outside the repository."""
+    root = Path(root or data_root())
+    override = os.environ.get("BRAIN_STATE_DIR", "").strip()
+    state = Path(override).expanduser() if override else osbackend.state_dir(root, create=True)
+    key = (str(root), str(state))
+    if key not in _CAPTURERS:
+        _CAPTURERS[key] = capture.Capturer(
+            BRAIN, root, capture.Ledger(state, capture.ledger_key(state)),
+            capture.BackupQueue(root, enabled=False))
+    return _CAPTURERS[key]
+
+
+def _verb_writer(via, client, source):
+    """The `write` callable `mcpcore.call_verb` takes, for this endpoint's stamps. An
+    endpoint that stamps a foreign source writes only through `brain_capture`."""
+    if source:
+        return None
+
+    def write(text, declared, flags, request_id, allow_duplicate):
+        return local_capturer().capture(
+            text, "local", via or "stdio", "-", client_request_id=request_id,
+            allow_duplicate=allow_duplicate, via=via, client=client, declared=declared,
+            extra_flags=flags)
+    return write
+
+
 def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
               client=None):
+    if isinstance(name, str) and name in verbs.UNSUPPORTED:
+        served = [v for v in verbs.SERVED if allow is None or v in allow]
+        return verbs.result(verbs.unavailable(name, served))
     # isinstance first: a non-string name (dict/list) is unhashable and would
     # raise on the membership test instead of reporting an unknown tool.
     if not isinstance(name, str) or name not in TOOLS_BY_NAME:
         return {"content": [{"type": "text", "text": f"unknown tool {name!r}"}], "isError": True}
+    if allow is not None and name not in allow and name in verbs.SERVED:
+        return verbs.result(verbs.scope_denied(name))
     if allow is not None and name not in allow:
         # The enforcement point, and it is deliberately HERE rather than in the
         # transport: a restriction that lives beside the dispatcher cannot be
@@ -322,13 +210,19 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
                              "property of how it was started, not a permission to retry "
                              "into."}],
                 "isError": True}
+    if name in verbs.SERVED:
+        # A caller reaching this brain over `brain serve` is remote; stdio is the owner
+        # at their own keyboard. Private facts are never returned to a remote caller.
+        return mcpcore.call_verb(name, args, "local", remote=via not in (None, "stdio"),
+                                 runner=lambda argv, timeout: run_cli(argv), timeout=120.0,
+                                 write=_verb_writer(via, client, source))
     declared, ignored = {}, []
     if name == "brain_capture":
         # The caller's declared fields are DROPPED when bad, never refused — a
         # note is worth more than its label — so they are taken out before the
         # strict validator, which would refuse the whole call over a bad enum.
         args, declared, ignored = provenance.take_declared(args)
-    args, problem = validate_args(name, args)
+    args, problem = mcpcore.validate_args(TOOLS_BY_NAME[name], args if args is not None else {})
     if problem:
         return {"content": [{"type": "text", "text": f"invalid arguments for {name}: {problem}"}],
                 "isError": True}
@@ -429,7 +323,8 @@ def _instructions(allow) -> str:
     served = TOOLS_BY_NAME if allow is None else allow
     if not any(name in served for name in READ_ONLY_TOOLS):
         return ""
-    return mcpcore.instructions("capture" if "brain_capture" in served else "read")
+    return mcpcore.instructions(
+        "capture" if "brain_capture" in served or "remember" in served else "read")
 
 
 def _client_of(info, announce: bool = False):
@@ -485,7 +380,11 @@ def handle(msg, allow=None, source=None, cap=None, log=None, via=None, session=N
         result = {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "brain", "version": "1.0.0"},
+            "serverInfo": {"name": "brain", "version": version.VERSION},
+            # What this endpoint serves of the memory-verbs contract, and what the
+            # brain never will (brainlib/verbs.py).
+            "_meta": {"brain-verbs": verbs.advertisement(
+                TOOLS_BY_NAME if allow is None else allow)},
         }
         text = _instructions(allow)
         if text:

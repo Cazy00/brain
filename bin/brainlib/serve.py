@@ -1334,7 +1334,7 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None,
 
     allow_tools = None
     if drop_box:
-        allow_tools = mcp.WRITE_ONLY_TOOLS
+        allow_tools = mcp.DROP_BOX_TOOLS
     elif read_only:
         allow_tools = mcp.READ_ONLY_TOOLS
 

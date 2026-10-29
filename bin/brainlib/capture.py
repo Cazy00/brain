@@ -171,6 +171,28 @@ class Ledger(object):
             return cursor.rowcount
 
 
+def ledger_key(state_dir) -> bytes:
+    """The HMAC key of a ledger that has no operator-supplied one (stdio and
+    `brain serve`): random, created once, readable by its owner only, and kept in
+    the same machine-local state as the ledger. Losing it costs nothing but the
+    deduplication window, so it is never backed up and never in the repository."""
+    path = os.path.join(str(state_dir), "capture-ledger.key")
+    os.makedirs(str(state_dir), exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        with open(path, "rb") as handle:
+            key = handle.read()
+        if key:
+            return key
+        os.unlink(path)                    # a crashed first writer: start again
+        return ledger_key(state_dir)
+    key = os.urandom(32)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(key)
+    return key
+
+
 class BackupQueue(object):
     """Pushes accepted captures to the private remote, and never blocks one.
 
@@ -342,12 +364,16 @@ class Capturer(object):
 
     def capture(self, text: str, profile: str, principal: str, cid: str,
                 client_request_id=None, allow_duplicate: bool = False,
-                via=None, client=None, declared=None) -> dict:
+                via=None, client=None, declared=None, extra_flags=()) -> dict:
         """`via` and `client` are what the endpoint stamps; `declared` is the
         caller's cleaned declared fields (provenance.take_declared). None of
         them is part of either fingerprint: "have I seen this request" and
         "have I seen this text" are questions about the request id and the
-        text, and a retry that relabels a note is still the same note."""
+        text, and a retry that relabels a note is still the same note.
+
+        `extra_flags` are further `brain capture` flags the caller has already
+        validated (the memory verbs' provenance, entity, expiry): they travel with
+        the write and, like the labels, are no part of either fingerprint."""
         if client_request_id:
             previous = self.ledger.lookup("request", profile, client_request_id)
             if previous is not None:
@@ -365,7 +391,8 @@ class Capturer(object):
                                      principal=principal, outcome="deduplicated")
                 return self._replay(previous, "content")
 
-        flags = provenance.cli_flags({"via": via, "client": client, **(declared or {})})
+        flags = (provenance.cli_flags({"via": via, "client": client, **(declared or {})})
+                 + list(extra_flags))
         outcome = self._run(text, flags)
         ignored = [name for name in (outcome.get("ignored") or [])
                    if name in provenance.DECLARED_FIELDS]
