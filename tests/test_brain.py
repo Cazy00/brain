@@ -467,7 +467,8 @@ class McpServerTests(unittest.TestCase):
         _proc, replies = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         names = {t["name"] for t in replies[1]["result"]["tools"]}
         self.assertEqual(names, {"brain_search", "brain_read", "brain_links",
-                                 "brain_recent", "brain_capture"})
+                                 "brain_recent", "brain_capture",
+                                 "recall", "remember", "forget", "delta"})
 
     def test_malformed_json_line_is_skipped(self):
         _proc, replies = self.rpc(raw="{not json at all\n[1,2,3]\n"
@@ -565,7 +566,9 @@ class UniversalClientTests(unittest.TestCase):
         _proc, replies = self.session(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = replies[1]["result"]["tools"]
-        blob = json.dumps(tools).lower()
+        # `cursor` is brain-verbs.v1's own pagination term (delta's cursor and
+        # next_cursor), not the editor of that name.
+        blob = re.sub(r"\b(next_)?cursor\b", "", json.dumps(tools).lower())
         for vendor in ("claude", "anthropic", "openai", "gemini", "cursor", "copilot"):
             self.assertNotIn(vendor, blob, f"the tool surface names {vendor}")
         for tool in tools:
@@ -652,7 +655,7 @@ class UniversalClientTests(unittest.TestCase):
         _proc, replies = self.session(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, protocol="2025-06-18")
         self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-06-18")
-        self.assertEqual(len(replies[1]["result"]["tools"]), 5)
+        self.assertEqual(len(replies[1]["result"]["tools"]), 9)
 
 
 class InitTests(unittest.TestCase):
