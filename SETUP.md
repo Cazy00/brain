@@ -612,7 +612,7 @@ entirely; nothing else in the system depends on it.
 ```sh
 bin/brain serve --new-token     # mint a token, store it, print it ONCE
 bin/brain serve                 # listen on 127.0.0.1:8787
-bin/brain serve --read-only     # the four read tools; no brain_capture
+bin/brain serve --read-only     # the read tools; no brain_capture, remember or forget
 ```
 
 It serves the **same tools** as the local stdio server, over HTTP, behind a
@@ -647,8 +647,9 @@ differently from the local one would be worse than no remote brain.
 bin/brain serve --read-only
 ```
 
-Serves `brain_search`, `brain_read`, `brain_links` and `brain_recent`, and
-refuses `brain_capture` — not just by leaving it out of the tool list, but by
+Serves `brain_search`, `brain_read`, `brain_links`, `brain_recent` and the verbs
+`recall` and `delta`, and refuses `brain_capture`, `remember` and `forget` — not
+just by leaving them out of the tool list, but by
 refusing it if a client calls it anyway. A server that hides a tool and then
 runs whatever arrives has implemented a suggestion.
 

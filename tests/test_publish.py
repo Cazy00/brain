@@ -596,17 +596,24 @@ class TestTheReviewQueue(PublishCase):
         self.assertIn("opening-hours", self.published_ids())
 
     def test_the_tool_surface_did_not_grow(self):
-        """No MCP tool was added here, and none ever will be. Approval over the
-        wire is approval by whoever holds a token."""
+        """No MCP tool was added for approving a note, and none ever will be. Approval
+        over the wire is approval by whoever holds a token. The tools added since are
+        the memory verbs; the one that mentions `visibility` (`remember`) can only
+        say `private` and `world`, and neither writes `public`."""
         sys.path.insert(0, str(ROOT / "bin"))
         from brainlib import mcp
 
         self.assertEqual({t["name"] for t in mcp.TOOLS},
                          {"brain_search", "brain_read", "brain_links", "brain_recent",
-                          "brain_capture"})
+                          "brain_capture", "recall", "remember", "forget", "delta"})
         for tool in mcp.TOOLS:
-            self.assertNotIn("visibility", json.dumps(tool).lower())
-            self.assertNotIn("publish", json.dumps(tool).lower())
+            blob = json.dumps(tool).lower()
+            self.assertNotIn("publish", blob)
+            self.assertNotIn("public", blob)
+            if "visibility" in blob:
+                self.assertEqual(tool["name"], "remember")
+                self.assertEqual(tool["inputSchema"]["properties"]["visibility"]["enum"],
+                                 ["world", "private"])
 
 
 if __name__ == "__main__":

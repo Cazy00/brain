@@ -28,7 +28,7 @@ No TLS here, deliberately. The tunnel terminates TLS; this serves plaintext to
 loopback, which is correct, or to whatever the operator explicitly asked for,
 which is their call and is printed back to them.
 
-`--read-only` serves the four read tools and refuses brain_capture, in the
+`--read-only` serves the read tools and refuses every tool that writes, in the
 dispatcher rather than here — a transport that filters the advertised list and
 then runs whatever arrives has implemented a suggestion. It shrinks what can be
 DONE to the brain, not what can be read out of it, and for a second brain the
@@ -571,7 +571,8 @@ class _Handler(BaseHTTPRequestHandler):
         fails identically; one told which scope it needs can step up in a
         single round trip.
         """
-        needed = (oauthlib.SCOPE_WRITE if tool in mcp.WRITE_ONLY_TOOLS
+        needed = (f"{oauthlib.SCOPE_READ} {oauthlib.SCOPE_WRITE}" if tool in mcp.READ_WRITE_TOOLS
+                  else oauthlib.SCOPE_WRITE if tool in mcp.WRITE_ONLY_TOOLS
                   else oauthlib.SCOPE_READ)
         cfg = getattr(self.server, "oauth", None)
         parts = ['Bearer error="insufficient_scope"', f'scope="{needed}"']
@@ -1044,9 +1045,9 @@ USAGE = """brain serve — reach this brain from another device.
                         Behind a tunnel this process only sees 127.0.0.1, and
                         every token it issues is bound to the PUBLIC url, so it
                         has to be told. https:// (http:// on loopback only)
-  --read-only           serve the four read tools; refuse brain_capture
-  --drop-box            serve brain_capture and NOTHING else; refuse all four
-                        read tools. Requires --source
+  --read-only           serve the read tools; refuse brain_capture, remember, forget
+  --drop-box            serve brain_capture and NOTHING else; refuse every
+                        read tool. Requires --source
   --source <slug>       what to stamp on every note this endpoint accepts.
                         Set by you, never by the caller; consolidation treats
                         anything other than `local` as an untrusted proposal
@@ -1103,18 +1104,18 @@ def startup_notes(host: str, port: int, read_only: bool = False,
     if drop_box:
         mode = [f"  DROP BOX — serving brain_capture and nothing else, stamped",
                 f"  `source: {source}`, capped at {daily_cap} captures a day.",
-                "  Nothing here can read this brain: the four read tools are not",
+                "  Nothing here can read this brain: the read tools are not",
                 "  served and are refused if a client calls them anyway.",
                 "",
                 "  What arrives is a PROPOSAL, not knowledge. It lands in inbox/,",
                 "  outside default search, and only consolidation can promote it."]
     elif read_only:
-        mode = ["  READ-ONLY — serving the four read tools. brain_capture is not",
-                "  served, and is refused if a client calls it anyway."]
+        mode = ["  READ-ONLY — serving the read tools. brain_capture, remember and forget",
+                "  are not served, and are refused if a client calls them anyway."]
     else:
-        mode = ["  Serving all five tools, which includes brain_capture: whoever holds",
-                "  the token can write notes into this brain, and they are committed",
-                "  and pushed automatically. `--read-only` serves the other four."]
+        mode = ["  Serving every tool, which includes brain_capture, remember and forget:",
+                "  whoever holds the token can write notes into this brain, and they are",
+                "  committed and pushed automatically. `--read-only` serves the read tools."]
     notes = [
         f"brain serve — listening on {url}",
         "",
@@ -1298,7 +1299,7 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None,
         # that both answers questions and accepts claims from the same socket
         # has no boundary in it. Two deployments, two processes, two ports.
         print("--drop-box and --read-only are two deployments, not two flags.\n\n"
-              "  One serves the four read tools; the other serves brain_capture and\n"
+              "  One serves the read tools; the other serves brain_capture and\n"
               "  refuses to read. Run two processes on two ports, with two tokens —\n"
               "  and if they face different things, on two hosts.", file=sys.stderr)
         return 2
@@ -1334,7 +1335,7 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None,
 
     allow_tools = None
     if drop_box:
-        allow_tools = mcp.WRITE_ONLY_TOOLS
+        allow_tools = mcp.DROP_BOX_TOOLS
     elif read_only:
         allow_tools = mcp.READ_ONLY_TOOLS
 

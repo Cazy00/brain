@@ -50,6 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import access
 from . import mcpcore
+from . import verbs
 from . import provenance
 from . import version
 
@@ -74,6 +75,9 @@ ASSUMED_LEGACY_VERSION = "2025-03-26"
 META_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
 META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+# Which of the memory verbs (brainlib/verbs.py) this endpoint serves, in `initialize`
+# and `server/discover` alike.
+META_VERBS = "brain-verbs"
 META_CLIENT_CAPS = "io.modelcontextprotocol/clientCapabilities"
 
 # Caching hints are REQUIRED on the two results this server produces that the
@@ -473,6 +477,7 @@ class Handler(BaseHTTPRequestHandler):
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": _instructions(principal.profile),
+                "_meta": {META_VERBS: verbs.advertisement(mcpcore.PROFILES[principal.profile])},
             }), cid=cid)
 
         if msg_id is None:
@@ -558,7 +563,8 @@ class Handler(BaseHTTPRequestHandler):
                 "capabilities": {"tools": {}},
                 "instructions": _instructions(principal.profile),
                 "_meta": {META_SERVER_INFO: {"name": SERVER_NAME,
-                                             "version": SERVER_VERSION}},
+                                             "version": SERVER_VERSION},
+                          META_VERBS: verbs.advertisement(mcpcore.PROFILES[principal.profile])},
             }), cid=cid)
 
         if method == "ping":
@@ -605,7 +611,7 @@ class Handler(BaseHTTPRequestHandler):
         reply = _modern_result if modern else _result
         name = params.get("name")
         args = params.get("arguments")
-        writes = name == "brain_capture"
+        writes = name == "brain_capture" or name in verbs.WRITE_VERBS
 
         if writes and name not in mcpcore.PROFILES[principal.profile]:
             # The read-only boundary, enforced where a hand-built call arrives
@@ -615,6 +621,9 @@ class Handler(BaseHTTPRequestHandler):
                                 principal=principal.stable_id, profile=principal.profile,
                                 endpoint=principal.endpoint, outcome="denied",
                                 ms=_ms(started))
+            if name in verbs.WRITE_VERBS:
+                return self._send(200, reply(msg_id, verbs.result(verbs.scope_denied(
+                    name, mcpcore.served_verbs(principal.profile)))), cid=cid)
             return self._send(200, reply(msg_id, mcpcore.error_result(
                 "brain_capture is not available on this endpoint. This is the read-only "
                 "brain; use the read/capture endpoint to save a note.")), cid=cid)
@@ -633,7 +642,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._refuse(503, cid, "the brain is not accepting writes right now",
                                 "maintenance_mode", headers={"Retry-After": "60"})
 
-        if writes:
+        if name in verbs.WRITE_VERBS:
+            result = mcpcore.call(name, args, profile=principal.profile, transport="remote",
+                                  timeout=READ_TIMEOUT_SECONDS,
+                                  write=self._verb_writer(principal, cid, client_name,
+                                                          client_version))
+        elif writes:
             result = self._capture(args, principal, cid, client_name, client_version)
         else:
             result = mcpcore.call(name, args, profile=principal.profile,
@@ -641,6 +655,8 @@ class Handler(BaseHTTPRequestHandler):
         extra = {}
         if name == "brain_search" and not result.get("isError"):
             extra["results"] = search_result_count(result)
+        elif name == "recall" and not result.get("isError"):
+            extra["results"] = recall_result_count(result)
         self.service.record("tool_call", cid=cid, tool=str(name)[:64],
                             principal=principal.stable_id, profile=principal.profile,
                             endpoint=principal.endpoint, mode=principal.mode,
@@ -648,6 +664,27 @@ class Handler(BaseHTTPRequestHandler):
                             outcome="error" if result.get("isError") else "ok",
                             ms=_ms(started), **extra)
         return self._send(200, reply(msg_id, result), cid=cid)
+
+    def _verb_writer(self, principal, cid, client_name, client_version):
+        """How `remember` and `forget` land a capture on this endpoint: the same
+        transaction `brain_capture` uses (ledger, push queue), stamped from what
+        THIS server verified, never from the arguments. None when the server was
+        started without a write path."""
+        capturer = self.service.capturer
+        if capturer is None:                   # pragma: no cover - misconfiguration
+            return None
+        client = provenance.client_label(client_name, client_version)
+        if client is None and client_name:
+            self.service.record("provenance_dropped", cid=cid, principal=principal.stable_id,
+                                reason="client")
+
+        def write(text, declared, flags, request_id, allow_duplicate, dedupe_text=None):
+            return capturer.capture(
+                text, principal.profile, principal.stable_id, cid,
+                client_request_id=request_id, allow_duplicate=allow_duplicate,
+                via=principal.label or principal.mode, client=client, declared=declared,
+                extra_flags=flags, dedupe_text=dedupe_text)
+        return write
 
     def _capture(self, args, principal, cid, client_name=None, client_version=None) -> dict:
         table = {tool["name"]: tool for tool in mcpcore.tool_table("remote")}
@@ -705,6 +742,17 @@ def search_result_count(result) -> int:
                    if isinstance(block, dict))
     more = _MORE_LINE.search(text)
     return len(_HIT_LINE.findall(text)) + (int(more.group(1)) if more else 0)
+
+
+def recall_result_count(result) -> int:
+    """How many notes a `recall` found: the pages arm's results plus the hits below the
+    cap. Facts are not counted (they are not a search), and only the number leaves."""
+    try:
+        body = json.loads("".join(block.get("text", "") for block in result.get("content", [])
+                                  if isinstance(block, dict)))
+        return len(body.get("results") or []) + int(body.get("more") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return 0
 
 
 def _instructions(profile: str) -> str:

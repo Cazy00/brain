@@ -559,7 +559,8 @@ class TestReadOnlyServing(ServeCase):
         # that quietly dropped brain_links as well would be discovered by
         # somebody far from their laptop, which is the one place this runs.
         self.assertEqual(self.tools(),
-                         {"brain_search", "brain_read", "brain_links", "brain_recent"})
+                         {"brain_search", "brain_read", "brain_links", "brain_recent",
+                          "recall", "delta"})
 
     def test_calling_the_write_tool_by_name_is_refused(self):
         """The whole mode, in one assertion.
@@ -620,7 +621,9 @@ class TestTheReadOnlySetIsDerivedFailingClosed(unittest.TestCase):
 
     def test_the_write_tool_is_not_in_the_read_only_set(self):
         self.assertNotIn("brain_capture", mcp.READ_ONLY_TOOLS)
-        self.assertEqual(len(mcp.READ_ONLY_TOOLS), len(mcp.TOOLS) - 1)
+        self.assertNotIn("remember", mcp.READ_ONLY_TOOLS)
+        self.assertNotIn("forget", mcp.READ_ONLY_TOOLS)
+        self.assertEqual(len(mcp.READ_ONLY_TOOLS), len(mcp.TOOLS) - 3)
 
 
 class TestDropBoxServing(ServeCase):
@@ -636,7 +639,7 @@ class TestDropBoxServing(ServeCase):
     tester's own brain. What a capture hands back is asserted below, against
     the dispatcher, with the CLI mocked.
     """
-    ALLOW_TOOLS = mcp.WRITE_ONLY_TOOLS
+    ALLOW_TOOLS = mcp.DROP_BOX_TOOLS
 
     def tools(self):
         _status, _headers, body = self.request(
@@ -674,8 +677,14 @@ class TestTheWriteOnlySetIsDerivedFailingClosed(unittest.TestCase):
     NEITHER restricted mode — so it is never exposed by one of them by
     accident, in either direction."""
 
-    def test_the_write_only_set_is_the_write_tool(self):
-        self.assertEqual(set(mcp.WRITE_ONLY_TOOLS), {"brain_capture"})
+    def test_the_write_only_set_is_every_tool_that_writes(self):
+        self.assertEqual(set(mcp.WRITE_ONLY_TOOLS), {"brain_capture", "remember", "forget"})
+
+    def test_a_drop_box_serves_brain_capture_and_nothing_else(self):
+        """The write scope opens every writing tool, but a drop box is a slot: `remember`
+        and `forget` are for an endpoint whose caller may also read."""
+        self.assertEqual(tuple(mcp.DROP_BOX_TOOLS), ("brain_capture",))
+        self.assertTrue(set(mcp.DROP_BOX_TOOLS) <= set(mcp.WRITE_ONLY_TOOLS))
 
     def test_an_unannotated_tool_joins_neither_set(self):
         for annotations in ({}, {"annotations": {}},
@@ -1034,7 +1043,7 @@ class TestServeStampsItsTransport(ServeCase):
 
 
 class TestTheDropBoxStampsItsTransport(TestServeStampsItsTransport):
-    ALLOW_TOOLS = mcp.WRITE_ONLY_TOOLS
+    ALLOW_TOOLS = mcp.DROP_BOX_TOOLS
     SOURCE = "support-bot"
     EXPECTED_VIA = "drop-box"
 
@@ -1426,7 +1435,7 @@ class TestTheDropBoxCli(TestTheCli):
     def test_it_narrows_what_the_server_will_run(self):
         server = self.serve_and_get_server("--drop-box", "--source", "support-bot",
                                            "--port", "0")
-        self.assertEqual(set(server.allow_tools), set(mcp.WRITE_ONLY_TOOLS))
+        self.assertEqual(set(server.allow_tools), set(mcp.DROP_BOX_TOOLS))
 
     def test_the_source_reaches_the_server(self):
         server = self.serve_and_get_server("--drop-box", "--source", "support-bot",

@@ -300,7 +300,10 @@ def tools_for_scopes(granted, allow_tools=None) -> frozenset:
     if SCOPE_READ in granted:
         allowed |= set(mcp.READ_ONLY_TOOLS)
     if SCOPE_WRITE in granted:
-        allowed |= set(mcp.WRITE_ONLY_TOOLS)
+        allowed |= set(mcp.WRITE_SCOPE_TOOLS)
+        # A tool that writes and also answers needs both scopes: write alone is a slot.
+        if SCOPE_READ in granted:
+            allowed |= set(mcp.READ_WRITE_TOOLS)
     return frozenset(served & allowed)
 
 

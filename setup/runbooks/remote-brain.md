@@ -481,8 +481,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://brain.<ZONE>/mcp   # 302/401 f
 ```
 
 - OAuth login works on both hostnames, as the owner and as nobody else.
-- `tools/list` on `brain-read` returns exactly four tools; on `brain` exactly
-  five.
+- `tools/list` on `brain-read` returns exactly six tools (`brain_search`,
+  `brain_read`, `brain_links`, `brain_recent`, `recall`, `delta`); on `brain`
+  exactly nine (those plus `brain_capture`, `remember`, `forget`).
 - A hand-built `brain_capture` call against `brain-read` is refused.
 - A canary capture commits, comes back `provisional`, survives a
   `docker compose restart brain`, and reaches the private git remote.

@@ -22,10 +22,16 @@ Two axes, deliberately separate:
   owner is sitting at. A remote capture may not: an uncommitted remote capture
   is neither durable nor auditable, and it dirties the tree that consolidation
   needs clean.
-- **Profile** decides WHICH TOOLS exist. `read` is the four retrieval tools;
-  `capture` is those four plus `brain_capture`. Nothing else is ever added by
-  a request — the profile comes from the authenticated audience, never from a
-  parameter.
+- **Profile** decides WHICH TOOLS exist. `read` is the retrieval tools (the
+  four old ones, plus the verbs `recall` and `delta`); `capture` is those plus
+  `brain_capture` and the verbs `remember` and `forget`. Nothing else is ever
+  added by a request — the profile comes from the authenticated audience, never
+  from a parameter.
+
+The memory verbs (`recall`, `remember`, `forget`, `delta`) are the contract
+`brain-verbs.v1`; brainlib/verbs.py is where its rules are code. The old tools
+`brain_search`, `brain_capture` and `brain_recent` are served unchanged beside
+them until the last client has moved.
 
 `tools_for` filtering the advertised list is usability. `call` re-checking the
 profile is the security boundary, and it is checked again there precisely
@@ -34,17 +40,21 @@ because a client can construct a call for a tool that was never advertised.
 from __future__ import annotations
 
 import difflib
+import json
+import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from . import provenance
+from . import provenance, verbs
 
 ENGINE = Path(__file__).resolve().parent.parent.parent
 BRAIN = str(ENGINE / "bin" / "brain")
 
-READ_TOOLS = ("brain_search", "brain_read", "brain_links", "brain_recent")
-CAPTURE_TOOLS = READ_TOOLS + ("brain_capture",)
+READ_TOOLS = ("brain_search", "brain_read", "brain_links", "brain_recent") \
+    + verbs.READ_VERBS
+CAPTURE_TOOLS = READ_TOOLS + ("brain_capture",) + verbs.WRITE_VERBS
 PROFILES = {"read": READ_TOOLS, "capture": CAPTURE_TOOLS}
 
 # The remote caps come from the design spec; the local ones are what stdio has
@@ -123,6 +133,44 @@ CORRECTION_FORMAT = (
     "note (scope handoff) with a correction starting \"Filed <path>: <where now>\" or "
     "\"Already recorded: <path>: <where>\"."
 )
+# The verbs' own descriptions. `recall` and `delta` say what the contract says (their
+# trust markers are fields, not text tags); `remember` carries the capture policy as
+# `brain_capture` does, with the correction format in the verbs' own vocabulary.
+RECALL_DESCRIPTION = (
+    "Search the user's permanent second brain — their decisions, projects, people, "
+    "reference notes and life context. Use this BEFORE answering any question about the "
+    "user's past decisions, preferences, projects or personal history. `query` searches "
+    "notes and returns CURRENT knowledge only (superseded notes are structurally excluded); "
+    "its trust markers ([provisional — unconsolidated], [journal], [correction pending], a "
+    "passed review_by) are part of the answer, so never present such a note as settled fact. "
+    "`entity` returns saved facts (unconsolidated captures) for that label. If a query "
+    "misses, retry with 2-3 lexical variants before concluding the brain has nothing."
+)
+REMEMBER_DESCRIPTION = (
+    "Save ONE fact to the brain's inbox, with mandatory attribution. It is scanned for "
+    "credentials, committed and backed up with no way to hold it back, and it stays "
+    "PROVISIONAL until the brain's consolidation pass promotes it."
+)
+VERB_CORRECTION_FORMAT = (
+    "To correct a note, call remember with note_kind \"correction\" and start the fact "
+    "\"Correction to <id or path>: <what is true now>\" or, for one that should not exist, "
+    "\"Retract <id or path>: <the user's reason>\". Find its path with recall (scope all "
+    "reaches inbox notes) or delta. Close a handoff note (scope handoff) with a correction "
+    "starting \"Filed <path>: <where now>\" or \"Already recorded: <path>: <where>\"."
+)
+FORGET_DESCRIPTION = (
+    "Retract one saved fact by its id (from remember, or recall facts[].fact_id), never a "
+    "note id or path. The fact leaves recall at once; git keeps the record and consolidation "
+    "drains the retraction. Forgetting it again returns expired: false."
+)
+DELTA_DESCRIPTION = (
+    "What changed in the brain since a moment: notes touched after it and facts captured "
+    "after it, oldest first, with their trust markers. Pass `since` (ISO 8601), or `cursor` "
+    "from the previous reply's next_cursor. Delivery is at-least-once; when has_more is "
+    "true, call again with next_cursor.cursor. `pages` is authoritative; `facts` are "
+    "ordered by capture time, so a capture synced in with an earlier time than your cursor "
+    "shows in `pages` but may never appear in `facts`."
+)
 READ_ONLY_SENTENCE = "This endpoint is read-only; it cannot save anything."
 LOCAL_CAPTURE_DESCRIPTION = (
     "Save a note to the brain's inbox, committed and backed up at once (pass commit: "
@@ -143,10 +191,129 @@ def instructions(profile: str) -> str:
     return READ_POLICY + " " + READ_ONLY_SENTENCE
 
 
-def tool_table(transport: str = "local") -> list:
-    """Every tool this brain can expose, with the limits of one transport."""
+def verb_tools(transport: str) -> list:
+    """The four memory verbs, with the limits of one transport (contract: tools)."""
     caps = LIMITS[transport]
-    tools = [
+    entity = {"type": "string", "pattern": verbs.ENTITY_RE.pattern, "maxLength": 100,
+              "description": "A label, not an entity page. Filters the facts arm; remember "
+                             "writes it."}
+    iso = "ISO 8601 date or datetime."
+    recall = {
+        "name": "recall", "description": RECALL_DESCRIPTION,
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string", "maxLength": caps["query"],
+                      "description": "Search query. Runs the pages arm. Empty only with "
+                                     "scope handoff."},
+            "entity": entity,
+            "scope": {"type": "string", "enum": ["canonical", "all", "handoff"],
+                      "description": "canonical (default). 'all' adds the journal and the "
+                                     "unprocessed inbox (tagged) and opens the facts arm. "
+                                     "'handoff' lists only notes waiting to be filed in a "
+                                     "project's own records."},
+            "mode": {"type": "string", "enum": ["keyword", "hybrid"],
+                     "description": "keyword = FTS only (the default). hybrid = FTS plus "
+                                    "meaning, where the engine has it; where it has not, the "
+                                    "answer is keyword-only and sets search_degraded."},
+            "limit": {"type": "integer", "minimum": caps["limit"][0],
+                      "maximum": caps["limit"][1], "description": "Per-arm cap. Default 8."},
+            "offset": {"type": "integer", "minimum": 0, "maximum": caps["offset"],
+                       "description": "Scope handoff only: skip this many hits."},
+            "since": {"type": "string",
+                      "description": iso + " Filters the facts arm only. Unparseable: "
+                                     "invalid_params."},
+            "budget_tokens": {"type": "integer", "minimum": 1,
+                              "description": "Server-side packing, facts first. Cost is "
+                                             "ceil(len/4) per fact, ceil(title/4)+"
+                                             "ceil(chunk/4) per result."},
+            "source_id": {"type": "string", "maxLength": 64,
+                          "description": "Only 'default' exists. Any other value: not_found."},
+            "question": {"type": "string", "maxLength": 2000,
+                         "description": "Accepted and ignored in v1; facts_order stays "
+                                        "'newest'."},
+            "budget_policy": {"type": "string", "enum": ["facts_first", "query_first"],
+                              "description": "Accepted and ignored in v1."},
+            "session_id": {"type": "string", "maxLength": 128,
+                           "description": "Accepted and ignored in v1."},
+        }},
+        "annotations": {"readOnlyHint": True},
+    }
+    kinds = list(provenance.KINDS)
+    remember = {
+        "name": "remember",
+        "description": " ".join((REMEMBER_DESCRIPTION, CAPTURE_POLICY, VERB_CORRECTION_FORMAT)),
+        "inputSchema": {"type": "object", "properties": {
+            "fact": {"type": "string", "minLength": 1, "maxLength": caps["text"],
+                     "description": "The content to save."},
+            "provenance": {"type": "string", "maxLength": verbs.PROVENANCE_MAX,
+                           "description": "Required. Where the fact came from, free text, one "
+                                          "line. Blank: provenance_required."},
+            "ttl": {"type": "string",
+                    "description": "Duration shorthand ('30d', '12h', '45m') or an absolute "
+                                   "ISO 8601 timestamp. ISO durations ('P30D') are refused "
+                                   "with a fix. Omitted: never expires."},
+            "entity": entity,
+            "kind": {"type": "string",
+                     "enum": ["event", "preference", "commitment", "belief", "fact"],
+                     "description": "Default 'fact'. Maps to a note kind: fact to fact, "
+                                    "preference to preference, the rest to other."},
+            "visibility": {"type": "string", "enum": ["world", "private"],
+                           "description": "Default world."},
+            "valid_from": {"type": "string",
+                           "description": iso + " When the fact became true. Omitted: write "
+                                          "time."},
+            "request_id": {"type": "string", "maxLength": 128,
+                           "description": "Send the SAME value when retrying a write that may "
+                                          "already have succeeded; within 24 hours the retry "
+                                          "returns the original result."},
+            "note_kind": {"type": "string", "enum": kinds,
+                          "description": "Harbor extension. Wins over kind. 'correction' is "
+                                         "how a canonical note is corrected or retracted."},
+            **{name: dict(spec) for name, spec in provenance.declared_schema().items()
+               if name != "kind"},
+            "allow_duplicate": {"type": "boolean",
+                                "description": "Save even if an identical fact was captured "
+                                               "recently. Default false."},
+        }, "required": ["fact", "provenance"]},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False},
+    }
+    forget = {
+        "name": "forget", "description": FORGET_DESCRIPTION,
+        "inputSchema": {"type": "object", "properties": {
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "reason": {"type": "string", "maxLength": 500},
+            "request_id": {"type": "string", "maxLength": 128,
+                           "description": "Accepted and not used: forget is idempotent."},
+        }, "required": ["id"]},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                        "idempotentHint": True},
+    }
+    delta = {
+        "name": "delta", "description": DELTA_DESCRIPTION,
+        "inputSchema": {"type": "object", "properties": {
+            "since": {"type": "string",
+                      "description": iso + " Unparseable, or outside 0001-01-01..9999-12-31: "
+                                     "invalid_params."},
+            "cursor": {"type": "string", "maxLength": 512,
+                       "description": "A previous reply's next_cursor.cursor. Wins over "
+                                      "since."},
+            "budget_tokens": {"type": "integer", "minimum": 1,
+                              "description": "Pages pack first, then facts; text fits the "
+                                             "budget."},
+            "session_id": {"type": "string", "maxLength": 128,
+                           "description": "Accepted and ignored: the cursor is stateless. "
+                                          "Alone it does not satisfy the since-or-cursor "
+                                          "rule."},
+        }},
+        "annotations": {"readOnlyHint": True},
+    }
+    return [recall, remember, forget, delta]
+
+
+def tool_table(transport: str = "local") -> list:
+    """Every tool this brain can expose, with the limits of one transport. The one
+    table: stdio, `brain serve` and the remote endpoint all read it."""
+    caps = LIMITS[transport]
+    tools = verb_tools(transport) + [
         {
             "name": "brain_search",
             "description": SEARCH_DESCRIPTION,
@@ -340,6 +507,11 @@ def validate_args(tool: dict, args):
                     field, len(value), cap)
             if len(value) < spec.get("minLength", 0):
                 return None, "argument %r is empty" % field
+            # fullmatch, never match-with-$: `$` also matches before a trailing newline,
+            # which is exactly the character a label must not carry.
+            if "pattern" in spec and not re.fullmatch(spec["pattern"], value):
+                return None, "argument %r does not match the required form %s" % (
+                    field, spec["pattern"])
         elif expected == "integer":
             if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
                 value = int(value)
@@ -368,9 +540,15 @@ def validate_args(tool: dict, args):
 
 def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> list:
     """The bin/brain argv one validated tool call becomes. `declared` is a
-    capture's cleaned declared fields (provenance.take_declared)."""
+    capture's cleaned declared fields (provenance.take_declared).
+
+    A remote caller's read tools carry `--hide-private`: a capture marked
+    `visibility: private` does not exist for them (the same rule the facts arm of
+    `recall` follows). It sits before any positional argument, so it can never be
+    read as query text."""
+    hide = ["--hide-private"] if transport == "remote" else []
     if name == "brain_search":
-        cli = ["search", "--limit", str(args.get("limit", 8))]
+        cli = ["search", *hide, "--limit", str(args.get("limit", 8))]
         if args.get("scope") in ("all", "handoff"):
             cli += ["--scope", args["scope"]]
         if args.get("scope") == "handoff" and args.get("offset") is not None:
@@ -378,11 +556,11 @@ def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> l
         cli += ["--", args["query"]]      # query text, never parsed as flags
         return cli
     if name == "brain_read":
-        return ["read", args["id_or_path"]]
+        return ["read", *hide, args["id_or_path"]]
     if name == "brain_links":
-        return ["links", args["id_or_path"]]
+        return ["links", *hide, args["id_or_path"]]
     if name == "brain_recent":
-        return ["recent", "--days", str(args.get("days", 7))]
+        return ["recent", *hide, "--days", str(args.get("days", 7))]
     if name == "brain_capture":
         # Default stays True on both transports, and remotely there is no way
         # to ask for anything else: committing is what backs the note up, and
@@ -401,21 +579,37 @@ def error_result(message: str) -> dict:
     return {"content": [{"type": "text", "text": message}], "isError": True}
 
 
+def served_verbs(profile: str) -> list:
+    """The memory verbs one profile serves."""
+    return [verb for verb in verbs.SERVED if verb in PROFILES[profile]]
+
+
 def call(name, args, profile: str = "capture", transport: str = "local",
-         runner=None, timeout: float = 120.0):
+         runner=None, timeout: float = 120.0, write=None):
     """Dispatch one tools/call. Never raises; every failure is an isError result.
 
     The profile is re-checked here even though `tools_for` already filtered the
     advertised list. Hiding a tool is usability — a client can still construct
-    the call — so this is where the read-only boundary is actually enforced."""
+    the call — so this is where the read-only boundary is actually enforced.
+
+    `write` is how a verb's write lands: a callable the transport supplies
+    (see `call_verb`). Without one `remember` and `forget` refuse, because this
+    layer has no write path of its own."""
+    if isinstance(name, str) and name in verbs.UNSUPPORTED:
+        return verbs.result(verbs.unavailable(name, served_verbs(profile)))
     if not isinstance(name, str) or name not in PROFILES["capture"]:
         # isinstance first: a non-string name (dict/list) is unhashable and
         # would raise on the membership test instead of reporting an unknown tool.
         return error_result("unknown tool %r" % (name,))
     if name not in PROFILES[profile]:
+        if name in verbs.SERVED:
+            return verbs.result(verbs.scope_denied(name, served_verbs(profile)))
         return error_result(
             "tool %r is not available on this endpoint (profile %r is read-only)"
             % (name, profile))
+    if name in verbs.SERVED:
+        return call_verb(name, args, transport, remote=(transport == "remote"),
+                         runner=runner, timeout=timeout, write=write)
     table = {tool["name"]: tool for tool in tool_table(transport)}
     args = args if args is not None else {}
     declared, ignored = {}, []
@@ -436,6 +630,103 @@ def call(name, args, profile: str = "capture", transport: str = "local",
             "isError": run.returncode != 0}
 
 
+def _verb_cli(run, op: str, request: dict, timeout: float) -> dict:
+    """One `brain verb` op: the request as JSON out, on stdin (a fact may be far larger
+    than one command-line argument can be), the answer's last JSON line back (hooks and
+    git may print before it)."""
+    done = run(["verb", op, "-"], timeout, input=json.dumps(request))
+    for line in reversed((done.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            return json.loads(line)
+    raise RuntimeError("brain verb %s returned no result (exit %s)" % (op, done.returncode))
+
+
+def _invalid_arguments(tool: dict, problem: str) -> dict:
+    accepted = ", ".join(sorted(tool["inputSchema"]["properties"]))
+    return verbs.invalid("invalid arguments for %s: %s" % (tool["name"], problem),
+                         "Fix the argument and call again. %s accepts: %s." % (
+                             tool["name"], accepted))
+
+
+def call_verb(name: str, args, transport: str = "local", remote: bool = False,
+              runner=None, timeout: float = 120.0, write=None):
+    """One memory-verb call, already past the profile check. Every outcome is a
+    verb response or the verb error envelope; nothing here raises.
+
+    `write(text=, declared=, flags=, request_id=, allow_duplicate=, dedupe_text=)` lands a capture
+    and returns the capture outcome (`capture.Capturer.capture`'s shape). The
+    transport owns it because the transports differ in who the principal is, what
+    is stamped (`via`, `client`) and whether a push queue exists."""
+    tool = next(t for t in tool_table(transport) if t["name"] == name)
+    args = args if args is not None else {}
+    declared, ignored = {}, []
+    if name == "remember":
+        args, declared, ignored, early = verbs.split_remember(args)
+        if early:
+            return verbs.result(early)
+    clean, problem = validate_args(tool, args)
+    if problem:
+        return verbs.result(_invalid_arguments(tool, problem))
+    now = datetime.now(timezone.utc)
+    run = runner or _run_cli
+    try:
+        if name == "recall":
+            request, refused = verbs.prepare_recall(clean, remote, now)
+            return verbs.result(refused or _verb_cli(run, "recall", request, timeout))
+        if name == "delta":
+            request, refused = verbs.prepare_delta(clean, remote, now)
+            return verbs.result(refused or _verb_cli(run, "delta", request, timeout))
+        if write is None:
+            return verbs.result(verbs.error(
+                "unavailable", "This brain is configured without a write path.",
+                "Use an endpoint that can save; this one only reads."))
+        if name == "remember":
+            request, refused = verbs.prepare_remember(clean, now)
+            if refused:
+                return verbs.result(refused)
+            if _verb_cli(run, "withdrawn", {"text": request["text"]}, timeout)["withdrawn"]:
+                return verbs.result(verbs.invalid(
+                    "fact_withdrawn: this claim was forgotten and its retraction is still "
+                    "pending, so it cannot be remembered again yet.",
+                    "Forget is final until consolidation drains the retraction. State the "
+                    "claim differently, or correct it with note_kind 'correction'."))
+            outcome = write(text=request["text"],
+                            declared={**declared, "kind": request["note_kind"]},
+                            flags=request["flags"], request_id=request["request_id"],
+                            allow_duplicate=request["allow_duplicate"],
+                            dedupe_text=request["dedupe_text"])
+            if not outcome.get("ok"):
+                return verbs.result(verbs.write_error(outcome))
+            # A declared field dropped by the capture itself is named as well.
+            later = [n for n in outcome.get("ignored") or [] if n not in ignored]
+            return verbs.result(verbs.remember_response(
+                outcome, request, [n for n in ("basis", "project", "job", "model")
+                                   if n in ignored or n in later]))
+        planned, refused = verbs.prepare_forget(clean)         # name == "forget"
+        if refused:
+            return verbs.result(refused)
+        stem, reason = planned
+        plan = _verb_cli(run, "forget-plan", {"stem": stem}, timeout)
+        state = plan["state"]
+        if state == "missing":
+            return verbs.result(verbs.error(
+                "not_found", "No saved fact has the id 'inbox-%s'." % stem[:60],
+                "Use a fact id from remember or from recall's facts[].fact_id. A fact that "
+                "consolidation already drained is gone."))
+        if state == "pending":
+            return verbs.result(verbs.forget_response(stem, False, reason))
+        outcome = write(text=verbs.retraction_text(stem, reason), declared={"kind": "correction"},
+                        flags=verbs.retraction_flags(stem, bool(plan.get("private"))),
+                        request_id=None, allow_duplicate=True)
+        if not outcome.get("ok"):
+            return verbs.result(verbs.write_error(outcome))
+        return verbs.result(verbs.forget_response(stem, True, reason))
+    except Exception as exc:
+        return verbs.result(verbs.error(
+            "internal", "The brain could not complete %s." % name,
+            _failure_hint(exc, "remote" if remote else transport)))
+
 
 def _failure_hint(exc, transport: str) -> str:
     if transport == "remote":
@@ -448,6 +739,6 @@ def _failure_hint(exc, transport: str) -> str:
             "(archive/ and vault/ are excluded by .rgignore)." % (exc, ENGINE))
 
 
-def _run_cli(args: list, timeout: float):
+def _run_cli(args: list, timeout: float, input=None):
     return subprocess.run([sys.executable, BRAIN, *args], capture_output=True,
-                          text=True, cwd=ENGINE, timeout=timeout)
+                          text=True, cwd=ENGINE, timeout=timeout, input=input)

@@ -38,6 +38,7 @@ the oldest failure started, which is the one question git cannot answer.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -46,6 +47,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -119,10 +121,18 @@ class Ledger(object):
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             db.execute("VACUUM")
 
+    @contextlib.contextmanager
     def _connect(self):
+        """A connection that commits on success, rolls back on failure and is CLOSED
+        either way (sqlite3's own `with` commits but leaves the connection open, and a
+        ledger asked a few thousand questions left that many open files behind)."""
         db = sqlite3.connect(self.path, timeout=10)
-        db.execute("PRAGMA journal_mode=WAL")
-        return db
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def fingerprint(self, kind: str, profile: str, value: str) -> str:
         """One-way, keyed, and scoped.
@@ -169,6 +179,52 @@ class Ledger(object):
                 "OR (kind <> 'request' AND at < ?)",
                 (now - REQUEST_TTL_SECONDS, now - CONTENT_TTL_SECONDS))
             return cursor.rowcount
+
+
+def ledger_key(state_dir) -> bytes:
+    """The HMAC key of a ledger that has no operator-supplied one (stdio and
+    `brain serve`): random, created once, readable by its owner only, and kept in
+    the same machine-local state as the ledger. Losing it costs nothing but the
+    deduplication window, so it is never backed up and never in the repository."""
+    path = os.path.join(str(state_dir), "capture-ledger.key")
+    os.makedirs(str(state_dir), exist_ok=True)
+    for _attempt in range(3):
+        try:
+            with open(path, "rb") as handle:
+                key = handle.read()
+            if key:
+                return key
+        except FileNotFoundError:
+            pass
+        # The key is written whole to a file of its own and then linked into place, so
+        # the name never exists empty or half written, and of any number of processes
+        # starting at once exactly one link succeeds: every other one reads that key.
+        key = os.urandom(32)
+        fd, tmp = tempfile.mkstemp(prefix="capture-ledger.key.", dir=str(state_dir))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(key)
+            os.chmod(tmp, 0o600)
+            try:
+                os.link(tmp, path)
+                return key
+            except FileExistsError:
+                # Lost the race: read the winner's key next time round. Only an empty
+                # file (left by an older version that crashed between creating and
+                # writing) is replaced, and atomically.
+                try:
+                    empty = os.path.getsize(path) == 0
+                except OSError:
+                    empty = False
+                if empty:
+                    os.replace(tmp, path)
+                    return key
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    raise OSError("could not create the capture ledger key in %s" % state_dir)
 
 
 class BackupQueue(object):
@@ -342,12 +398,20 @@ class Capturer(object):
 
     def capture(self, text: str, profile: str, principal: str, cid: str,
                 client_request_id=None, allow_duplicate: bool = False,
-                via=None, client=None, declared=None) -> dict:
+                via=None, client=None, declared=None, extra_flags=(),
+                dedupe_text=None) -> dict:
         """`via` and `client` are what the endpoint stamps; `declared` is the
         caller's cleaned declared fields (provenance.take_declared). None of
         them is part of either fingerprint: "have I seen this request" and
         "have I seen this text" are questions about the request id and the
-        text, and a retry that relabels a note is still the same note."""
+        text, and a retry that relabels a note is still the same note.
+
+        `extra_flags` are further `brain capture` flags the caller has already
+        validated (the memory verbs' provenance, entity, expiry): they travel with
+        the write and, like the labels, are no part of either fingerprint.
+
+        `dedupe_text` is what the content fingerprint is taken of, when that is more
+        than the note's text: the same sentence filed under two entities is two facts."""
         if client_request_id:
             previous = self.ledger.lookup("request", profile, client_request_id)
             if previous is not None:
@@ -357,15 +421,17 @@ class Capturer(object):
                     self._log.record("capture_deduplicated", cid=cid, profile=profile,
                                      principal=principal, outcome="deduplicated")
                 return self._replay(previous, "request")
+        fingerprint = text if dedupe_text is None else dedupe_text
         if not allow_duplicate:
-            previous = self.ledger.lookup("content", profile, text)
+            previous = self.ledger.lookup("content", profile, fingerprint)
             if previous is not None:
                 if self._log:
                     self._log.record("capture_deduplicated", cid=cid, profile=profile,
                                      principal=principal, outcome="deduplicated")
                 return self._replay(previous, "content")
 
-        flags = provenance.cli_flags({"via": via, "client": client, **(declared or {})})
+        flags = (provenance.cli_flags({"via": via, "client": client, **(declared or {})})
+                 + list(extra_flags))
         outcome = self._run(text, flags)
         ignored = [name for name in (outcome.get("ignored") or [])
                    if name in provenance.DECLARED_FIELDS]
@@ -389,7 +455,7 @@ class Capturer(object):
         # success — and the note would never be written at all.
         if client_request_id:
             self.ledger.remember("request", profile, client_request_id, result)
-        self.ledger.remember("content", profile, text, result)
+        self.ledger.remember("content", profile, fingerprint, result)
         if self._log:
             self._log.record("capture_accepted", cid=cid, profile=profile,
                              principal=principal, outcome="ok",

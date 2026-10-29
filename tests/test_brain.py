@@ -467,7 +467,8 @@ class McpServerTests(unittest.TestCase):
         _proc, replies = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         names = {t["name"] for t in replies[1]["result"]["tools"]}
         self.assertEqual(names, {"brain_search", "brain_read", "brain_links",
-                                 "brain_recent", "brain_capture"})
+                                 "brain_recent", "brain_capture",
+                                 "recall", "remember", "forget", "delta"})
 
     def test_malformed_json_line_is_skipped(self):
         _proc, replies = self.rpc(raw="{not json at all\n[1,2,3]\n"
@@ -565,7 +566,9 @@ class UniversalClientTests(unittest.TestCase):
         _proc, replies = self.session(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = replies[1]["result"]["tools"]
-        blob = json.dumps(tools).lower()
+        # `cursor` is brain-verbs.v1's own pagination term (delta's cursor and
+        # next_cursor), not the editor of that name.
+        blob = re.sub(r"\b(next_)?cursor\b", "", json.dumps(tools).lower())
         for vendor in ("claude", "anthropic", "openai", "gemini", "cursor", "copilot"):
             self.assertNotIn(vendor, blob, f"the tool surface names {vendor}")
         for tool in tools:
@@ -652,7 +655,7 @@ class UniversalClientTests(unittest.TestCase):
         _proc, replies = self.session(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, protocol="2025-06-18")
         self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-06-18")
-        self.assertEqual(len(replies[1]["result"]["tools"]), 5)
+        self.assertEqual(len(replies[1]["result"]["tools"]), 9)
 
 
 class InitTests(unittest.TestCase):
@@ -1761,6 +1764,51 @@ class ConsolidateTests(unittest.TestCase):
                               f"Retract {self.SEED}: it should not be in the brain.")
         commit_at(self.repo, "the owner's retraction", iso_ago(0), fix)
         self.committed(self.toolbelt("drain", self.SEED, fix[0]))
+
+    def forgotten(self, name, target, retracts, source="local"):
+        """The retraction `forget` writes: no basis, a `retracts:` key naming one capture."""
+        return (f"knowledge/inbox/{name}",
+                f"---\ncreated: 2026-10-18\nsource: {source}\nkind: correction\n"
+                f'retracts: "{retracts}"\nstatus: draft\n---\n\n'
+                f"Retract {target}: forgotten through forget\n")
+
+    def test_a_forgotten_capture_and_its_retraction_are_drained_together(self):
+        """Review of #15, row 2: `forget` is trusted for the one inbox capture it names,
+        though it claims no basis, so a pass that drains the pair is not blocked."""
+        fix = self.forgotten("2026-10-18-070000-retract.md", self.SEED, self.SEED)
+        commit_at(self.repo, "a forget", iso_ago(0), fix)
+        self.committed(self.toolbelt("drain", self.SEED, fix[0]))
+
+    def test_a_forget_retracts_an_inbox_capture_and_nothing_else(self):
+        other = "knowledge/inbox/2026-10-15-130000-other.md"
+        commit_at(self.repo, "another capture", iso_ago(0),
+                  (other, "---\ncreated: 2026-10-15\nsource: local\nstatus: draft\n---\n\n"
+                          "Another capture.\n"))
+        cases = {
+            "the key names another capture than the text": (
+                self.forgotten("2026-10-18-070000-retract.md", self.SEED, other),
+                self.toolbelt("drain", self.SEED, "knowledge/inbox/2026-10-18-070000-retract.md")),
+            "a drop box cannot use the key": (
+                self.forgotten("2026-10-18-070000-retract.md", self.SEED, self.SEED,
+                               source="support-bot"),
+                self.toolbelt("drain", self.SEED, "knowledge/inbox/2026-10-18-070000-retract.md")),
+            "the key is not an inbox path": (
+                self.forgotten("2026-10-18-070000-retract.md", self.SEED,
+                               "knowledge/reference/vendor-limits.md"),
+                self.toolbelt("drain", self.SEED, "knowledge/inbox/2026-10-18-070000-retract.md")),
+        }
+        for label, (fix, body) in cases.items():
+            with self.subTest(label):
+                commit_at(self.repo, "a forget", iso_ago(0), fix)
+                self.blocked(body, "only the owner's own correction")
+                commit_at(self.repo, "drop it", iso_ago(0), (fix[0], None))
+        # And never a note under knowledge/: the archive check wants the owner's own words.
+        note = self.reference("vendor-limits")
+        commit_at(self.repo, "a note", iso_ago(0), note)
+        fix = self.forgotten("2026-10-18-070000-retract.md", "vendor-limits", self.SEED)
+        commit_at(self.repo, "a forget naming a note", iso_ago(0), fix)
+        self.blocked(self.toolbelt("retract", "vendor-limits", "saved by mistake")
+                     + self.toolbelt("drain", fix[0]), "only the owner's own correction")
 
     def test_an_archived_retraction_needs_its_trusted_correction(self):
         """Review B4(b, c): a note archived as retracted is checked against the correction

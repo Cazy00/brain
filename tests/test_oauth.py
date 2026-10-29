@@ -160,6 +160,25 @@ class ScopeDerivationTests(unittest.TestCase):
             oauth.tools_for_scopes((oauth.SCOPE_READ, oauth.SCOPE_WRITE)),
             frozenset(mcp.READ_ONLY_TOOLS) | frozenset(mcp.WRITE_ONLY_TOOLS))
 
+    def test_the_write_scope_alone_opens_the_slot_and_nothing_that_answers(self):
+        """Review of #15, row 7: `remember` and `forget` answer back (a stored path, a
+        missing id from an expired one), so a write-only token must not reach them."""
+        self.assertEqual(oauth.tools_for_scopes((oauth.SCOPE_WRITE,)),
+                         frozenset({"brain_capture"}))
+        self.assertEqual(oauth.tools_for_scopes((oauth.SCOPE_WRITE,), allow_tools=None),
+                         frozenset(mcp.DROP_BOX_TOOLS))
+
+    def test_the_read_scope_alone_reaches_no_writing_tool(self):
+        got = oauth.tools_for_scopes((oauth.SCOPE_READ,))
+        self.assertEqual(got, frozenset(mcp.READ_ONLY_TOOLS))
+        self.assertFalse(got & {"brain_capture", "remember", "forget"})
+
+    def test_remember_and_forget_need_both_scopes(self):
+        both = oauth.tools_for_scopes((oauth.SCOPE_READ, oauth.SCOPE_WRITE))
+        self.assertLessEqual({"remember", "forget", "brain_capture"}, both)
+        for one in (oauth.SCOPE_READ, oauth.SCOPE_WRITE):
+            self.assertFalse(oauth.tools_for_scopes((one,)) & {"remember", "forget"}, one)
+
     def test_the_process_still_wins(self):
         """A token granted write against a read-only process reaches no write
         tool. The flag bounds the scope, never the other way round."""

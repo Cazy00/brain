@@ -217,6 +217,16 @@ def _maybe_json(data: bytes):
         return data
 
 
+
+def vendor_names_in(text: str) -> list:
+    """The vendor names a tool contract must not carry. `cursor` and `next_cursor` as whole
+    words are brain-verbs.v1's pagination terms (tests/test_brain.py strips the same two)."""
+    # Case-sensitive on purpose: the pagination words are lowercase, the editor is "Cursor".
+    blob = re.sub(r"\b(next_)?cursor\b", "", text).lower()
+    return [v for v in ("claude", "anthropic", "openai", "gemini", "cursor", "cloudflare")
+            if v in blob]
+
+
 class RemoteTestCase(unittest.TestCase):
     ORIGIN_POLICY = "observe"
     GIT_PUSH = False
@@ -294,19 +304,20 @@ class HandshakeTests(RemoteTestCase):
 class CapabilityBoundaryTests(RemoteTestCase):
     """The read/capture split, which is the whole reason there are two hostnames."""
 
-    def test_the_read_only_endpoint_advertises_exactly_four_tools(self):
+    def test_the_read_only_endpoint_advertises_exactly_its_six_tools(self):
         status, _h, body = self.brain.rpc("tools/list", host="brain-read.test")
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in body["result"]["tools"])
         self.assertEqual(names, ["brain_links", "brain_read", "brain_recent",
-                                 "brain_search"])
+                                 "brain_search", "delta", "recall"])
 
-    def test_the_capture_endpoint_advertises_exactly_five_tools(self):
+    def test_the_capture_endpoint_advertises_exactly_its_nine_tools(self):
         status, _h, body = self.brain.rpc("tools/list", host="brain.test")
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in body["result"]["tools"])
         self.assertEqual(names, ["brain_capture", "brain_links", "brain_read",
-                                 "brain_recent", "brain_search"])
+                                 "brain_recent", "brain_search", "delta", "forget",
+                                 "recall", "remember"])
 
     def test_a_hand_built_capture_call_on_the_read_endpoint_is_refused(self):
         """The security half of the boundary. Hiding the tool from tools/list is
@@ -324,10 +335,15 @@ class CapabilityBoundaryTests(RemoteTestCase):
 
     def test_the_read_only_tool_descriptions_never_mention_capturing(self):
         status, _h, body = self.brain.rpc("tools/list", host="brain-read.test")
-        blob = json.dumps(body["result"]["tools"]).lower()
-        for vendor in ("claude", "anthropic", "openai", "gemini", "cursor", "cloudflare"):
-            self.assertNotIn(vendor, blob,
-                             "a vendor name leaked into the tool contract")
+        self.assertEqual(vendor_names_in(json.dumps(body["result"]["tools"])), [],
+                         "a vendor name leaked into the tool contract")
+
+    def test_the_vendor_check_still_catches_the_editor_called_cursor(self):
+        """`cursor` and `next_cursor` are delta's pagination words and are let through;
+        the editor's name is not, in any case or position."""
+        self.assertEqual(vendor_names_in('{"cursor": "x", "next_cursor": {"cursor": "y"}}'), [])
+        self.assertEqual(vendor_names_in("Works with Cursor and next_cursor."), ["cursor"])
+        self.assertEqual(vendor_names_in("a cursorial note"), ["cursor"])
 
 
 class AssertionTests(RemoteTestCase):
@@ -400,7 +416,7 @@ class AssertionTests(RemoteTestCase):
             "tools/list", host="brain-read.test",
             assertion=sign_assertion(service_claims(AUD_READ)))
         self.assertEqual(status, 200)
-        self.assertEqual(len(body["result"]["tools"]), 4)
+        self.assertEqual(len(body["result"]["tools"]), 6)
 
     def test_a_service_token_is_refused_on_a_profile_it_was_not_granted(self):
         """The origin refuses independently of Access policy. Two things have to
@@ -1031,7 +1047,7 @@ class ModernEraTests(RemoteTestCase):
         statement, not an omission."""
         status, _h, body = self.modern("tools/list", caps={})
         self.assertEqual(status, 200)
-        self.assertEqual(len(body["result"]["tools"]), 5)
+        self.assertEqual(len(body["result"]["tools"]), 9)
 
     def test_a_missing_protocol_version_in_meta_is_invalid_params(self):
         status, _h, body = self.brain.post(
@@ -1144,7 +1160,7 @@ class ModernEraTests(RemoteTestCase):
     def test_tools_list_works_in_the_modern_era(self):
         status, _h, body = self.modern("tools/list")
         self.assertEqual(status, 200)
-        self.assertEqual(len(body["result"]["tools"]), 5)
+        self.assertEqual(len(body["result"]["tools"]), 9)
 
     def test_a_tools_call_needs_a_matching_mcp_name_header(self):
         status, _h, body = self.modern(
@@ -1235,6 +1251,47 @@ class FakeGit(object):
                 return self.Done(0)
             return self.Done(1)
         raise AssertionError("unexpected git call: %r" % (args,))
+
+
+class LedgerKeyTests(unittest.TestCase):
+    """Review of #15, row 8: two servers starting together on a fresh state directory must
+    end with ONE key, or request ids and deduplication stop working between them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+
+    def test_a_second_starter_arriving_mid_creation_gets_the_same_key(self):
+        from unittest import mock
+        real, nested, inner = os.fdopen, [], []
+
+        def fdopen(fd, *args, **kwargs):
+            # Between the key file being created and its key being written: the moment
+            # a second process (here, a nested call) can look at the file.
+            if not nested:
+                nested.append(True)
+                inner.append(capture.ledger_key(self.state))
+            return real(fd, *args, **kwargs)
+        with mock.patch.object(os, "fdopen", fdopen):
+            outer = capture.ledger_key(self.state)
+        self.assertEqual(len(outer), 32)
+        self.assertEqual(inner, [outer])
+        self.assertEqual((self.state / "capture-ledger.key").read_bytes(), outer)
+
+    def test_the_key_is_private_and_stable(self):
+        key = capture.ledger_key(self.state)
+        self.assertEqual(capture.ledger_key(self.state), key)
+        path = self.state / "capture-ledger.key"
+        self.assertEqual(path.stat().st_mode & 0o077, 0, "the key is readable by others")
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["capture-ledger.key"])
+
+    def test_an_empty_key_file_from_an_older_crash_is_replaced_once(self):
+        self.state.mkdir()
+        (self.state / "capture-ledger.key").write_bytes(b"")
+        key = capture.ledger_key(self.state)
+        self.assertEqual(len(key), 32)
+        self.assertEqual(capture.ledger_key(self.state), key)
 
 
 class LedgerUpgradeTests(unittest.TestCase):

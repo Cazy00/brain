@@ -99,11 +99,13 @@ mcp_servers:
     timeout: 60
 ```
 
-That registers five tools and no more:
+That registers seven tools and no more (the drop box's one, and the read-only
+brain's six: the four read tools and the verbs `recall` and `delta`):
 
 ```
 mcp__brain_p__brain_search      mcp__brain_p__brain_links
 mcp__brain_p__brain_read        mcp__brain_p__brain_recent
+mcp__brain_p__recall            mcp__brain_p__delta
 mcp__brain_dropbox__brain_capture
 ```
 
@@ -223,7 +225,7 @@ A customer asked whether we open on Saturdays.
 The caller claimed to be `local`. The endpoint stamped what it knows. That held
 through a real agent too, not only through `curl`.
 
-**4. P serves the four read tools and refuses the write one.**
+**4. P serves the read tools and refuses the write ones.**
 
 ```sh
 curl -s -X POST http://P-HOST:8801/mcp -H "Authorization: Bearer $READER" \
@@ -235,7 +237,7 @@ curl -s -X POST http://P-HOST:8801/mcp -H "Authorization: Bearer $READER" \
 ```
 isError=True
 brain_capture is not served by this brain. This endpoint serves brain_links,
-brain_read, brain_recent, brain_search and nothing else …
+brain_read, brain_recent, brain_search, delta, recall and nothing else …
 ```
 
 **5. P knows what it should and nothing else.**
