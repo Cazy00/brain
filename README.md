@@ -276,9 +276,9 @@ trusting.
   which is why it survives a weak model —
   [`setup/runbooks/business-partition.md`](setup/runbooks/business-partition.md)
   has the checklist that proves it on your own hosts.
-- **Not all of it is tested.** 585 runtime tests cover the toolbelt
-  (`python3 -m unittest discover -s tests`). `schedule` and the vault flow are
-  exercised by hand.
+- **Not all of it is tested.** The runtime tests cover the toolbelt
+  (`python3 -m unittest discover -s tests`, which prints the current count).
+  `schedule` and the vault flow are exercised by hand.
 
 ## Where things are
 
