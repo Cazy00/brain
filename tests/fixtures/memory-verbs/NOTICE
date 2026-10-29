@@ -1,0 +1,34 @@
+cases.json in this directory is garrytan/gbrain's
+test/fixtures/memory-verbs/cases.json at commit
+fd22a75d136df59bd7d3d43f6ccd6b9ef823037a, vendored byte for byte
+(sha256 b0d8a2fd8e77c48eb01571891b49e0c9898333d0c8e303db9fba822ea028bbd2).
+It is the conformance suite of MEMORY_VERBS v1, which the memory verbs of this
+brain (contract brain-verbs.v1) follow. gbrain itself is never installed or
+run: tests/test_memory_verbs_conformance.py is a small runner of our own, and it
+only ever targets a temporary corpus.
+
+gbrain's licence, which governs that file, follows.
+
+----------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 Garry Tan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

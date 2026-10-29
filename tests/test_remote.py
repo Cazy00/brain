@@ -294,19 +294,20 @@ class HandshakeTests(RemoteTestCase):
 class CapabilityBoundaryTests(RemoteTestCase):
     """The read/capture split, which is the whole reason there are two hostnames."""
 
-    def test_the_read_only_endpoint_advertises_exactly_four_tools(self):
+    def test_the_read_only_endpoint_advertises_exactly_its_six_tools(self):
         status, _h, body = self.brain.rpc("tools/list", host="brain-read.test")
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in body["result"]["tools"])
         self.assertEqual(names, ["brain_links", "brain_read", "brain_recent",
-                                 "brain_search"])
+                                 "brain_search", "delta", "recall"])
 
-    def test_the_capture_endpoint_advertises_exactly_five_tools(self):
+    def test_the_capture_endpoint_advertises_exactly_its_nine_tools(self):
         status, _h, body = self.brain.rpc("tools/list", host="brain.test")
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in body["result"]["tools"])
         self.assertEqual(names, ["brain_capture", "brain_links", "brain_read",
-                                 "brain_recent", "brain_search"])
+                                 "brain_recent", "brain_search", "delta", "forget",
+                                 "recall", "remember"])
 
     def test_a_hand_built_capture_call_on_the_read_endpoint_is_refused(self):
         """The security half of the boundary. Hiding the tool from tools/list is
@@ -325,7 +326,9 @@ class CapabilityBoundaryTests(RemoteTestCase):
     def test_the_read_only_tool_descriptions_never_mention_capturing(self):
         status, _h, body = self.brain.rpc("tools/list", host="brain-read.test")
         blob = json.dumps(body["result"]["tools"]).lower()
-        for vendor in ("claude", "anthropic", "openai", "gemini", "cursor", "cloudflare"):
+        # "cursor" is not in the list: it is the pagination word of `delta`
+        # (brain-verbs.v1 names the parameter), not the editor.
+        for vendor in ("claude", "anthropic", "openai", "gemini", "cloudflare"):
             self.assertNotIn(vendor, blob,
                              "a vendor name leaked into the tool contract")
 
@@ -400,7 +403,7 @@ class AssertionTests(RemoteTestCase):
             "tools/list", host="brain-read.test",
             assertion=sign_assertion(service_claims(AUD_READ)))
         self.assertEqual(status, 200)
-        self.assertEqual(len(body["result"]["tools"]), 4)
+        self.assertEqual(len(body["result"]["tools"]), 6)
 
     def test_a_service_token_is_refused_on_a_profile_it_was_not_granted(self):
         """The origin refuses independently of Access policy. Two things have to
@@ -1031,7 +1034,7 @@ class ModernEraTests(RemoteTestCase):
         statement, not an omission."""
         status, _h, body = self.modern("tools/list", caps={})
         self.assertEqual(status, 200)
-        self.assertEqual(len(body["result"]["tools"]), 5)
+        self.assertEqual(len(body["result"]["tools"]), 9)
 
     def test_a_missing_protocol_version_in_meta_is_invalid_params(self):
         status, _h, body = self.brain.post(
@@ -1144,7 +1147,7 @@ class ModernEraTests(RemoteTestCase):
     def test_tools_list_works_in_the_modern_era(self):
         status, _h, body = self.modern("tools/list")
         self.assertEqual(status, 200)
-        self.assertEqual(len(body["result"]["tools"]), 5)
+        self.assertEqual(len(body["result"]["tools"]), 9)
 
     def test_a_tools_call_needs_a_matching_mcp_name_header(self):
         status, _h, body = self.modern(

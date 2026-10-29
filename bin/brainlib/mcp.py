@@ -222,7 +222,13 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
         # note is worth more than its label — so they are taken out before the
         # strict validator, which would refuse the whole call over a bad enum.
         args, declared, ignored = provenance.take_declared(args)
-    args, problem = mcpcore.validate_args(TOOLS_BY_NAME[name], args if args is not None else {})
+    if isinstance(args, dict):
+        # The older tools drop an argument they do not declare, as this transport always
+        # has (a `source` in a capture is discarded, never believed). The verbs, which
+        # are new, refuse it instead: see mcpcore.call_verb.
+        declared_args = TOOLS_BY_NAME[name]["inputSchema"]["properties"]
+        args = {key: value for key, value in args.items() if key in declared_args}
+    args, problem = mcpcore.validate_args(TOOLS_BY_NAME[name], args)
     if problem:
         return {"content": [{"type": "text", "text": f"invalid arguments for {name}: {problem}"}],
                 "isError": True}
