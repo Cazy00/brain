@@ -1,0 +1,74 @@
+{
+ "capture": {
+  "isError": false,
+  "text": "<data>/knowledge/inbox/<date>-<hhmmss>-golden-probe-the-widget-line-gets-a-seco.md\ncaptured and committed — push runs in background (bin/brain doctor verifies backup)"
+ },
+ "links": {
+  "isError": false,
+  "text": "# links for gadget-overview\n\nlinked FROM (1) — notes that reference this one:\n  <- widgets-hub  Widgets hub (knowledge/topics/widgets.md)\n\nlinks TO (2):\n  -> 2026-03-01-choose-widget-engine  Choose the widget engine (knowledge/decisions/2026-03-01-choose-widget-engine.md)\n  -> widget-glossary  Widget glossary (knowledge/reference/widget-glossary.md)"
+ },
+ "read_archived": {
+  "isError": false,
+  "text": "# Choose the widget engine  (decision, created 2026-03-01, status current)\npath: knowledge/decisions/2026-03-01-choose-widget-engine.md\nNOTE: '2026-02-01-old-engine' was superseded — this is the CURRENT version. Chain: 2026-02-01-old-engine -> 2026-03-01-choose-widget-engine\nlinked from (1): [[gadget-overview]]\n\n---\nid: 2026-03-01-choose-widget-engine\nkind: decision\ntitle: Choose the widget engine\ntopics: [widgets]\naliases: [widget engine choice, engine pick]\ncreated: 2026-03-01\nstatus: current\n---\n\nWe chose the sprocket widget engine because it indexes quickly.\nThe rejected alternative was the cog engine."
+ },
+ "read_by_id": {
+  "isError": false,
+  "text": "# Widget glossary  (reference, created 2026-03-02, status current)\npath: knowledge/reference/widget-glossary.md\nWARNING: review_by 2026-04-01 has passed — this fact may be STALE; verify before relying on it.\nWARNING: [correction pending — knowledge/inbox/<date>-<hhmmss>-glossary-fix.md] — a correction to this note waits for the next consolidation; read it before relying on this note.\nlinked from (2): [[gadget-overview]], [[widgets-hub]]\n\n---\nid: widget-glossary\nkind: reference\ntitle: Widget glossary\ntopics: [widgets]\naliases: [widget terms]\ncreated: 2026-03-02\nstatus: current\nreview_by: 2026-04-01\n---\n\nA sprocket is a toothed wheel. A cog is a smaller toothed wheel."
+ },
+ "read_inbox_path": {
+  "isError": false,
+  "text": "WARNING: this is an INBOX capture — PROVISIONAL, not consolidated knowledge. Do not present it as settled.\n\n---\ncreated: 2026-03-06\ncaptured_at: 2026-03-06T09:00:00Z\nsource: local\nkind: idea\nbasis: owner-said\nstatus: draft\n---\n\nTry a gear-shaped widget handle for the sprocket line."
+ },
+ "recent_default": {
+  "isError": false,
+  "text": "no notes touched in the last 7 day(s)"
+ },
+ "recent_wide": {
+  "isError": false,
+  "text": "2026-03-31  knowledge/handoff/gadget/<date>-<hhmmss>-file-this.md [handoff — belongs in gadget]\n2026-03-31  knowledge/inbox/<date>-<hhmmss>-glossary-fix.md [provisional — unconsolidated]\n2026-03-31  knowledge/inbox/<date>-<hhmmss>-widget-idea.md [provisional — unconsolidated]\n2026-03-31  knowledge/journal/2026/2026-03-05.md [journal]\n2026-03-31  knowledge/topics/widgets.md\n2026-03-31  knowledge/projects/gadget/overview.md\n2026-03-31  knowledge/reference/widget-glossary.md [correction pending — knowledge/inbox/<date>-<hhmmss>-glossary-fix.md]\n2026-03-31  knowledge/decisions/2026-03-01-choose-widget-engine.md"
+ },
+ "search_alias": {
+  "isError": false,
+  "text": "1. knowledge/decisions/2026-03-01-choose-widget-engine.md — Choose the widget engine (decision, 2026-03-01)\n   We chose the sprocket widget [engine] because it indexes quickly. The rejected alternative was…\n[match mode: all-terms]"
+ },
+ "search_all": {
+  "isError": false,
+  "text": "1. knowledge/reference/widget-glossary.md — Widget glossary (reference, 2026-03-02) [STALE — review_by 2026-04-01 passed] [correction pending — knowledge/inbox/<date>-<hhmmss>-glossary-fix.md]\n   A [sprocket] is a toothed wheel. A cog is a smaller toothed wheel.\n2. knowledge/decisions/2026-03-01-choose-widget-engine.md — Choose the widget engine (decision, 2026-03-01)\n   We chose the [sprocket] widget engine because it indexes quickly. The rejected alternative was…\n3. knowledge/journal/2026/2026-03-05.md — Journal 2026-03-05 (journal, 2026-03-05) [journal]\n   Tried the [sprocket] engine on the bench today.\n4. knowledge/inbox/<date>-<hhmmss>-widget-idea.md — <date>-<hhmmss>-widget-idea (inbox, 2026-03-06) [provisional — unconsolidated]\n   Try a gear-shaped widget handle for the [sprocket] line.\n[match mode: all-terms]"
+ },
+ "search_and_terms": {
+  "isError": false,
+  "text": "1. knowledge/decisions/2026-03-01-choose-widget-engine.md — Choose the widget engine (decision, 2026-03-01)\n   We chose the [sprocket] widget [engine] because it indexes quickly. The rejected alternative was…\n[match mode: all-terms]"
+ },
+ "search_any_term": {
+  "isError": false,
+  "text": "1. knowledge/reference/widget-glossary.md — Widget glossary (reference, 2026-03-02) [STALE — review_by 2026-04-01 passed] [correction pending — knowledge/inbox/<date>-<hhmmss>-glossary-fix.md]\n   A [sprocket] is a toothed wheel. A cog is a smaller toothed wheel.\n2. knowledge/decisions/2026-03-01-choose-widget-engine.md — Choose the widget engine (decision, 2026-03-01)\n   We chose the [sprocket] widget engine because it indexes quickly. The rejected alternative was…\n[match mode: any-term]"
+ },
+ "search_handoff_listing": {
+  "isError": false,
+  "text": "1. knowledge/handoff/gadget/<date>-<hhmmss>-file-this.md — <date>-<hhmmss>-file-this (handoff, 2026-03-08) [handoff — belongs in gadget]\n   The gadget backlog needs a sprocket supplier.\n[match mode: listing]"
+ },
+ "search_handoff_none": {
+  "isError": false,
+  "text": "no handoff notes waiting for that query [scope: handoff]"
+ },
+ "search_handoff_project": {
+  "isError": false,
+  "text": "1. knowledge/handoff/gadget/<date>-<hhmmss>-file-this.md — <date>-<hhmmss>-file-this (handoff, 2026-03-08) [handoff — belongs in gadget]\n   The gadget backlog needs a sprocket supplier.\n[match mode: project]"
+ },
+ "search_more_below_cap": {
+  "isError": false,
+  "text": "1. knowledge/reference/widget-glossary.md — Widget glossary (reference, 2026-03-02) [STALE — review_by 2026-04-01 passed] [correction pending — knowledge/inbox/<date>-<hhmmss>-glossary-fix.md]\n   A sprocket is a toothed wheel. A cog is a smaller toothed wheel.\n(3 more hits below the cap — narrow the query to see them)\n[match mode: all-terms]"
+ },
+ "search_none": {
+  "isError": false,
+  "text": "no hits — rewrite the query into 2-3 lexical variants (synonyms, singular/plural) before concluding the brain has nothing"
+ },
+ "search_substring": {
+  "isError": false,
+  "text": "1. knowledge/decisions/2026-03-01-choose-widget-engine.md — Choose the widget engine (decision, 2026-03-01)\n   We chose the sprocket widget engine because it indexes quickly. The rejected alternative was the cog engine.\n2. knowledge/reference/widget-glossary.md — Widget glossary (reference, 2026-03-02) [STALE — review_by 2026-04-01 passed] [correction pending — knowledge/inbox/<date>-<hhmmss>-glossary-fix.md]\n   A sprocket is a toothed wheel. A cog is a smaller toothed wheel.\n[match mode: substring]"
+ },
+ "search_title": {
+  "isError": false,
+  "text": "1. knowledge/decisions/2026-03-01-choose-widget-engine.md — Choose the widget engine (decision, 2026-03-01)\n   We chose the sprocket [widget] [engine] because it indexes quickly. The rejected alternative was…\n2. knowledge/projects/gadget/overview.md — Gadget overview (project, 2026-03-03)\n   …See [[[widget]-glossary]] and [[2026-03-01-[choose]-[widget]-[engine]]].\n[match mode: all-terms]"
+ }
+}
