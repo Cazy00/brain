@@ -167,7 +167,9 @@ DELTA_DESCRIPTION = (
     "What changed in the brain since a moment: notes touched after it and facts captured "
     "after it, oldest first, with their trust markers. Pass `since` (ISO 8601), or `cursor` "
     "from the previous reply's next_cursor. Delivery is at-least-once; when has_more is "
-    "true, call again with next_cursor.cursor."
+    "true, call again with next_cursor.cursor. `pages` is authoritative; `facts` are "
+    "ordered by capture time, so a capture synced in with an earlier time than your cursor "
+    "shows in `pages` but may never appear in `facts`."
 )
 READ_ONLY_SENTENCE = "This endpoint is read-only; it cannot save anything."
 LOCAL_CAPTURE_DESCRIPTION = (
@@ -538,9 +540,15 @@ def validate_args(tool: dict, args):
 
 def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> list:
     """The bin/brain argv one validated tool call becomes. `declared` is a
-    capture's cleaned declared fields (provenance.take_declared)."""
+    capture's cleaned declared fields (provenance.take_declared).
+
+    A remote caller's read tools carry `--hide-private`: a capture marked
+    `visibility: private` does not exist for them (the same rule the facts arm of
+    `recall` follows). It sits before any positional argument, so it can never be
+    read as query text."""
+    hide = ["--hide-private"] if transport == "remote" else []
     if name == "brain_search":
-        cli = ["search", "--limit", str(args.get("limit", 8))]
+        cli = ["search", *hide, "--limit", str(args.get("limit", 8))]
         if args.get("scope") in ("all", "handoff"):
             cli += ["--scope", args["scope"]]
         if args.get("scope") == "handoff" and args.get("offset") is not None:
@@ -548,11 +556,11 @@ def cli_for(name: str, args: dict, transport: str = "local", declared=None) -> l
         cli += ["--", args["query"]]      # query text, never parsed as flags
         return cli
     if name == "brain_read":
-        return ["read", args["id_or_path"]]
+        return ["read", *hide, args["id_or_path"]]
     if name == "brain_links":
-        return ["links", args["id_or_path"]]
+        return ["links", *hide, args["id_or_path"]]
     if name == "brain_recent":
-        return ["recent", "--days", str(args.get("days", 7))]
+        return ["recent", *hide, "--days", str(args.get("days", 7))]
     if name == "brain_capture":
         # Default stays True on both transports, and remotely there is no way
         # to ask for anything else: committing is what backs the note up, and
@@ -595,7 +603,7 @@ def call(name, args, profile: str = "capture", transport: str = "local",
         return error_result("unknown tool %r" % (name,))
     if name not in PROFILES[profile]:
         if name in verbs.SERVED:
-            return verbs.result(verbs.scope_denied(name))
+            return verbs.result(verbs.scope_denied(name, served_verbs(profile)))
         return error_result(
             "tool %r is not available on this endpoint (profile %r is read-only)"
             % (name, profile))
@@ -623,9 +631,10 @@ def call(name, args, profile: str = "capture", transport: str = "local",
 
 
 def _verb_cli(run, op: str, request: dict, timeout: float) -> dict:
-    """One `brain verb` op: the request as JSON out, the answer's last JSON line back
-    (hooks and git may print before it)."""
-    done = run(["verb", op, json.dumps(request)], timeout)
+    """One `brain verb` op: the request as JSON out, on stdin (a fact may be far larger
+    than one command-line argument can be), the answer's last JSON line back (hooks and
+    git may print before it)."""
+    done = run(["verb", op, "-"], timeout, input=json.dumps(request))
     for line in reversed((done.stdout or "").strip().splitlines()):
         line = line.strip()
         if line.startswith("{"):
@@ -698,7 +707,8 @@ def call_verb(name: str, args, transport: str = "local", remote: bool = False,
         if refused:
             return verbs.result(refused)
         stem, reason = planned
-        state = _verb_cli(run, "forget-plan", {"stem": stem}, timeout)["state"]
+        plan = _verb_cli(run, "forget-plan", {"stem": stem}, timeout)
+        state = plan["state"]
         if state == "missing":
             return verbs.result(verbs.error(
                 "not_found", "No saved fact has the id 'inbox-%s'." % stem[:60],
@@ -707,7 +717,8 @@ def call_verb(name: str, args, transport: str = "local", remote: bool = False,
         if state == "pending":
             return verbs.result(verbs.forget_response(stem, False, reason))
         outcome = write(text=verbs.retraction_text(stem, reason), declared={"kind": "correction"},
-                        flags=[], request_id=None, allow_duplicate=True)
+                        flags=verbs.retraction_flags(stem, bool(plan.get("private"))),
+                        request_id=None, allow_duplicate=True)
         if not outcome.get("ok"):
             return verbs.result(verbs.write_error(outcome))
         return verbs.result(verbs.forget_response(stem, True, reason))
@@ -728,6 +739,6 @@ def _failure_hint(exc, transport: str) -> str:
             "(archive/ and vault/ are excluded by .rgignore)." % (exc, ENGINE))
 
 
-def _run_cli(args: list, timeout: float):
+def _run_cli(args: list, timeout: float, input=None):
     return subprocess.run([sys.executable, BRAIN, *args], capture_output=True,
-                          text=True, cwd=ENGINE, timeout=timeout)
+                          text=True, cwd=ENGINE, timeout=timeout, input=input)

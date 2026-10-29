@@ -268,8 +268,9 @@ class ForgetAndFactsTests(CorpusCase):
         verb("forget", id=saved["id"])
         _e, found = verb("recall", entity="widgets/bench")
         self.assertEqual(found["facts"], [])
-        _e, found = verb("recall", scope="all", query="zzzz")
+        _e, found = verb("recall", scope="all", query="forget")
         self.assertNotIn(saved["id"], [f["fact_id"] for f in found["facts"]])
+        self.assertNotIn(saved["path"], [r["path"] for r in found["results"]])
         _e, delta = verb("delta", since="1970-01-01")
         self.assertNotIn(saved["id"], [f["fact_id"] for f in delta["facts"]])
         is_error, body = verb("remember", fact="  A fact   to forget. ", provenance="p")
@@ -604,3 +605,182 @@ class EnvelopeAndProfileTests(CorpusCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def remote(name, **args):
+    """The text of one call as a remote caller makes it."""
+    return mcpcore.call(name, args, transport="remote")["content"][0]["text"]
+
+
+class PrivacyFenceTests(CorpusCase):
+    """`visibility: private` is a guarantee for every read path a remote caller has, not
+    only the facts arm. Every check lowercases the reply: a file name is a slug of the
+    fact, so the leak that matters is the lowercase one."""
+
+    SECRET = "zebra"
+
+    def setUp(self):
+        super().setUp()
+        _e, self.saved = verb("remember", fact="Zebra private fact.", provenance="p",
+                              visibility="private")
+        self.assertEqual(self.saved["status"], "inserted", self.saved)
+
+    def assert_hidden(self, text, label):
+        self.assertNotIn(self.SECRET, text.lower(), label + " showed a private capture")
+        self.assertNotIn(self.saved["id"][len("inbox-"):].lower(), text.lower(), label)
+
+    def test_no_remote_read_path_shows_it(self):
+        path = self.saved["path"]
+        calls = (("recall", {"query": "zebra", "scope": "all"}),
+                 ("recall", {"entity": "widgets/none", "scope": "all"}),
+                 ("recall", {"scope": "all"}),
+                 ("delta", {"since": "1970-01-01"}),
+                 ("brain_search", {"query": "zebra", "scope": "all"}),
+                 ("brain_search", {"query": "private fact", "scope": "all"}),
+                 ("brain_recent", {"days": 30}),
+                 ("brain_read", {"id_or_path": path}),
+                 ("brain_read", {"id_or_path": path.upper()}),
+                 ("brain_links", {"id_or_path": path}))
+        for name, args in calls:
+            with self.subTest(name=name, args=args):
+                text = remote(name, **args)
+                # A not-found answer repeats the caller's own argument, which it knew.
+                self.assert_hidden(text.replace(args.get("id_or_path", "\0"), ""), name)
+
+    def test_read_of_a_private_capture_answers_not_found(self):
+        result = mcpcore.call("brain_read", {"id_or_path": self.saved["path"]},
+                              transport="remote")
+        self.assertTrue(result["isError"])
+        self.assertIn("not found", result["content"][0]["text"])
+
+    def test_the_owner_at_the_keyboard_still_sees_it(self):
+        for name, args in (("recall", {"query": "zebra", "scope": "all"}),
+                           ("delta", {"since": "1970-01-01"}),
+                           ("brain_search", {"query": "zebra", "scope": "all"}),
+                           ("brain_read", {"id_or_path": self.saved["path"]})):
+            with self.subTest(name=name):
+                text = mcpcore.call(name, args, transport="local")["content"][0]["text"]
+                self.assertIn(self.SECRET, text.lower())
+
+    def test_the_fence_holds_when_the_marker_is_cased_or_padded(self):
+        note = self.corpus.root / self.saved["path"]
+        text = note.read_text(encoding="utf-8")
+        self.assertIn('visibility: "private"', text)
+        note.write_text(text.replace('visibility: "private"', 'Visibility:   PRIVATE '),
+                        encoding="utf-8")
+        for name, args in (("recall", {"query": "zebra", "scope": "all"}),
+                           ("delta", {"since": "1970-01-01"}),
+                           ("brain_search", {"query": "zebra", "scope": "all"})):
+            with self.subTest(name=name):
+                self.assert_hidden(remote(name, **args), name)
+
+    def test_the_search_cut_counts_only_what_a_remote_caller_may_see(self):
+        for n in range(3):
+            verb("remember", fact="Zebra public fact %d." % n, provenance="p")
+        body = json.loads(remote("recall", query="zebra", scope="all", limit=2))
+        self.assertEqual(len(body["results"]), 2, body)
+        self.assertEqual(body["more"], 1, "the private capture was counted")
+
+    def test_forgetting_a_private_fact_leaves_a_private_retraction(self):
+        verb("forget", id=self.saved["id"], reason="wrong")
+        retraction = [f for f in inbox_files(self.corpus) if "retract" in f.name][0]
+        fm, _body = parse_frontmatter(retraction.read_text(encoding="utf-8"))
+        self.assertEqual(fm["visibility"], "private")
+        for name, args in (("recall", {"query": "zebra", "scope": "all"}),
+                           ("delta", {"since": "1970-01-01"}),
+                           ("brain_search", {"query": "retract", "scope": "all"}),
+                           ("brain_recent", {"days": 30})):
+            with self.subTest(name=name):
+                self.assert_hidden(remote(name, **args), name)
+
+
+class ForgetTrustTests(CorpusCase):
+    def remember(self, text):
+        _e, saved = verb("remember", fact=text, provenance="p", entity="widgets/bench")
+        return saved
+
+    def retraction(self):
+        notes = [f for f in inbox_files(self.corpus) if "retract" in f.name]
+        self.assertEqual(len(notes), 1)
+        return parse_frontmatter(notes[0].read_text(encoding="utf-8"))[0]
+
+    def test_the_retraction_names_what_it_removes_and_claims_no_basis(self):
+        saved = self.remember("A fact to forget.")
+        verb("forget", id=saved["id"])
+        fm = self.retraction()
+        self.assertEqual(fm["retracts"], saved["path"])
+        self.assertEqual(fm["source"], "local")
+        self.assertNotIn("basis", fm, "forget must not claim to be the owner's own word")
+
+    def test_a_retraction_withdraws_a_capture_only_when_it_is_trusted_for_it(self):
+        def cap(text, **head):
+            lines = "".join('%s: "%s"\n' % kv for kv in head.items())
+            return verbs.Capture("c.md", 0, verbs.split_note(
+                "---\nkind: correction\nsource: local\n%sstatus: draft\n---\n\n%s\n"
+                % (lines, text))[0], text)
+        target = "knowledge/inbox/2026-10-30-000000-x.md"
+        text = "Retract %s: why" % target
+        self.assertEqual(verbs.retracted_stem(cap(text, basis="owner-said")),
+                         "2026-10-30-000000-x")
+        self.assertEqual(verbs.retracted_stem(cap(text, retracts=target)),
+                         "2026-10-30-000000-x")
+        self.assertIsNone(verbs.retracted_stem(cap(text)), "no basis, no retracts")
+        self.assertIsNone(verbs.retracted_stem(cap(text, basis="agent-found")))
+        self.assertIsNone(verbs.retracted_stem(
+            cap(text, retracts="knowledge/inbox/other.md")), "retracts names another file")
+        drop = cap(text, retracts=target)
+        drop.head["source"] = "support-bot"
+        self.assertIsNone(verbs.retracted_stem(drop), "a drop box withdraws nothing")
+
+
+class ForgetLeavesEveryViewTests(CorpusCase):
+    def test_a_forgotten_fact_leaves_the_pages_arm_and_the_delta_walk(self):
+        _e, saved = verb("remember", fact="Quokka fact to forget.", provenance="p")
+        _e, before = verb("recall", query="quokka", scope="all")
+        self.assertIn(saved["path"], [r["path"] for r in before["results"]])
+        verb("forget", id=saved["id"])
+        for transport in ("local", "remote"):
+            with self.subTest(transport=transport):
+                found = json.loads(mcpcore.call(
+                    "recall", {"query": "quokka", "scope": "all"},
+                    transport=transport)["content"][0]["text"])
+                self.assertNotIn(saved["id"], [f["fact_id"] for f in found["facts"]])
+                self.assertNotIn(saved["path"], [r["path"] for r in found["results"]],
+                                 "the forgotten capture is still a page")
+                walk = json.loads(mcpcore.call(
+                    "delta", {"since": "1970-01-01"}, transport=transport)["content"][0]["text"])
+                self.assertNotIn(saved["path"], [p["path"] for p in walk["pages"]])
+                self.assertNotIn(saved["id"], [f["fact_id"] for f in walk["facts"]])
+
+
+class OddCallTests(CorpusCase):
+    def test_a_drop_box_answers_a_verb_it_does_not_have_like_any_unserved_tool(self):
+        for name in ("entity", "context_pack", "synthesize"):
+            result = mcp.call_tool(name, {}, allow=mcp.DROP_BOX_TOOLS)
+            body = json.loads(result["content"][0]["text"])
+            self.assertEqual((result["isError"], body["error"]), (True, "unavailable"))
+            self.assertIn("no memory verbs", body["suggestion"])
+        result = mcp.call_tool("recall", {"query": "x"}, allow=mcp.DROP_BOX_TOOLS)
+        body = json.loads(result["content"][0]["text"])
+        self.assertEqual(body["error"], "scope_denied")
+        self.assertNotIn("recall and delta", body["suggestion"])
+        self.assertIn("no memory verbs", body["suggestion"])
+
+    def test_the_read_only_denial_names_what_that_endpoint_serves(self):
+        result = mcp.call_tool("remember", {"fact": "x", "provenance": "p"},
+                               allow=mcp.READ_ONLY_TOOLS)
+        body = json.loads(result["content"][0]["text"])
+        self.assertIn("recall and delta", body["suggestion"])
+
+    def test_a_fact_in_a_script_the_command_line_cannot_carry_is_saved(self):
+        fact = "ا" * 25000                       # 150 000 bytes once JSON-escaped
+        is_error, body = verb("remember", fact=fact, provenance="p")
+        self.assertFalse(is_error, body)
+        self.assertEqual(body["status"], "inserted")
+        is_error, again = verb("remember", fact=fact, provenance="p")
+        self.assertFalse(is_error, again)
+        self.assertEqual(again["status"], "duplicate")
+
+    def test_delta_says_pages_are_authoritative(self):
+        self.assertIn("`pages` is authoritative", mcpcore.DELTA_DESCRIPTION)
+        self.assertIn("pages", mcpcore.DELTA_DESCRIPTION.split("authoritative")[0][-20:])

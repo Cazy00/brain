@@ -2638,9 +2638,11 @@ def atomic_write(path: Path, body: str) -> None:
 
 # The frontmatter keys `remember` adds to a capture, in the order they are written, and
 # the flags that carry them. They sit between the provenance fields and `status`.
-VERB_KEYS = ("entity", "provenance", "expires", "valid_from", "visibility")
+VERB_KEYS = ("entity", "provenance", "expires", "valid_from", "visibility", "retracts")
 VERB_FLAGS = {"--entity": "entity", "--provenance": "provenance", "--expires": "expires",
-              "--valid-from": "valid_from", "--visibility": "visibility"}
+              "--valid-from": "valid_from", "--visibility": "visibility",
+              "--retracts": "retracts"}
+RETRACTS_RE = re.compile(r"knowledge/inbox/[A-Za-z0-9][A-Za-z0-9._-]*\.md")
 
 
 def verb_capture_fields(offered: dict):
@@ -2666,6 +2668,8 @@ def verb_capture_fields(offered: dict):
                 problem = f"{name} is not an ISO 8601 date or datetime."
             elif name == "visibility" and value != "private":
                 problem = "visibility can only be private (world is the absence of it)."
+            elif name == "retracts" and not RETRACTS_RE.fullmatch(value):
+                problem = "retracts must be the path of one inbox capture."
         if problem:
             return {}, problem
         values[name] = value.strip() if name == "provenance" else value
@@ -2714,7 +2718,8 @@ def cmd_capture(argv: list) -> int:
         print("usage: brain capture \"<text>\" [--commit] [--source <slug>] [--atomic] [--json]\n"
               "         [--via V] [--client C] [--kind K] [--basis B] [--project P]\n"
               "         [--job J] [--model M] [--provenance P] [--entity E]\n"
-              "         [--expires ISO] [--valid-from ISO] [--visibility private]")
+              "         [--expires ISO] [--valid-from ISO] [--visibility private]\n"
+              "         [--retracts knowledge/inbox/<capture>.md]")
         return 2
     if not ID_RE.fullmatch(source):
         # Refused here rather than written and linted later: this value is how
@@ -3214,7 +3219,7 @@ def index_stale() -> bool:
 BM25_WEIGHTS = "8.0, 6.0, 4.0, 1.0, 0, 0, 0, 0, 0"  # title, aliases, topics, body, then UNINDEXED
 
 
-def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
+def do_search(query: str, scope: str = "canonical", limit: int = 8, exclude=()) -> dict:
     """Rank inside SQLite, THEN limit.
 
     This used to `LIMIT 100` with no ORDER BY and sort those rows in Python.
@@ -3222,6 +3227,9 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
     than 100 notes matched, the best hit could be discarded before ranking ever
     ran. Folder authority is folded into the SQL ordering expression so the
     ranking that decides the cut is the same one that orders the output.
+
+    `exclude` is a set of repo paths that never appear, in the hits or the counts: the
+    private captures a remote caller may not see are removed here, before the cut.
     """
     import sqlite3
     if index_stale():
@@ -3237,6 +3245,8 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
     weight_sql = ("CASE folder " + " ".join("WHEN ? THEN ?" for _ in FOLDER_WEIGHTS)
                   + " ELSE 1.0 END")
     weight_params = [v for pair in FOLDER_WEIGHTS.items() for v in pair]
+    barred = sorted(exclude)
+    barred_sql = f" AND path NOT IN ({','.join('?' * len(barred))})" if barred else ""
     rows, total, mode = [], 0, "none"
     for joiner, mode_name in ((" AND ", "all-terms"), (" OR ", "any-term")):
         match = joiner.join(f'"{t}"' for t in terms)
@@ -3245,14 +3255,15 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
                 f"SELECT id, path, title, folder, kind, created, "
                 f"snippet(fts, 3, '[', ']', '…', 14), "
                 f"bm25(fts, {BM25_WEIGHTS}) * ({weight_sql}) AS score "
-                f"FROM fts WHERE fts MATCH ? AND folder IN ({placeholders}) "
+                f"FROM fts WHERE fts MATCH ? AND folder IN ({placeholders}){barred_sql} "
                 f"ORDER BY score LIMIT ?",
-                (*weight_params, match, *folders, limit),
+                (*weight_params, match, *folders, *barred, limit),
             ).fetchall()
             if rows:
                 total = db.execute(
                     f"SELECT COUNT(*) FROM fts WHERE fts MATCH ? "
-                    f"AND folder IN ({placeholders})", (match, *folders)).fetchone()[0]
+                    f"AND folder IN ({placeholders}){barred_sql}",
+                    (match, *folders, *barred)).fetchone()[0]
         except sqlite3.OperationalError:
             rows = []
         if rows:
@@ -3262,14 +3273,15 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
         like = f"%{terms[0]}%"
         rows = db.execute(
             f"SELECT id, path, title, folder, kind, created, substr(body, 1, 120), 0.0 "
-            f"FROM fts WHERE (title LIKE ? OR body LIKE ?) AND folder IN ({placeholders}) "
-            f"ORDER BY folder, id LIMIT ?",
-            (like, like, *folders, limit),
+            f"FROM fts WHERE (title LIKE ? OR body LIKE ?) AND folder IN ({placeholders})"
+            f"{barred_sql} ORDER BY folder, id LIMIT ?",
+            (like, like, *folders, *barred, limit),
         ).fetchall()
         if rows:
             total = db.execute(
                 f"SELECT COUNT(*) FROM fts WHERE (title LIKE ? OR body LIKE ?) "
-                f"AND folder IN ({placeholders})", (like, like, *folders)).fetchone()[0]
+                f"AND folder IN ({placeholders}){barred_sql}",
+                (like, like, *folders, *barred)).fetchone()[0]
         mode = "substring" if rows else "none"
     hits = [
         {"id": r[0], "path": r[1], "title": r[2], "folder": r[3], "kind": r[4],
@@ -3303,7 +3315,7 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8) -> dict:
     return {"mode": mode, "hits": hits, "more": max(0, total - len(hits))}
 
 
-def do_links(note_id: str, rebuild: bool = True) -> dict:
+def do_links(note_id: str, rebuild: bool = True, exclude=()) -> dict:
     """The [[wikilink]] neighbourhood of one note: what it points at, and what
     points back at it.
 
@@ -3335,6 +3347,8 @@ def do_links(note_id: str, rebuild: bool = True) -> dict:
                 row = db.execute(
                     "SELECT id, title, path, kind, folder FROM fts WHERE id = ? LIMIT 1",
                     (nid,)).fetchone()
+                if row and row[2] in exclude:
+                    continue                      # not there, as far as this caller knows
                 if row:
                     found.append({"id": row[0], "title": row[1], "path": row[2],
                                   "kind": row[3], "folder": row[4]})
@@ -3389,11 +3403,17 @@ def cmd_links(argv: list) -> int:
         print("usage: brain links <id-or-path> [--json]")
         return 2
     wanted = args[0]
+    barred = barred_paths(argv)
     metas = all_metas()
     note_id = wanted
+    if wanted in metas and is_barred(K / metas[wanted][0], barred):
+        print(f"note {wanted!r} not found (by id or path)")
+        return 1
     if wanted not in metas:
         # Accept a path too, so `brain links knowledge/decisions/x.md` works.
         candidate = resolve_note_path(wanted)
+        if candidate is not None and is_barred(candidate, barred):
+            candidate = None
         if candidate is not None:
             fm, _err = parse_frontmatter(read_text(candidate))
             if fm and fm.get("id"):
@@ -3401,7 +3421,7 @@ def cmd_links(argv: list) -> int:
         if note_id == wanted and wanted not in metas:
             print(f"note {wanted!r} not found (by id or path)")
             return 1
-    result = do_links(note_id)
+    result = do_links(note_id, exclude=barred)
     print(_json.dumps(result, indent=2) if "--json" in argv
           else format_links(note_id, result))
     return 0
@@ -3700,6 +3720,26 @@ def format_hits(result: dict) -> str:
     return "\n".join(lines)
 
 
+HIDE_PRIVATE = "--hide-private"
+
+
+def barred_paths(argv: list) -> set:
+    """Repo paths the older read tools must not show: the private inbox captures, when the
+    caller asked (`--hide-private`, which the MCP layer adds for every remote caller)."""
+    return verbs.private_paths(K / "inbox") if HIDE_PRIVATE in argv else set()
+
+
+def is_barred(path, barred) -> bool:
+    """True when `path` (any spelling that resolves inside knowledge/) is one of `barred`."""
+    if not barred:
+        return False
+    try:
+        rel = Path(path).resolve().relative_to(ROOT.resolve())
+    except (ValueError, OSError, RuntimeError):
+        return False
+    return rel.as_posix() in barred
+
+
 def cmd_search(argv: list) -> int:
     import json as _json
     scope, limit, as_json, terms, offset = "canonical", 8, False, [], 0
@@ -3749,7 +3789,8 @@ def cmd_search(argv: list) -> int:
         print("usage: brain search \"<query>\" [--scope canonical|all|handoff] [--limit N] "
               "[--offset N] [--json]")
         return 2
-    result = do_search(" ".join(terms), scope=scope, limit=limit)
+    result = do_search(" ".join(terms), scope=scope, limit=limit,
+                       exclude=barred_paths(argv))
     print(_json.dumps(result, indent=2) if as_json else format_hits(result))
     return 0
 
@@ -3958,10 +3999,14 @@ def cmd_read(argv: list) -> int:
         print("usage: brain read <id-or-path>")
         return 2
     wanted = args[0]
+    barred = barred_paths(argv)
     metas = MetaIndex()
     target_id = None
     if metas.get(wanted) is not None:
         target_id = wanted
+        if is_barred(K / metas.get(wanted)[0], barred):
+            print(f"note {wanted!r} not found (by id or path)")
+            return 1
     else:
         p = Path(wanted)
         try:
@@ -3973,8 +4018,13 @@ def cmd_read(argv: list) -> int:
             found = metas.by_rel(rel)
             if found:
                 target_id = found[0]
+                if is_barred(K / metas.get(target_id)[0], barred):
+                    print(f"note {wanted!r} not found (by id or path)")
+                    return 1
     if target_id is None:
         candidate = resolve_note_path(wanted)
+        if candidate is not None and is_barred(candidate, barred):
+            candidate = None            # a private capture does not exist to this caller
         if candidate is not None:
             # Notes with no frontmatter id (inbox captures, journal entries)
             # reach here. They are provisional/dated, never canonical — say so
@@ -4089,7 +4139,7 @@ def cmd_read(argv: list) -> int:
     # Backlinks: the context a lone note body cannot carry — what else in the
     # brain refers to this. Never triggers an index rebuild; a stale or missing
     # index simply means no graph line, not a slow read.
-    graph = do_links(current_id, rebuild=False)
+    graph = do_links(current_id, rebuild=False, exclude=barred)
     if graph.get("inbound"):
         refs = ", ".join(f"[[{n['id']}]]" for n in graph["inbound"][:12])
         more = "" if len(graph["inbound"]) <= 12 else f" (+{len(graph['inbound']) - 12} more)"
@@ -4109,10 +4159,13 @@ def cmd_recent(argv: list) -> int:
                 print(f"--days needs an integer, got {argv[i + 1]!r}")
                 return 2
     cutoff = time.time() - days * 86400
+    barred = barred_paths(argv)
     rows = []
     for path in K.rglob("*.md"):
         top = path.relative_to(K).parts[0]
         if top in ("archive", "vault") or path.name in EXEMPT_NAMES:
+            continue
+        if barred and path.relative_to(ROOT).as_posix() in barred:
             continue
         if path.stat().st_mtime >= cutoff:
             rows.append((path.stat().st_mtime, path))
@@ -4212,38 +4265,44 @@ def cmd_verb(argv: list) -> int:
     """`brain verb <op> '<json>'`: the engine half of the memory verbs, one JSON object
     out. Internal to the MCP layer (brainlib/mcpcore.py), which has already validated
     the request; the ranking, the markers and the inbox are read here so a verb and the
-    old tool it sits beside cannot disagree. Ops: recall, delta, forget-plan, withdrawn."""
+    old tool it sits beside cannot disagree. Ops: recall, delta, forget-plan, withdrawn.
+
+    The request is JSON, read from stdin when the second argument is `-` (how the MCP
+    layer sends it: a fact can be far larger than one command-line argument may be)."""
     import json as _json
     if len(argv) != 2:
-        print("usage: brain verb recall|delta|forget-plan|withdrawn '<json request>'")
+        print("usage: brain verb recall|delta|forget-plan|withdrawn '<json request>' | -")
         return 2
     op = argv[0]
     try:
-        request = _json.loads(argv[1])
+        request = _json.loads(sys.stdin.read() if argv[1] == "-" else argv[1])
     except ValueError:
         print("brain verb: the request is not JSON")
         return 2
     inbox = K / "inbox"
     if op == "recall":
         search = None
+        facts_arm = request["entity"] is not None or request["scope"] == "all"
+        captures = verbs.read_inbox(inbox) if facts_arm else []
         if request["scope"] == "handoff":
             search = do_handoff_search(request["query"], limit=request["limit"],
                                        offset=request["offset"])
         elif request["query"]:
             search = do_search(request["query"], scope=request["scope"],
-                               limit=request["limit"])
+                               limit=request["limit"],
+                               exclude=verbs.hidden_paths(captures, request["remote"]))
         for hit in (search or {"hits": []})["hits"]:
             hit["markers"] = hit_markers(hit)
             hit["aliases"] = aliases_of(hit)
-        facts_arm = request["entity"] is not None or request["scope"] == "all"
-        out = verbs.recall(request, search,
-                           verbs.read_inbox(inbox) if facts_arm else [],
+        out = verbs.recall(request, search, captures,
                            pending_corrections() if facts_arm else {})
     elif op == "delta":
         out = verbs.delta(request, verb_walk(request["page_pos"][0]),
                           verbs.read_inbox(inbox), pending_corrections())
     elif op == "forget-plan":
-        out = {"state": verbs.forget_state(verbs.read_inbox(inbox), request["stem"])}
+        held = verbs.read_inbox(inbox)
+        out = {"state": verbs.forget_state(held, request["stem"]),
+               "private": verbs.forget_is_private(held, request["stem"])}
     elif op == "withdrawn":
         out = {"withdrawn": verbs.withdrawn(verbs.read_inbox(inbox), request["text"])}
     else:
@@ -5902,6 +5961,17 @@ def trusted_retraction(fm: dict) -> bool:
     return fm.get("source") == DEFAULT_SOURCE and fm.get("basis") == "owner-said"
 
 
+def forget_target(fm: dict):
+    """The inbox capture a `forget` retraction may remove, or None. The `retracts` key is
+    written only by the memory verbs' own write path, from an owner endpoint
+    (`source: local`); a drop box cannot set it, and it can only name an inbox capture."""
+    retracts = fm.get("retracts")
+    if fm.get("source") == DEFAULT_SOURCE and isinstance(retracts, str) \
+            and RETRACTS_RE.fullmatch(retracts):
+        return retracts
+    return None
+
+
 def handoff_problems(today: str):
     """The first way the staged change set breaks the handoff rules, or None. Checked as
     code before the audit, because the keys are the filing job's interface and a handoff
@@ -6022,6 +6092,10 @@ def correction_problems():
         if trusted_retraction(fm):
             trusted.update(targets)
             continue
+        # A `forget` retraction is trusted for the one inbox capture it names and
+        # nothing else: it never retracts a canonical note, and it does not count
+        # towards the retracted notes archived below.
+        targets = [t for t in targets if t != forget_target(fm)]
         hit = next((t for t in targets if t in deleted or t in removed_ids), None)
         if hit:
             return (f"{one_line(rel)} (source {fm.get('source')!r}, basis "

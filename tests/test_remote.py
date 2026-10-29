@@ -217,6 +217,16 @@ def _maybe_json(data: bytes):
         return data
 
 
+
+def vendor_names_in(text: str) -> list:
+    """The vendor names a tool contract must not carry. `cursor` and `next_cursor` as whole
+    words are brain-verbs.v1's pagination terms (tests/test_brain.py strips the same two)."""
+    # Case-sensitive on purpose: the pagination words are lowercase, the editor is "Cursor".
+    blob = re.sub(r"\b(next_)?cursor\b", "", text).lower()
+    return [v for v in ("claude", "anthropic", "openai", "gemini", "cursor", "cloudflare")
+            if v in blob]
+
+
 class RemoteTestCase(unittest.TestCase):
     ORIGIN_POLICY = "observe"
     GIT_PUSH = False
@@ -325,12 +335,15 @@ class CapabilityBoundaryTests(RemoteTestCase):
 
     def test_the_read_only_tool_descriptions_never_mention_capturing(self):
         status, _h, body = self.brain.rpc("tools/list", host="brain-read.test")
-        blob = json.dumps(body["result"]["tools"]).lower()
-        # "cursor" is not in the list: it is the pagination word of `delta`
-        # (brain-verbs.v1 names the parameter), not the editor.
-        for vendor in ("claude", "anthropic", "openai", "gemini", "cloudflare"):
-            self.assertNotIn(vendor, blob,
-                             "a vendor name leaked into the tool contract")
+        self.assertEqual(vendor_names_in(json.dumps(body["result"]["tools"])), [],
+                         "a vendor name leaked into the tool contract")
+
+    def test_the_vendor_check_still_catches_the_editor_called_cursor(self):
+        """`cursor` and `next_cursor` are delta's pagination words and are let through;
+        the editor's name is not, in any case or position."""
+        self.assertEqual(vendor_names_in('{"cursor": "x", "next_cursor": {"cursor": "y"}}'), [])
+        self.assertEqual(vendor_names_in("Works with Cursor and next_cursor."), ["cursor"])
+        self.assertEqual(vendor_names_in("a cursorial note"), ["cursor"])
 
 
 class AssertionTests(RemoteTestCase):
@@ -1238,6 +1251,47 @@ class FakeGit(object):
                 return self.Done(0)
             return self.Done(1)
         raise AssertionError("unexpected git call: %r" % (args,))
+
+
+class LedgerKeyTests(unittest.TestCase):
+    """Review of #15, row 8: two servers starting together on a fresh state directory must
+    end with ONE key, or request ids and deduplication stop working between them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+
+    def test_a_second_starter_arriving_mid_creation_gets_the_same_key(self):
+        from unittest import mock
+        real, nested, inner = os.fdopen, [], []
+
+        def fdopen(fd, *args, **kwargs):
+            # Between the key file being created and its key being written: the moment
+            # a second process (here, a nested call) can look at the file.
+            if not nested:
+                nested.append(True)
+                inner.append(capture.ledger_key(self.state))
+            return real(fd, *args, **kwargs)
+        with mock.patch.object(os, "fdopen", fdopen):
+            outer = capture.ledger_key(self.state)
+        self.assertEqual(len(outer), 32)
+        self.assertEqual(inner, [outer])
+        self.assertEqual((self.state / "capture-ledger.key").read_bytes(), outer)
+
+    def test_the_key_is_private_and_stable(self):
+        key = capture.ledger_key(self.state)
+        self.assertEqual(capture.ledger_key(self.state), key)
+        path = self.state / "capture-ledger.key"
+        self.assertEqual(path.stat().st_mode & 0o077, 0, "the key is readable by others")
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["capture-ledger.key"])
+
+    def test_an_empty_key_file_from_an_older_crash_is_replaced_once(self):
+        self.state.mkdir()
+        (self.state / "capture-ledger.key").write_bytes(b"")
+        key = capture.ledger_key(self.state)
+        self.assertEqual(len(key), 32)
+        self.assertEqual(capture.ledger_key(self.state), key)
 
 
 class LedgerUpgradeTests(unittest.TestCase):

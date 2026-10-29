@@ -57,6 +57,8 @@ PROVENANCE_MAX = 500
 DELTA_PAGE_MAX = 30
 DELTA_FACT_MAX = 30
 MAX_INBOX_BYTES = 256 * 1024
+# Enough to hold any capture's frontmatter (the engine peeks the same amount).
+FRONTMATTER_PEEK = 8192
 
 # Every control character (C0, DEL, C1) and the Unicode line breaks that
 # str.splitlines() also honours, tab included: a value is ONE line.
@@ -69,6 +71,7 @@ _PUNCT = "`'\"()[]<>*,;:."
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 PROVISIONAL_MARKER = "[provisional — unconsolidated]"
+INBOX_PREFIX = "knowledge/inbox/"
 
 
 # -- envelopes -------------------------------------------------------------
@@ -97,21 +100,33 @@ def result(payload: dict) -> dict:
 
 def _names(verbs) -> str:
     verbs = list(verbs)
+    if not verbs:
+        return "no memory verbs"
     return verbs[0] if len(verbs) == 1 else ", ".join(verbs[:-1]) + " and " + verbs[-1]
 
 
 def unavailable(verb: str, served=SERVED) -> dict:
     """The answer to a verb this brain does not serve (contract, error_envelope)."""
+    names = [v for v in SERVED if v in served]
+    if not names:
+        # A drop box serves no verb at all: nothing here to point the caller at.
+        return error("unavailable", "This brain does not serve the verb '%s'." % verb,
+                     "This endpoint serves no memory verbs.", detail="unsupported_verb:%s" % verb)
     return error(
         "unavailable", "This brain does not serve the verb '%s'." % verb,
         "Use recall: pass query for notes, or entity for saved facts. This brain serves %s."
-        % _names([v for v in SERVED if v in served]), detail="unsupported_verb:%s" % verb)
+        % _names(names), detail="unsupported_verb:%s" % verb)
 
 
-def scope_denied(verb: str) -> dict:
-    return error("scope_denied", "This endpoint is read-only: it does not serve '%s'." % verb,
-                 "Use the read/capture endpoint to save or forget a fact; this one serves "
-                 "recall and delta.")
+def scope_denied(verb: str, served=SERVED) -> dict:
+    """The refusal of a verb this endpoint (or this token's scope) does not serve."""
+    names = [v for v in SERVED if v in served]
+    if names:
+        hint = ("Use the read/capture endpoint to save or forget a fact; this one serves %s."
+                % _names(names))
+    else:
+        hint = "This endpoint serves no memory verbs."
+    return error("scope_denied", "This endpoint does not serve '%s'." % verb, hint)
 
 
 def advertisement(served) -> dict:
@@ -390,6 +405,17 @@ def prepare_forget(args: dict):
     return (m.group(1), reason.strip() if isinstance(reason, str) and reason.strip() else None), None
 
 
+def retraction_flags(stem: str, private: bool) -> list:
+    """The capture flags of a `forget` retraction: what it retracts, which is what
+    makes it trusted for that capture alone, and `private` when the fact was, so
+    the retraction (whose text carries the fact's file name) is no more readable
+    to a remote caller than the fact."""
+    flags = ["--retracts", INBOX_PREFIX + stem + ".md"]
+    if private:
+        flags += ["--visibility", "private"]
+    return flags
+
+
 def retraction_text(stem: str, reason) -> str:
     """The capture `forget` writes. An inbox note has only a path, so the path is
     what the correction names (AGENTS.md, "Writing notes"); consolidation drains
@@ -508,7 +534,9 @@ class Capture(object):
         self.name = name
         self.stem = name[:-3] if name.endswith(".md") else name
         self.path = "knowledge/inbox/" + name
-        self.head = head
+        # Keys are matched without regard to case: a fence that a capital letter
+        # steps around is not a fence.
+        self.head = {key.lower(): value for key, value in reversed(list(head.items()))}
         self.body = body
         stamp = parse_iso(read_scalar(head.get("captured_at", ""))) if head.get("captured_at") \
             else None
@@ -526,6 +554,11 @@ class Capture(object):
     @property
     def fact_id(self) -> str:
         return "inbox-" + self.stem
+
+    @property
+    def private(self) -> bool:
+        """Marked `visibility: private`, however the value is cased or padded."""
+        return (self.get("visibility") or "").strip().lower() == "private"
 
     def expired(self, now_ms: int) -> bool:
         raw = self.get("expires")
@@ -567,24 +600,39 @@ def normalise_fact(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def retracted_stem(cap):
+    """The stem of the inbox capture `cap` retracts, or None when it retracts nothing
+    this brain acts on. The rule is the one the consolidation pass enforces
+    (`correction_problems` in bin/brain), so a fact leaves the views exactly when
+    the pass may drain it:
+
+    - the owner's own retraction (`source: local`, `basis: owner-said`) names any
+      inbox capture;
+    - a `forget` retraction (`source: local` and a `retracts:` key, which only the
+      verb's own write path can set) is trusted for the one capture `retracts`
+      names, and for nothing the text goes on to say;
+    - anything else, a drop box's included, withdraws nothing."""
+    if cap.get("kind") != "correction" or cap.get("source") != "local":
+        return None
+    lead = _RETRACT_LEAD.match(cap.body)
+    if not lead:
+        return None
+    target = lead.group(1).strip(_PUNCT)
+    m = re.fullmatch(r"(?:knowledge/)?inbox/([^/]+?)\.md", target)
+    stem = m.group(1) if m else target[len("inbox-"):] if target.startswith("inbox-") else None
+    if stem is None:
+        return None
+    if cap.get("basis") == "owner-said":
+        return stem
+    retracts = cap.get("retracts")
+    if retracts and retracts == INBOX_PREFIX + stem + ".md":
+        return stem
+    return None
+
+
 def pending_retractions(captures) -> set:
-    """Stems of the inbox captures a pending retraction names. Only a retraction
-    from an owner endpoint (`source: local`) counts, as for every correction: a
-    drop box's caller must not be able to withdraw what it cannot read."""
-    gone = set()
-    for cap in captures:
-        if cap.get("kind") != "correction" or cap.get("source") != "local":
-            continue
-        lead = _RETRACT_LEAD.match(cap.body)
-        if not lead:
-            continue
-        target = lead.group(1).strip(_PUNCT)
-        m = re.fullmatch(r"(?:knowledge/)?inbox/([^/]+?)\.md", target)
-        if m:
-            gone.add(m.group(1))
-        elif target.startswith("inbox-"):
-            gone.add(target[len("inbox-"):])
-    return gone
+    """Stems of the inbox captures a pending retraction names (see `retracted_stem`)."""
+    return {stem for stem in (retracted_stem(cap) for cap in captures) if stem}
 
 
 def withdrawn(captures, text: str) -> bool:
@@ -602,6 +650,48 @@ def forget_state(captures, stem: str) -> str:
     return "pending" if stem in pending_retractions(captures) else "ready"
 
 
+def forget_is_private(captures, stem: str) -> bool:
+    return any(c.stem == stem and c.private for c in captures)
+
+
+def hidden_paths(captures, remote: bool, now_ms=None) -> set:
+    """Repo paths of the inbox captures a view must not show: one under a pending
+    retraction, and, to a remote caller, every private one. The facts arm, the
+    pages arm and the `delta` walk all answer from this one rule."""
+    gone = pending_retractions(captures)
+    return {c.path for c in captures if c.stem in gone or (remote and c.private)}
+
+
+def private_paths(inbox: Path) -> set:
+    """Repo paths of every private capture in `inbox`, for the older tools. Only the
+    head of each file is read, and a file is private when its `visibility` says so
+    in any case; one too large for the facts arm still counts."""
+    import os
+    out = set()
+    try:
+        entries = list(os.scandir(inbox))
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.name.endswith(".md"):
+            continue
+        try:
+            with open(entry.path, "r", encoding="utf-8-sig", errors="replace") as handle:
+                lines = handle.read(FRONTMATTER_PEEK).splitlines()
+        except OSError:
+            continue
+        if not lines or lines[0].strip() != "---":
+            continue
+        for line in lines[1:]:
+            if line.strip() == "---":
+                break
+            m = re.match(r"^visibility\s*:\s*(.*)$", line, re.I)
+            if m and read_scalar(m.group(1)).strip().lower() == "private":
+                out.add(INBOX_PREFIX + entry.name)
+                break
+    return out
+
+
 def visible_facts(captures, now_ms: int, remote: bool, entity=None):
     """The captures the facts arm may show, oldest first: not expired, not under a
     pending retraction, and not private to a remote caller."""
@@ -610,7 +700,7 @@ def visible_facts(captures, now_ms: int, remote: bool, entity=None):
     for cap in captures:
         if cap.stem in gone or cap.expired(now_ms):
             continue
-        if remote and cap.get("visibility") == "private":
+        if remote and cap.private:
             continue
         if entity is not None and cap.get("entity") != entity:
             continue
@@ -697,8 +787,10 @@ def recall(request: dict, search, captures, pending: dict) -> dict:
     """The `recall` reply. `search` is the result of the ranking (or None when no
     pages arm runs); its hits carry `markers` and `aliases` already."""
     results, more, match_mode = [], 0, None
+    hidden = hidden_paths(captures, request["remote"])
     if search is not None:
-        results = [page_record(h, request["query"]) for h in search["hits"]]
+        results = [page_record(h, request["query"]) for h in search["hits"]
+                   if h.get("path") not in hidden]
         more, match_mode = int(search.get("more") or 0), search.get("mode")
     facts = []
     if request["entity"] is not None or request["scope"] == "all":
@@ -745,7 +837,9 @@ def delta(request: dict, pages: list, captures, pending: dict) -> dict:
     stale, markers), in any order."""
     # JSON hands the positions back as lists; they are compared as (ms, name) tuples.
     page_pos, fact_pos = tuple(request["page_pos"]), tuple(request["fact_pos"])
-    walk = sorted(((int(p["mtime"] * 1000), p["path"]), p) for p in pages)
+    hidden = hidden_paths(captures, request["remote"])
+    walk = sorted(((int(p["mtime"] * 1000), p["path"]), p) for p in pages
+                  if p["path"] not in hidden)
     walk = [(key, p) for key, p in walk if key > page_pos]
     more_pages = len(walk) > DELTA_PAGE_MAX
     walk = walk[:DELTA_PAGE_MAX]

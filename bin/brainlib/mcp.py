@@ -82,11 +82,18 @@ WRITE_ONLY_TOOLS = write_only_names()
 # What a drop box serves: `brain_capture` and nothing else. It is a slot, not a small
 # brain; `remember` and `forget` are for an endpoint whose caller may also read.
 DROP_BOX_TOOLS = ("brain_capture",)
+# What the `write` scope opens by itself: the drop box's slot and nothing more. `remember`
+# and `forget` write too, but they also ANSWER (a duplicate returns the stored note's path,
+# and a forget tells a missing id from an expired one), which makes a write-only token a
+# way to probe what the brain holds. They need the `read` scope as well as `write`.
+WRITE_SCOPE_TOOLS = tuple(name for name in WRITE_ONLY_TOOLS if name in DROP_BOX_TOOLS)
+READ_WRITE_TOOLS = tuple(name for name in WRITE_ONLY_TOOLS if name not in DROP_BOX_TOOLS)
 
 
-def run_cli(args):
+def run_cli(args, input=None):
     return subprocess.run(
-        [sys.executable, BRAIN, *args], capture_output=True, text=True, cwd=ROOT, timeout=120
+        [sys.executable, BRAIN, *args], capture_output=True, text=True, cwd=ROOT, timeout=120,
+        input=input
     )
 
 
@@ -191,7 +198,8 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
     if not isinstance(name, str) or name not in TOOLS_BY_NAME:
         return {"content": [{"type": "text", "text": f"unknown tool {name!r}"}], "isError": True}
     if allow is not None and name not in allow and name in verbs.SERVED:
-        return verbs.result(verbs.scope_denied(name))
+        return verbs.result(verbs.scope_denied(
+            name, [v for v in verbs.SERVED if v in allow]))
     if allow is not None and name not in allow:
         # The enforcement point, and it is deliberately HERE rather than in the
         # transport: a restriction that lives beside the dispatcher cannot be
@@ -214,7 +222,8 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
         # A caller reaching this brain over `brain serve` is remote; stdio is the owner
         # at their own keyboard. Private facts are never returned to a remote caller.
         return mcpcore.call_verb(name, args, "local", remote=via not in (None, "stdio"),
-                                 runner=lambda argv, timeout: run_cli(argv), timeout=120.0,
+                                 runner=lambda argv, timeout, input=None: run_cli(argv, input),
+                                 timeout=120.0,
                                  write=_verb_writer(via, client, source))
     declared, ignored = {}, []
     if name == "brain_capture":
@@ -232,19 +241,22 @@ def call_tool(name, args, allow=None, source=None, cap=None, log=None, via=None,
     if problem:
         return {"content": [{"type": "text", "text": f"invalid arguments for {name}: {problem}"}],
                 "isError": True}
+    # A caller reaching this brain over `brain serve` is remote: a private capture does
+    # not exist for it (mcpcore.cli_for says why the flag comes first).
+    hide = ["--hide-private"] if via not in (None, "stdio") else []
     if name == "brain_search":
-        cli = ["search", "--limit", str(args.get("limit", 8))]
+        cli = ["search", *hide, "--limit", str(args.get("limit", 8))]
         if args.get("scope") in ("all", "handoff"):
             cli += ["--scope", args["scope"]]
         if args.get("scope") == "handoff" and args.get("offset") is not None:
             cli += ["--offset", str(args["offset"])]
         cli += ["--", args["query"]]      # query text, never parsed as flags
     elif name == "brain_read":
-        cli = ["read", args["id_or_path"]]
+        cli = ["read", *hide, args["id_or_path"]]
     elif name == "brain_links":
-        cli = ["links", args["id_or_path"]]
+        cli = ["links", *hide, args["id_or_path"]]
     elif name == "brain_recent":
-        cli = ["recent", "--days", str(args.get("days", 7))]
+        cli = ["recent", *hide, "--days", str(args.get("days", 7))]
     elif name == "brain_capture":
         # Default stays True: committing is what backs the note up, and an
         # uncommitted note dirties the tree, which blocks the consolidation pass

@@ -571,7 +571,8 @@ class _Handler(BaseHTTPRequestHandler):
         fails identically; one told which scope it needs can step up in a
         single round trip.
         """
-        needed = (oauthlib.SCOPE_WRITE if tool in mcp.WRITE_ONLY_TOOLS
+        needed = (f"{oauthlib.SCOPE_READ} {oauthlib.SCOPE_WRITE}" if tool in mcp.READ_WRITE_TOOLS
+                  else oauthlib.SCOPE_WRITE if tool in mcp.WRITE_ONLY_TOOLS
                   else oauthlib.SCOPE_READ)
         cfg = getattr(self.server, "oauth", None)
         parts = ['Bearer error="insufficient_scope"', f'scope="{needed}"']

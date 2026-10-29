@@ -622,8 +622,8 @@ class Handler(BaseHTTPRequestHandler):
                                 endpoint=principal.endpoint, outcome="denied",
                                 ms=_ms(started))
             if name in verbs.WRITE_VERBS:
-                return self._send(200, reply(msg_id, verbs.result(verbs.scope_denied(name))),
-                                  cid=cid)
+                return self._send(200, reply(msg_id, verbs.result(verbs.scope_denied(
+                    name, mcpcore.served_verbs(principal.profile)))), cid=cid)
             return self._send(200, reply(msg_id, mcpcore.error_result(
                 "brain_capture is not available on this endpoint. This is the read-only "
                 "brain; use the read/capture endpoint to save a note.")), cid=cid)

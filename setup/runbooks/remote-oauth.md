@@ -255,7 +255,7 @@ WWW-Authenticate: Bearer error="insufficient_scope", scope="brain:write", resour
 | Scope | What consenting to it allows |
 |---|---|
 | `brain:read` | read every note in this brain — decisions, projects, people, journal, everything except the encrypted vault |
-| `brain:write` | write new notes, which are committed and pushed to your private remote automatically |
+| `brain:write` | write new notes, which are committed and pushed to your private remote automatically. On its own it opens `brain_capture` only; `remember` and `forget` answer back (a stored path, a missing-or-expired id), so they need `brain:read` as well |
 | `offline_access` | stay connected without asking again, until you revoke it |
 
 Scopes **compose with** `--read-only` rather than replace it. The flag decides

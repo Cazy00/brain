@@ -47,6 +47,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -187,19 +188,43 @@ def ledger_key(state_dir) -> bytes:
     deduplication window, so it is never backed up and never in the repository."""
     path = os.path.join(str(state_dir), "capture-ledger.key")
     os.makedirs(str(state_dir), exist_ok=True)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        with open(path, "rb") as handle:
-            key = handle.read()
-        if key:
-            return key
-        os.unlink(path)                    # a crashed first writer: start again
-        return ledger_key(state_dir)
-    key = os.urandom(32)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(key)
-    return key
+    for _attempt in range(3):
+        try:
+            with open(path, "rb") as handle:
+                key = handle.read()
+            if key:
+                return key
+        except FileNotFoundError:
+            pass
+        # The key is written whole to a file of its own and then linked into place, so
+        # the name never exists empty or half written, and of any number of processes
+        # starting at once exactly one link succeeds: every other one reads that key.
+        key = os.urandom(32)
+        fd, tmp = tempfile.mkstemp(prefix="capture-ledger.key.", dir=str(state_dir))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(key)
+            os.chmod(tmp, 0o600)
+            try:
+                os.link(tmp, path)
+                return key
+            except FileExistsError:
+                # Lost the race: read the winner's key next time round. Only an empty
+                # file (left by an older version that crashed between creating and
+                # writing) is replaced, and atomically.
+                try:
+                    empty = os.path.getsize(path) == 0
+                except OSError:
+                    empty = False
+                if empty:
+                    os.replace(tmp, path)
+                    return key
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    raise OSError("could not create the capture ledger key in %s" % state_dir)
 
 
 class BackupQueue(object):

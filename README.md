@@ -171,8 +171,30 @@ fact is an unconsolidated capture, and an inbox note is met only by asking for i
 with `entity` or `scope: "all"`); `forget` takes fact ids only; `remember` refuses a
 credential, a line break or a bad label in `provenance` and `entity` before anything
 reaches git. `initialize` carries `_meta["brain-verbs"]` saying which verbs an
-endpoint serves; the read-only endpoint serves `recall`, `delta`, `brain_read` and
-`brain_links`.
+endpoint serves; the read-only endpoint serves `recall`, `delta`, `brain_search`,
+`brain_read`, `brain_links` and `brain_recent`.
+
+Three rules the verbs add, each held by a test:
+
+- **Private means private to a remote caller.** A fact saved with
+  `visibility: private` never appears over a remote transport in any form: not in
+  `recall` (facts or pages), not in `delta` (pages or facts), and `brain_search`,
+  `brain_recent`, `brain_read` and `brain_links` answer as if the capture did not exist.
+  The retraction `forget` writes for a private fact is private too.
+- **`forget` retracts one capture, and trusts itself for nothing else.** Its
+  retraction carries a `retracts:` key naming the one inbox capture it removes. The
+  consolidation pass accepts a drained pair of capture and retraction on that key alone;
+  it never lets a `forget` retract a note under `knowledge/`, and the owner's own
+  `Retract` correction (`source: local`, `basis: owner-said`) works as before. A forgotten
+  fact leaves the facts arm, the pages arm of `recall` and the `delta` walk at once.
+- **`delta` pages are authoritative.** The cursor orders facts by `captured_at`. A
+  capture synced in from another machine with a `captured_at` earlier than a cursor you
+  already hold appears in `pages` (by file time) but may never appear in `facts`. Read
+  `pages` to be sure nothing is missed.
+
+A `brain:write` OAuth token opens `brain_capture` only; `remember` and `forget` need
+`brain:read` as well, because they answer (a duplicate returns the stored path, a forget
+tells a missing id from an expired one).
 
 ## How it stays true
 
