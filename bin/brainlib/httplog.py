@@ -69,6 +69,9 @@ EVENTS = frozenset((
     "auth_failed", "keys_refreshed", "keys_unavailable",
     # the tool layer
     "tool_call", "tool_error", "tool_denied", "tool_timeout",
+    # a recall that ran the one-shot command instead of the warm worker (reason: busy,
+    # error or refused; verbworker.py)
+    "worker_fallback",
     # a stamp the endpoint could not write (reason names the field, never its value)
     "provenance_dropped",
     # mutation

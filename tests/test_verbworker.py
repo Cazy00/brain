@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from array import array
@@ -126,12 +127,139 @@ class WorkerTests(HybridCase):
         self.assertIsNone(verbworker.run(["verb", "recall", "-"], 5, "{}"))     # the worker says no
         self.assertEqual(recall(query="gizmo"), self.cold(query="gizmo"))
 
+    def test_concurrent_recalls_do_not_queue_behind_one_worker(self):
+        """The worker takes one call at a time; the others run the one-shot command at once
+        instead of waiting their turn (and then their own full timeout)."""
+        self.fake.delay = 1.5
+        want = self.cold(query="gizmo")
+        results, errors = [], []
+
+        def call():
+            try:
+                results.append(recall(query="gizmo"))
+            except BaseException as exc:         # noqa: BLE001
+                errors.append(exc)
+        threads = [threading.Thread(target=call) for _ in range(5)]
+        began = time.monotonic()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        elapsed = time.monotonic() - began
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [want] * 5)
+        self.assertGreaterEqual(verbworker.fallbacks().get("busy", 0), 1)
+        self.assertLess(elapsed, 5 * 1.5 * 0.7, "the calls were serialized behind the worker")
+
+    def test_a_busy_worker_is_not_waited_for(self):
+        recall(query="gizmo")
+        request, _ = verbs.prepare_recall({"query": "gizmo"}, False, datetime.now(timezone.utc))
+        began = time.monotonic()
+        with verbworker._lock:                   # another call is in the worker
+            self.assertIsNone(verbworker.run(["verb", "recall", "-"], 30, json.dumps(request)))
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertIsNotNone(pid(), "a busy worker is left alone, not killed")
+
     def test_the_prewarmed_worker_has_the_vectors_before_the_first_call(self):
         verbworker.prewarm(cwd=mcp.ROOT).join(30)
         first = pid()
         self.assertIsNotNone(first)
         recall(query="gizmo")
         self.assertEqual(pid(), first)
+
+
+class FallbackReportTests(unittest.TestCase):
+    def setUp(self):
+        self.seen = []
+        self.addCleanup(setattr, verbworker, "observer", None)
+        self.addCleanup(verbworker._fallbacks.clear)
+        self.addCleanup(verbworker._reported.clear)
+        verbworker._fallbacks.clear()
+        verbworker._reported.clear()
+        verbworker.observer = self.seen.append
+
+    def test_a_busy_worker_and_a_refusal_are_reported_and_counted(self):
+        with verbworker._lock:
+            self.assertIsNone(verbworker.run(["verb", "recall", "-"], 5, "{}"))
+        self.assertEqual(self.seen, ["busy"])
+        self.addCleanup(verbworker.stop)
+        self.addCleanup(os.environ.pop, "BRAIN_VECTORS", None)
+        self.assertIsNone(verbworker.run(["verb", "recall", "-"], 20, "{}"))      # the worker says no
+        self.assertEqual(self.seen, ["busy", "refused"])
+        self.assertEqual(verbworker.fallbacks(), {"busy": 1, "refused": 1})
+
+    def test_without_an_observer_it_goes_to_stderr_once_a_minute_per_reason(self):
+        import contextlib
+        import io
+        verbworker.observer = None
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(3):
+                with verbworker._lock:
+                    verbworker.run(["verb", "recall", "-"], 5, "{}")
+        self.assertEqual(verbworker.fallbacks(), {"busy": 3})
+        self.assertEqual(err.getvalue().count("one-shot"), 1)
+        self.assertIn("busy", err.getvalue())
+
+    def test_both_servers_write_a_fall_back_to_their_event_log(self):
+        from brainlib import eventlog, httplog, httpmcp, serve
+        with tempfile.TemporaryDirectory() as tmp:
+            for make, watch, name in (
+                    (lambda d: eventlog.EventLog(Path(d) / "events.jsonl"), serve.watch_worker, "events.jsonl"),
+                    (lambda d: httplog.EventLog(d), httpmcp.watch_worker, "events.jsonl")):
+                folder = Path(tmp) / str(watch.__module__)
+                folder.mkdir()
+                log = make(folder)
+                watch(log)
+                for reason in verbworker.REASONS:            # every reason the worker can give is loggable
+                    verbworker._fell_back(reason)
+                lines = [json.loads(line) for line in (folder / name).read_text().splitlines()]
+                self.assertEqual([(e["event"], e["reason"]) for e in lines],
+                                 [("worker_fallback", r) for r in verbworker.REASONS])
+
+    def test_a_call_the_worker_does_not_take_is_not_a_fall_back(self):
+        self.assertIsNone(verbworker.run(["verb", "delta", "-"], 5, "{}"))
+        self.assertIsNone(verbworker.run(["verb", "recall", "-"], 5, "not json"))
+        self.assertEqual(self.seen, [])
+
+
+class EngineUpdateTests(HybridCase):
+    def setUp(self):
+        super().setUp()
+        self.index()
+        self.env(BRAIN_VECTORS="on", BRAIN_VERB_WORKER=None)
+        self.addCleanup(verbworker.stop)
+        verbworker.stop()
+
+    def test_the_stamp_follows_bin_brain_and_every_brainlib_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "brainlib").mkdir()
+            (root / "brain").write_text("a")
+            (root / "brainlib" / "x.py").write_text("a")
+            real, verbworker.BRAIN = verbworker.BRAIN, str(root / "brain")
+            self.addCleanup(setattr, verbworker, "BRAIN", real)
+            first = verbworker._engine_stamp()
+            self.assertEqual(verbworker._engine_stamp(), first)
+            (root / "brainlib" / "x.py").write_text("bb")
+            second = verbworker._engine_stamp()
+            self.assertNotEqual(second, first)
+            os.utime(root / "brain", (1, 1))
+            self.assertNotEqual(verbworker._engine_stamp(), second)
+            (root / "brainlib" / "y.py").write_text("")
+            self.assertEqual(len(verbworker._engine_stamp()), 3)
+
+    def test_an_engine_update_replaces_the_warm_worker(self):
+        want = recall(query="gizmo")
+        first = pid()
+        self.assertIsNotNone(first)
+        self.assertEqual(recall(query="gizmo"), want)
+        self.assertEqual(pid(), first)
+        real = verbworker._engine_stamp
+        verbworker._engine_stamp = lambda: real() + (("brain", 1, 1),)     # `brain sync` installed new code
+        self.addCleanup(setattr, verbworker, "_engine_stamp", real)
+        self.assertEqual(recall(query="gizmo"), want)
+        self.assertNotEqual(pid(), first)
 
 
 def write_db(path, rows):

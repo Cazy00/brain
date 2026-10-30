@@ -992,6 +992,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._served(started)
 
 
+def watch_worker(log) -> None:
+    """Record in `log` each recall that ran the one-shot command instead of the warm worker."""
+    verbworker.observer = lambda reason: log.record("worker_fallback", reason=reason)
+
+
 def make_server(token: str, host: str = "127.0.0.1", port: int = 0,
                 allow_origin=(), quiet: bool = False,
                 allow_tools=None, limiter=None,
@@ -1226,6 +1231,7 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None,
             return None
     if run is None:
         def run(server):
+            watch_worker(log)
             if vectors.settings()["mode"] != "off":
                 verbworker.prewarm(cwd=mcpcore.ENGINE)      # the first recall finds the worker ready
             server.serve_forever()

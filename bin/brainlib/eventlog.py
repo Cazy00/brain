@@ -53,6 +53,8 @@ EVENTS = frozenset((
     "origin_refused", "body_refused", "protocol_refused",
     # the tool layer
     "tool_call", "tool_error", "capture_committed", "capture_uncommitted",
+    # a recall that ran the one-shot command instead of the warm worker (verbworker.py)
+    "worker_fallback",
     # the authorization server
     "oauth_metadata_served", "oauth_authorize_shown", "oauth_consent_failed",
     "oauth_code_issued", "oauth_token_issued", "oauth_token_refreshed",
@@ -107,6 +109,9 @@ REASONS = (
     "not_https", "no_path", "blocked_address", "dns_failure", "redirected",
     "too_big", "timeout", "bad_document", "client_id_mismatch", "fetch_failed",
     "unknown_client",
+    # why a recall did not use the warm worker (the others it can give, error and
+    # refused, are in OUTCOMES)
+    "busy",
 )
 
 # RFC 6749 error codes, so a `code` field cannot become a custom string. A

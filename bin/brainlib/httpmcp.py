@@ -52,6 +52,7 @@ from . import access
 from . import mcpcore
 from . import verbs
 from . import provenance
+from . import verbworker
 from . import version
 
 ENDPOINT = "/mcp"
@@ -826,6 +827,11 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, service: Service):
         ThreadingHTTPServer.__init__(self, address, Handler)
         self.service = service
+
+
+def watch_worker(log) -> None:
+    """Record in `log` each recall that ran the one-shot command instead of the warm worker."""
+    verbworker.observer = lambda reason: log.record("worker_fallback", reason=reason)
 
 
 def make_server(service: Service, host: str = "127.0.0.1", port: int = 0) -> Server:
