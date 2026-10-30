@@ -236,6 +236,35 @@ class IndexingTests(HybridCase):
         self.assertEqual(sorted(p.name for p in self.corpus.state.glob("vectors.db*")),
                          ["vectors.db"])
 
+    def test_the_scheduled_form_warns_and_exits_0_when_vectors_are_off_or_the_embedder_is_down(self):
+        """The sync and maintenance units run `index --vectors --quiet`: it must never fail them."""
+        self.env(BRAIN_VECTORS="off")
+        off = self.index("--quiet")
+        self.assertEqual((off.returncode, off.stdout), (0, ""), off.stdout + off.stderr)
+        self.assertIn("BRAIN_VECTORS is off", off.stderr)
+        self.assertFalse((self.corpus.state / "vectors.db").exists(), "off must embed nothing")
+        self.env(BRAIN_VECTORS="shadow")
+        self.fake.fail = 503
+        down = self.index("--quiet")
+        self.assertEqual((down.returncode, down.stdout), (0, ""), down.stdout + down.stderr)
+        self.assertIn("warning", down.stderr)
+        self.env(BRAIN_EMBEDDER_URL="http://127.0.0.1:9")                  # nothing listens
+        gone = self.index("--quiet")
+        self.assertEqual(gone.returncode, 0, gone.stdout + gone.stderr)
+        self.assertIn("warning", gone.stderr)
+        self.env(BRAIN_EMBEDDER_URL="")                                     # unset
+        unset = self.index("--quiet")
+        self.assertEqual(unset.returncode, 0, unset.stdout + unset.stderr)
+        self.fake.fail = None
+        self.env(BRAIN_EMBEDDER_URL=self.fake.url)                          # recovers: next run embeds
+        back = self.index("--quiet")
+        self.assertEqual(back.returncode, 0, back.stdout + back.stderr)
+        self.assertEqual(self.vector_ids(), self.fts_ids())
+        # a person asking by hand still gets the exit code
+        self.fake.fail = 503
+        self.env(BRAIN_EMBEDDER_MODEL="other-model")
+        self.assertEqual(self.index().returncode, 1)
+
     def test_full_without_vectors_is_refused(self):
         done = subprocess.run([sys.executable, BRAIN, "index", "--full"], capture_output=True,
                               text=True, cwd=support.ENGINE)

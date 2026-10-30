@@ -39,7 +39,9 @@ Commands:
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
   brain index --vectors [--full] [--quiet]
                                    embed changed notes into vectors.db (search by meaning;
-                                   needs BRAIN_EMBEDDER_URL, see README)
+                                   needs BRAIN_EMBEDDER_URL, see README; with --quiet, as the
+                                   timers run it, BRAIN_VECTORS=off or an embedder that is
+                                   down is a warning on stderr and exit 0)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
                                    Code sessions into .cache/ (never committed)
   brain sessions --jsonl --out FILE [--days N]
@@ -3142,9 +3144,20 @@ def cmd_index_vectors(full: bool = False, quiet: bool = False) -> int:
     every note that is no longer in the indexed set. The set is `note_records()`, the
     same one the FTS index is built from, so NOT_INDEXED folders are never embedded."""
     cfg = vectors.settings()
+    # --quiet is the scheduled form (the sync and maintenance units): there, vectors
+    # being off or the embedder being down is a logged warning and exit 0, because the
+    # keyword brain is fine without them and a failed unit would page for nothing. A
+    # person at a terminal still gets the exit 1 and the reason.
+    if quiet and cfg["mode"] == "off":
+        print("brain index --vectors: BRAIN_VECTORS is off; nothing embedded", file=sys.stderr)
+        return 0
     try:
         stats = vectors.build(note_records(), state_dir(), cfg, full=full)
     except vectors.EmbedError as exc:
+        if quiet:
+            print(f"brain index --vectors: warning: {exc}; vectors.db keeps what was finished, "
+                  "the next run retries", file=sys.stderr)
+            return 0
         print(f"brain index --vectors: {exc}; vectors.db keeps what was finished")
         return 1
     if not quiet:

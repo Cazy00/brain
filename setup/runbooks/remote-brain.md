@@ -544,6 +544,13 @@ sudo docker build --pull -f /srv/brain/engine/deploy/Dockerfile \
      --build-arg BRAIN_VERSION="$V" -t "brain:$V" /srv/brain/engine
 sudo sed -i "s/^BRAIN_VERSION=.*/BRAIN_VERSION=$V/" /srv/brain/engine/deploy/.env
 sudo docker compose -p brain pull cloudflared
+#    0.6.0 and later also run the `embedder` service (search by meaning). Its image
+#    comes from a registry, pinned by digest in deploy/embedder.env, and its model
+#    is a file, fetched into /srv/brain/models and checked against MODEL_BYTES and
+#    MODEL_SHA256 from that same file before the container may start:
+sudo docker compose -p brain pull embedder
+#    Step 6 builds the vectors once by hand, so the first run is not left to the
+#    sync timer.
 
 # 5. Preflight against the real data, without serving traffic.
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
@@ -555,6 +562,8 @@ sudo docker compose -p brain --profile maintenance run --rm --no-deps \
 #    the probe goes to the container's address on the egress bridge, which is
 #    the same path the host-side monitoring uses.
 sudo docker compose -p brain up -d
+sudo docker compose -p brain --profile maintenance run --rm --no-deps \
+     maintenance index --vectors
 EG=$(sudo docker inspect -f '{{(index .NetworkSettings.Networks "brain_egress").IPAddress}}' brain-brain-1)
 curl -fsS "http://$EG:8787/readyz"
 sudo docker compose -p brain logs --since 5m brain

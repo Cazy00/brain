@@ -7,13 +7,14 @@
 # answering requests, which is precisely the difference a nightly check exists
 # to catch.
 #
-# Order matters. The index is rebuilt first so lint and doctor judge a current
-# one; doctor runs last because its output is the report an operator reads, and
+# Order matters. The index is rebuilt first, then the vectors (search by meaning;
+# a warning and exit 0 when BRAIN_VECTORS is off or the embedder is down, never a
+# failed night), so lint and doctor judge a current index; doctor runs last because its output is the report an operator reads, and
 # a Type=oneshot unit stops at the first ExecStart that fails — so if lint
 # fails, the alert carries lint's exit code and nothing else has run to muddy
 # it.
 [Unit]
-Description=brain nightly maintenance (index, lint, doctor)
+Description=brain nightly maintenance (index, vectors, lint, doctor)
 Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
 # Ordering only, not a dependency: if the backup is queued for the same window
 # it should finish first, but a missing backup must never cancel maintenance.
@@ -38,6 +39,7 @@ Environment=DOCKER_CONFIG=/tmp/docker
 Environment=DOCKER_CLI_HINTS=false
 
 ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance index --quiet
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance index --vectors --quiet
 ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance lint
 ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance doctor
 

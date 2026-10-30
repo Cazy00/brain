@@ -224,7 +224,18 @@ indexes, never `archive/`, `vault/`, `attachments/` or `handoff/`. The file,
 `vectors.db`, sits in the state directory next to `index.db`, is never backed up and
 may be deleted at any time. A note is embedded as its title, aliases and topics plus
 body chunks of about 1,500 characters cut at paragraph breaks, and scores by its best
-chunk. Running it after a pull or on a timer is a deployment concern, not wired here.
+chunk. Running it after a pull or on a timer is a deployment concern: the shipped
+`deploy/` (below the engine, for a VPS) wires it. With `--quiet`, the form the timers
+use, `BRAIN_VECTORS=off` or an embedder that is down is one warning on stderr and exit
+0 instead of a failure.
+
+**Deployed (0.6.0).** `deploy/compose.yaml` runs the embedder as its own service:
+llama.cpp's server, image and model pinned in `deploy/embedder.env` (multi-arch image
+digest; model repository revision, size and sha256), no published port, no egress, on
+an internal `embed` network shared only with `brain` and `maintenance`, 1 GiB and 2
+CPUs. The model file is fetched by the host into `BRAIN_HOST_MODELS` and mounted
+read-only. `BRAIN_VECTORS` in `deploy/.env` defaults to `shadow` there. `brain` does not
+wait for the embedder: with it down, everything works and `recall` answers keyword-only.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 30 best chunks above the floor (cosine times the same folder

@@ -16,8 +16,8 @@ the runbook says which ones to enable when.
 |---|---|---|
 | `brain-backup` | the archive built, encrypted, uploaded, pruned | whether it can be restored |
 | `brain-restore-drill` | that it can be restored | anything between drills |
-| `brain-maintenance` | index, content, backup age, disk, unpushed commits | anything outside the box |
-| `brain-sync` | merged PRs arriving, captures leaving, refusals (exit 2 alerts) | a push pending for minutes (the server queue alerts on that) |
+| `brain-maintenance` | index, content, backup age, disk, unpushed commits | anything outside the box; whether search by meaning is current (see below) |
+| `brain-sync` | merged PRs arriving, captures leaving, refusals (exit 2 alerts) | a push pending for minutes (the server queue alerts on that); the embedder being down |
 | `brain-edge-check` | the Cloudflare side: expiring service tokens, drifted applications, policies, DNS | whether the brain itself is answering |
 
 The blind spot is the same for the first three: they run ON the VPS, so they go
@@ -30,6 +30,22 @@ reported by Cloudflare, and never by neither.
 allowed to have an opinion: it writes nothing and exits non-zero on what it
 finds. A plain dry run exits 0 whatever it sees, so scheduling that would have
 produced a green timer on the morning a headless credential lapsed.
+
+## Search by meaning (0.6.0)
+
+`brain-sync` runs `index --vectors --quiet` after `sync`, and `brain-maintenance` runs
+it after the FTS rebuild. Both talk to the `embedder` compose service over the
+internal `embed` network (`maintenance` joins it; the units need no change for that).
+The step is incremental by content hash, so a quiet five minutes costs a file scan,
+and a changed `BRAIN_EMBEDDER_MODEL` makes the next run re-embed every note.
+
+With `BRAIN_VECTORS=off`, or with the embedder down, `--quiet` prints one warning to
+stderr (it lands in the journal) and exits 0, so neither unit fails and nothing
+alerts: the keyword brain does not depend on the vectors. That is also the blind
+spot. A silently down embedder shows up as `search_degraded: "embed_unavailable"` in
+`recall` answers and as that warning in `journalctl -u brain-sync`, not as an alert.
+`brain-sync` has a 30-minute start timeout because the first run after an upgrade
+embeds every note.
 
 ## Why there is no consolidation timer
 

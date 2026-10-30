@@ -446,6 +446,19 @@ set. Nothing is pushed until the audit passes, and then only the
 the command when `gh` is not installed). A folder that is no longer served
 stays refused until you delete its marker.
 
+### Search by meaning on the VPS (0.6.0)
+
+Optional. The `deploy/` stack from 0.6.0 includes an `embedder` service (llama.cpp
+serving `nomic-embed-text-v1.5`, pinned in `deploy/embedder.env`), reachable only from
+`brain` and `maintenance` over an internal network. Before `docker compose up`, the
+model file named in `embedder.env` must be in `BRAIN_HOST_MODELS` (default
+`/srv/brain/models`), checked against its size and sha256; and `docker compose pull
+embedder`. `BRAIN_VECTORS` in `deploy/.env` is `shadow` to start (`off` turns the whole
+thing off; `on` makes hybrid `recall`'s default and follows the calibration check).
+`brain-sync` and `brain-maintenance` then run `brain index --vectors --quiet`, which
+warns and exits 0 when the mode is off or the embedder is down. Details:
+`deploy/systemd/README.md` and "Search by meaning" in `README.md`.
+
 ### Backup alarm (re-enabling the CI pulse)
 
 If you installed from the public template, its CI (`.github/workflows/gate.yml`)
