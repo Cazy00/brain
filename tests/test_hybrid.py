@@ -17,11 +17,13 @@ needs a network or can touch real notes. What is proved:
 Run:  python3 -m unittest tests.test_hybrid -v
 """
 import json
+import math
 import os
 import sqlite3
 import subprocess
 import sys
 import unittest
+from array import array
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,7 +35,8 @@ from hybrid_snapshot import snapshot  # noqa: E402
 BRAIN = str(support.ENGINE / "bin" / "brain")
 GOLDEN = Path(__file__).resolve().parent / "fixtures" / "golden" / "recall-0.5.0.json"
 KEYS = ("BRAIN_VECTORS", "BRAIN_EMBEDDER_URL", "BRAIN_EMBEDDER_MODEL",
-        "BRAIN_VECTOR_FLOOR", "BRAIN_VECTOR_HIGH")
+        "BRAIN_VECTOR_FLOOR", "BRAIN_VECTOR_HIGH", "BRAIN_EMBEDDER_QUERY_PREFIX",
+        "BRAIN_EMBEDDER_DOC_PREFIX")
 
 
 def recall(**args):
@@ -62,13 +65,39 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(chunks[0], "T\nAliases: a1, a2\nTopics: t1")
         self.assertGreater(len(chunks), 2)
         self.assertTrue(all(len(c) <= vectors.CHUNK_CHARS for c in chunks[1:]))
-        self.assertEqual("\n\n".join(chunks[1:]), rec["body"])        # cut at breaks only
+        self.assertTrue(all(c.startswith("T\n") for c in chunks[1:]))   # every body chunk names its note
+        self.assertEqual("\n\n".join(c[2:] for c in chunks[1:]), rec["body"])   # cut at breaks only
 
     def test_a_long_paragraph_is_cut_at_a_space_and_nothing_is_lost(self):
         rec = {"title": "T", "body": " ".join("word%d" % i for i in range(1000))}
         chunks = vectors.chunk_texts(rec)
         self.assertTrue(all(len(c) <= vectors.CHUNK_CHARS for c in chunks))
-        self.assertEqual(" ".join(chunks[1:]).split(), rec["body"].split())
+        self.assertEqual(" ".join(c[2:] for c in chunks[1:]).split(), rec["body"].split())
+
+    def test_the_prefixes_follow_the_model_and_the_environment_overrides_them(self):
+        qwen = vectors.settings({"BRAIN_EMBEDDER_MODEL": "Qwen3-Embedding-0.6B"})
+        self.assertTrue(qwen["query_prefix"].startswith("Instruct: ") and qwen["query_prefix"].endswith("\nQuery:"))
+        self.assertEqual(qwen["doc_prefix"], "")
+        nomic = vectors.settings({"BRAIN_EMBEDDER_MODEL": "nomic-embed-text-v1.5"})
+        self.assertEqual((nomic["query_prefix"], nomic["doc_prefix"]), ("search_query: ", "search_document: "))
+        other = vectors.settings({"BRAIN_EMBEDDER_MODEL": "x", "BRAIN_EMBEDDER_DOC_PREFIX": "doc:\\n"})
+        self.assertEqual((other["query_prefix"], other["doc_prefix"]), ("", "doc:\n"))
+        self.assertEqual(vectors.settings({})["model"], vectors.DEFAULT_MODEL)
+
+    def test_a_note_scores_by_its_best_chunk_plus_a_tenth_of_its_second_and_the_arm_keeps_ten_notes(self):
+        def unit(x, y):
+            norm = math.hypot(x, y)
+            return array("f", (x / norm, y / norm, 0.0))
+        query = array("f", (1.0, 0.0, 0.0)).tobytes()
+        rows = [("one", 0, "h", unit(1.0, 1.0)), ("one", 1, "h", unit(1.0, 1.1)),
+                ("two", 0, "h", unit(1.0, 0.99)), ("old", 0, "h", unit(1.0, 0.0))]
+        allowed = {"one": "reference", "two": "reference", "old": "reference"}
+        out = vectors.vector_list(query, rows, allowed, {}, 0.0, lambda n, h: n != "old")
+        self.assertEqual([h["id"] for h in out], ["one", "two"])    # the second chunk breaks the near tie
+        self.assertEqual(out[0]["chunk_no"], 0)                       # the entry names the best chunk
+        many = [("n%d" % i, 0, "h", unit(1.0, 1.0 + i)) for i in range(25)]
+        out = vectors.vector_list(query, many, {n: "reference" for n, *_ in many}, {}, 0.0, lambda n, h: True)
+        self.assertEqual(len(out), vectors.VECTOR_NOTES)
 
     def test_the_hash_follows_the_text_the_vector_is_made_from(self):
         base = {"title": "T", "aliases": "a", "topics": "t", "body": "b"}
@@ -124,8 +153,10 @@ class HybridCase(unittest.TestCase):
             os.environ.pop(key, None)
         # The fake is a bag of words, so its cosines are small; the real floor is
         # calibrated elsewhere. These keep the tests about behaviour, not calibration.
+        # The fake strips nomic's prefixes, so the tests ask for them whatever the model is called.
         self.env(BRAIN_EMBEDDER_URL=self.fake.url, BRAIN_VECTOR_FLOOR="0.05",
-                 BRAIN_VECTOR_HIGH="0.30")
+                 BRAIN_VECTOR_HIGH="0.30", BRAIN_EMBEDDER_QUERY_PREFIX="search_query: ",
+                 BRAIN_EMBEDDER_DOC_PREFIX="search_document: ")
 
     def env(self, **kw):
         for k, v in kw.items():
@@ -164,7 +195,7 @@ class IndexingTests(HybridCase):
         done = self.index()
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(self.vector_ids(), self.fts_ids())
-        everything = " ".join(self.fake.embedded_texts(vectors.DOC_PREFIX))
+        everything = " ".join(self.fake.embedded_texts("search_document: "))
         for never in ("We used the cog engine", "needs a sprocket supplier", "Old engine"):
             self.assertNotIn(never, everything)         # archive/ and handoff/ text
         self.assertIn("Choose the widget engine", everything)
@@ -285,7 +316,7 @@ class SearchTests(HybridCase):
         self.assertNotIn("search_degraded", found)
         self.assertEqual(found["match_mode"], "hybrid")
         self.assertIn(self.GLOSSARY, paths(found))
-        top = found["results"][0]
+        top = next(r for r in found["results"] if r["path"] == self.GLOSSARY)
         self.assertIn(top["evidence"], ("high_vector_match", "weak_semantic"))
         self.assertEqual(top["trust"], "stale")                # review_by 2026-04-01 passed
         self.assertEqual(top["markers"][0], "[STALE — review_by 2026-04-01 passed]")

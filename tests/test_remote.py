@@ -2069,6 +2069,7 @@ class EmbedderDeploymentTests(unittest.TestCase):
         self.assertIn("image: " + self.pins["EMBED_IMAGE"], lines)
         self.assertIn('- "/models/%s"' % self.pins["MODEL_FILE"], lines)
         self.assertIn('- "%s"' % self.pins["MODEL_ALIAS"], lines)
+        self.assertIn('- "last"', lines)      # Qwen3-Embedding pools by its last token, not the mean
 
     def test_the_embedder_is_hardened_unpublished_and_on_the_internal_network_alone(self):
         lines = self.block("  embedder:", 2)

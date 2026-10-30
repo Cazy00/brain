@@ -433,11 +433,11 @@ services:
     command:
       - "--embeddings"
       - "--pooling"
-      - "mean"
+      - "last"
       - "-m"
-      - "/models/nomic-embed-text-v1.5.Q8_0.gguf"
+      - "/models/Qwen3-Embedding-0.6B-Q8_0.gguf"
       - "--alias"
-      - "nomic-embed-text-v1.5"
+      - "qwen3-embedding-0.6b"
       - "-c"
       - "2048"
       - "-b"
@@ -489,7 +489,8 @@ services:
     networks:
       - embed
 
-    # A 146 MB quantised model plus a 2048-token context fits well inside 1 GiB.
+    # A 640 MB quantised model plus a 2048-token context fits inside 1 GiB (measured
+    # peak of the cgroup while indexing a few hundred notes: under 500 MiB).
     # memswap_limit equal to the memory limit means no swap: an embedder that
     # outgrows it is OOM-killed and restarted, which the brain survives, rather
     # than pushing the box into swap. It is the only limit that has no home under

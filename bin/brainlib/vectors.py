@@ -41,20 +41,28 @@ except ImportError:          # non-POSIX: the atomic rename below still holds
     fcntl = None
 
 MODES = ("off", "shadow", "on")
-DEFAULT_MODEL = "nomic-embed-text-v1.5"
+DEFAULT_MODEL = "qwen3-embedding-0.6b"
 # Placeholders. The real floor and threshold are calibrated later, on data that does not
 # live in this repository, and then set in the deployment's config.
 DEFAULT_FLOOR = 0.35
 DEFAULT_HIGH = 0.65
 
-QUERY_PREFIX = "search_query: "
-DOC_PREFIX = "search_document: "
+# What each model wants in front of a query and in front of a document. A model that is not
+# listed gets no prefix; BRAIN_EMBEDDER_QUERY_PREFIX / _DOC_PREFIX override either side (a
+# literal backslash-n in the value is a newline).
+PREFIXES = {
+    "qwen3-embedding-0.6b": ("Instruct: Given a question, retrieve the note that answers it\nQuery:", ""),
+    "nomic-embed-text-v1.5": ("search_query: ", "search_document: "),
+}
 QUERY_TIMEOUT = 2.0         # seconds, the whole query embed
 INDEX_TIMEOUT = 60.0        # seconds, one batch of documents
 BATCH = 16
 MAX_RESPONSE = 32 * 1024 * 1024
 CHUNK_CHARS = 1500
-TOP_CHUNKS = 30
+CHUNK_SCHEME = "2"          # part of what a vector was made from: a new scheme re-embeds every note
+KEYWORD_NOTES = 30             # keyword candidates handed to fusion
+VECTOR_NOTES = 10           # meaning candidates handed to fusion
+SECOND_CHUNK = 0.1          # weight of a note's second-best chunk in its score
 RRF_K = 60
 DB_NAME = "vectors.db"
 
@@ -83,9 +91,16 @@ def settings(env=None) -> dict:
     env = os.environ if env is None else env
     mode = (env.get("BRAIN_VECTORS") or "off").strip().lower()
     model = (env.get("BRAIN_EMBEDDER_MODEL") or "").strip() or DEFAULT_MODEL
+    query_prefix, doc_prefix = PREFIXES.get(model.lower(), ("", ""))
+    if env.get("BRAIN_EMBEDDER_QUERY_PREFIX") is not None:
+        query_prefix = env["BRAIN_EMBEDDER_QUERY_PREFIX"].replace("\\n", "\n")
+    if env.get("BRAIN_EMBEDDER_DOC_PREFIX") is not None:
+        doc_prefix = env["BRAIN_EMBEDDER_DOC_PREFIX"].replace("\\n", "\n")
     return {"mode": mode if mode in MODES else "off",
             "url": (env.get("BRAIN_EMBEDDER_URL") or "").strip(),
             "model": model,
+            "query_prefix": query_prefix,
+            "doc_prefix": doc_prefix,
             "floor": _number(env.get("BRAIN_VECTOR_FLOOR"), DEFAULT_FLOOR),
             "high": _number(env.get("BRAIN_VECTOR_HIGH"), DEFAULT_HIGH)}
 
@@ -151,8 +166,10 @@ def embed(cfg: dict, texts: list, prefix: str, timeout: float) -> list:
 # -- chunking and hashing --------------------------------------------------
 
 def record_hash(rec: dict) -> str:
-    """What a vector was made from: the title, aliases, topics and body of a note."""
-    blob = "\x00".join(str(rec.get(k) or "") for k in ("title", "aliases", "topics", "body"))
+    """What a vector was made from: the title, aliases, topics and body of a note, cut by
+    the current chunking scheme."""
+    blob = "\x00".join([CHUNK_SCHEME] + [str(rec.get(k) or "")
+                                         for k in ("title", "aliases", "topics", "body")])
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -169,13 +186,15 @@ def _windows(paragraph: str, size: int) -> list:
 def chunk_texts(rec: dict, size: int = CHUNK_CHARS) -> list:
     """Chunk 0 is the title, aliases and topics; the rest are body chunks of about
     `size` characters, cut at paragraph breaks (a paragraph longer than that is cut at
-    a space)."""
+    a space), each led by the title so that a chunk says which note it belongs to."""
     head = [str(rec.get("title") or "")]
     if rec.get("aliases"):
         head.append("Aliases: %s" % rec["aliases"])
     if rec.get("topics"):
         head.append("Topics: %s" % rec["topics"])
     chunks = ["\n".join(head).strip()]
+    title = head[0].strip()
+    size = max(size - len(title) - 1, size // 2) if title else size    # room for the title
     current = ""
     for paragraph in re.split(r"\n\s*\n", str(rec.get("body") or "")):
         paragraph = paragraph.strip()
@@ -189,7 +208,8 @@ def chunk_texts(rec: dict, size: int = CHUNK_CHARS) -> list:
                 current = current + "\n\n" + piece if current else piece
     if current:
         chunks.append(current)
-    return [c for c in chunks if c]
+    body = [("%s\n%s" % (title, c) if title else c) for c in chunks[1:]]
+    return [c for c in chunks[:1] + body if c]
 
 
 # -- the store -------------------------------------------------------------
@@ -245,7 +265,8 @@ def build(records, state_dir, cfg: dict, full: bool = False, embedder=None, quie
                 texts = chunk_texts(rec)
                 vectors = []
                 for start in range(0, len(texts), BATCH):
-                    vectors += embedder(cfg, texts[start:start + BATCH], DOC_PREFIX, INDEX_TIMEOUT)
+                    vectors += embedder(cfg, texts[start:start + BATCH], cfg["doc_prefix"],
+                                        INDEX_TIMEOUT)
                 with db:
                     db.execute("DELETE FROM vectors WHERE note_id = ?", (rec["id"],))
                     db.executemany(
@@ -329,40 +350,40 @@ _dot = getattr(math, "sumprod", None) or (lambda a, b: sum(map(operator.mul, a, 
 
 
 def vector_list(query_vec, rows, allowed: dict, weights: dict, floor: float, fresh,
-                limit: int = TOP_CHUNKS) -> list:
-    """The meaning arm's ranked list, one entry per note, best chunk first.
+                limit: int = VECTOR_NOTES) -> list:
+    """The meaning arm's ranked list, one entry per note, best note first.
 
     `allowed` maps note id -> folder for the notes this query may see; a stored vector
     for any other note (archived, out of scope, hidden from this caller) is ignored.
     `fresh(note_id, stored_hash)` says whether the vector still describes the note as it
     is on disk; a stale one is skipped, so an old meaning is never served.
-    Only chunks whose cosine is above `floor` count; they rank by cosine times the folder
-    weight; the top `limit` chunks are kept; a note scores by its best one."""
+    Only chunks whose cosine is above `floor` count. A note scores by its best chunk plus
+    SECOND_CHUNK times its second best (a note that matches in two places beats one that
+    matches in one), times the folder weight; the top `limit` notes are kept. The entry
+    carries the best chunk's number and cosine."""
     qarr = array("f")
     qarr.frombytes(query_vec)
     qvec = tuple(qarr)          # floats made once, not once per chunk
-    scored = []
+    best = {}
     for note_id, chunk_no, content_hash, vec in rows:
-        folder = allowed.get(note_id)
-        if folder is None:
+        if allowed.get(note_id) is None:
             continue
         sim = cosine(qvec, vec)
         if sim > floor:
-            scored.append((-sim * weights.get(folder, 1.0), note_id, chunk_no, sim, content_hash))
-    scored.sort()
-    out, seen, verdict, taken = [], set(), {}, 0
-    for _weighted, note_id, chunk_no, sim, content_hash in scored:
-        if taken >= limit:
-            break
+            best.setdefault(note_id, []).append((sim, chunk_no, content_hash))
+    scored, verdict = [], {}
+    for note_id, found in best.items():
+        found.sort(key=lambda item: (-item[0], item[1]))
+        sim, chunk_no, content_hash = found[0]
         if note_id not in verdict:
             verdict[note_id] = bool(fresh(note_id, content_hash))
         if not verdict[note_id]:
             continue
-        taken += 1
-        if note_id not in seen:
-            seen.add(note_id)
-            out.append({"id": note_id, "chunk_no": chunk_no, "cosine": sim})
-    return out
+        score = sim + (SECOND_CHUNK * found[1][0] if len(found) > 1 else 0.0)
+        scored.append((-score * weights.get(allowed[note_id], 1.0), note_id, chunk_no, sim))
+    scored.sort()
+    return [{"id": note_id, "chunk_no": chunk_no, "cosine": sim}
+            for _score, note_id, chunk_no, sim in scored[:limit]]
 
 
 def fuse(keyword_ids: list, vector_hits: list, high: float) -> list:

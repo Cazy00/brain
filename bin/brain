@@ -3384,10 +3384,10 @@ def do_hybrid_search(query: str, scope: str = "canonical", limit: int = 8, exclu
     if not rows:
         return plain()
     try:
-        qvec = embedder(cfg, [query], vectors.QUERY_PREFIX, vectors.QUERY_TIMEOUT)[0]
+        qvec = embedder(cfg, [query], cfg["query_prefix"], vectors.QUERY_TIMEOUT)[0]
     except vectors.EmbedError:
         return plain()
-    pool = max(limit, vectors.TOP_CHUNKS)
+    pool = max(limit, vectors.KEYWORD_NOTES)
     base = do_search(query, scope=scope, limit=pool, exclude=exclude)
     if not INDEX_DB.exists():
         return plain()

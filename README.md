@@ -204,16 +204,17 @@ engine ships no model and no server, only a client for an embedder you run.
 
 **Point it at an embedder.** Any server that answers the OpenAI-shaped
 `POST {BRAIN_EMBEDDER_URL}/v1/embeddings` works (llama.cpp's `llama-server
---embeddings` with `nomic-embed-text-v1.5` is the intended one). It should be
+--embeddings` with `Qwen3-Embedding-0.6B` is the intended one; `nomic-embed-text-v1.5` also works). It should be
 reachable only from the brain's host, because note text is sent to it. The engine
-sends the task prefixes `search_document: ` (indexing) and `search_query: ` (queries),
-uses no proxy and follows no redirect.
+sends the model's task prefixes (a built-in table by model name: Qwen3's `Instruct: ...\nQuery:` before a query and nothing before a document; nomic's `search_query: ` and
+`search_document: `; none for a model not in the table; `BRAIN_EMBEDDER_QUERY_PREFIX` and
+`BRAIN_EMBEDDER_DOC_PREFIX` override either, `\n` meaning a newline), uses no proxy and follows no redirect.
 
 | Setting (environment) | Meaning |
 |---|---|
 | `BRAIN_VECTORS` | `off` (default), `shadow` or `on`. `shadow` builds nothing by itself but serves hybrid to `recall` calls that pass `mode: "hybrid"`; `on` makes hybrid `recall`'s default. `brain_search` is keyword-only in every mode. Anything else counts as `off`. |
 | `BRAIN_EMBEDDER_URL` | Base URL of the embedder (`http` or `https`). |
-| `BRAIN_EMBEDDER_MODEL` | Model name, sent to the embedder and stored as each vector's `model_key` (default `nomic-embed-text-v1.5`). A new name makes every stored vector stale. |
+| `BRAIN_EMBEDDER_MODEL` | Model name, sent to the embedder and stored as each vector's `model_key` (default `qwen3-embedding-0.6b`). A new name makes every stored vector stale. |
 | `BRAIN_VECTOR_FLOOR` | A chunk counts only if its cosine is above this (placeholder default 0.35; calibrate on your own notes). |
 | `BRAIN_VECTOR_HIGH` | A vector-only hit at or above this is `high_vector_match`, below it `weak_semantic` (placeholder default 0.65). |
 
@@ -223,8 +224,8 @@ the file; a failed rebuild leaves the old one serving). It embeds exactly the no
 indexes, never `archive/`, `vault/`, `attachments/` or `handoff/`. The file,
 `vectors.db`, sits in the state directory next to `index.db`, is never backed up and
 may be deleted at any time. A note is embedded as its title, aliases and topics plus
-body chunks of about 1,500 characters cut at paragraph breaks, and scores by its best
-chunk. Running it after a pull or on a timer is a deployment concern: the shipped
+body chunks of about 1,500 characters cut at paragraph breaks, each led by the title,
+and scores by its best chunk plus a tenth of its second best. Running it after a pull or on a timer is a deployment concern: the shipped
 `deploy/` (below the engine, for a VPS) wires it. With `--quiet`, the form the timers
 use, `BRAIN_VECTORS=off` or an embedder that is down is one warning on stderr and exit
 0 instead of a failure.
@@ -238,7 +239,7 @@ read-only. `BRAIN_VECTORS` in `deploy/.env` defaults to `shadow` there. `brain` 
 wait for the embedder: with it down, everything works and `recall` answers keyword-only.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
-vector list is the 30 best chunks above the floor (cosine times the same folder
+vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
 weights), brute force in pure Python. The two are fused by reciprocal rank,
 `sum 1/(60+rank)`, ties broken by keyword order. A hit in both lists is
 `keyword_exact`; a vector-only hit is `high_vector_match` or `weak_semantic`. The
