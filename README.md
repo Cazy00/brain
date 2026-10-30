@@ -238,6 +238,17 @@ and every hit carries the same markers. If the embedder is unreachable, takes mo
 2 seconds, refuses, or no vectors exist for the model, `recall` answers keyword-only and
 sets `search_degraded: "embed_unavailable"`; it never errors.
 
+**Speed.** An MCP server answers `recall` through one long-lived `brain verb-worker`
+process (`brainlib/verbworker.py`) instead of starting `brain verb recall` for every call:
+the compile, the imports and the read of `vectors.db` are paid once, so a hybrid call is
+the query embed plus about 15 ms of arithmetic per 1,000 chunks (Python 3.12+; about
+three times that on older Pythons). The worker reads `vectors.db` again whenever the file
+changes, restarts when any `BRAIN_*` setting changes, takes the tree lock only for the
+length of a call, and any trouble with it falls back to the one-shot command, which gives
+the same answer. `BRAIN_VERB_WORKER=off` switches it off. The embedder's speed is the
+rest: give `llama-server` as many threads (`-t`) as its CPU quota; more threads than
+cores makes every query slower, not faster.
+
 ## How it stays true
 
 | Mechanism | What it prevents |

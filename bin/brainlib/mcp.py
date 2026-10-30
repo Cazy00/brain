@@ -31,7 +31,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import capture, mcpcore, osbackend, provenance, verbs, version
+from . import capture, mcpcore, osbackend, provenance, vectors, verbs, verbworker, version
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 BRAIN = str(ROOT / "bin" / "brain")
@@ -91,6 +91,9 @@ READ_WRITE_TOOLS = tuple(name for name in WRITE_ONLY_TOOLS if name not in DROP_B
 
 
 def run_cli(args, input=None):
+    warm = verbworker.run(args, 120, input, cwd=ROOT)       # recall: a warm process, else the line below
+    if warm is not None:
+        return warm
     return subprocess.run(
         [sys.executable, BRAIN, *args], capture_output=True, text=True, cwd=ROOT, timeout=120,
         input=input
@@ -448,6 +451,8 @@ def serve_stdio():
     remembered for the captures it makes, and every capture is stamped
     `via: stdio`."""
     session = {}
+    if vectors.settings()["mode"] != "off":
+        verbworker.prewarm(cwd=ROOT)          # the first recall finds the worker ready
     for line in sys.stdin:
         line = line.strip()
         if not line or len(line) > MAX_LINE_CHARS:

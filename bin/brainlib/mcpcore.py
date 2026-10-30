@@ -47,7 +47,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import provenance, verbs
+from . import provenance, verbs, verbworker
 
 ENGINE = Path(__file__).resolve().parent.parent.parent
 BRAIN = str(ENGINE / "bin" / "brain")
@@ -741,5 +741,8 @@ def _failure_hint(exc, transport: str) -> str:
 
 
 def _run_cli(args: list, timeout: float, input=None):
+    warm = verbworker.run(args, timeout, input, cwd=ENGINE)     # recall: a warm process, else below
+    if warm is not None:
+        return warm
     return subprocess.run([sys.executable, BRAIN, *args], capture_output=True,
                           text=True, cwd=ENGINE, timeout=timeout, input=input)

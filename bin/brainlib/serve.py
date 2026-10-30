@@ -86,10 +86,13 @@ from urllib.parse import urlsplit
 
 from . import eventlog
 from . import mcp
+from . import mcpcore
 from . import notes
 from . import oauth as oauthlib
 from . import osbackend
 from . import served
+from . import vectors
+from . import verbworker
 
 ENDPOINT = "/mcp"
 # Re-exported so the startup banner can name it without importing the module
@@ -1221,7 +1224,11 @@ def run_serve(argv: list, store=None, run=None, oauth_store=None, log=None,
         # checkout: never mark that served.
         def mark():
             return None
-    run = run or (lambda server: server.serve_forever())
+    if run is None:
+        def run(server):
+            if vectors.settings()["mode"] != "off":
+                verbworker.prewarm(cwd=mcpcore.ENGINE)      # the first recall finds the worker ready
+            server.serve_forever()
 
     if "--new-client" in argv:
         return _new_client(argv, oauth_store)

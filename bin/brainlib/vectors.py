@@ -24,6 +24,7 @@ inside that set, so a vector can never surface a note keyword search would have 
 import hashlib
 import json
 import math
+import operator
 import os
 import re
 import sqlite3
@@ -265,12 +266,35 @@ def build(records, state_dir, cfg: dict, full: bool = False, embedder=None, quie
             os.unlink(tmp)
 
 
+_LOADED = {}                # (path, model_key) -> (signature, rows): one process's warm copy
+_SETTLE_NS = 2_000_000_000  # a file written this recently may still change under the same signature
+
+
+def _signature(path):
+    """What identifies this version of the file: it changes whenever the file is rebuilt
+    (a new inode) or written (mtime, size). None when it cannot be read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
 def load(state_dir, model_key: str) -> list:
     """Every stored chunk made with `model_key`, as (note_id, chunk_no, hash, vector).
-    Empty when the file is missing, unreadable or built for another model."""
+    Empty when the file is missing, unreadable or built for another model.
+
+    A long-lived process (the recall worker) keeps its copy and reads the file again only
+    when its signature has changed. A file written in the last two seconds is never kept:
+    two writes can share a timestamp and a size, and a stale copy would be served as true."""
     path = db_path(state_dir)
-    if not os.path.exists(path):
+    sig = _signature(path)
+    if sig is None:
+        _LOADED.pop((path, model_key), None)
         return []
+    held = _LOADED.get((path, model_key))
+    if held and held[0] == sig:
+        return held[1]
     try:
         db = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True, timeout=2)
         try:
@@ -285,6 +309,10 @@ def load(state_dir, model_key: str) -> list:
         vec = array("f")
         vec.frombytes(blob)
         out.append((note_id, chunk_no, content_hash, vec))
+    if time.time_ns() - sig[1] > _SETTLE_NS and _signature(path) == sig:
+        _LOADED[(path, model_key)] = (sig, out)
+    else:
+        _LOADED.pop((path, model_key), None)
     return out
 
 
@@ -292,7 +320,12 @@ def load(state_dir, model_key: str) -> list:
 
 def cosine(a, b) -> float:
     """Dot product; both sides are unit length."""
-    return sum(x * y for x, y in zip(a, b)) if len(a) == len(b) else 0.0
+    return _dot(a, b) if len(a) == len(b) else 0.0
+
+
+# math.sumprod (Python 3.12) runs the whole dot product in C; older Pythons fall back to
+# map/mul, about twice as slow and the same arithmetic up to rounding in the last digits.
+_dot = getattr(math, "sumprod", None) or (lambda a, b: sum(map(operator.mul, a, b)))
 
 
 def vector_list(query_vec, rows, allowed: dict, weights: dict, floor: float, fresh,
@@ -305,8 +338,9 @@ def vector_list(query_vec, rows, allowed: dict, weights: dict, floor: float, fre
     is on disk; a stale one is skipped, so an old meaning is never served.
     Only chunks whose cosine is above `floor` count; they rank by cosine times the folder
     weight; the top `limit` chunks are kept; a note scores by its best one."""
-    qvec = array("f")
-    qvec.frombytes(query_vec)
+    qarr = array("f")
+    qarr.frombytes(query_vec)
+    qvec = tuple(qarr)          # floats made once, not once per chunk
     scored = []
     for note_id, chunk_no, content_hash, vec in rows:
         folder = allowed.get(note_id)
