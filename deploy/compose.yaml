@@ -34,9 +34,11 @@ x-brain-env: &brain-env
   # by name on the internal `embed` network, so the URL is a fixed string like the
   # paths above. The mode is the one thing an operator turns: `off` keeps the keyword
   # brain exactly as it was, `shadow` and `on` are explained in deploy/env.example.
-  # Unset means off, and so does anything that is not one of the three words.
+  # Unset in deploy/.env means shadow here, so an upgrade to 0.6.0 builds the vectors
+  # without changing any answer (bin/brain on its own treats unset as off). Anything
+  # that is not one of the three words is off.
   BRAIN_EMBEDDER_URL: http://embedder:8080/v1
-  BRAIN_VECTORS: ${BRAIN_VECTORS:-off}
+  BRAIN_VECTORS: ${BRAIN_VECTORS:-shadow}
   # The calendar the brain dates things by. A capture's `created`, its inbox
   # file name and a drop box's daily cap are all the container's LOCAL date, so
   # an owner living away from UTC would see a capture made in their small hours

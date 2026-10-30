@@ -2101,7 +2101,7 @@ class EmbedderDeploymentTests(unittest.TestCase):
     def test_brain_and_maintenance_are_pointed_at_the_embedder_and_the_mode_comes_from_env(self):
         env = self.block("x-brain-env: &brain-env", 0)
         self.assertIn("BRAIN_EMBEDDER_URL: http://embedder:8080/v1", env)
-        self.assertIn("BRAIN_VECTORS: ${BRAIN_VECTORS:-off}", env)
+        self.assertIn("BRAIN_VECTORS: ${BRAIN_VECTORS:-shadow}", env)
         self.assertIn("environment: *brain-env", self.block("  brain:", 2))
         self.assertIn("<<: *brain-env", self.block("  maintenance:", 2))
         example = (self.deploy / "env.example").read_text(encoding="utf-8")
