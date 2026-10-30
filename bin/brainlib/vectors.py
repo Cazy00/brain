@@ -42,10 +42,10 @@ except ImportError:          # non-POSIX: the atomic rename below still holds
 
 MODES = ("off", "shadow", "on")
 DEFAULT_MODEL = "qwen3-embedding-0.6b"
-# Placeholders. The real floor and threshold are calibrated later, on data that does not
-# live in this repository, and then set in the deployment's config.
-DEFAULT_FLOOR = 0.35
-DEFAULT_HIGH = 0.65
+# Calibrated for DEFAULT_MODEL and this chunk scheme on a private question set (B40 P3);
+# a deployment with other notes or another model calibrates its own and sets them in its config.
+DEFAULT_FLOOR = 0.53
+DEFAULT_HIGH = 0.71
 
 # What each model wants in front of a query and in front of a document. A model that is not
 # listed gets no prefix; BRAIN_EMBEDDER_QUERY_PREFIX / _DOC_PREFIX override either side (a

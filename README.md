@@ -215,8 +215,8 @@ sends the model's task prefixes (a built-in table by model name: Qwen3's `Instru
 | `BRAIN_VECTORS` | `off` (default), `shadow` or `on`. `shadow` builds nothing by itself but serves hybrid to `recall` calls that pass `mode: "hybrid"`; `on` makes hybrid `recall`'s default. `brain_search` is keyword-only in every mode. Anything else counts as `off`. |
 | `BRAIN_EMBEDDER_URL` | Base URL of the embedder (`http` or `https`). |
 | `BRAIN_EMBEDDER_MODEL` | Model name, sent to the embedder and stored as each vector's `model_key` (default `qwen3-embedding-0.6b`). A new name makes every stored vector stale. |
-| `BRAIN_VECTOR_FLOOR` | A chunk counts only if its cosine is above this (placeholder default 0.35; calibrate on your own notes). |
-| `BRAIN_VECTOR_HIGH` | A vector-only hit at or above this is `high_vector_match`, below it `weak_semantic` (placeholder default 0.65). |
+| `BRAIN_VECTOR_FLOOR` | A chunk counts only if its cosine is above this (default 0.53, calibrated for the pinned model; calibrate on your own notes). |
+| `BRAIN_VECTOR_HIGH` | A vector-only hit at or above this is `high_vector_match`, below it `weak_semantic` (default 0.71, calibrated for the pinned model). |
 
 **Build the vectors:** `brain index --vectors` (incremental by content hash, and it
 deletes the vectors of notes that left the index) or `--vectors --full` (rebuilds
