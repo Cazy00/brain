@@ -3151,8 +3151,13 @@ def cmd_index_vectors(full: bool = False, quiet: bool = False) -> int:
     if quiet and cfg["mode"] == "off":
         print("brain index --vectors: BRAIN_VECTORS is off; nothing embedded", file=sys.stderr)
         return 0
+    # The tree lock (shared) is held only to read the notes. The embedder can take minutes,
+    # and `brain sync` needs the tree exclusively to install a revision: it must not wait
+    # for that. A note edited meanwhile is caught by the content hash, here and on read.
+    with locks.tree_lock(state_dir()):
+        records = list(note_records())
     try:
-        stats = vectors.build(note_records(), state_dir(), cfg, full=full)
+        stats = vectors.build(records, state_dir(), cfg, full=full)
     except vectors.EmbedError as exc:
         if quiet:
             print(f"brain index --vectors: warning: {exc}; vectors.db keeps what was finished, "
@@ -8948,10 +8953,11 @@ def main() -> int:
         return cmd_doctor_notify()
     if cmd == "index":
         # Shared, like the reads below: an index built from a half-installed tree would
-        # look fresh afterwards and serve the mix until the next rebuild.
+        # look fresh afterwards and serve the mix until the next rebuild. The vectors
+        # step takes the lock itself, for its read of the notes only.
+        if "--vectors" in rest:
+            return cmd_index_vectors(full="--full" in rest, quiet="--quiet" in rest)
         with locks.tree_lock(state_dir()):
-            if "--vectors" in rest:
-                return cmd_index_vectors(full="--full" in rest, quiet="--quiet" in rest)
             if "--full" in rest:
                 print("brain index: --full goes with --vectors")
                 return 2

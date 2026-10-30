@@ -35,6 +35,7 @@ class FakeEmbedder(object):
 
     def __init__(self):
         self.calls, self.fail, self.delay, self.drip = [], None, 0.0, 0.0
+        self.arrivals = 0                  # embedding requests received, counted before any delay
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -48,6 +49,7 @@ class FakeEmbedder(object):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+                outer.arrivals += 1
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 if outer.delay:
                     time.sleep(outer.delay)

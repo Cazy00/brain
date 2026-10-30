@@ -210,6 +210,35 @@ class IndexingTests(HybridCase):
             self.assertNotIn(never, everything)         # archive/ and handoff/ text
         self.assertIn("Choose the widget engine", everything)
 
+    def test_a_slow_embed_does_not_hold_the_tree_lock_but_reading_the_notes_waits_for_an_install(self):
+        """`brain sync` installs a revision under the exclusive tree lock; an embed that takes
+        minutes must not hold it off, while the read of the notes still waits for a running install."""
+        from brainlib import locks
+        self.fake.delay = 4.0
+        proc = subprocess.Popen([sys.executable, BRAIN, "index", "--vectors"], cwd=support.ENGINE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(proc.kill)
+        until = time.monotonic() + 30
+        while not self.fake.arrivals and time.monotonic() < until:
+            time.sleep(0.05)
+        self.assertTrue(self.fake.arrivals, "the build never reached the embedder")
+        began = time.monotonic()
+        with locks.tree_lock(self.corpus.state, exclusive=True):      # blocks while a reader holds it shared
+            pass
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertIsNone(proc.poll(), "the build ended before the lock was tried")
+        proc.communicate(timeout=300)
+        self.assertEqual(proc.returncode, 0)
+        with locks.tree_lock(self.corpus.state, exclusive=True):      # an install running: the read waits
+            waiting = subprocess.Popen([sys.executable, BRAIN, "index", "--vectors"],
+                                       cwd=support.ENGINE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True)
+            self.addCleanup(waiting.kill)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                waiting.communicate(timeout=1.5)
+        out, _ = waiting.communicate(timeout=120)
+        self.assertEqual(waiting.returncode, 0, out)
+
     def test_documents_and_queries_carry_the_task_prefixes(self):
         self.index()
         self.assertTrue(self.fake.embedded_texts("search_document: "))
