@@ -447,7 +447,7 @@ def prepare_recall(args: dict, remote: bool, now: datetime):
                                  % str(args["since"])[:40],
                                  "Use e.g. 2026-10-29 or 2026-10-29T08:00:00Z.")
     return {"query": query, "entity": entity, "scope": scope,
-            "mode": args.get("mode") or "keyword", "limit": args.get("limit", 8),
+            "mode": args.get("mode"), "limit": args.get("limit", 8),
             "offset": args.get("offset", 0), "remote": remote,
             "since_ms": to_ms(since) if since is not None else None,
             "budget_tokens": args.get("budget_tokens"),
@@ -770,7 +770,7 @@ def page_record(hit: dict, query: str) -> dict:
     slug = hit["path"] if folder in ("inbox", "handoff") or synthetic else hit["id"]
     out = {"slug": slug, "title": hit.get("title") or "", "chunk": hit.get("snippet") or "",
            "evidence": ("exact_title_match" if title_match else
-                        "alias_hit" if alias_match else "keyword_exact"),
+                        "alias_hit" if alias_match else hit.get("evidence", "keyword_exact")),
            "create_safety": "exists" if title_match else "unknown",
            "provenance": hit["path"], "source_id": "default", "path": hit["path"],
            "folder": folder or "", "kind": hit.get("kind") or "",
@@ -822,10 +822,10 @@ def recall(request: dict, search, captures, pending: dict) -> dict:
     if match_mode is not None:
         out["more"] = more
         out["match_mode"] = match_mode
-    if request["mode"] == "hybrid":
-        # This release has no meaning arm. A request for one is answered
-        # keyword-only and says so, which is what the contract has an embed
-        # failure do: degrade, never error.
+    if request.get("mode") == "hybrid" and not (search or {}).get("hybrid"):
+        # A meaning search was asked for (or is the engine's default) and could not be
+        # served: no vectors built, the embedder down or too slow, or BRAIN_VECTORS=off.
+        # The answer is the keyword one and says so; it is never an error.
         out["search_degraded"] = "embed_unavailable"
     return out
 

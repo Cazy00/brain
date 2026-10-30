@@ -211,9 +211,10 @@ def verb_tools(transport: str) -> list:
                                      "'handoff' lists only notes waiting to be filed in a "
                                      "project's own records."},
             "mode": {"type": "string", "enum": ["keyword", "hybrid"],
-                     "description": "keyword = FTS only (the default). hybrid = FTS plus "
-                                    "meaning, where the engine has it; where it has not, the "
-                                    "answer is keyword-only and sets search_degraded."},
+                     "description": "keyword = FTS only. hybrid = FTS plus meaning, where "
+                                    "the engine has it; where it has not, the answer is "
+                                    "keyword-only and sets search_degraded. Default: the "
+                                    "engine's setting."},
             "limit": {"type": "integer", "minimum": caps["limit"][0],
                       "maximum": caps["limit"][1], "description": "Per-arm cap. Default 8."},
             "offset": {"type": "integer", "minimum": 0, "maximum": caps["offset"],

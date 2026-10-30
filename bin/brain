@@ -37,6 +37,9 @@ Commands:
   brain drain <inbox-path>...      remove inbox notes (and nothing outside the inbox)
   brain recent [--days N]          recently touched notes
   brain index [--quiet]            rebuild the FTS5 search index (.cache/)
+  brain index --vectors [--full] [--quiet]
+                                   embed changed notes into vectors.db (search by meaning;
+                                   needs BRAIN_EMBEDDER_URL, see README)
   brain sessions [--days N] [--stdout]   digest own turns from recent Claude
                                    Code sessions into .cache/ (never committed)
   brain sessions --jsonl --out FILE [--days N]
@@ -178,7 +181,7 @@ def state_dir() -> Path:
 # file is also exec'd directly by tests/test_brain.py's load_brain_module(),
 # where sys.path[0] belongs to the test runner, not to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import locks, osbackend, provenance, served, verbs
+from brainlib import locks, osbackend, provenance, served, vectors, verbs
 # The note contract lives in brainlib/notes.py so that `brain publish` — which
 # decides what a customer may see — applies the SAME rules as lint, rather than
 # a second copy of them that drifts. Imported by name, so every call site in
@@ -3009,34 +3012,39 @@ def all_note_paths():
         yield path
 
 
+def note_record(path) -> dict:
+    """The indexable record of one note file (see `note_records`)."""
+    top = path.relative_to(K).parts[0]
+    text = read_text(path)
+    fm, _err = parse_frontmatter(text)
+    body = text
+    if fm:
+        body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
+    aliases = (fm or {}).get("aliases") or []
+    topics_list = (fm or {}).get("topics") or []
+    # An inbox note's `kind:` is its writer's declared claim (decision,
+    # fact, ...), not a canonical kind, and provisional material never
+    # claims a note id. So in the index an inbox note is always listed as
+    # `inbox`, under the id its file name gives it.
+    provisional = top == "inbox"
+    return {
+        "id": (None if provisional else (fm or {}).get("id")) or f"{top}-{path.stem}",
+        "path": str(path.relative_to(ROOT)),
+        "title": str((fm or {}).get("title") or path.stem),
+        "folder": top,
+        "kind": top if provisional else str((fm or {}).get("kind") or top),
+        "created": str((fm or {}).get("created") or ""),
+        "aliases": ", ".join(aliases if isinstance(aliases, list) else [str(aliases)]),
+        "topics": ", ".join(topics_list if isinstance(topics_list, list) else [str(topics_list)]),
+        "body": body,
+        "links": extract_links(body),
+    }
+
+
 def note_records():
     """Indexable records for searchable notes (canonical + journal + inbox; never archive/vault)."""
     for path in indexable_paths():
-        top = path.relative_to(K).parts[0]
-        text = read_text(path)
-        fm, _err = parse_frontmatter(text)
-        body = text
-        if fm:
-            body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
-        aliases = (fm or {}).get("aliases") or []
-        topics_list = (fm or {}).get("topics") or []
-        # An inbox note's `kind:` is its writer's declared claim (decision,
-        # fact, ...), not a canonical kind, and provisional material never
-        # claims a note id. So in the index an inbox note is always listed as
-        # `inbox`, under the id its file name gives it.
-        provisional = top == "inbox"
-        yield {
-            "id": (None if provisional else (fm or {}).get("id")) or f"{top}-{path.stem}",
-            "path": str(path.relative_to(ROOT)),
-            "title": str((fm or {}).get("title") or path.stem),
-            "folder": top,
-            "kind": top if provisional else str((fm or {}).get("kind") or top),
-            "created": str((fm or {}).get("created") or ""),
-            "aliases": ", ".join(aliases if isinstance(aliases, list) else [str(aliases)]),
-            "topics": ", ".join(topics_list if isinstance(topics_list, list) else [str(topics_list)]),
-            "body": body,
-            "links": extract_links(body),
-        }
+        yield note_record(path)
 
 
 def cmd_index(quiet: bool = False, skip_if_fresh: bool = False) -> int:
@@ -3126,6 +3134,23 @@ def cmd_index(quiet: bool = False, skip_if_fresh: bool = False) -> int:
         lock_file.close()
     if not quiet:
         print(f"brain index: {count} notes indexed -> .cache/index.db")
+    return 0
+
+
+def cmd_index_vectors(full: bool = False, quiet: bool = False) -> int:
+    """Embed the notes whose content changed into vectors.db, and drop the vectors of
+    every note that is no longer in the indexed set. The set is `note_records()`, the
+    same one the FTS index is built from, so NOT_INDEXED folders are never embedded."""
+    cfg = vectors.settings()
+    try:
+        stats = vectors.build(note_records(), state_dir(), cfg, full=full)
+    except vectors.EmbedError as exc:
+        print(f"brain index --vectors: {exc}; vectors.db keeps what was finished")
+        return 1
+    if not quiet:
+        print(f"brain index --vectors: {stats['embedded']} notes embedded "
+              f"({stats['chunks']} chunks), {stats['skipped']} unchanged, "
+              f"{stats['removed']} removed -> .cache/{vectors.DB_NAME}")
     return 0
 
 
@@ -3219,6 +3244,37 @@ def index_stale() -> bool:
 BM25_WEIGHTS = "8.0, 6.0, 4.0, 1.0, 0, 0, 0, 0, 0"  # title, aliases, topics, body, then UNINDEXED
 
 
+def _decorate(db, hits: list) -> None:
+    """Currency and pending corrections for ranked hits, in place. One definition for the
+    keyword ranking and the hybrid one, so a hit is marked the same whichever list it
+    came from."""
+    import sqlite3
+    # Currency, from the notes_meta table the index already builds. `brain read`
+    # has always warned on a draft or a passed review_by; search never did, so
+    # the ranked list — the surface a caller actually answers from — presented a
+    # stale or unfinished note identically to a settled one. Carried here rather
+    # than as FTS columns so the schema and BM25 weights stay untouched.
+    if hits:
+        try:
+            marks = dict((r[0], (r[1], r[2])) for r in db.execute(
+                "SELECT id, status, review_by FROM notes_meta WHERE id IN "
+                f"({','.join('?' * len(hits))})", [h["id"] for h in hits]))
+        except sqlite3.OperationalError:
+            marks = {}                     # index predates notes_meta
+        today = date.today().isoformat()
+        for h in hits:
+            status, review_by = marks.get(h["id"], (None, None))
+            h["status"] = status
+            h["stale"] = bool(review_by and DATE_RE.match(str(review_by))
+                              and str(review_by) < today)
+            h["review_by"] = review_by
+        # A correction waiting in the inbox: the note is not settled until a pass
+        # applies it, so the hit says so (and which capture to read).
+        pending = pending_corrections()
+        for h in hits:
+            h["corrections_pending"] = corrections_naming(pending, h["id"], h["path"])
+
+
 def do_search(query: str, scope: str = "canonical", limit: int = 8, exclude=()) -> dict:
     """Rank inside SQLite, THEN limit.
 
@@ -3288,31 +3344,88 @@ def do_search(query: str, scope: str = "canonical", limit: int = 8, exclude=()) 
          "created": r[5], "snippet": " ".join(str(r[6]).split())}
         for r in rows
     ]
-    # Currency, from the notes_meta table the index already builds. `brain read`
-    # has always warned on a draft or a passed review_by; search never did, so
-    # the ranked list — the surface a caller actually answers from — presented a
-    # stale or unfinished note identically to a settled one. Carried here rather
-    # than as FTS columns so the schema and BM25 weights stay untouched.
-    if hits:
-        try:
-            marks = dict((r[0], (r[1], r[2])) for r in db.execute(
-                "SELECT id, status, review_by FROM notes_meta WHERE id IN "
-                f"({','.join('?' * len(hits))})", [h["id"] for h in hits]))
-        except sqlite3.OperationalError:
-            marks = {}                     # index predates notes_meta
-        today = date.today().isoformat()
-        for h in hits:
-            status, review_by = marks.get(h["id"], (None, None))
-            h["status"] = status
-            h["stale"] = bool(review_by and DATE_RE.match(str(review_by))
-                              and str(review_by) < today)
-            h["review_by"] = review_by
-        # A correction waiting in the inbox: the note is not settled until a pass
-        # applies it, so the hit says so (and which capture to read).
-        pending = pending_corrections()
-        for h in hits:
-            h["corrections_pending"] = corrections_naming(pending, h["id"], h["path"])
+    _decorate(db, hits)
     return {"mode": mode, "hits": hits, "more": max(0, total - len(hits))}
+
+
+def do_hybrid_search(query: str, scope: str = "canonical", limit: int = 8, exclude=(),
+                     cfg=None, embedder=None) -> dict:
+    """Keyword search fused with search by meaning (brainlib/vectors.py).
+
+    Both lists are built over the same scope filter: the vector arm only ranks notes
+    that sit in the FTS index, in a folder this scope allows, and not in `exclude`; a
+    note whose text has changed since its vector was made is left out of the vector
+    list. Archive, vault, attachments and handoff are not in the FTS index, so they
+    cannot appear. Hits are marked by the code `do_search` uses.
+
+    Any reason the meaning arm cannot answer (no vectors, a model the vectors were not
+    built with, an embedder that times out or refuses) returns exactly what `do_search`
+    returns, with `hybrid` False. The caller says so; nothing here raises for it."""
+    import sqlite3
+    cfg = cfg or vectors.settings()
+    embedder = embedder or vectors.embed
+    plain = lambda: do_search(query, scope=scope, limit=limit, exclude=exclude)  # noqa: E731
+    if not re.findall(r"\w+", query):
+        return plain()
+    rows = vectors.load(state_dir(), cfg["model"])
+    if not rows:
+        return plain()
+    try:
+        qvec = embedder(cfg, [query], vectors.QUERY_PREFIX, vectors.QUERY_TIMEOUT)[0]
+    except vectors.EmbedError:
+        return plain()
+    pool = max(limit, vectors.TOP_CHUNKS)
+    base = do_search(query, scope=scope, limit=pool, exclude=exclude)
+    if not INDEX_DB.exists():
+        return plain()
+    folders = list(CANONICAL) + (["journal", "inbox"] if scope == "all" else [])
+    barred = set(exclude)
+    db = sqlite3.connect(index_uri(), uri=True)
+    try:
+        meta = {}
+        for nid, path, title, folder, kind, created in db.execute(
+                "SELECT id, path, title, folder, kind, created FROM fts WHERE folder IN "
+                f"({','.join('?' * len(folders))})", folders):
+            if path not in barred and nid not in meta:
+                meta[nid] = {"id": nid, "path": path, "title": title, "folder": folder,
+                             "kind": kind, "created": created}
+        records = {}
+
+        def current(nid):
+            if nid not in records:
+                try:
+                    records[nid] = note_record(ROOT / meta[nid]["path"])
+                except OSError:
+                    records[nid] = None
+            return records[nid]
+
+        def fresh(nid, stored_hash):
+            rec = current(nid)
+            return bool(rec and rec["id"] == nid and vectors.record_hash(rec) == stored_hash)
+
+        vec_hits = vectors.vector_list(
+            qvec, rows, {nid: m["folder"] for nid, m in meta.items()}, FOLDER_WEIGHTS,
+            cfg["floor"], fresh)
+        by_id = {h["id"]: h for h in base["hits"]}
+        fused = vectors.fuse([h["id"] for h in base["hits"]], vec_hits, cfg["high"])
+        hits, new = [], []
+        for entry in fused[:limit]:
+            nid = entry["id"]
+            if nid in by_id:
+                hits.append(by_id[nid])
+                continue
+            hit = dict(meta[nid])
+            chunks = vectors.chunk_texts(current(nid))
+            at = entry["vec"]["chunk_no"]
+            hit["snippet"] = " ".join((chunks[at] if at < len(chunks) else "").split())[:160]
+            hit["evidence"] = entry["evidence"]
+            hits.append(hit)
+            new.append(hit)
+        _decorate(db, new)
+    finally:
+        db.close()
+    return {"mode": "hybrid", "hybrid": True, "hits": hits,
+            "more": max(0, len(fused) - len(hits)) + base["more"]}
 
 
 def do_links(note_id: str, rebuild: bool = True, exclude=()) -> dict:
@@ -4288,9 +4401,16 @@ def cmd_verb(argv: list) -> int:
             search = do_handoff_search(request["query"], limit=request["limit"],
                                        offset=request["offset"])
         elif request["query"]:
-            search = do_search(request["query"], scope=request["scope"],
-                               limit=request["limit"],
-                               exclude=verbs.hidden_paths(captures, request["remote"]))
+            # `mode` absent means the engine's setting (the contract): hybrid only when
+            # BRAIN_VECTORS=on. An explicit mode always wins; hybrid needs the arm built,
+            # so with BRAIN_VECTORS=off it is answered keyword-only and flagged.
+            cfg = vectors.settings()
+            request["mode"] = request.get("mode") or (
+                "hybrid" if cfg["mode"] == "on" else "keyword")
+            ranker = (do_hybrid_search if request["mode"] == "hybrid" and cfg["mode"] != "off"
+                      else do_search)
+            search = ranker(request["query"], scope=request["scope"], limit=request["limit"],
+                            exclude=verbs.hidden_paths(captures, request["remote"]))
         for hit in (search or {"hits": []})["hits"]:
             hit["markers"] = hit_markers(hit)
             hit["aliases"] = aliases_of(hit)
@@ -8766,6 +8886,11 @@ def main() -> int:
         # Shared, like the reads below: an index built from a half-installed tree would
         # look fresh afterwards and serve the mix until the next rebuild.
         with locks.tree_lock(state_dir()):
+            if "--vectors" in rest:
+                return cmd_index_vectors(full="--full" in rest, quiet="--quiet" in rest)
+            if "--full" in rest:
+                print("brain index: --full goes with --vectors")
+                return 2
             return cmd_index(quiet="--quiet" in rest)
     if cmd in ("search", "read", "links", "recent", "verb"):
         # Readers take the tree shared; `brain sync` installs a new revision with
