@@ -132,8 +132,11 @@ def embed(cfg: dict, texts: list, prefix: str, timeout: float) -> list:
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise EmbedError("BRAIN_EMBEDDER_URL is not an http(s) URL")
     body = json.dumps({"model": cfg["model"], "input": [prefix + t for t in texts]}).encode()
+    base = url.rstrip("/")
+    if base.endswith("/v1"):             # the OpenAI-style base URL: the path is added below
+        base = base[:-3]
     request = urllib.request.Request(
-        url.rstrip("/") + "/v1/embeddings", data=body, method="POST",
+        base + "/v1/embeddings", data=body, method="POST",
         headers={"Content-Type": "application/json"})
     deadline = time.monotonic() + timeout
     try:

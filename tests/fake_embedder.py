@@ -42,6 +42,12 @@ class FakeEmbedder(object):
                 pass
 
             def do_POST(self):
+                if self.path != "/v1/embeddings":       # a wrong path in the client must fail a test
+                    self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 if outer.delay:
                     time.sleep(outer.delay)

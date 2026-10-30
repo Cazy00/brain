@@ -58,6 +58,15 @@ class UnitTests(unittest.TestCase):
         self.assertEqual((cfg["floor"], cfg["high"], cfg["url"]),
                          (0.5, vectors.DEFAULT_HIGH, "http://x"))
 
+    def test_the_embedder_url_may_end_in_a_slash_or_v1_and_a_wrong_path_is_a_404(self):
+        with FakeEmbedder() as fake:
+            for url in (fake.url, fake.url + "/", fake.url + "/v1", fake.url + "/v1/"):
+                cfg = dict(vectors.settings({"BRAIN_EMBEDDER_URL": url}))
+                self.assertEqual(len(vectors.embed(cfg, ["alpha", "beta"], "search_document: ", 5)), 2, url)
+            self.assertEqual(len(fake.calls), 8)
+            with self.assertRaises(vectors.EmbedError):             # not the embeddings path
+                vectors.embed({"url": fake.url + "/v2", "model": "m"}, ["alpha"], "search_document: ", 5)
+
     def test_chunks_start_with_title_aliases_topics_then_paragraph_bodies(self):
         rec = {"title": "T", "aliases": "a1, a2", "topics": "t1",
                "body": "\n\n".join(("para %d " % i) + "x" * 600 for i in range(5))}

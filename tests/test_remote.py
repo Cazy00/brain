@@ -26,6 +26,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 from brainlib import access, capture, httplog, httpmcp, mcpcore, rs256  # noqa: E402
@@ -2109,7 +2110,9 @@ class EmbedderDeploymentTests(unittest.TestCase):
 
     def test_brain_and_maintenance_are_pointed_at_the_embedder_and_the_mode_comes_from_env(self):
         env = self.block("x-brain-env: &brain-env", 0)
-        self.assertIn("BRAIN_EMBEDDER_URL: http://embedder:8080/v1", env)
+        url = next(l.split(": ", 1)[1].strip() for l in env if l.strip().startswith("BRAIN_EMBEDDER_URL:"))
+        self.assertEqual(url, "http://embedder:8080")
+        self.assertEqual(urlparse(url.rstrip("/") + "/v1/embeddings").path, "/v1/embeddings")
         self.assertIn("BRAIN_VECTORS: ${BRAIN_VECTORS:-shadow}", env)
         self.assertIn("environment: *brain-env", self.block("  brain:", 2))
         self.assertIn("<<: *brain-env", self.block("  maintenance:", 2))
