@@ -22,6 +22,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import unittest
 from array import array
 from pathlib import Path
@@ -436,6 +437,20 @@ class DegradedTests(HybridCase):
     def test_an_embedder_that_stalls_past_two_seconds_degrades(self):
         self.fake.delay = vectors.QUERY_TIMEOUT + 1.0
         self.assert_keyword_only(query="sprocket engine")
+
+    def test_an_embedder_that_drips_its_answer_is_cut_off_at_the_timeout(self):
+        """Headers late, then one byte per 1.9 s: each socket read is within its own timeout,
+        so only a deadline on the whole call ends it."""
+        self.fake.delay = vectors.QUERY_TIMEOUT - 0.1
+        self.fake.drip = vectors.QUERY_TIMEOUT - 0.1
+        cfg = vectors.settings()
+        began = time.monotonic()
+        with self.assertRaises(vectors.EmbedError):
+            vectors.embed(cfg, ["sprocket"], "search_query: ", 1.0)
+        self.assertLess(time.monotonic() - began, 1.5)
+        began = time.monotonic()
+        self.assert_keyword_only(query="sprocket engine")
+        self.assertLess(time.monotonic() - began, 2 * (vectors.QUERY_TIMEOUT + 2.5))   # two calls, each with a cold start
 
     def test_an_unreachable_embedder_degrades(self):
         self.env(BRAIN_EMBEDDER_URL="http://127.0.0.1:9")

@@ -28,6 +28,7 @@ import operator
 import os
 import re
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -138,25 +139,41 @@ def embed(cfg: dict, texts: list, prefix: str, timeout: float) -> list:
     request = urllib.request.Request(
         base + "/v1/embeddings", data=body, method="POST",
         headers={"Content-Type": "application/json"})
-    deadline = time.monotonic() + timeout
+    result = {}
+
+    def fetch():
+        # The socket timeout applies to connect, to the headers and to each read on its
+        # own, so a body dripped a byte at a time never trips it: the deadline is also
+        # checked between reads, and the caller stops waiting for this thread at the deadline.
+        deadline = time.monotonic() + timeout
+        try:
+            with _OPENER.open(request, timeout=timeout) as response:
+                raw = bytearray()
+                while True:
+                    if time.monotonic() > deadline:
+                        raise EmbedError("the embedder timed out")
+                    piece = response.read(65536)
+                    if not piece:
+                        break
+                    raw += piece
+                    if len(raw) > MAX_RESPONSE:
+                        raise EmbedError("the embedder's answer is too large")
+            result["raw"] = bytes(raw)
+        except EmbedError as exc:
+            result["error"] = exc
+        except Exception as exc:     # URLError, HTTPError, timeouts, resets, bad HTTP
+            result["error"] = EmbedError("the embedder is unavailable (%s)" % type(exc).__name__)
+
+    thread = threading.Thread(target=fetch, name="embed", daemon=True)
+    thread.start()
+    thread.join(timeout)             # `timeout` bounds the whole call: connect, headers and body
+    if thread.is_alive():
+        raise EmbedError("the embedder timed out")
+    if "error" in result:
+        raise result["error"] from None
+    raw = result["raw"]
     try:
-        with _OPENER.open(request, timeout=timeout) as response:
-            raw = bytearray()
-            while True:
-                if time.monotonic() > deadline:
-                    raise EmbedError("the embedder timed out")
-                piece = response.read(65536)
-                if not piece:
-                    break
-                raw += piece
-                if len(raw) > MAX_RESPONSE:
-                    raise EmbedError("the embedder's answer is too large")
-    except EmbedError:
-        raise
-    except Exception as exc:     # URLError, HTTPError, timeouts, resets, bad HTTP
-        raise EmbedError("the embedder is unavailable (%s)" % type(exc).__name__) from None
-    try:
-        data = sorted(json.loads(bytes(raw))["data"], key=lambda item: item["index"])
+        data = sorted(json.loads(raw)["data"], key=lambda item: item["index"])
         if [item["index"] for item in data] != list(range(len(texts))):
             raise ValueError("indexes")
         return [_unit(item["embedding"]) for item in data]

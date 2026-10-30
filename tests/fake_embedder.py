@@ -31,10 +31,10 @@ def vectorize(text: str) -> list:
 class FakeEmbedder(object):
     """`with FakeEmbedder() as fake:` then point BRAIN_EMBEDDER_URL at `fake.url`.
     `fake.calls` records (prefix, text) for every input; `fake.fail` / `fake.delay`
-    make it refuse or stall."""
+    make it refuse or stall, `fake.drip` makes it send the body a byte at a time."""
 
     def __init__(self):
-        self.calls, self.fail, self.delay = [], None, 0.0
+        self.calls, self.fail, self.delay, self.drip = [], None, 0.0, 0.0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -67,6 +67,15 @@ class FakeEmbedder(object):
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
+                if outer.drip:               # a body one byte per `drip` seconds, until the client gives up
+                    try:
+                        for at in range(len(payload)):
+                            self.wfile.write(payload[at:at + 1])
+                            self.wfile.flush()
+                            time.sleep(outer.drip)
+                    except OSError:
+                        pass
+                    return
                 self.wfile.write(payload)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
