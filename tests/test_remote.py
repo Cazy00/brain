@@ -26,6 +26,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 from brainlib import access, capture, httplog, httpmcp, mcpcore, rs256  # noqa: E402
@@ -809,6 +810,14 @@ class CaptureStampTests(_StampCases, RemoteTestCase):
         self.assertEqual(fields["source"], "local")
         # A legacy tools/call carries no clientInfo; absent is the honest answer.
         self.assertNotIn("client", fields)
+
+    def test_a_legacy_call_may_name_its_client_in_meta(self):
+        """A stateless caller that never initializes names itself the modern way."""
+        _status, _h, body = self.brain.rpc("tools/call", {
+            "name": "brain_capture", "arguments": {"text": "Named in _meta, 2026-10-30."},
+            "_meta": {httpmcp.META_CLIENT_INFO: {"name": "harbor-relay", "version": "1"}}})
+        self.assertFalse(body["result"]["isError"], body)
+        self.assertEqual(self.only_note()["client"], "harbor-relay/1")
 
     def test_a_service_credential_is_stamped_service(self):
         assertion = sign_assertion(service_claims(aud=AUD_WRITE, common_name=CAPTURE_CLIENT))
@@ -2016,6 +2025,111 @@ class DeploymentUnitTests(unittest.TestCase):
         self.assertFalse(token_files[0].startswith("-"),
                          "a missing API token would be tolerated silently")
 
+
+
+class EmbedderDeploymentTests(unittest.TestCase):
+    """Prevents: search by meaning that is wired in one place and not another.
+
+    The pins live in deploy/embedder.env (read by a root script with a strict
+    parser) and are repeated in compose.yaml, which cannot interpolate that file;
+    the units that feed it, and the network that holds it, are separate files.
+    Each of them is wrong quietly: a stale digest runs the old image, an embedder
+    on the wrong network is reachable or unreachable without any error."""
+
+    LINE = re.compile(r"^[A-Z][A-Z0-9_]*=[A-Za-z0-9._:/@+-]+$")
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parent.parent
+        cls.deploy = root / "deploy"
+        cls.compose = (cls.deploy / "compose.yaml").read_text(encoding="utf-8")
+        cls.pins = {}
+        for line in (cls.deploy / "embedder.env").read_text(encoding="utf-8").splitlines():
+            if line.strip() and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                cls.pins[key] = value
+
+    def block(self, opener, indent):
+        lines = self.compose.splitlines()
+        start = lines.index(opener)
+        out = []
+        for line in lines[start + 1:]:
+            if line.strip() and not line.lstrip().startswith("#") \
+                    and len(line) - len(line.lstrip()) <= indent:
+                break
+            out.append(line.strip())
+        return out
+
+    def test_the_pins_file_is_key_value_lines_a_strict_parser_can_read(self):
+        text = (self.deploy / "embedder.env").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.strip() and not line.startswith("#"):
+                self.assertRegex(line, self.LINE, "not plain KEY=VALUE: %r" % line)
+        self.assertEqual(sorted(self.pins), sorted(
+            ["EMBED_IMAGE", "MODEL_REPO", "MODEL_REV", "MODEL_FILE", "MODEL_SHA256",
+             "MODEL_BYTES", "MODEL_ALIAS"]))
+        self.assertRegex(self.pins["EMBED_IMAGE"], r"@sha256:[0-9a-f]{64}$")
+        self.assertRegex(self.pins["MODEL_REV"], r"^[0-9a-f]{40}$")
+        self.assertRegex(self.pins["MODEL_SHA256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(self.pins["MODEL_BYTES"].isdigit())
+
+    def test_compose_repeats_the_pins_exactly(self):
+        lines = self.block("  embedder:", 2)
+        self.assertIn("image: " + self.pins["EMBED_IMAGE"], lines)
+        self.assertIn('- "/models/%s"' % self.pins["MODEL_FILE"], lines)
+        self.assertIn('- "%s"' % self.pins["MODEL_ALIAS"], lines)
+        self.assertIn('- "last"', lines)      # Qwen3-Embedding pools by its last token, not the mean
+
+    def test_the_embedder_is_hardened_unpublished_and_on_the_internal_network_alone(self):
+        lines = self.block("  embedder:", 2)
+        self.assertIn("<<: *hardening", lines)
+        self.assertIn("logging: *logging", lines)
+        self.assertFalse([l for l in lines if l.startswith("ports:")], "the embedder publishes a port")
+        self.assertIn("memswap_limit: 1g", lines)
+        self.assertIn("memory: 1G", lines)
+        self.assertIn('cpus: "2.0"', lines)
+        self.assertIn("- ${BRAIN_HOST_MODELS:-/srv/brain/models}:/models:ro", lines)
+        self.assertIn("- embed", lines)
+        self.assertNotIn("- egress", lines)
+        self.assertNotIn("egress:", lines)
+        self.assertTrue([l for l in lines if "/health" in l], "no healthcheck on /health")
+
+    def test_the_embed_network_is_internal_and_holds_exactly_three_services(self):
+        self.assertIn("internal: true", self.block("  embed:", 2))
+        holders = []
+        for name in ("brain", "cloudflared", "maintenance", "embedder"):
+            lines = self.block("  %s:" % name, 2)
+            if "- embed" in lines or "embed:" in lines:
+                holders.append(name)
+        self.assertEqual(sorted(holders), ["brain", "embedder", "maintenance"])
+
+    def test_the_brain_does_not_wait_for_the_embedder(self):
+        """Keyword search, capture and the rest must work with the embedder down."""
+        self.assertNotIn("depends_on:", self.block("  brain:", 2))
+        self.assertNotIn("depends_on:", self.block("  maintenance:", 2))
+
+    def test_brain_and_maintenance_are_pointed_at_the_embedder_and_the_mode_comes_from_env(self):
+        env = self.block("x-brain-env: &brain-env", 0)
+        url = next(l.split(": ", 1)[1].strip() for l in env if l.strip().startswith("BRAIN_EMBEDDER_URL:"))
+        self.assertEqual(url, "http://embedder:8080")
+        self.assertEqual(urlparse(url.rstrip("/") + "/v1/embeddings").path, "/v1/embeddings")
+        self.assertIn("BRAIN_VECTORS: ${BRAIN_VECTORS:-shadow}", env)
+        self.assertIn("environment: *brain-env", self.block("  brain:", 2))
+        self.assertIn("<<: *brain-env", self.block("  maintenance:", 2))
+        example = (self.deploy / "env.example").read_text(encoding="utf-8")
+        self.assertIn("\nBRAIN_VECTORS=shadow\n", example)
+        self.assertIn("BRAIN_HOST_MODELS=", example)
+
+    def test_sync_and_nightly_maintenance_build_the_vectors_after_their_own_step(self):
+        for unit, after in (("brain-sync.service", " maintenance sync"),
+                            ("brain-maintenance.service", " maintenance index --quiet")):
+            text = (self.deploy / "systemd" / unit).read_text(encoding="utf-8")
+            execs = [l for l in text.splitlines() if l.startswith("ExecStart=")]
+            index = next(i for i, l in enumerate(execs) if l.endswith(after))
+            self.assertTrue(execs[index + 1].endswith(" maintenance index --vectors --quiet"),
+                            "%s does not embed right after its own step" % unit)
+            self.assertFalse(execs[index + 1].startswith("ExecStart=-"),
+                             "tolerated by the unit, not by the command: the engine must exit 0")
 
 
 class RunbookFirewallScriptTests(unittest.TestCase):

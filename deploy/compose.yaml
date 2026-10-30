@@ -1,4 +1,4 @@
-# deploy/compose.yaml — the production brain, as three roles on one VPS.
+# deploy/compose.yaml — the production brain, as four roles on one VPS.
 #
 # Run from this directory, with `deploy/.env` present:
 #
@@ -30,6 +30,15 @@ x-brain-env: &brain-env
   BRAIN_DATA_ROOT: /srv/brain/data
   BRAIN_STATE_DIR: /srv/brain/state
   BRAIN_HTTP_CONFIG: /etc/brain/brain-http.json
+  # Search by meaning (0.6.0). The embedder is the `embedder` service below, reached
+  # by name on the internal `embed` network, so the URL is a fixed string like the
+  # paths above. The mode is the one thing an operator turns: `off` keeps the keyword
+  # brain exactly as it was, `shadow` and `on` are explained in deploy/env.example.
+  # Unset in deploy/.env means shadow here, so an upgrade to 0.6.0 builds the vectors
+  # without changing any answer (bin/brain on its own treats unset as off). Anything
+  # that is not one of the three words is off.
+  BRAIN_EMBEDDER_URL: http://embedder:8080
+  BRAIN_VECTORS: ${BRAIN_VECTORS:-shadow}
   # The calendar the brain dates things by. A capture's `created`, its inbox
   # file name and a drop box's daily cap are all the container's LOCAL date, so
   # an owner living away from UTC would see a capture made in their small hours
@@ -206,6 +215,18 @@ services:
         # Static, and paired with cloudflared's extra_hosts below. See the
         # networks section for why the request path has to be pinned.
         ipv4_address: 10.77.0.10
+      # Where the embedder is. Lowest priority: it has no gateway, so it never
+      # decides the default route.
+      embed:
+        priority: 5
+
+    # Deliberately NO depends_on for the embedder. The brain answers keyword
+    # search, capture and the rest with the embedder stopped, absent or wedged:
+    # `recall` then answers keyword-only and says `search_degraded:
+    # "embed_unavailable"`, and a brain held back from starting by a search
+    # accessory would turn an optional feature into an outage of the knowledge
+    # base. Start order does not matter either, since the client resolves the
+    # name per request.
 
     # Sized as a CAP, not as an allocation, on a box that is not dedicated to
     # this: the VPS has 4 OCPU and 24 GB but already runs a host cloudflared
@@ -378,6 +399,9 @@ services:
     # and the pinned consolidator's provider.
     networks:
       - egress
+      # The nightly and five-minute `index --vectors` runs embed through the
+      # embedder, so it joins that internal network and nothing else new.
+      - embed
 
     # Twice the brain's ceiling on both axes, because consolidation and an
     # index rebuild are the two genuinely heavy things this system does, and
@@ -389,6 +413,95 @@ services:
           cpus: "2.0"
           memory: 1G
           pids: 512
+
+  embedder:
+    # llama.cpp's server, pinned by the digest of the multi-arch INDEX (linux/amd64,
+    # arm64, s390x), so the same line serves this VPS (Ampere, arm64) and a dev
+    # box. The digest, the model file and its hash are in deploy/embedder.env, which
+    # the host upgrade script reads and which is the one place a version moves;
+    # they are repeated below because compose interpolates only deploy/.env, and a
+    # test fails if the two ever differ.
+    image: ghcr.io/ggml-org/llama.cpp@sha256:b32890309c1a33a534a01b0b461e953dc2c5a6bac20213abcf48e22847a19c85
+
+    # The image's entrypoint is /app/llama-server; these are its arguments. The
+    # server listens on 0.0.0.0 INSIDE its own container network, and that is the
+    # point of the `embed` network being `internal: true` and holding only the
+    # three services that need it: nothing else can reach this port and there is
+    # no `ports:` stanza. -t 2 matches the cpus quota below, because more threads
+    # than cores makes every query slower. -c/-b/-ub 2048 is the model's usable
+    # window for one note chunk.
+    command:
+      - "--embeddings"
+      - "--pooling"
+      - "last"
+      - "-m"
+      - "/models/Qwen3-Embedding-0.6B-Q8_0.gguf"
+      - "--alias"
+      - "qwen3-embedding-0.6b"
+      - "-c"
+      - "2048"
+      - "-b"
+      - "2048"
+      - "-ub"
+      - "2048"
+      - "-t"
+      - "2"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+
+    restart: unless-stopped
+    # The brain's uid, so a model file the upgrade script put in place readable
+    # by anyone (0644) is all it needs; the image would otherwise run as root.
+    user: "10001:10001"
+    <<: *hardening
+    logging: *logging
+    init: true
+
+    # The model is a data file fetched and hash-checked by the host, never baked
+    # into an image layer and never written by this container. HOME and the
+    # llama.cpp cache point at /tmp so a nonroot uid on a read-only rootfs has
+    # nowhere it tries and fails to write.
+    environment:
+      HOME: /tmp
+      LLAMA_CACHE: /tmp
+    volumes:
+      - ${BRAIN_HOST_MODELS:-/srv/brain/models}:/models:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+
+    # /health answers 503 while the model loads and 200 once it can embed. curl
+    # is in this image (unlike the brain's), and the probe stays inside the
+    # container. Nothing waits on it: it is a signal for `docker ps` and for the
+    # operator, see the missing depends_on on brain.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    stop_grace_period: 10s
+
+    # `embed` ONLY: no egress, so a compromised or buggy embedder cannot reach out
+    # and the note text it is sent has nowhere to go.
+    networks:
+      - embed
+
+    # A 640 MB quantised model plus a 2048-token context fits inside 1 GiB (measured
+    # peak of the cgroup while indexing a few hundred notes: under 500 MiB).
+    # memswap_limit equal to the memory limit means no swap: an embedder that
+    # outgrows it is OOM-killed and restarted, which the brain survives, rather
+    # than pushing the box into swap. It is the only limit that has no home under
+    # deploy.resources, so it is the one top-level key here.
+    memswap_limit: 1g
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+          pids: 64
 
 # ---------------------------------------------------------------------------
 # Networks — the reachability argument, written down
@@ -429,6 +542,10 @@ services:
 #                          backup object storage, consolidator provider.
 #                inbound:  nothing. It is not on `mcp` at all.
 #
+#   embedder     outbound: nothing. It is on `embed` alone, which has no gateway.
+#                inbound:  brain and maintenance, over `embed`, port 8080. Note
+#                          text travels that segment and no other.
+#
 # WHY TWO NETWORKS RATHER THAN ONE BRIDGE. `mcp` is `internal: true`, which
 # means Docker creates it with no gateway and gives the host no address on it.
 # The MCP request path therefore runs entirely on a segment that has no route
@@ -459,6 +576,16 @@ networks:
         # ever does collide, change it here and in cloudflared's extra_hosts —
         # those two are the only places the address appears.
         - subnet: 10.77.0.0/24
+
+  embed:
+    # The same construction as `mcp`: no gateway, no host address, so the one
+    # service on it that speaks HTTP to brain and maintenance cannot be reached
+    # from outside or reach out. Only `embedder`, `brain` and `maintenance` join
+    # it. Subnet pinned for the reason the other two are, adjacent to them.
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.77.2.0/24
 
   egress:
     # An ordinary bridge. Named and declared rather than left to the implicit

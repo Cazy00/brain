@@ -12,6 +12,13 @@
 # a push pending for fifteen minutes is the server queue's alert to raise. Exit 2
 # is "refused" — a conflict, a local change that is not a new inbox note, or a
 # merged tree that fails lint — where a person decides, so it alerts.
+#
+# Since 0.6.0 a second step embeds the notes that just arrived (`index --vectors
+# --quiet`, search by meaning). It is incremental by content hash, so a run with
+# nothing new costs a file scan. It exits 0 with a warning on stderr when
+# BRAIN_VECTORS is off or the embedder is down: the keyword brain does not depend
+# on it, and the nightly run catches up. The first run after an upgrade has every
+# note to embed, which is why the timeout is longer than sync alone needs.
 [Unit]
 Description=brain sync (merged PRs in, captures out)
 Documentation=file:///srv/brain/engine/setup/runbooks/remote-brain.md
@@ -21,7 +28,7 @@ OnFailure=brain-alert@%n.service
 
 [Service]
 Type=oneshot
-TimeoutStartSec=10min
+TimeoutStartSec=30min
 SuccessExitStatus=1
 EnvironmentFile=-/etc/brain/deploy.env
 Environment=BRAIN_COMPOSE=/srv/brain/engine/deploy/compose.yaml
@@ -29,6 +36,7 @@ Environment=DOCKER_CONFIG=/tmp/docker
 Environment=DOCKER_CLI_HINTS=false
 
 ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance sync
+ExecStart=/usr/bin/docker compose --file ${BRAIN_COMPOSE} --project-name brain --profile maintenance run --rm --no-deps maintenance index --vectors --quiet
 
 # Hardening. This unit is a docker CLI client and nothing else: it opens one
 # AF_UNIX socket, and the work happens in a container with its own, stricter

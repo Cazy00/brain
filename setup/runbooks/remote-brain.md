@@ -544,6 +544,31 @@ sudo docker build --pull -f /srv/brain/engine/deploy/Dockerfile \
      --build-arg BRAIN_VERSION="$V" -t "brain:$V" /srv/brain/engine
 sudo sed -i "s/^BRAIN_VERSION=.*/BRAIN_VERSION=$V/" /srv/brain/engine/deploy/.env
 sudo docker compose -p brain pull cloudflared
+#    0.6.0 and later also run the `embedder` service (search by meaning). Its image
+#    comes from a registry, pinned by digest in deploy/embedder.env; its model is a
+#    file that no registry serves. Fetch it once (a host upgrade script may do these
+#    same steps; nothing else does), from the pins in that file, into the models
+#    directory (BRAIN_HOST_MODELS in deploy/.env, /srv/brain/models by default), and
+#    check its size and sha256 BEFORE the container may start: an absent or wrong file
+#    makes the embedder crash-loop and every recall answer keyword-only, with no alarm.
+pin() { sed -n "s/^$1=//p" /srv/brain/engine/deploy/embedder.env; }
+MODELS=/srv/brain/models
+sudo install -d -m 0755 "$MODELS"
+FILE=$(pin MODEL_FILE)
+if [ ! -f "$MODELS/$FILE" ]; then
+  sudo curl -fL --proto '=https' --tlsv1.2 -o "$MODELS/$FILE.part" \
+       "https://huggingface.co/$(pin MODEL_REPO)/resolve/$(pin MODEL_REV)/$FILE"
+  [ "$(sudo stat -c %s "$MODELS/$FILE.part")" = "$(pin MODEL_BYTES)" ] \
+    && echo "$(pin MODEL_SHA256)  $MODELS/$FILE.part" | sudo sha256sum -c - \
+    && sudo chmod 0644 "$MODELS/$FILE.part" && sudo mv "$MODELS/$FILE.part" "$MODELS/$FILE" \
+    || { sudo rm -f "$MODELS/$FILE.part"; echo "model check FAILED: do not start the embedder"; }
+fi
+#    An existing file is checked the same way, whenever the pins change:
+[ "$(sudo stat -c %s "$MODELS/$FILE")" = "$(pin MODEL_BYTES)" ] \
+  && echo "$(pin MODEL_SHA256)  $MODELS/$FILE" | sudo sha256sum -c -
+sudo docker compose -p brain pull embedder
+#    Step 6 builds the vectors once by hand, so the first run is not left to the
+#    sync timer.
 
 # 5. Preflight against the real data, without serving traffic.
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
@@ -555,6 +580,8 @@ sudo docker compose -p brain --profile maintenance run --rm --no-deps \
 #    the probe goes to the container's address on the egress bridge, which is
 #    the same path the host-side monitoring uses.
 sudo docker compose -p brain up -d
+sudo docker compose -p brain --profile maintenance run --rm --no-deps \
+     maintenance index --vectors
 EG=$(sudo docker inspect -f '{{(index .NetworkSettings.Networks "brain_egress").IPAddress}}' brain-brain-1)
 curl -fsS "http://$EG:8787/readyz"
 sudo docker compose -p brain logs --since 5m brain

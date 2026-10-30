@@ -325,6 +325,7 @@ def main(argv) -> int:
     queue.start()
     queue.nudge()                              # push anything a crash left behind
     log.record("server_started", endpoint=host, count=len(config["endpoints"]))
+    httpmcp.watch_worker(log)
 
     stopping = threading.Event()
 

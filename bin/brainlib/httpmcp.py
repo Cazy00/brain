@@ -52,6 +52,7 @@ from . import access
 from . import mcpcore
 from . import verbs
 from . import provenance
+from . import verbworker
 from . import version
 
 ENDPOINT = "/mcp"
@@ -438,7 +439,10 @@ class Handler(BaseHTTPRequestHandler):
         # of being told which versions it could retry with.
         modern = (META_VERSION in meta
                   or (header_version in MODERN_VERSIONS and method != "initialize"))
-        client = meta.get(META_CLIENT_INFO) if modern else params.get("clientInfo")
+        # A legacy request names its client at initialize; a stateless caller that
+        # never initializes may still name itself in _meta, as the modern era does.
+        client = (meta.get(META_CLIENT_INFO) if modern
+                  else params.get("clientInfo") or meta.get(META_CLIENT_INFO))
         client_name, client_version = _client_identity(client)
 
         if modern:
@@ -823,6 +827,11 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, service: Service):
         ThreadingHTTPServer.__init__(self, address, Handler)
         self.service = service
+
+
+def watch_worker(log) -> None:
+    """Record in `log` each recall that ran the one-shot command instead of the warm worker."""
+    verbworker.observer = lambda reason: log.record("worker_fallback", reason=reason)
 
 
 def make_server(service: Service, host: str = "127.0.0.1", port: int = 0) -> Server:

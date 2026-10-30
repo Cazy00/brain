@@ -196,6 +196,71 @@ A `brain:write` OAuth token opens `brain_capture` only; `remember` and `forget` 
 `brain:read` as well, because they answer (a duplicate returns the stored path, a forget
 tells a missing id from an expired one).
 
+## Search by meaning (optional, off by default)
+
+Keyword search stays the default and the truth. Beside it the engine can rank by
+meaning, from **derived** vectors, and fuse the two lists. It is stdlib-only: the
+engine ships no model and no server, only a client for an embedder you run.
+
+**Point it at an embedder.** Any server that answers the OpenAI-shaped
+`POST {BRAIN_EMBEDDER_URL}/v1/embeddings` works (llama.cpp's `llama-server
+--embeddings` with `Qwen3-Embedding-0.6B` is the intended one; `nomic-embed-text-v1.5` also works). It should be
+reachable only from the brain's host, because note text is sent to it. The engine
+sends the model's task prefixes (a built-in table by model name: Qwen3's `Instruct: ...\nQuery:` before a query and nothing before a document; nomic's `search_query: ` and
+`search_document: `; none for a model not in the table; `BRAIN_EMBEDDER_QUERY_PREFIX` and
+`BRAIN_EMBEDDER_DOC_PREFIX` override either, `\n` meaning a newline), uses no proxy and follows no redirect.
+
+| Setting (environment) | Meaning |
+|---|---|
+| `BRAIN_VECTORS` | `off` (default), `shadow` or `on`. `shadow` builds nothing by itself but serves hybrid to `recall` calls that pass `mode: "hybrid"`; `on` makes hybrid `recall`'s default. `brain_search` is keyword-only in every mode. Anything else counts as `off`. |
+| `BRAIN_EMBEDDER_URL` | Base URL of the embedder (`http` or `https`). |
+| `BRAIN_EMBEDDER_MODEL` | Model name, sent to the embedder and stored as each vector's `model_key` (default `qwen3-embedding-0.6b`). A new name makes every stored vector stale. |
+| `BRAIN_VECTOR_FLOOR` | A chunk counts only if its cosine is above this (default 0.53, calibrated for the pinned model; calibrate on your own notes). |
+| `BRAIN_VECTOR_HIGH` | A vector-only hit at or above this is `high_vector_match`, below it `weak_semantic` (default 0.71, calibrated for the pinned model). |
+
+**Build the vectors:** `brain index --vectors` (incremental by content hash, and it
+deletes the vectors of notes that left the index) or `--vectors --full` (rebuilds
+the file; a failed rebuild leaves the old one serving). It embeds exactly the notes FTS
+indexes, never `archive/`, `vault/`, `attachments/` or `handoff/`. The file,
+`vectors.db`, sits in the state directory next to `index.db`, is never backed up and
+may be deleted at any time. A note is embedded as its title, aliases and topics plus
+body chunks of about 1,500 characters cut at paragraph breaks, each led by the title,
+and scores by its best chunk plus a tenth of its second best. Running it after a pull or on a timer is a deployment concern: the shipped
+`deploy/` (below the engine, for a VPS) wires it. With `--quiet`, the form the timers
+use, `BRAIN_VECTORS=off` or an embedder that is down is one warning on stderr and exit
+0 instead of a failure.
+
+**Deployed (0.6.0).** `deploy/compose.yaml` runs the embedder as its own service:
+llama.cpp's server, image and model pinned in `deploy/embedder.env` (multi-arch image
+digest; model repository revision, size and sha256), no published port, no egress, on
+an internal `embed` network shared only with `brain` and `maintenance`, 1 GiB and 2
+CPUs. The model file is fetched by the host into `BRAIN_HOST_MODELS` and mounted
+read-only. `BRAIN_VECTORS` in `deploy/.env` defaults to `shadow` there. `brain` does not
+wait for the embedder: with it down, everything works and `recall` answers keyword-only.
+
+**What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
+vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
+weights), brute force in pure Python. The two are fused by reciprocal rank,
+`sum 1/(60+rank)`, ties broken by keyword order. A hit in both lists is
+`keyword_exact`; a vector-only hit is `high_vector_match` or `weak_semantic`. The
+trust rules are the keyword ones: the vector arm only ranks notes the FTS index holds
+in a folder the scope allows (inbox and journal only in `scope: "all"`, at weight
+0.6), a note whose text changed since its vector was made is served by keyword only,
+and every hit carries the same markers. If the embedder is unreachable, takes more than
+2 seconds, refuses, or no vectors exist for the model, `recall` answers keyword-only and
+sets `search_degraded: "embed_unavailable"`; it never errors.
+
+**Speed.** An MCP server answers `recall` through one long-lived `brain verb-worker`
+process (`brainlib/verbworker.py`) instead of starting `brain verb recall` for every call:
+the compile, the imports and the read of `vectors.db` are paid once, so a hybrid call is
+the query embed plus about 15 ms of arithmetic per 1,000 chunks (Python 3.12+; about
+three times that on older Pythons). The worker reads `vectors.db` again whenever the file
+changes, restarts when any `BRAIN_*` setting changes, takes the tree lock only for the
+length of a call, and any trouble with it falls back to the one-shot command, which gives
+the same answer. `BRAIN_VERB_WORKER=off` switches it off. The embedder's speed is the
+rest: give `llama-server` as many threads (`-t`) as its CPU quota; more threads than
+cores makes every query slower, not faster.
+
 ## How it stays true
 
 | Mechanism | What it prevents |
@@ -263,10 +328,11 @@ every time, and so does `brain setup --no-repo`, on purpose.
 Listed because a second brain that oversells itself is exactly the kind you stop
 trusting.
 
-- **No semantic search.** Retrieval is lexical plus structure (SQLite FTS5, BM25
-  over title/aliases/topics/body, folder-weighted, plus the link graph). If your
-  words differ completely from the note's words, it can miss where an
-  embeddings system would not. Deferred on purpose.
+- **Semantic search is optional and never the truth.** Retrieval is lexical plus
+  structure (SQLite FTS5, BM25 over title/aliases/topics/body, folder-weighted,
+  plus the link graph). Search by meaning exists only as derived vectors you opt
+  into (see above); with `BRAIN_VECTORS` off, the default, the engine is as lexical
+  as ever.
 - **No contradiction detection between two current notes.** The system fights
   staleness structurally — supersede, `review_by`, link validation — but nothing
   automatically notices that two live notes disagree.
