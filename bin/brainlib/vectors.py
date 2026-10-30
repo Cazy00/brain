@@ -42,7 +42,7 @@ except ImportError:          # non-POSIX: the atomic rename below still holds
 
 MODES = ("off", "shadow", "on")
 DEFAULT_MODEL = "qwen3-embedding-0.6b"
-# Calibrated for DEFAULT_MODEL and this chunk scheme on a private question set (B40 P3);
+# Calibrated for DEFAULT_MODEL and this chunk scheme on a private question set;
 # a deployment with other notes or another model calibrates its own and sets them in its config.
 DEFAULT_FLOOR = 0.53
 DEFAULT_HIGH = 0.71
