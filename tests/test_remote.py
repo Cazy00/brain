@@ -810,6 +810,14 @@ class CaptureStampTests(_StampCases, RemoteTestCase):
         # A legacy tools/call carries no clientInfo; absent is the honest answer.
         self.assertNotIn("client", fields)
 
+    def test_a_legacy_call_may_name_its_client_in_meta(self):
+        """A stateless caller that never initializes names itself the modern way."""
+        _status, _h, body = self.brain.rpc("tools/call", {
+            "name": "brain_capture", "arguments": {"text": "Named in _meta, 2026-10-30."},
+            "_meta": {httpmcp.META_CLIENT_INFO: {"name": "harbor-relay", "version": "1"}}})
+        self.assertFalse(body["result"]["isError"], body)
+        self.assertEqual(self.only_note()["client"], "harbor-relay/1")
+
     def test_a_service_credential_is_stamped_service(self):
         assertion = sign_assertion(service_claims(aud=AUD_WRITE, common_name=CAPTURE_CLIENT))
         _status, body = self.brain.call("brain_capture", {"text": "From a service, 2026-10-18."},

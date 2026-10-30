@@ -438,7 +438,10 @@ class Handler(BaseHTTPRequestHandler):
         # of being told which versions it could retry with.
         modern = (META_VERSION in meta
                   or (header_version in MODERN_VERSIONS and method != "initialize"))
-        client = meta.get(META_CLIENT_INFO) if modern else params.get("clientInfo")
+        # A legacy request names its client at initialize; a stateless caller that
+        # never initializes may still name itself in _meta, as the modern era does.
+        client = (meta.get(META_CLIENT_INFO) if modern
+                  else params.get("clientInfo") or meta.get(META_CLIENT_INFO))
         client_name, client_version = _client_identity(client)
 
         if modern:
