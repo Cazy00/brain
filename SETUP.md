@@ -449,11 +449,13 @@ stays refused until you delete its marker.
 ### Search by meaning on the VPS (0.6.0)
 
 Optional. The `deploy/` stack from 0.6.0 includes an `embedder` service (llama.cpp
-serving `nomic-embed-text-v1.5`, pinned in `deploy/embedder.env`), reachable only from
-`brain` and `maintenance` over an internal network. Before `docker compose up`, the
-model file named in `embedder.env` must be in `BRAIN_HOST_MODELS` (default
-`/srv/brain/models`), checked against its size and sha256; and `docker compose pull
-embedder`. `BRAIN_VECTORS` in `deploy/.env` is `shadow` to start (`off` turns the whole
+serving the model pinned in `deploy/embedder.env`: its `MODEL_FILE`, today
+`Qwen3-Embedding-0.6B-Q8_0.gguf`), reachable only from `brain` and `maintenance` over an
+internal network. Before `docker compose up`, the file `MODEL_FILE` names must be in
+`BRAIN_HOST_MODELS` (default `/srv/brain/models`), fetched at `MODEL_REV` and checked
+against `MODEL_BYTES` and `MODEL_SHA256` (the commands are in upgrade step 4 of
+`setup/runbooks/remote-brain.md`); another file there is not found and the embedder
+restarts forever. Then `docker compose pull embedder`. `BRAIN_VECTORS` in `deploy/.env` is `shadow` to start (`off` turns the whole
 thing off; `on` makes hybrid `recall`'s default and follows the calibration check).
 `brain-sync` and `brain-maintenance` then run `brain index --vectors --quiet`, which
 warns and exits 0 when the mode is off or the embedder is down. Details:
