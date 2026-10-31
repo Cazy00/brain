@@ -945,6 +945,36 @@ class RateLimitTests(RemoteTestCase):
         self.assertFalse(body["result"]["isError"])
 
 
+class RateLimitEventNamesClientTests(RemoteTestCase):
+    LIMITS = {"read": (1, 60.0), "capture": (1, 60.0), "protocol": (100, 60.0)}
+
+    def limited_events(self):
+        path = self.brain.state_dir / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        return [e for e in events if e["event"] == "rate_limited"]
+
+    def search(self, meta=None):
+        params = {"name": "brain_search", "arguments": {"query": "connector"}}
+        if meta:
+            params["_meta"] = meta
+        return self.brain.rpc("tools/call", params)[0]
+
+    def test_a_client_that_identified_itself_is_named(self):
+        self.assertEqual(self.search(), 200)
+        self.assertEqual(self.search({httpmcp.META_CLIENT_INFO:
+                                      {"name": "harbor-relay", "version": "2"}}), 429)
+        (event,) = self.limited_events()
+        self.assertEqual(event["client"], "harbor-relay")
+        self.assertEqual(event["client_version"], "2")
+
+    def test_a_client_that_did_not_is_not_invented(self):
+        self.assertEqual(self.search(), 200)
+        self.assertEqual(self.search(), 429)
+        (event,) = self.limited_events()
+        self.assertNotIn("client", event)
+        self.assertNotIn("client_version", event)
+
+
 class RateLimitDefaultsTests(unittest.TestCase):
     def test_the_default_limits_are_pinned(self):
         self.assertEqual(httpmcp.RATE_LIMITS, {"read": (1200, 60.0), "capture": (10, 60.0),

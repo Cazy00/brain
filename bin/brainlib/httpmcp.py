@@ -471,7 +471,8 @@ class Handler(BaseHTTPRequestHandler):
             # not support the requested version responds with one it does
             # support, and lets the client decide whether it can live with it.
             agreed = asked if asked in LEGACY_VERSIONS else PREFERRED_LEGACY
-            if not self._allow_or_refuse(principal, "protocol", cid):
+            if not self._allow_or_refuse(principal, "protocol", cid,
+                                         client_name, client_version):
                 return None  # the 429 is already sent: one response per request (audit A5)
             self.service.record("request", cid=cid, method="initialize",
                                 principal=principal.stable_id, profile=principal.profile,
@@ -499,7 +500,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "tools/list":
             allowed, retry = self.service.limiter.take(principal.stable_id, "protocol")
             if not allowed:
-                return self._rate_limited(cid, principal, retry)
+                return self._rate_limited(cid, principal, retry, client=client_name,
+                                          client_version=client_version)
             return self._send(200, _result(msg_id, {
                 "tools": mcpcore.tools_for(principal.profile, "remote")}), cid=cid)
 
@@ -580,7 +582,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "tools/list":
             allowed, retry = self.service.limiter.take(principal.stable_id, "protocol")
             if not allowed:
-                return self._rate_limited(cid, principal, retry)
+                return self._rate_limited(cid, principal, retry, client=client_name,
+                                          client_version=client_version)
             return self._send(200, _modern_result(msg_id, {
                 "tools": mcpcore.tools_for(principal.profile, "remote"),
                 "ttlMs": TOOLS_TTL_MS,
@@ -638,7 +641,8 @@ class Handler(BaseHTTPRequestHandler):
         allowed, retry = self.service.limiter.take(
             principal.stable_id, "capture" if writes else "read")
         if not allowed:
-            return self._rate_limited(cid, principal, retry, tool=str(name)[:64])
+            return self._rate_limited(cid, principal, retry, tool=str(name)[:64],
+                                      client=client_name, client_version=client_version)
 
         reason = self.service.write_block() if writes else None
         if reason:
@@ -725,16 +729,21 @@ class Handler(BaseHTTPRequestHandler):
         return {"content": [{"type": "text", "text": capturelib.format_result(outcome)}],
                 "isError": not outcome.get("ok", False)}
 
-    def _rate_limited(self, cid, principal, retry, tool=None) -> None:
+    def _rate_limited(self, cid, principal, retry, tool=None, client=None,
+                      client_version=None) -> None:
+        # The client is whatever the request named itself (None when it did not, and
+        # a None field is not written), the same values a tool_call records.
         self._refuse(429, cid, "rate limit exceeded; retry in %ds" % retry,
                      "rate_limited", principal=principal.stable_id,
                      profile=principal.profile, tool=tool, retry_after=retry,
+                     client=client, client_version=client_version,
                      headers={"Retry-After": str(retry)})
 
-    def _allow_or_refuse(self, principal, bucket, cid):
+    def _allow_or_refuse(self, principal, bucket, cid, client=None, client_version=None):
         allowed, retry = self.service.limiter.take(principal.stable_id, bucket)
         if not allowed:
-            self._rate_limited(cid, principal, retry)
+            self._rate_limited(cid, principal, retry, client=client,
+                               client_version=client_version)
         return allowed
 
 
