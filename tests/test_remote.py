@@ -2058,6 +2058,7 @@ class ComposeNetworkIsolationTests(unittest.TestCase):
     network, or adding an internal network without it, is silent."""
 
     GATEWAY_MODE = "com.docker.network.bridge.gateway_mode_ipv4"
+    GATEWAY_MODE_V6 = "com.docker.network.bridge.gateway_mode_ipv6"
 
     @classmethod
     def setUpClass(cls):
@@ -2071,14 +2072,16 @@ class ComposeNetworkIsolationTests(unittest.TestCase):
         internal = [n for n, v in self.networks.items() if v.get("internal") == "true"]
         self.assertEqual(sorted(internal), ["embed", "mcp"])
         for name in internal:
-            self.assertEqual(self.networks[name].get(self.GATEWAY_MODE), "isolated",
-                             "internal network %r leaves the host an address on its "
-                             "bridge: set %s: isolated" % (name, self.GATEWAY_MODE))
+            for option in (self.GATEWAY_MODE, self.GATEWAY_MODE_V6):
+                self.assertEqual(self.networks[name].get(option), "isolated",
+                                 "internal network %r leaves the host an address on its "
+                                 "bridge: set %s: isolated" % (name, option))
 
     def test_egress_is_not_internal(self):
         """It is the only way out; making it internal would cut git, backups and the tunnel."""
         self.assertNotEqual(self.networks["egress"].get("internal"), "true")
         self.assertNotIn(self.GATEWAY_MODE, self.networks["egress"])
+        self.assertNotIn(self.GATEWAY_MODE_V6, self.networks["egress"])
 
 
 class EmbedderDeploymentTests(unittest.TestCase):

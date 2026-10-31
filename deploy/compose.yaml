@@ -555,8 +555,10 @@ services:
 # listening on that address. So `mcp` and `embed` also set gateway mode
 # `isolated` (Docker Engine 28.0.0 or later, and valid only on an internal
 # network): "No address is assigned to the bridge", so the host has no address
-# on the segment and nothing on it can reach the host. Both facts are from
-# https://docs.docker.com/engine/network/port-publishing/ . The MCP request
+# on the segment, and a container attached only to `mcp` or `embed` (the
+# embedder) cannot reach host services through them. brain and cloudflared are
+# also on `egress`, an ordinary bridge, and reach the host through that. Both
+# facts are from https://docs.docker.com/engine/network/port-publishing/ . The MCP request
 # path therefore runs entirely on a segment that has no route on or off it, and
 # it stays that way for free: nothing about a future change to firewall rules,
 # published ports or host routing can expose it, because there is nothing to
@@ -585,6 +587,7 @@ networks:
     driver_opts:
       # Needs Docker Engine 28.0.0 or later, the release that added this mode.
       com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
     ipam:
       config:
         # Chosen outside Docker's default 172.17.0.0/16 address pool and away
@@ -595,14 +598,15 @@ networks:
 
   embed:
     # The same construction as `mcp`: internal and gateway mode `isolated`, so the
-    # host has no address on it and the one service on it that speaks HTTP to
-    # brain and maintenance cannot be reached from outside, cannot reach the host
-    # and cannot reach out. Only `embedder`, `brain` and `maintenance` join it.
+    # host has no address on it, and the one service on it that speaks HTTP to
+    # brain and maintenance cannot be reached from outside, cannot reach host
+    # services through it and cannot reach out. Only `embedder`, `brain` and `maintenance` join it.
     # Subnet pinned for the reason the other two are, adjacent to them.
     internal: true
     driver: bridge
     driver_opts:
       com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
     ipam:
       config:
         - subnet: 10.77.2.0/24
