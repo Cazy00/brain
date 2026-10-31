@@ -1083,6 +1083,53 @@ class EventLogHistoryDefaultsTests(unittest.TestCase):
         self.assertEqual(httplog.MAX_BYTES, 25_000_000)
 
 
+class EventLogPruneTests(unittest.TestCase):
+    """Retention reaches the rolled generation too, not only the live file."""
+
+    DAY = 86400
+
+    def setUp(self):
+        self.now = [1_000_000.0]
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = httplog.EventLog(self.tmp.name, clock=lambda: self.now[0], max_bytes=300)
+        self.dir = Path(self.tmp.name)
+
+    def lines(self, name):
+        return (self.dir / name).read_text(encoding="utf-8").splitlines()
+
+    def test_no_line_older_than_the_cutoff_survives_in_either_generation(self):
+        for stamp in (0, 1, 2, 3, 4, 5, 6, 7):
+            self.now[0] = 1_000_000.0 + stamp * 3600
+            self.log.record("request", method="ping", outcome="ok")
+            self.log.record("capture_accepted", outcome="ok")
+        self.assertTrue((self.dir / "events.jsonl.1").exists())
+        self.assertTrue((self.dir / "mutations.jsonl.1").exists())
+        # A later "now" that puts the first four hours past retention and the rest inside it.
+        later = 1_000_000.0 + 3.5 * 3600 + httplog.RUNTIME_RETENTION_DAYS * self.DAY
+        cutoff = httplog._iso(later - httplog.RUNTIME_RETENTION_DAYS * self.DAY)
+        streams = (("events.jsonl", "events.jsonl.1"), ("mutations.jsonl", "mutations.jsonl.1"))
+        for live, rolled in streams:
+            self.assertTrue(any(json.loads(line)["ts"] < cutoff for line in self.lines(rolled)),
+                            "the rolled file starts with an old line: " + rolled)
+        dropped = self.log.prune(now=later)
+        for live, rolled in streams:
+            kept = []
+            for name in (live, rolled):
+                kept += [json.loads(line)["ts"] for line in self.lines(name)]
+            self.assertTrue(kept, live)
+            self.assertTrue(all(ts >= cutoff for ts in kept), live)
+            self.assertGreater(dropped[rolled], 0, rolled)
+        self.assertEqual(set(dropped), {"events.jsonl", "events.jsonl.1",
+                                        "mutations.jsonl", "mutations.jsonl.1"})
+
+    def test_a_line_that_cannot_be_parsed_is_kept_in_the_rolled_file_too(self):
+        (self.dir / "events.jsonl.1").write_text(
+            'not json\n{"ts":"1970-01-01T00:00:00Z","event":"request"}\n', encoding="utf-8")
+        self.log.prune(now=httplog.RUNTIME_RETENTION_DAYS * self.DAY + 1_000_000.0)
+        self.assertEqual(self.lines("events.jsonl.1"), ["not json"])
+
+
 class OneResponsePerRequestTests(RemoteTestCase):
     """Audit A5: a rate-limited initialize sent a 429 AND a 200 on one connection, which
     corrupts HTTP framing for every request after it on that keep-alive connection."""
