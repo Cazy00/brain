@@ -246,7 +246,11 @@ Needs Docker Engine 28.0.0 or later; upgrade step in `SETUP.md` ("Docker require
 
 **0.6.2.** The per-principal read limit is now 1200 a minute, up from 120, so several clients
 sharing one credential no longer starve each other's searches; the capture limit is unchanged
-at 10 a minute. No data, network or configuration change; upgrading is an ordinary image rebuild.
+at 10 a minute. A `rate_limited` event now names the client (`client`, `client_version`) when the
+request identified itself, as `tool_call` does, and records nothing extra when it did not. The
+event log keeps more history for troubleshooting: its cap is 25 MB plus one rolled generation
+(about 50 MB), up from 5 MB. No data, network or configuration change; upgrading is an ordinary
+image rebuild.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
