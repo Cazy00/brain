@@ -219,6 +219,12 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(len(self.lines()), 2)
 
 
+class DefaultCapTests(unittest.TestCase):
+    def test_the_default_cap_is_pinned(self):
+        """Kept for troubleshooting history, so generous; one rolled generation keeps it bounded."""
+        self.assertEqual(eventlog.DEFAULT_MAX_BYTES, 25_000_000)
+
+
 class RotationTests(unittest.TestCase):
     """A bound decided now, not after a disk fills."""
 
