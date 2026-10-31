@@ -33,8 +33,8 @@ Three more properties, each from the spec:
 - **It never reaches git.** Not by `.gitignore` — by living under the state
   directory, outside the knowledge repository entirely. A rule enforced by
   geography does not depend on anyone maintaining a pattern file.
-- **It is bounded and it expires.** Runtime events keep 30 days, mutation audit
-  metadata 180. Both are size-capped as well, because a retention window is not
+- **It is bounded and it expires.** Runtime events and mutation audit metadata
+  both keep 180 days, a troubleshooting history. Both are size-capped as well, because a retention window is not
   a size limit and a disk fills on whichever comes first.
 - **Failures to write are swallowed.** A log that can take the server down is a
   worse problem than a log with a gap in it.
@@ -50,11 +50,11 @@ from pathlib import Path
 RUNTIME_FILE = "events.jsonl"
 AUDIT_FILE = "mutations.jsonl"
 
-RUNTIME_RETENTION_DAYS = 30
+RUNTIME_RETENTION_DAYS = 180
 AUDIT_RETENTION_DAYS = 180
 
-# 5 MB live plus one rolled generation, so the ceiling is ~10 MB per stream.
-MAX_BYTES = 5_000_000
+# 25 MB live plus one rolled generation, so the ceiling is ~50 MB per stream.
+MAX_BYTES = 25_000_000
 
 # Every event this server can record. An unknown name raises: the vocabulary IS
 # the redaction control, so it must fail loudly in a test rather than quietly

@@ -248,8 +248,9 @@ Needs Docker Engine 28.0.0 or later; upgrade step in `SETUP.md` ("Docker require
 sharing one credential no longer starve each other's searches; the capture limit is unchanged
 at 10 a minute. A `rate_limited` event now names the client (`client`, `client_version`) when the
 request identified itself, as `tool_call` does, and records nothing extra when it did not. The
-event log keeps more history for troubleshooting: its cap is 25 MB plus one rolled generation
-(about 50 MB), up from 5 MB. No data, network or configuration change; upgrading is an ordinary
+event logs keep more history for troubleshooting: the HTTP server's runtime events now keep
+180 days, up from 30, and every event log's cap is 25 MB plus one rolled generation (about 50 MB),
+up from 5 MB. No data, network or configuration change; upgrading is an ordinary
 image rebuild.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the

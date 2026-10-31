@@ -981,6 +981,13 @@ class RateLimitDefaultsTests(unittest.TestCase):
                                                "protocol": (600, 60.0)})
 
 
+class EventLogHistoryDefaultsTests(unittest.TestCase):
+    def test_the_server_logs_keep_a_troubleshooting_history(self):
+        self.assertEqual(httplog.RUNTIME_RETENTION_DAYS, 180)
+        self.assertEqual(httplog.AUDIT_RETENTION_DAYS, 180)
+        self.assertEqual(httplog.MAX_BYTES, 25_000_000)
+
+
 class OneResponsePerRequestTests(RemoteTestCase):
     """Audit A5: a rate-limited initialize sent a 429 AND a 200 on one connection, which
     corrupts HTTP framing for every request after it on that keep-alive connection."""
