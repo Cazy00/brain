@@ -28,7 +28,8 @@ Two more properties, both from the handoff that asked for this:
   repository entirely, under `osbackend.state_dir`. A rule enforced by
   geography does not depend on anyone maintaining a pattern file.
 - **It is bounded.** One rollover generation and a byte cap, decided now
-  rather than after a disk fills. This exists for a testing phase.
+  rather than after a disk fills. The log is kept as troubleshooting history, so
+  the cap is generous, but it is still a cap.
 
 Failures to write are swallowed, always. A log that can take the server down is
 a worse problem than a log with a gap in it.
@@ -41,8 +42,9 @@ from . import mcp
 
 FILENAME = "events.jsonl"
 
-# 5 MB live, plus one rolled generation, so the ceiling is ~10 MB per brain.
-DEFAULT_MAX_BYTES = 5_000_000
+# 25 MB live, plus one rolled generation, so the ceiling is ~50 MB per brain. Sized
+# to keep weeks of troubleshooting history; still bounded.
+DEFAULT_MAX_BYTES = 25_000_000
 
 # Every event this server can record. An unknown name raises: the vocabulary IS
 # the redaction control, so it fails loudly in a test rather than quietly

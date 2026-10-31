@@ -945,6 +945,191 @@ class RateLimitTests(RemoteTestCase):
         self.assertFalse(body["result"]["isError"])
 
 
+class RateLimitEventNamesClientTests(RemoteTestCase):
+    LIMITS = {"read": (1, 60.0), "capture": (1, 60.0), "protocol": (100, 60.0)}
+
+    def limited_events(self):
+        path = self.brain.state_dir / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        return [e for e in events if e["event"] == "rate_limited"]
+
+    def search(self, meta=None):
+        params = {"name": "brain_search", "arguments": {"query": "connector"}}
+        if meta:
+            params["_meta"] = meta
+        return self.brain.rpc("tools/call", params)[0]
+
+    def test_a_client_that_identified_itself_is_named(self):
+        self.assertEqual(self.search(), 200)
+        self.assertEqual(self.search({httpmcp.META_CLIENT_INFO:
+                                      {"name": "harbor-relay", "version": "2"}}), 429)
+        (event,) = self.limited_events()
+        self.assertEqual(event["client"], "harbor-relay")
+        self.assertEqual(event["client_version"], "2")
+
+    def test_a_client_that_did_not_is_not_invented(self):
+        self.assertEqual(self.search(), 200)
+        self.assertEqual(self.search(), 429)
+        (event,) = self.limited_events()
+        self.assertNotIn("client", event)
+        self.assertNotIn("client_version", event)
+
+
+class RateLimitedProtocolEventNamesClientTests(RemoteTestCase):
+    LIMITS = {"read": (1, 60.0), "capture": (1, 60.0), "protocol": (1, 60.0)}
+
+    def limited_events(self):
+        path = self.brain.state_dir / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        return [e for e in events if e["event"] == "rate_limited"]
+
+    def test_an_over_budget_initialize_names_the_client(self):
+        params = {"protocolVersion": "2025-11-25", "capabilities": {},
+                  "clientInfo": {"name": "harbor-relay", "version": "3"}}
+        self.assertEqual(self.brain.rpc("initialize", params)[0], 200)
+        self.assertEqual(self.brain.rpc("initialize", params)[0], 429)
+        (event,) = self.limited_events()
+        self.assertEqual(event["client"], "harbor-relay")
+        self.assertEqual(event["client_version"], "3")
+
+    def test_an_over_budget_modern_tools_list_names_the_client(self):
+        def modern_list():
+            meta = {httpmcp.META_VERSION: "2026-07-28", httpmcp.META_CLIENT_CAPS: {},
+                    httpmcp.META_CLIENT_INFO: {"name": "harbor-relay", "version": "4"}}
+            return self.brain.post(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}},
+                assertion=sign_assertion(owner_claims()),
+                headers={"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"})[0]
+        self.assertEqual(modern_list(), 200)
+        self.assertEqual(modern_list(), 429)
+        (event,) = self.limited_events()
+        self.assertEqual(event["client"], "harbor-relay")
+        self.assertEqual(event["client_version"], "4")
+
+
+class RateLimitDefaultsTests(unittest.TestCase):
+    def test_the_default_limits_are_pinned(self):
+        self.assertEqual(httpmcp.RATE_LIMITS, {"read": (1200, 60.0), "capture": (10, 60.0),
+                                               "protocol": (600, 60.0)})
+
+    def test_the_burst_limits_are_pinned(self):
+        self.assertEqual(httpmcp.BURST_LIMITS, {"read": (20, 1.0)})
+
+
+class ReadBurstTests(unittest.TestCase):
+    """The per-second bound on reads, with an injected clock: no test sleeps."""
+
+    def setUp(self):
+        self.now = [1000.0]
+        self.limiter = httpmcp.Limiter(clock=lambda: self.now[0])
+
+    def take(self, bucket="read", principal="p"):
+        return self.limiter.take(principal, bucket)
+
+    def test_twenty_reads_in_one_second_pass_and_the_next_is_refused(self):
+        for _ in range(20):
+            self.assertEqual(self.take(), (True, 0))
+        allowed, retry = self.take()
+        self.assertFalse(allowed)
+        self.assertGreaterEqual(retry, 1)
+
+    def test_a_refused_read_records_no_hit(self):
+        for _ in range(20):
+            self.take()
+        for _ in range(5):
+            self.assertFalse(self.take()[0])
+        self.now[0] += 1.0
+        for _ in range(20):
+            self.assertTrue(self.take()[0])
+
+    def test_the_burst_is_per_principal(self):
+        for _ in range(20):
+            self.take()
+        self.assertFalse(self.take()[0])
+        self.assertTrue(self.take(principal="other")[0])
+
+    def test_twenty_a_second_for_a_minute_passes_and_then_the_minute_is_full(self):
+        start = self.now[0]
+        for second in range(60):
+            self.now[0] = start + second
+            for _ in range(20):
+                self.assertTrue(self.take()[0])
+        self.now[0] = start + 59.5
+        allowed, retry = self.take()
+        self.assertFalse(allowed)
+        self.assertGreaterEqual(retry, 1)
+        # The oldest second leaves both windows together.
+        self.now[0] = start + 60
+        self.assertTrue(self.take()[0])
+
+    def test_captures_and_protocol_have_no_burst_bound(self):
+        limiter = httpmcp.Limiter({"read": (1200, 60.0), "capture": (100, 60.0),
+                                   "protocol": (100, 60.0)}, clock=lambda: self.now[0])
+        for bucket in ("capture", "protocol"):
+            for _ in range(100):
+                self.assertTrue(limiter.take("p", bucket)[0])
+            self.assertFalse(limiter.take("p", bucket)[0])
+
+    def test_a_limiter_can_be_built_without_a_burst_bound(self):
+        limiter = httpmcp.Limiter(burst={}, clock=lambda: self.now[0])
+        for _ in range(100):
+            self.assertTrue(limiter.take("p", "read")[0])
+
+
+class EventLogHistoryDefaultsTests(unittest.TestCase):
+    def test_the_server_logs_keep_a_troubleshooting_history(self):
+        self.assertEqual(httplog.RUNTIME_RETENTION_DAYS, 180)
+        self.assertEqual(httplog.AUDIT_RETENTION_DAYS, 180)
+        self.assertEqual(httplog.MAX_BYTES, 25_000_000)
+
+
+class EventLogPruneTests(unittest.TestCase):
+    """Retention reaches the rolled generation too, not only the live file."""
+
+    DAY = 86400
+
+    def setUp(self):
+        self.now = [1_000_000.0]
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = httplog.EventLog(self.tmp.name, clock=lambda: self.now[0], max_bytes=300)
+        self.dir = Path(self.tmp.name)
+
+    def lines(self, name):
+        return (self.dir / name).read_text(encoding="utf-8").splitlines()
+
+    def test_no_line_older_than_the_cutoff_survives_in_either_generation(self):
+        for stamp in (0, 1, 2, 3, 4, 5, 6, 7):
+            self.now[0] = 1_000_000.0 + stamp * 3600
+            self.log.record("request", method="ping", outcome="ok")
+            self.log.record("capture_accepted", outcome="ok")
+        self.assertTrue((self.dir / "events.jsonl.1").exists())
+        self.assertTrue((self.dir / "mutations.jsonl.1").exists())
+        # A later "now" that puts the first four hours past retention and the rest inside it.
+        later = 1_000_000.0 + 3.5 * 3600 + httplog.RUNTIME_RETENTION_DAYS * self.DAY
+        cutoff = httplog._iso(later - httplog.RUNTIME_RETENTION_DAYS * self.DAY)
+        streams = (("events.jsonl", "events.jsonl.1"), ("mutations.jsonl", "mutations.jsonl.1"))
+        for live, rolled in streams:
+            self.assertTrue(any(json.loads(line)["ts"] < cutoff for line in self.lines(rolled)),
+                            "the rolled file starts with an old line: " + rolled)
+        dropped = self.log.prune(now=later)
+        for live, rolled in streams:
+            kept = []
+            for name in (live, rolled):
+                kept += [json.loads(line)["ts"] for line in self.lines(name)]
+            self.assertTrue(kept, live)
+            self.assertTrue(all(ts >= cutoff for ts in kept), live)
+            self.assertGreater(dropped[rolled], 0, rolled)
+        self.assertEqual(set(dropped), {"events.jsonl", "events.jsonl.1",
+                                        "mutations.jsonl", "mutations.jsonl.1"})
+
+    def test_a_line_that_cannot_be_parsed_is_kept_in_the_rolled_file_too(self):
+        (self.dir / "events.jsonl.1").write_text(
+            'not json\n{"ts":"1970-01-01T00:00:00Z","event":"request"}\n', encoding="utf-8")
+        self.log.prune(now=httplog.RUNTIME_RETENTION_DAYS * self.DAY + 1_000_000.0)
+        self.assertEqual(self.lines("events.jsonl.1"), ["not json"])
+
+
 class OneResponsePerRequestTests(RemoteTestCase):
     """Audit A5: a rate-limited initialize sent a 429 AND a 200 on one connection, which
     corrupts HTTP framing for every request after it on that keep-alive connection."""

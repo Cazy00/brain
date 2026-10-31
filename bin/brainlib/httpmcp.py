@@ -96,11 +96,21 @@ MAX_BODY_BYTES = 1024 * 1024              # the spec's 1 MiB cap
 READ_TIMEOUT_SECONDS = 30.0
 CAPTURE_TIMEOUT_SECONDS = 120.0
 
-# Per verified principal, per minute. Protocol chatter — initialize, ping,
-# tools/list, server/discover — is deliberately counted in its own generous
-# bucket so that a client reconnecting after a token refresh cannot consume the
-# budget a capture needs.
-RATE_LIMITS = {"read": (120, 60.0), "capture": (10, 60.0), "protocol": (600, 60.0)}
+# Per verified principal, per minute. Reads get a large budget because several
+# clients may share one credential and so one budget: a burst from one (an
+# evaluation run sends dozens of recalls within seconds) must not refuse
+# another's ordinary search. What that bounds, per principal, is at most 20
+# reads in any second and 1200 in any minute (BURST_LIMITS below); a runaway
+# loop is held to that rate, not stopped. Captures stay tight because they
+# write. Protocol chatter — initialize, ping, tools/list, server/discover — is
+# counted in its own bucket so that a client reconnecting after a token refresh
+# cannot use up the budget reads and captures need.
+RATE_LIMITS = {"read": (1200, 60.0), "capture": (10, 60.0), "protocol": (600, 60.0)}
+
+# A short-window bound checked beside the minute window, so a bucket's whole
+# minute of budget cannot be spent in one second. 20 a second times 60 is the
+# 1200 a minute above, so the two agree. A bucket with no entry has no bound.
+BURST_LIMITS = {"read": (20, 1.0)}
 
 PROTOCOL_METHODS = frozenset(("initialize", "notifications/initialized", "ping",
                               "tools/list", "server/discover"))
@@ -123,8 +133,9 @@ class Limiter(object):
     one client throttle every other. There is nothing to key on but identity,
     and identity is exactly what the assertion already established."""
 
-    def __init__(self, limits=None, clock=time.time):
+    def __init__(self, limits=None, clock=time.time, burst=None):
         self._limits = dict(limits or RATE_LIMITS)
+        self._burst = dict(BURST_LIMITS if burst is None else burst)
         self._clock = clock
         self._buckets = {}
         self._lock = threading.Lock()
@@ -145,6 +156,12 @@ class Limiter(object):
             if len(hits) >= capacity:
                 self._buckets[key] = hits
                 return False, max(1, int(window - (now - hits[0])) + 1)
+            if bucket in self._burst:
+                burst_capacity, burst_window = self._burst[bucket]
+                recent = [t for t in hits if t > now - burst_window]
+                if len(recent) >= burst_capacity:
+                    self._buckets[key] = hits
+                    return False, max(1, int(burst_window - (now - recent[0])) + 1)
             hits.append(now)
             self._buckets[key] = hits
         return True, 0
@@ -468,7 +485,8 @@ class Handler(BaseHTTPRequestHandler):
             # not support the requested version responds with one it does
             # support, and lets the client decide whether it can live with it.
             agreed = asked if asked in LEGACY_VERSIONS else PREFERRED_LEGACY
-            if not self._allow_or_refuse(principal, "protocol", cid):
+            if not self._allow_or_refuse(principal, "protocol", cid,
+                                         client_name, client_version):
                 return None  # the 429 is already sent: one response per request (audit A5)
             self.service.record("request", cid=cid, method="initialize",
                                 principal=principal.stable_id, profile=principal.profile,
@@ -496,7 +514,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "tools/list":
             allowed, retry = self.service.limiter.take(principal.stable_id, "protocol")
             if not allowed:
-                return self._rate_limited(cid, principal, retry)
+                return self._rate_limited(cid, principal, retry, client=client_name,
+                                          client_version=client_version)
             return self._send(200, _result(msg_id, {
                 "tools": mcpcore.tools_for(principal.profile, "remote")}), cid=cid)
 
@@ -577,7 +596,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "tools/list":
             allowed, retry = self.service.limiter.take(principal.stable_id, "protocol")
             if not allowed:
-                return self._rate_limited(cid, principal, retry)
+                return self._rate_limited(cid, principal, retry, client=client_name,
+                                          client_version=client_version)
             return self._send(200, _modern_result(msg_id, {
                 "tools": mcpcore.tools_for(principal.profile, "remote"),
                 "ttlMs": TOOLS_TTL_MS,
@@ -635,7 +655,8 @@ class Handler(BaseHTTPRequestHandler):
         allowed, retry = self.service.limiter.take(
             principal.stable_id, "capture" if writes else "read")
         if not allowed:
-            return self._rate_limited(cid, principal, retry, tool=str(name)[:64])
+            return self._rate_limited(cid, principal, retry, tool=str(name)[:64],
+                                      client=client_name, client_version=client_version)
 
         reason = self.service.write_block() if writes else None
         if reason:
@@ -722,16 +743,21 @@ class Handler(BaseHTTPRequestHandler):
         return {"content": [{"type": "text", "text": capturelib.format_result(outcome)}],
                 "isError": not outcome.get("ok", False)}
 
-    def _rate_limited(self, cid, principal, retry, tool=None) -> None:
+    def _rate_limited(self, cid, principal, retry, tool=None, client=None,
+                      client_version=None) -> None:
+        # The client is whatever the request named itself (None when it did not, and
+        # a None field is not written), the same values a tool_call records.
         self._refuse(429, cid, "rate limit exceeded; retry in %ds" % retry,
                      "rate_limited", principal=principal.stable_id,
                      profile=principal.profile, tool=tool, retry_after=retry,
+                     client=client, client_version=client_version,
                      headers={"Retry-After": str(retry)})
 
-    def _allow_or_refuse(self, principal, bucket, cid):
+    def _allow_or_refuse(self, principal, bucket, cid, client=None, client_version=None):
         allowed, retry = self.service.limiter.take(principal.stable_id, bucket)
         if not allowed:
-            self._rate_limited(cid, principal, retry)
+            self._rate_limited(cid, principal, retry, client=client,
+                               client_version=client_version)
         return allowed
 
 

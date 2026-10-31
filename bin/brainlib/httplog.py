@@ -28,14 +28,15 @@ of forgetting is a `ValueError` in a test rather than the owner's notes on a
 disk somewhere. The cost is real and worth paying: adding a field means editing
 this module, whose only job is to think about exactly this question.
 
-Three more properties, each from the spec:
+Three more properties:
 
 - **It never reaches git.** Not by `.gitignore` — by living under the state
   directory, outside the knowledge repository entirely. A rule enforced by
   geography does not depend on anyone maintaining a pattern file.
-- **It is bounded and it expires.** Runtime events keep 30 days, mutation audit
-  metadata 180. Both are size-capped as well, because a retention window is not
-  a size limit and a disk fills on whichever comes first.
+- **It is bounded and it expires.** Runtime events and mutation audit metadata
+  both keep 180 days, a troubleshooting history. Both are size-capped as well,
+  because a retention window is not a size limit and a disk fills on whichever
+  comes first.
 - **Failures to write are swallowed.** A log that can take the server down is a
   worse problem than a log with a gap in it.
 """
@@ -50,11 +51,11 @@ from pathlib import Path
 RUNTIME_FILE = "events.jsonl"
 AUDIT_FILE = "mutations.jsonl"
 
-RUNTIME_RETENTION_DAYS = 30
+RUNTIME_RETENTION_DAYS = 180
 AUDIT_RETENTION_DAYS = 180
 
-# 5 MB live plus one rolled generation, so the ceiling is ~10 MB per stream.
-MAX_BYTES = 5_000_000
+# 25 MB live plus one rolled generation, so the ceiling is ~50 MB per stream.
+MAX_BYTES = 25_000_000
 
 # Every event this server can record. An unknown name raises: the vocabulary IS
 # the redaction control, so it must fail loudly in a test rather than quietly
@@ -169,6 +170,10 @@ class EventLog(object):
     def prune(self, now=None) -> dict:
         """Drop events older than each stream's retention window.
 
+        Covers the live file and its rolled `.1` generation, which holds lines
+        the live file no longer does. Returns the count dropped per file name,
+        `.1` included, for each file that exists.
+
         Rewrites rather than truncates, because these are append-only streams
         with no index — and rewrites through a temporary file so an interrupted
         prune cannot leave a half-written log."""
@@ -177,31 +182,42 @@ class EventLog(object):
         for filename, days in ((RUNTIME_FILE, RUNTIME_RETENTION_DAYS),
                                (AUDIT_FILE, AUDIT_RETENTION_DAYS)):
             cutoff = _iso(now - days * 86400)
-            path = self.dir / filename
-            if not path.exists():
-                continue
-            kept, removed = [], 0
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    for line in handle:
-                        stamp = line[8:8 + 20] if line.startswith('{"ts":"') else ""
-                        # Lexicographic comparison is valid because the stamp is
-                        # ISO-8601 UTC with a fixed width. A line we cannot read
-                        # is KEPT: silently deleting what we failed to parse is
-                        # how an audit trail quietly loses its worst day.
-                        if stamp and stamp < cutoff:
-                            removed += 1
-                        else:
-                            kept.append(line)
-                if removed:
-                    tmp = path.with_name(path.name + ".prune")
-                    with open(tmp, "w", encoding="utf-8") as handle:
-                        handle.writelines(kept)
-                    os.replace(str(tmp), str(path))
-            except Exception:
-                continue
-            dropped[filename] = removed
+            for name in (filename, filename + ".1"):
+                path = self.dir / name
+                if not path.exists():
+                    continue
+                kept, removed = [], 0
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        for line in handle:
+                            stamp = _stamp(line)
+                            # Lexicographic comparison is valid because the stamp is
+                            # ISO-8601 UTC with a fixed width. A line we cannot read
+                            # is KEPT: silently deleting what we failed to parse is
+                            # how an audit trail quietly loses its worst day.
+                            if stamp and stamp < cutoff:
+                                removed += 1
+                            else:
+                                kept.append(line)
+                    if removed:
+                        tmp = path.with_name(path.name + ".prune")
+                        with open(tmp, "w", encoding="utf-8") as handle:
+                            handle.writelines(kept)
+                        os.replace(str(tmp), str(path))
+                except Exception:
+                    continue
+                dropped[name] = removed
         return dropped
+
+
+def _stamp(line: str) -> str:
+    """The line's `ts`, or "" when it has none. Lines are written with sorted
+    keys, so `ts` is not at the start and has to be read out of the JSON."""
+    try:
+        stamp = json.loads(line).get("ts")
+    except (ValueError, AttributeError):
+        return ""
+    return stamp if isinstance(stamp, str) and len(stamp) == 20 else ""
 
 
 def _checked(name: str, value):
