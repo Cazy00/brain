@@ -205,8 +205,8 @@ services:
 
     networks:
       # egress first and at the higher priority so the default route is taken
-      # from it. The mcp network is `internal: true` and therefore has no
-      # gateway to offer, but stating the priority makes the outcome a
+      # from it. The mcp network is `internal: true` and therefore offers no
+      # default route, but stating the priority makes the outcome a
       # decision rather than a consequence of Docker's connection ordering.
       egress:
         priority: 100
@@ -215,8 +215,8 @@ services:
         # Static, and paired with cloudflared's extra_hosts below. See the
         # networks section for why the request path has to be pinned.
         ipv4_address: 10.77.0.10
-      # Where the embedder is. Lowest priority: it has no gateway, so it never
-      # decides the default route.
+      # Where the embedder is. Lowest priority: it is internal and offers no
+      # default route, so it never decides it.
       embed:
         priority: 5
 
@@ -542,17 +542,29 @@ services:
 #                          backup object storage, consolidator provider.
 #                inbound:  nothing. It is not on `mcp` at all.
 #
-#   embedder     outbound: nothing. It is on `embed` alone, which has no gateway.
+#   embedder     outbound: nothing. It is on `embed` alone, which is internal: no
+#                          route off the segment, and (gateway mode `isolated`)
+#                          no host address on it either.
 #                inbound:  brain and maintenance, over `embed`, port 8080. Note
 #                          text travels that segment and no other.
 #
 # WHY TWO NETWORKS RATHER THAN ONE BRIDGE. `mcp` is `internal: true`, which
-# means Docker creates it with no gateway and gives the host no address on it.
-# The MCP request path therefore runs entirely on a segment that has no route
-# on or off it, and it stays that way for free: nothing about a future change
-# to firewall rules, published ports or host routing can expose it, because
-# there is nothing to route to. `egress` exists only because both long-running
-# services must ORIGINATE connections, and it carries no service traffic.
+# stops Docker routing traffic on or off the segment. `internal` alone does NOT
+# take the host off it: "An address is normally assigned to the bridge device in
+# an `internal` network", and a container there can reach any host service
+# listening on that address. So `mcp` and `embed` also set gateway mode
+# `isolated` (Docker Engine 28.0.0 or later, and valid only on an internal
+# network): "No address is assigned to the bridge", so the host has no address
+# on the segment and nothing on it can reach the host. Both facts are from
+# https://docs.docker.com/engine/network/port-publishing/ . The MCP request
+# path therefore runs entirely on a segment that has no route on or off it, and
+# it stays that way for free: nothing about a future change to firewall rules,
+# published ports or host routing can expose it, because there is nothing to
+# route to. `egress` exists only because both long-running services must
+# ORIGINATE connections, and it carries no service traffic.
+#
+# Changing a network's options on an existing deployment is handled by the
+# upgrade procedure in setup/runbooks/remote-brain.md, section 2.
 #
 # WHY THE STATIC IP AND extra_hosts. brain and cloudflared are both on both
 # networks, and Docker's embedded DNS answers a service name with one address
@@ -569,6 +581,10 @@ services:
 networks:
   mcp:
     internal: true
+    driver: bridge
+    driver_opts:
+      # Needs Docker Engine 28.0.0 or later, the release that added this mode.
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
     ipam:
       config:
         # Chosen outside Docker's default 172.17.0.0/16 address pool and away
@@ -578,11 +594,15 @@ networks:
         - subnet: 10.77.0.0/24
 
   embed:
-    # The same construction as `mcp`: no gateway, no host address, so the one
-    # service on it that speaks HTTP to brain and maintenance cannot be reached
-    # from outside or reach out. Only `embedder`, `brain` and `maintenance` join
-    # it. Subnet pinned for the reason the other two are, adjacent to them.
+    # The same construction as `mcp`: internal and gateway mode `isolated`, so the
+    # host has no address on it and the one service on it that speaks HTTP to
+    # brain and maintenance cannot be reached from outside, cannot reach the host
+    # and cannot reach out. Only `embedder`, `brain` and `maintenance` join it.
+    # Subnet pinned for the reason the other two are, adjacent to them.
     internal: true
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
     ipam:
       config:
         - subnet: 10.77.2.0/24
