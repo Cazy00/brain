@@ -238,6 +238,12 @@ CPUs. The model file is fetched by the host into `BRAIN_HOST_MODELS` and mounted
 read-only. `BRAIN_VECTORS` in `deploy/.env` defaults to `shadow` there. `brain` does not
 wait for the embedder: with it down, everything works and `recall` answers keyword-only.
 
+**0.6.1.** The internal `mcp` and `embed` networks now also use bridge gateway mode `isolated`,
+so the host has no address on either, and a container attached only to them (the embedder)
+cannot reach host services through them (an `internal` network alone leaves that address).
+`brain` and `cloudflared` are also on the `egress` network and reach the host through that.
+Needs Docker Engine 28.0.0 or later; upgrade step in `SETUP.md` ("Docker requirement (0.6.1)").
+
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
 weights), brute force in pure Python. The two are fused by reciprocal rank,

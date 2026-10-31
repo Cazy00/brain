@@ -2027,6 +2027,63 @@ class DeploymentUnitTests(unittest.TestCase):
 
 
 
+def _compose_networks(path: Path):
+    """The top-level networks of compose.yaml as {name: {key: value}}, flattened.
+
+    Same section-aware line scan as `_compose_services`. Each network's keys are
+    its own (`internal`) and those one level down (`driver_opts`' entries), which
+    is all these tests need."""
+    networks, current, in_section = {}, None, False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line[:1].isalpha():
+            in_section = line.rstrip() == "networks:"
+            continue
+        stripped = line.strip()
+        if not in_section or not stripped or stripped.startswith("#"):
+            continue
+        if line.startswith("  ") and not line.startswith("   "):
+            current = networks.setdefault(stripped.rstrip(":"), {})
+        elif current is not None and ":" in stripped:
+            key, _, value = stripped.partition(":")
+            current[key.strip()] = value.strip()
+    return networks
+
+
+class ComposeNetworkIsolationTests(unittest.TestCase):
+    """Prevents: an internal network that still gives the host an address.
+
+    `internal: true` stops routing off the segment, but Docker still puts an
+    address on the bridge, and a container can reach any host service listening
+    there. Gateway mode `isolated` is what removes it. Losing that line from a
+    network, or adding an internal network without it, is silent."""
+
+    GATEWAY_MODE = "com.docker.network.bridge.gateway_mode_ipv4"
+    GATEWAY_MODE_V6 = "com.docker.network.bridge.gateway_mode_ipv6"
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parent.parent
+        cls.networks = _compose_networks(root / "deploy" / "compose.yaml")
+
+    def test_the_scan_finds_the_networks_it_is_meant_to_check(self):
+        self.assertEqual(sorted(self.networks), ["egress", "embed", "mcp"])
+
+    def test_every_internal_network_is_isolated_from_the_host(self):
+        internal = [n for n, v in self.networks.items() if v.get("internal") == "true"]
+        self.assertEqual(sorted(internal), ["embed", "mcp"])
+        for name in internal:
+            for option in (self.GATEWAY_MODE, self.GATEWAY_MODE_V6):
+                self.assertEqual(self.networks[name].get(option), "isolated",
+                                 "internal network %r leaves the host an address on its "
+                                 "bridge: set %s: isolated" % (name, option))
+
+    def test_egress_is_not_internal(self):
+        """It is the only way out; making it internal would cut git, backups and the tunnel."""
+        self.assertNotEqual(self.networks["egress"].get("internal"), "true")
+        self.assertNotIn(self.GATEWAY_MODE, self.networks["egress"])
+        self.assertNotIn(self.GATEWAY_MODE_V6, self.networks["egress"])
+
+
 class EmbedderDeploymentTests(unittest.TestCase):
     """Prevents: search by meaning that is wired in one place and not another.
 

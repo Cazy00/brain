@@ -136,6 +136,13 @@ Pin what you installed into the deployment log. Versions verified on arm64
 noble on 2026-08-23: `docker-ce 5:29.7.2-1~ubuntu.24.04~noble`,
 `containerd.io 2.3.3`, `docker-compose-plugin 5.5.0`.
 
+**Docker Engine 28.0.0 or later is required from brain 0.6.1.** `deploy/compose.yaml`
+sets gateway mode `isolated` on the two internal networks, so the host has no address
+on them; Docker's release notes list that mode under 28.0.0
+(https://docs.docker.com/engine/release-notes/28/#2800). Check with
+`docker version --format '{{.Server.Version}}'`. Compose 2.31.0 or later is needed for
+the upgrade below to recreate a changed network by itself (see step 5 of the upgrade).
+
 Add the Docker origin to unattended-upgrades — its `Release` file has
 `Origin: Docker`, `Label: Docker CE`, `Suite: noble` and **no Codename**, so
 match on `o=` / `l=` / `a=`, never on `n=`:
@@ -567,16 +574,49 @@ fi
 [ "$(sudo stat -c %s "$MODELS/$FILE")" = "$(pin MODEL_BYTES)" ] \
   && echo "$(pin MODEL_SHA256)  $MODELS/$FILE" | sudo sha256sum -c -
 sudo docker compose -p brain pull embedder
-#    Step 6 builds the vectors once by hand, so the first run is not left to the
+#    Step 7 builds the vectors once by hand, so the first run is not left to the
 #    sync timer.
 
-# 5. Preflight against the real data, without serving traffic.
+# 5. Moving from 0.6.0 to 0.6.1 only (skip it on any other upgrade): the `mcp` and
+#    `embed` networks changed (gateway mode `isolated`: the host no longer has an
+#    address on them), and they already exist. Do it NOW, before anything below
+#    runs a `docker compose` command: Docker Compose 2.31.0 and later stores a
+#    hash of each network's definition on the network when it creates it, and any
+#    compose command that finds a changed hash stops the containers on that
+#    network, disconnects them, removes the network, creates it again from the
+#    file and reconnects them. It does not prompt, so it works without a TTY.
+#    Recreating the networks therefore briefly restarts brain and the embedder
+#    (and cloudflared, which is on `mcp`); it is better to have that happen at a
+#    step you chose than inside the preflight. A network created without the
+#    label (by an older Compose) is reused as it is, so verify instead of assuming.
+sudo docker compose -p brain up -d
+#    Verify the effect, not the configuration. The bridge must have no IPv4
+#    address. This check is the proof; `docker network inspect ... --format
+#    '{{.Options}}'` only echoes the option that was requested, and shows it even
+#    on a network that was never recreated, so treat that as a hint at most.
+for n in mcp embed; do
+  ID=$(sudo docker network inspect "brain_$n" --format '{{.Id}}')
+  echo "== brain_$n (br-${ID:0:12})"
+  ip -4 addr show "br-${ID:0:12}"       # expect NO inet line for either network
+done
+#    If either bridge still shows an inet line, the network was not recreated.
+#    Recreate it once by hand (this stops the whole stack for as long as it takes
+#    to start again; no data is touched, the data and state are bind mounts),
+#    then run the loop above again:
+#
+#      sudo docker compose -p brain down
+#      sudo docker compose -p brain up -d
+#
+#    A fresh install gets this from its first `up -d`.
+
+# 6. Preflight against the real data. (On a 0.6.0 to 0.6.1 upgrade, step 5 has
+#    already started the stack, so brain is serving again by now.)
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
      maintenance lint
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
      maintenance doctor
 
-# 6. Restart, and prove it. There is no host port -- that is the design -- so
+# 7. Restart, and prove it. There is no host port -- that is the design -- so
 #    the probe goes to the container's address on the egress bridge, which is
 #    the same path the host-side monitoring uses.
 sudo docker compose -p brain up -d
@@ -587,7 +627,7 @@ curl -fsS "http://$EG:8787/readyz"
 sudo docker compose -p brain logs --since 5m brain
 ```
 
-**7. Release evidence, before anyone is told it shipped.** A handback owes an
+**8. Release evidence, before anyone is told it shipped.** A handback owes an
 image identity, a bill of materials and a vulnerability scan, and all three are
 about the image that is now running rather than the one that was intended.
 
@@ -1108,7 +1148,7 @@ so this is a host firewall job — `compose.yaml` says so and points here.
 | container → internet | `FORWARD` → `DOCKER-USER` | yes |
 | host → internet (`docker pull`, `apt`, the host connector) | `OUTPUT` | **no** — a different chain, deliberately out of scope |
 | internet → SSH | `INPUT` | no — **nothing here can lock you out** |
-| brain ↔ cloudflared, the MCP path itself | never leaves `brain_mcp` | nothing to do: the network is `internal: true` and has no gateway |
+| brain ↔ cloudflared, the MCP path itself | never leaves `brain_mcp` | nothing to do: the network is `internal: true`, the host has no address on it (gateway mode `isolated`) |
 
 Row three is why this is safe to attempt at all. A mistake breaks the tunnel —
 visible within seconds, one command to undo — and cannot cost you the way in.
