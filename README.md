@@ -244,6 +244,10 @@ cannot reach host services through them (an `internal` network alone leaves that
 `brain` and `cloudflared` are also on the `egress` network and reach the host through that.
 Needs Docker Engine 28.0.0 or later; upgrade step in `SETUP.md` ("Docker requirement (0.6.1)").
 
+**0.6.2.** The per-principal read limit is now 1200 a minute, up from 120, so several clients
+sharing one credential no longer starve each other's searches; the capture limit is unchanged
+at 10 a minute. No data, network or configuration change; upgrading is an ordinary image rebuild.
+
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
 weights), brute force in pure Python. The two are fused by reciprocal rank,
