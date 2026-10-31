@@ -466,10 +466,19 @@ warns and exits 0 when the mode is off or the embedder is down. Details:
 list under 28.0.0) and Docker Compose 2.31.0 or later. An internal network alone leaves
 the host an address on its bridge, reachable from the containers; `isolated` removes it
 (<https://docs.docker.com/engine/network/port-publishing/>). Upgrading a running 0.6.0
-stack: `setup/runbooks/remote-brain.md`, section 2, step 5b. In short, `docker compose up -d`
-recreates the two networks by itself, with a brief outage, and `docker network inspect
-brain_embed` should then show `gateway_mode_ipv4:isolated`; if it does not, run
-`docker compose down` then `up -d` once.
+stack: `setup/runbooks/remote-brain.md`, section 2, step 5. In short, `docker compose -p brain up -d`
+recreates the two networks by itself, which briefly restarts brain and the embedder.
+Verify the effect on both networks; this check is the proof, and `docker network inspect`'s
+`.Options` only shows the option that was requested:
+
+```sh
+for n in mcp embed; do
+  ID=$(docker network inspect "brain_$n" --format '{{.Id}}')
+  ip -4 addr show "br-${ID:0:12}"     # expect no inet line
+done
+```
+
+If either bridge still has an inet line, run `docker compose -p brain down` then `up -d` once.
 
 ### Backup alarm (re-enabling the CI pulse)
 
