@@ -461,6 +461,16 @@ thing off; `on` makes hybrid `recall`'s default and follows the calibration chec
 warns and exits 0 when the mode is off or the embedder is down. Details:
 `deploy/systemd/README.md` and "Search by meaning" in `README.md`.
 
+**Docker requirement (0.6.1).** The `deploy/` stack needs Docker Engine 28.0.0 or later
+(its internal networks use bridge gateway mode `isolated`, which Docker's release notes
+list under 28.0.0) and Docker Compose 2.31.0 or later. An internal network alone leaves
+the host an address on its bridge, reachable from the containers; `isolated` removes it
+(<https://docs.docker.com/engine/network/port-publishing/>). Upgrading a running 0.6.0
+stack: `setup/runbooks/remote-brain.md`, section 2, step 5b. In short, `docker compose up -d`
+recreates the two networks by itself, with a brief outage, and `docker network inspect
+brain_embed` should then show `gateway_mode_ipv4:isolated`; if it does not, run
+`docker compose down` then `up -d` once.
+
 ### Backup alarm (re-enabling the CI pulse)
 
 If you installed from the public template, its CI (`.github/workflows/gate.yml`)

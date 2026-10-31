@@ -136,6 +136,13 @@ Pin what you installed into the deployment log. Versions verified on arm64
 noble on 2026-08-23: `docker-ce 5:29.7.2-1~ubuntu.24.04~noble`,
 `containerd.io 2.3.3`, `docker-compose-plugin 5.5.0`.
 
+**Docker Engine 28.0.0 or later is required from brain 0.6.1.** `deploy/compose.yaml`
+sets gateway mode `isolated` on the two internal networks, so the host has no address
+on them; Docker's release notes list that mode under 28.0.0
+(https://docs.docker.com/engine/release-notes/28/#2800). Check with
+`docker version --format '{{.Server.Version}}'`. Compose 2.31.0 or later is needed for
+the upgrade below to recreate a changed network by itself (see the 0.6.0 to 0.6.1 step).
+
 Add the Docker origin to unattended-upgrades — its `Release` file has
 `Origin: Docker`, `Label: Docker CE`, `Suite: noble` and **no Codename**, so
 match on `o=` / `l=` / `a=`, never on `n=`:
@@ -575,6 +582,34 @@ sudo docker compose -p brain --profile maintenance run --rm --no-deps \
      maintenance lint
 sudo docker compose -p brain --profile maintenance run --rm --no-deps \
      maintenance doctor
+
+# 5b. Moving from 0.6.0 to 0.6.1 only: the `mcp` and `embed` networks changed
+#     (gateway mode `isolated`: the host no longer has an address on them), and
+#     they already exist. Docker Compose 2.31.0 and later stores a hash of each
+#     network's definition on it when it creates it; on `up -d` a changed hash
+#     stops the containers on that network, disconnects them, removes the network,
+#     creates it again from the file and reconnects them. It does not prompt, so
+#     it works without a TTY. Cost: a brief outage while they stop and reconnect.
+#     A network created without the label (by an older Compose) is reused as it
+#     is, so verify instead of assuming, after step 6's `up -d`:
+#
+#       for n in mcp embed; do
+#         sudo docker network inspect "brain_$n" --format '{{.Name}} {{.Options}}'
+#       done
+#       # expect com.docker.network.bridge.gateway_mode_ipv4:isolated on both, and
+#       # no inet line for the bridge (br- + the first 12 characters of the id):
+#       ID=$(sudo docker network inspect brain_embed --format '{{.Id}}')
+#       ip -4 addr show "br-${ID:0:12}"
+#
+#     If either network still lacks the option, recreate once by hand (this stops
+#     the whole stack for as long as it takes to start again; no data is touched,
+#     the data and state are bind mounts):
+#
+#       sudo docker compose -p brain down
+#       sudo docker compose -p brain up -d
+#
+#     `docker network inspect brain_embed` then shows the option and the bridge
+#     has no host address. A fresh install gets this from its first `up -d`.
 
 # 6. Restart, and prove it. There is no host port -- that is the design -- so
 #    the probe goes to the container's address on the egress bridge, which is
