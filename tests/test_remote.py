@@ -945,6 +945,12 @@ class RateLimitTests(RemoteTestCase):
         self.assertFalse(body["result"]["isError"])
 
 
+class RateLimitDefaultsTests(unittest.TestCase):
+    def test_the_default_limits_are_pinned(self):
+        self.assertEqual(httpmcp.RATE_LIMITS, {"read": (1200, 60.0), "capture": (10, 60.0),
+                                               "protocol": (600, 60.0)})
+
+
 class OneResponsePerRequestTests(RemoteTestCase):
     """Audit A5: a rate-limited initialize sent a 429 AND a 200 on one connection, which
     corrupts HTTP framing for every request after it on that keep-alive connection."""

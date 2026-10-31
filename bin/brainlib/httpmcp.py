@@ -96,11 +96,14 @@ MAX_BODY_BYTES = 1024 * 1024              # the spec's 1 MiB cap
 READ_TIMEOUT_SECONDS = 30.0
 CAPTURE_TIMEOUT_SECONDS = 120.0
 
-# Per verified principal, per minute. Protocol chatter — initialize, ping,
-# tools/list, server/discover — is deliberately counted in its own generous
-# bucket so that a client reconnecting after a token refresh cannot consume the
-# budget a capture needs.
-RATE_LIMITS = {"read": (120, 60.0), "capture": (10, 60.0), "protocol": (600, 60.0)}
+# Per verified principal, per minute. Reads are generous because several clients
+# may share one credential and so one budget: a burst from one (an evaluation
+# run sends dozens of recalls within seconds) must not refuse another's ordinary
+# search; 1200 a minute still stops a runaway loop. Captures stay tight because
+# they write. Protocol chatter — initialize, ping, tools/list, server/discover —
+# is deliberately counted in its own generous bucket so that a client
+# reconnecting after a token refresh cannot consume the budget a capture needs.
+RATE_LIMITS = {"read": (1200, 60.0), "capture": (10, 60.0), "protocol": (600, 60.0)}
 
 PROTOCOL_METHODS = frozenset(("initialize", "notifications/initialized", "ping",
                               "tools/list", "server/discover"))
