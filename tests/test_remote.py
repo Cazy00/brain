@@ -975,10 +975,105 @@ class RateLimitEventNamesClientTests(RemoteTestCase):
         self.assertNotIn("client_version", event)
 
 
+class RateLimitedProtocolEventNamesClientTests(RemoteTestCase):
+    LIMITS = {"read": (1, 60.0), "capture": (1, 60.0), "protocol": (1, 60.0)}
+
+    def limited_events(self):
+        path = self.brain.state_dir / "events.jsonl"
+        events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        return [e for e in events if e["event"] == "rate_limited"]
+
+    def test_an_over_budget_initialize_names_the_client(self):
+        params = {"protocolVersion": "2025-11-25", "capabilities": {},
+                  "clientInfo": {"name": "harbor-relay", "version": "3"}}
+        self.assertEqual(self.brain.rpc("initialize", params)[0], 200)
+        self.assertEqual(self.brain.rpc("initialize", params)[0], 429)
+        (event,) = self.limited_events()
+        self.assertEqual(event["client"], "harbor-relay")
+        self.assertEqual(event["client_version"], "3")
+
+    def test_an_over_budget_modern_tools_list_names_the_client(self):
+        def modern_list():
+            meta = {httpmcp.META_VERSION: "2026-07-28", httpmcp.META_CLIENT_CAPS: {},
+                    httpmcp.META_CLIENT_INFO: {"name": "harbor-relay", "version": "4"}}
+            return self.brain.post(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}},
+                assertion=sign_assertion(owner_claims()),
+                headers={"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/list"})[0]
+        self.assertEqual(modern_list(), 200)
+        self.assertEqual(modern_list(), 429)
+        (event,) = self.limited_events()
+        self.assertEqual(event["client"], "harbor-relay")
+        self.assertEqual(event["client_version"], "4")
+
+
 class RateLimitDefaultsTests(unittest.TestCase):
     def test_the_default_limits_are_pinned(self):
         self.assertEqual(httpmcp.RATE_LIMITS, {"read": (1200, 60.0), "capture": (10, 60.0),
                                                "protocol": (600, 60.0)})
+
+    def test_the_burst_limits_are_pinned(self):
+        self.assertEqual(httpmcp.BURST_LIMITS, {"read": (20, 1.0)})
+
+
+class ReadBurstTests(unittest.TestCase):
+    """The per-second bound on reads, with an injected clock: no test sleeps."""
+
+    def setUp(self):
+        self.now = [1000.0]
+        self.limiter = httpmcp.Limiter(clock=lambda: self.now[0])
+
+    def take(self, bucket="read", principal="p"):
+        return self.limiter.take(principal, bucket)
+
+    def test_twenty_reads_in_one_second_pass_and_the_next_is_refused(self):
+        for _ in range(20):
+            self.assertEqual(self.take(), (True, 0))
+        allowed, retry = self.take()
+        self.assertFalse(allowed)
+        self.assertGreaterEqual(retry, 1)
+
+    def test_a_refused_read_records_no_hit(self):
+        for _ in range(20):
+            self.take()
+        for _ in range(5):
+            self.assertFalse(self.take()[0])
+        self.now[0] += 1.0
+        for _ in range(20):
+            self.assertTrue(self.take()[0])
+
+    def test_the_burst_is_per_principal(self):
+        for _ in range(20):
+            self.take()
+        self.assertFalse(self.take()[0])
+        self.assertTrue(self.take(principal="other")[0])
+
+    def test_twenty_a_second_for_a_minute_passes_and_then_the_minute_is_full(self):
+        start = self.now[0]
+        for second in range(60):
+            self.now[0] = start + second
+            for _ in range(20):
+                self.assertTrue(self.take()[0])
+        self.now[0] = start + 59.5
+        allowed, retry = self.take()
+        self.assertFalse(allowed)
+        self.assertGreaterEqual(retry, 1)
+        # The oldest second leaves both windows together.
+        self.now[0] = start + 60
+        self.assertTrue(self.take()[0])
+
+    def test_captures_and_protocol_have_no_burst_bound(self):
+        limiter = httpmcp.Limiter({"read": (1200, 60.0), "capture": (100, 60.0),
+                                   "protocol": (100, 60.0)}, clock=lambda: self.now[0])
+        for bucket in ("capture", "protocol"):
+            for _ in range(100):
+                self.assertTrue(limiter.take("p", bucket)[0])
+            self.assertFalse(limiter.take("p", bucket)[0])
+
+    def test_a_limiter_can_be_built_without_a_burst_bound(self):
+        limiter = httpmcp.Limiter(burst={}, clock=lambda: self.now[0])
+        for _ in range(100):
+            self.assertTrue(limiter.take("p", "read")[0])
 
 
 class EventLogHistoryDefaultsTests(unittest.TestCase):

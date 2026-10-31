@@ -96,14 +96,21 @@ MAX_BODY_BYTES = 1024 * 1024              # the spec's 1 MiB cap
 READ_TIMEOUT_SECONDS = 30.0
 CAPTURE_TIMEOUT_SECONDS = 120.0
 
-# Per verified principal, per minute. Reads are generous because several clients
-# may share one credential and so one budget: a burst from one (an evaluation
-# run sends dozens of recalls within seconds) must not refuse another's ordinary
-# search; 1200 a minute still stops a runaway loop. Captures stay tight because
-# they write. Protocol chatter — initialize, ping, tools/list, server/discover —
-# is deliberately counted in its own generous bucket so that a client
-# reconnecting after a token refresh cannot consume the budget a capture needs.
+# Per verified principal, per minute. Reads get a large budget because several
+# clients may share one credential and so one budget: a burst from one (an
+# evaluation run sends dozens of recalls within seconds) must not refuse
+# another's ordinary search. What that bounds, per principal, is at most 20
+# reads in any second and 1200 in any minute (BURST_LIMITS below); a runaway
+# loop is held to that rate, not stopped. Captures stay tight because they
+# write. Protocol chatter — initialize, ping, tools/list, server/discover — is
+# counted in its own bucket so that a client reconnecting after a token refresh
+# cannot use up the budget reads and captures need.
 RATE_LIMITS = {"read": (1200, 60.0), "capture": (10, 60.0), "protocol": (600, 60.0)}
+
+# A short-window bound checked beside the minute window, so a bucket's whole
+# minute of budget cannot be spent in one second. 20 a second times 60 is the
+# 1200 a minute above, so the two agree. A bucket with no entry has no bound.
+BURST_LIMITS = {"read": (20, 1.0)}
 
 PROTOCOL_METHODS = frozenset(("initialize", "notifications/initialized", "ping",
                               "tools/list", "server/discover"))
@@ -126,8 +133,9 @@ class Limiter(object):
     one client throttle every other. There is nothing to key on but identity,
     and identity is exactly what the assertion already established."""
 
-    def __init__(self, limits=None, clock=time.time):
+    def __init__(self, limits=None, clock=time.time, burst=None):
         self._limits = dict(limits or RATE_LIMITS)
+        self._burst = dict(BURST_LIMITS if burst is None else burst)
         self._clock = clock
         self._buckets = {}
         self._lock = threading.Lock()
@@ -148,6 +156,12 @@ class Limiter(object):
             if len(hits) >= capacity:
                 self._buckets[key] = hits
                 return False, max(1, int(window - (now - hits[0])) + 1)
+            if bucket in self._burst:
+                burst_capacity, burst_window = self._burst[bucket]
+                recent = [t for t in hits if t > now - burst_window]
+                if len(recent) >= burst_capacity:
+                    self._buckets[key] = hits
+                    return False, max(1, int(burst_window - (now - recent[0])) + 1)
             hits.append(now)
             self._buckets[key] = hits
         return True, 0
