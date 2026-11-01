@@ -37,13 +37,17 @@ def load_notes(knowledge: Path, root: Path) -> list:
 
     Current means in a canonical folder with `status: current` and no `superseded_by`.
     A symlink is refused rather than followed, and so is a repeated id (lint rejects it
-    anyway). `hash` is the sha256 of the file's bytes, which is what makes a pair
+    anyway). So is any file whose resolved location is not under its canonical folder
+    (a symlinked directory). `hash` is the sha256 of the file's bytes, which is what makes a pair
     judged once stay judged until one of its two notes changes."""
     notes, seen = [], set()
     for folder in CANONICAL:
+        home = (knowledge / folder).resolve()
         for path in sorted((knowledge / folder).rglob("*.md")):
             if path.is_symlink() or not path.is_file() or path.name in ("index.md", "README.md"):
                 continue
+            if home != path.resolve().parent and home not in path.resolve().parents:
+                continue                      # reached through a symlinked directory
             raw = path.read_bytes()
             fm, _err = parse_frontmatter(read_text(path))
             if not fm or fm.get("status") != "current" or fm.get("superseded_by"):
@@ -133,33 +137,34 @@ def pair_key(a: dict, b: dict) -> str:
 
 
 def select_pairs(notes: list, changed: set, state: dict, limit: int = MAX_PAIRS) -> tuple:
-    """(pairs, next_offset): at most `limit` (never more than MAX_PAIRS) pairs to judge.
+    """(pairs, cursor): at most `limit` (never more than MAX_PAIRS) pairs to judge.
 
     Pairs already judged at both notes' current hashes are left out. Pairs touching a note
-    in `changed` come first; the room left goes to a slice of the rest that starts at the
-    state's rotation offset, so repeated runs walk the whole corpus. next_offset is where
-    the next run starts, and is only worth keeping once this run's judgement was kept."""
+    in `changed` come first; the room left goes to the rest, in pair-key order, resuming
+    after the state's cursor (the key of the last rotation pair taken) and wrapping. The
+    cursor is a key, not a position, so pairs that drop out once judged cannot shift the walk
+    past ones nobody has judged. It is the cursor the next run starts from, and is only worth
+    keeping once this run's judgement was kept. With no state every run starts at the first."""
     limit = max(1, min(int(limit), MAX_PAIRS))
     judged = state.get("judged") or {}
     todo = [(a, b) for a, b in candidate_pairs(notes)
             if (judged.get(pair_key(a, b)) or {}).get("hashes") != [a["hash"], b["hash"]]]
-    touched = [p[0]["id"] in changed or p[1]["id"] in changed for p in todo]
-    fresh = [p for p, t in zip(todo, touched) if t]
-    rest = [p for p, t in zip(todo, touched) if not t]
+    fresh = [p for p in todo if p[0]["id"] in changed or p[1]["id"] in changed]
+    rest = sorted((p for p in todo if p not in fresh), key=lambda p: pair_key(*p))
     picked = fresh[:limit]
-    offset = state.get("offset") if isinstance(state.get("offset"), int) else 0
+    cursor = state.get("cursor") if isinstance(state.get("cursor"), str) else ""
     taken = []
     if rest and limit > len(picked):
-        start = offset % len(rest)
+        start = next((i for i, p in enumerate(rest) if pair_key(*p) > cursor), 0)
         taken = (rest[start:] + rest[:start])[:limit - len(picked)]
-    return picked + taken, offset + len(taken)
+    return picked + taken, (pair_key(*taken[-1]) if taken else cursor)
 
 
 def read_state(path: Path) -> dict:
     """The state file as a dict; no file is an empty state. Anything unreadable raises
     ValueError rather than being reset, so a damaged file is noticed, not forgotten."""
     if not path.exists():
-        return {"v": STATE_VERSION, "offset": 0, "judged": {}}
+        return {"v": STATE_VERSION, "cursor": "", "judged": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -171,7 +176,7 @@ def read_state(path: Path) -> dict:
     return data
 
 
-def record_judged(state: dict, judged: list, notes: list, next_offset: int) -> dict:
+def record_judged(state: dict, judged: list, notes: list, cursor: str) -> dict:
     """The state after a successful call: `judged` is [(a, b, verdict)]. Entries for notes
     that no longer exist are dropped, so the file follows the corpus instead of growing."""
     ids = {n["id"] for n in notes}
@@ -179,7 +184,7 @@ def record_judged(state: dict, judged: list, notes: list, next_offset: int) -> d
             if all(part in ids for part in k.split("|"))}
     for a, b, verdict in judged:
         kept[pair_key(a, b)] = {"hashes": [a["hash"], b["hash"]], "verdict": verdict}
-    return {"v": STATE_VERSION, "offset": next_offset, "judged": kept}
+    return {"v": STATE_VERSION, "cursor": cursor, "judged": kept}
 
 
 def write_state(path: Path, state: dict) -> None:

@@ -5544,7 +5544,8 @@ def load_consolidator() -> dict:
 
     Returns {'model', 'model_reason', 'propose' (list), 'audit' (list),
     'propose_timeout', 'audit_timeout', 'audit_cannot_write', 'source', 'contradict' (list, or
-    None when the conf has no such line), 'contradict_timeout'}. The prompt is NOT in the
+    None when the conf has no such line or its line is bad), 'contradict_problem' (why the
+    judge line is bad, else None), 'contradict_timeout'}. The prompt is NOT in the
     argv — callers append it as the final argument, so no prompt text is ever
     interpolated into a shell string.
 
@@ -5622,13 +5623,20 @@ def load_consolidator() -> dict:
             "reads one snapshot and nothing else; every flag in the shipped audit line "
             "is what makes that true.")
     # The judge `brain contradictions` runs is held to the auditor's confinement, by the same
-    # function. A conf without the line still loads: consolidation never reads it.
-    contradict = argv_for("contradict") if conf.get("contradict", "").strip() else None
-    problem = audit_confinement_problem(contradict) if contradict else None
-    if problem:
-        raise ConsolidatorConfigError(
-            f"{source}: the contradict invocation is not confined — {problem}. It reads the "
-            "notes of the pairs it judges and nothing else, with the audit line's confinement.")
+    # function — but only when that command asks for it. A bad judge line is stored as
+    # `contradict_problem`, never raised: consolidation, audit-branch and doctor do not read it.
+    contradict, contradict_problem = None, None
+    try:
+        if conf.get("contradict", "").strip():
+            contradict = argv_for("contradict")
+            problem = audit_confinement_problem(contradict)
+            if problem:
+                contradict, contradict_problem = None, (
+                    f"{source}: the contradict invocation is not confined — {problem}. It reads "
+                    "the notes of the pairs it judges and nothing else, with the audit line's "
+                    "confinement.")
+    except ConsolidatorConfigError as exc:
+        contradict, contradict_problem = None, str(exc)
     problem = propose_isolation_problem(propose)
     if problem:
         raise ConsolidatorConfigError(
@@ -5650,6 +5658,12 @@ def load_consolidator() -> dict:
             raise ConsolidatorConfigError(f"{source}: {field} must be positive")
         return value
 
+    judge_timeout = None
+    try:
+        judge_timeout = seconds("contradict_timeout", CONSOLIDATOR_DEFAULTS["contradict_timeout"])
+    except ConsolidatorConfigError as exc:
+        contradict, contradict_problem = None, contradict_problem or str(exc)
+
     return {
         "model": conf["model"], "propose": propose, "audit": audit,
         "model_reason": (conf.get("model_reason") or "").strip()
@@ -5657,9 +5671,8 @@ def load_consolidator() -> dict:
         "propose_timeout": seconds("propose_timeout", CONSOLIDATOR_DEFAULTS["propose_timeout"]),
         "audit_timeout": seconds("audit_timeout", CONSOLIDATOR_DEFAULTS["audit_timeout"]),
         "audit_cannot_write": conf["audit_cannot_write"], "source": source,
-        "contradict": contradict,
-        "contradict_timeout": seconds("contradict_timeout",
-                                      CONSOLIDATOR_DEFAULTS["contradict_timeout"]),
+        "contradict": contradict, "contradict_problem": contradict_problem,
+        "contradict_timeout": judge_timeout,
     }
 
 
@@ -5736,6 +5749,21 @@ def staged_diff_vs_main() -> tuple:
 SNAPSHOT_PREFIX = "brain-audit-snapshot-"
 
 
+def sweep_stale_snapshots(prefix: str, stale_after: int = 3600) -> None:
+    """Remove this account's snapshot directories named `prefix`* in the system temp dir that
+    are older than `stale_after` seconds: what a crash left behind."""
+    import tempfile
+
+    for leftover in Path(tempfile.gettempdir()).glob(prefix + "*"):
+        try:
+            if leftover.is_dir() and not leftover.is_symlink() \
+                    and leftover.stat().st_uid == getattr(os, "getuid", lambda: 0)() \
+                    and time.time() - leftover.stat().st_mtime > stale_after:
+                remove_snapshot(leftover)
+        except OSError:
+            pass
+
+
 def audit_snapshot(stale_after: int = 3600) -> tuple:
     """(path, omitted, error): a fresh, read-only copy of the staged tree (2.3).
 
@@ -5749,14 +5777,7 @@ def audit_snapshot(stale_after: int = 3600) -> tuple:
     crash left behind is swept before a new one is made."""
     import tempfile
 
-    for leftover in Path(tempfile.gettempdir()).glob(SNAPSHOT_PREFIX + "*"):
-        try:
-            if leftover.is_dir() and not leftover.is_symlink() \
-                    and leftover.stat().st_uid == getattr(os, "getuid", lambda: 0)() \
-                    and time.time() - leftover.stat().st_mtime > stale_after:
-                remove_snapshot(leftover)
-        except OSError:
-            pass
+    sweep_stale_snapshots(SNAPSHOT_PREFIX, stale_after)
     snap = Path(tempfile.mkdtemp(prefix=SNAPSHOT_PREFIX))
 
     def fail(why):
@@ -6066,6 +6087,19 @@ def cmd_contradictions(argv: list) -> int:
         print(CONTRADICTION_RESULT + json.dumps(result))
 
 
+def _inside_brain(path: Path) -> bool:
+    """True when `path` or any of its existing ancestors IS the data root, by identity
+    (os.path.samefile), so a symlink, a bind mount or a case-insensitive spelling of the
+    root cannot slip past a comparison of path strings."""
+    for candidate in (path, *path.parents):
+        try:
+            if os.path.samefile(candidate, ROOT):
+                return True
+        except OSError:
+            continue                     # does not exist (yet): its parent is checked next
+    return False
+
+
 def _contradictions(argv: list, result: dict) -> int:
     import tempfile
     from brainlib import contradict
@@ -6083,14 +6117,15 @@ def _contradictions(argv: list, result: dict) -> int:
             value = args.pop(0)
             if flag == "--state":
                 state_path = Path(value).expanduser().resolve()
-            elif value.isdigit() and int(value) >= 1:
-                limit = min(int(value), contradict.MAX_PAIRS)
+            elif value.isascii() and value.isdigit() and value.strip("0"):
+                # Longer than 6 digits is past the cap anyway; int() is never asked to parse
+                # a string long enough to hit Python's digit limit.
+                limit = contradict.MAX_PAIRS if len(value) > 6 else min(int(value), contradict.MAX_PAIRS)
             else:
                 return refuse("--max-pairs takes a whole number of 1 or more", 2)
             continue
         return refuse("usage: brain contradictions --json [--state FILE] [--max-pairs N]", 2)
-    if state_path is not None and (state_path == ROOT.resolve()
-                                   or ROOT.resolve() in state_path.parents):
+    if state_path is not None and _inside_brain(state_path):
         return refuse(f"--state {state_path} is inside the brain, which this command never writes")
     try:
         state = contradict.read_state(state_path) if state_path else {"judged": {}}
@@ -6100,6 +6135,8 @@ def _contradictions(argv: list, result: dict) -> int:
         runner = load_consolidator()
     except ConsolidatorConfigError as exc:
         return refuse(f"refused — {exc}")
+    if runner["contradict_problem"]:
+        return refuse(f"refused — {runner['contradict_problem']}")
     if not runner["contradict"]:
         return refuse(f"{runner['source']} has no `contradict` line, which this command needs")
     prompt_path = ENGINE / "setup" / "contradiction-prompt.md"
@@ -6107,7 +6144,7 @@ def _contradictions(argv: list, result: dict) -> int:
         return refuse("missing setup/contradiction-prompt.md")
 
     notes = contradict.load_notes(K, ROOT)
-    pairs, next_offset = contradict.select_pairs(
+    pairs, cursor = contradict.select_pairs(
         notes, contradict.recent_ids(ROOT, notes), state, limit)
     if not pairs:
         result["status"] = "ok"
@@ -6123,6 +6160,7 @@ def _contradictions(argv: list, result: dict) -> int:
               + "\n".join(f"{i}. {number[id(a)]} and {number[id(b)]}"
                           for i, (a, b) in enumerate(pairs, 1)) + "\n")
 
+    sweep_stale_snapshots(CONTRADICTION_SNAPSHOT_PREFIX, max(2 * runner["contradict_timeout"], 3600))
     snap = Path(tempfile.mkdtemp(prefix=CONTRADICTION_SNAPSHOT_PREFIX))
     try:
         for note in used:
@@ -6156,9 +6194,11 @@ def _contradictions(argv: list, result: dict) -> int:
     result["status"] = "ok"
     if state_path is not None:
         try:
+            if _inside_brain(state_path.parent):
+                raise OSError(f"{state_path.parent} is now inside the brain")
             contradict.write_state(state_path, contradict.record_judged(
                 state, [(a, b, verdicts[i][0]) for i, (a, b) in enumerate(pairs, 1)
-                        if i in verdicts], notes, next_offset))
+                        if i in verdicts], notes, cursor))
         except OSError as exc:
             result["status"] = "error"
             return refuse(f"could not write --state: {exc!r}")

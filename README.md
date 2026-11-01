@@ -264,11 +264,12 @@ confinement, refused if weaker, read by this command alone), judges all of them 
 snapshot holding only those notes, and says `contradicts`, `compatible` or `unclear` for each with
 a reason of at most 200 characters. The command ends on one
 `contradiction-result: {"v":1,"status":...,"pairs":[{"a","b","verdict","why"}],"cost_microusd",
-"tokens_in","tokens_out"}` line and exits non-zero on error. It writes nothing in the brain: no
-note, commit, git setting or index file, and a `--state` path inside it is refused. `--state`, a
+"tokens_in","tokens_out"}` line and exits non-zero on error. It writes no note, commit, git
+setting or index file in the brain, and a `--state` path inside it is refused. `--state`, a
 JSON file kept elsewhere, records each judged pair against both notes' content hashes so it is not
-asked again until one changes, and the rotation offset; it is only updated when the call
-succeeded. Consolidation is unchanged, and a `consolidator.conf` without `contradict` still
+asked again until one changes, and the rotation cursor (the last pair reached, so the walk resumes
+after it); it is only updated when the call succeeded. Without `--state` every run judges the
+same first pairs, so schedule it with `--state`. Consolidation is unchanged, and a `consolidator.conf` without `contradict` still
 works for it.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the

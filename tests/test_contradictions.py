@@ -197,10 +197,10 @@ class CommandCase(unittest.TestCase):
         self.state_dir = base / "state"
         self.state = base / "outside" / "state.json"
 
-    def run_command(self, *args, engine=None, mode="judge", data=None):
+    def run_command(self, *args, engine=None, mode="judge", data=None, env=None):
         env = dict(os.environ, BRAIN_DATA_ROOT=str(data or self.data),
                    BRAIN_STATE_DIR=str(self.state_dir), STUB_LOG=str(self.log), STUB_MODE=mode,
-                   PATH=f"{self.stubs}{os.pathsep}{os.environ['PATH']}")
+                   PATH=f"{self.stubs}{os.pathsep}{os.environ['PATH']}", **(env or {}))
         return subprocess.run([sys.executable, str((engine or ROOT) / "bin" / "brain"),
                                "contradictions", "--json", *args], cwd=self.tmp.name,
                               capture_output=True, text=True, env=env, timeout=120)
@@ -267,6 +267,7 @@ class ConfinementTests(unittest.TestCase):
         self.conf.unlink()
         self.assertEqual(self.module.load_consolidator()["contradict"],
                          self.module.load_consolidator()["audit"])
+        self.assertIsNone(self.module.load_consolidator()["contradict_problem"])
 
     def test_a_conf_without_the_judge_line_still_loads(self):
         self.write_conf()
@@ -279,6 +280,49 @@ class ConfinementTests(unittest.TestCase):
         runner = self.module.load_consolidator()
         self.assertEqual(runner["contradict"], runner["audit"])
         self.assertEqual(runner["contradict_timeout"], 60)
+
+    def judge_problem(self):
+        return self.module.load_consolidator()["contradict_problem"]
+
+    def run_cli(self):
+        data = Path(self.tmp.name) / "data"
+        data.mkdir(exist_ok=True)
+        build_corpus(data)
+        return subprocess.run(
+            [sys.executable, str(self.repo / "bin" / "brain"), "contradictions", "--json"],
+            cwd=self.tmp.name, capture_output=True, text=True,
+            env=dict(os.environ, BRAIN_DATA_ROOT=str(data),
+                     BRAIN_STATE_DIR=str(Path(self.tmp.name) / "s")))
+
+    def test_a_weakened_judge_line_is_refused_by_the_command_not_by_consolidation(self):
+        bad = {
+            "a weakened line": dict(contradict="claude --model {model} -p "
+                                    + CONFINED.replace("--restricted ", "")),
+            "another program": dict(contradict="other --model {model} -p " + CONFINED),
+            "an unparsable line": dict(contradict="claude --model {model} -p 'unbalanced"),
+            "a zero timeout": dict(contradict="claude --model {model} -p " + CONFINED,
+                                   contradict_timeout="0"),
+            "a timeout that is no number": dict(contradict="claude --model {model} -p " + CONFINED,
+                                                contradict_timeout="soon"),
+            "a zero timeout and no line": dict(contradict_timeout="0"),
+        }
+        for label, fields in bad.items():
+            with self.subTest(bad=label):
+                self.write_conf(**fields)
+                runner = self.module.load_consolidator()          # does not raise
+                self.assertEqual(runner["audit"], ["claude", "--model", "test-model", "-p",
+                                                   *CONFINED_ARGV])
+                self.assertTrue(runner["propose"])
+                self.assertIsNone(runner["contradict"])
+                if "no line" in label:
+                    self.assertEqual(runner["contradict_timeout"], None)
+                    self.assertIn("contradict_timeout", runner["contradict_problem"])
+                    continue
+                self.assertTrue(runner["contradict_problem"])
+                run = self.run_cli()
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertIn("refused", run.stderr)
+                self.assertEqual(json.loads(run.stdout.strip()[len(RESULT):])["status"], "error")
 
     def test_a_weakened_judge_line_is_refused(self):
         widened = {
@@ -296,10 +340,10 @@ class ConfinementTests(unittest.TestCase):
         for label, flags in widened.items():
             with self.subTest(widened=label):
                 self.write_conf(contradict="claude --model {model} -p " + flags)
-                self.assertIn("contradict invocation is not confined", self.refusal())
+                self.assertIn("contradict invocation is not confined", self.judge_problem())
         with self.subTest(widened="another program"):
             self.write_conf(contradict="other --model {model} -p " + CONFINED)
-            self.assertIn("contradict", self.refusal())
+            self.assertIn("contradict", self.judge_problem())
 
     def test_the_command_refuses_a_conf_without_the_judge_line(self):
         data = Path(self.tmp.name) / "data"
@@ -380,17 +424,54 @@ class SelectionTests(unittest.TestCase):
     def test_the_rest_rotates_so_repeated_runs_cover_the_corpus(self):
         everything = self.ids(contradict.candidate_pairs(self.notes))
         self.assertGreater(len(everything), 6)
-        state, seen = {"offset": 0, "judged": {}}, []
+        # Without state every run judges the same first pairs.
+        again, _ = contradict.select_pairs(self.notes, set(), {}, limit=3)
+        self.assertEqual(self.ids(again), self.ids(contradict.select_pairs(self.notes, set(), {}, 3)[0]))
+        # Judged pairs drop out of what is left; the walk must not skip one that was never judged.
+        state, seen = {"judged": {}}, []
         for _ in range(len(everything)):
-            picked, nxt = contradict.select_pairs(self.notes, set(), {**state, "judged": {}}, limit=3)
-            self.assertEqual(len(picked), 3)
+            picked, cursor = contradict.select_pairs(self.notes, set(), state, limit=3)
+            if not picked:
+                break
             seen += self.ids(picked)
-            state["offset"] = nxt
-        self.assertEqual(set(seen), set(everything))
-        first, off = contradict.select_pairs(self.notes, set(), {"offset": 0}, limit=3)
-        second, _ = contradict.select_pairs(self.notes, set(), {"offset": off}, limit=3)
-        self.assertEqual(off, 3)
-        self.assertFalse(set(self.ids(first)) & set(self.ids(second)))
+            state = contradict.record_judged(
+                state, [(a, b, "compatible") for a, b in picked], self.notes, cursor)
+        self.assertEqual(sorted(seen), sorted(everything))
+        self.assertEqual(len(seen), len(set(seen)), "a pair was judged twice")
+        # Without judgements being kept, the cursor alone still walks, and wraps.
+        walk, cursor = [], ""
+        for _ in range(-(-len(everything) // 3) + 1):
+            picked, cursor = contradict.select_pairs(self.notes, set(), {"cursor": cursor}, limit=3)
+            walk += self.ids(picked)
+        self.assertEqual(set(walk), set(everything))
+        self.assertEqual(walk[:3], self.ids(contradict.select_pairs(self.notes, set(), {}, 3)[0]))
+
+    def test_a_pair_the_call_did_not_answer_is_not_lost_by_the_rotation(self):
+        everything = self.ids(contradict.candidate_pairs(self.notes))
+        picked, cursor = contradict.select_pairs(self.notes, set(), {}, limit=4)
+        # Only the last two of the four were answered.
+        state = contradict.record_judged({"judged": {}}, [(a, b, "compatible") for a, b in picked[2:]],
+                                         self.notes, cursor)
+        seen = set(self.ids(picked[2:]))
+        for _ in range(len(everything)):
+            more, cursor = contradict.select_pairs(self.notes, set(), state, limit=4)
+            if not more:
+                break
+            seen |= set(self.ids(more))
+            state = contradict.record_judged(state, [(a, b, "compatible") for a, b in more],
+                                             self.notes, cursor)
+        self.assertEqual(seen, set(everything))
+
+    def test_a_note_reached_through_a_symlinked_directory_is_not_read(self):
+        outside = Path(self.tmp.name) / "elsewhere"
+        outside.mkdir()
+        (outside / "smuggled.md").write_text(
+            note("reference", "smuggled", "Smuggled", ["backup"], "Claim: x = 1")[1], encoding="utf-8")
+        link = self.root / "knowledge" / "reference" / "linked"
+        link.symlink_to(outside, target_is_directory=True)
+        ids = {n["id"] for n in contradict.load_notes(self.root / "knowledge", self.root)}
+        self.assertNotIn("smuggled", ids)
+        self.assertIn("office-wifi", ids)
 
     def test_never_more_than_twenty_pairs(self):
         crowd = Path(self.tmp.name) / "crowd"
@@ -481,11 +562,68 @@ class CommandTests(CommandCase):
                 self.assertFalse(inside.exists())
         self.assertEqual(self.calls(), [])
 
+    def test_a_state_file_reached_through_an_alias_of_the_brain_is_refused(self):
+        alias = Path(self.tmp.name) / "alias"
+        alias.symlink_to(self.data, target_is_directory=True)
+        for inside in (alias / "state.json", alias / "knowledge" / "state.json",
+                       alias / "not-yet" / "deeper" / "state.json"):
+            with self.subTest(path=str(inside.relative_to(alias))):
+                run = self.run_command("--state", str(inside))
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertEqual(self.result_of(run)["status"], "error")
+                self.assertIn("inside the brain", run.stderr)
+        self.assertFalse((self.data / "state.json").exists())
+        self.assertFalse((self.data / "not-yet").exists())
+        self.assertEqual(self.calls(), [])
+        module = load_brain_module()
+        module.ROOT = self.data
+        self.assertTrue(module._inside_brain(alias / "a" / "b" / "state.json"))
+        self.assertTrue(module._inside_brain(alias))
+        self.assertFalse(module._inside_brain(self.state))
+        self.assertFalse(module._inside_brain(Path(self.tmp.name) / "not-there" / "state.json"))
+
+    def test_max_pairs_takes_ascii_digits_only(self):
+        for value in ("٣", "²", "1e1", "-1", "+3", " 3", "3.0", "", "0", "000"):
+            with self.subTest(value=value[:12]):
+                run = self.run_command("--max-pairs", value)
+                self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                self.assertNotIn("Traceback", run.stderr)
+                self.assertEqual(self.result_of(run)["status"], "error")
+        self.assertEqual(self.calls(), [])
+        for value, most in (("3", 3), ("0003", 3), ("1000000", 20), ("9" * 5000, 20)):
+            with self.subTest(accepted=value[:12]):
+                run = self.run_command("--max-pairs", value)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertLessEqual(len(self.result_of(run)["pairs"]), most)
+
+    def test_a_snapshot_a_crash_left_behind_is_swept(self):
+        scratch = Path(self.tmp.name) / "scratch"
+        scratch.mkdir()
+        old, fresh = scratch / "brain-contradict-snapshot-old", scratch / "brain-contradict-snapshot-new"
+        other = scratch / "unrelated-dir"
+        for path in (old, fresh, other):
+            path.mkdir()
+            (path / "n01.md").write_text("x", encoding="utf-8")
+            os.chmod(path / "n01.md", 0o400)
+            os.chmod(path, 0o500)
+        os.utime(old, (1, 1))
+        os.utime(other, (1, 1))
+        try:
+            run = self.run_command(env={"TMPDIR": str(scratch)})
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertFalse(old.exists(), "the stale snapshot was not swept")
+            self.assertTrue(fresh.exists())
+            self.assertTrue(other.exists())
+        finally:
+            for path in (old, fresh, other):
+                if path.exists():
+                    os.chmod(path, 0o700)
+
     def test_judged_pairs_are_remembered_and_not_asked_again(self):
         first = self.result_of(self.run_command("--state", str(self.state), "--max-pairs", "4"))
         state = json.loads(self.state.read_text())
         self.assertEqual(len(state["judged"]), 4)
-        self.assertEqual(state["offset"], 0, "four fresh pairs leave the rotation where it was")
+        self.assertEqual(state["cursor"], "", "four fresh pairs leave the rotation where it was")
         second = self.result_of(self.run_command("--state", str(self.state), "--max-pairs", "4"))
         seen = lambda out: {(p["a"], p["b"]) for p in out["pairs"]}
         self.assertEqual(len(first["pairs"]), 4)
