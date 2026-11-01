@@ -7536,7 +7536,9 @@ class ConsolidatorConfigTests(unittest.TestCase):
                     "handoff", "drain"):
             self.assertTrue([a for a in allowed if a.startswith("Bash(%s/bin/brain %s" % (engine, sub))],
                             sub)
-        self.assertFalse([a for a in allowed if "rg" in a.split("(")[1].split()[0]])
+        # The program's own name, not its path: a temp folder such as tmpxf8m6hrg holds "rg".
+        self.assertFalse([a for a in allowed
+                          if os.path.basename(a.split("(")[1].split()[0]) == "rg"])
         for forbidden in ("capture", "serve", "setup", "init", "schedule", "publish", "consolidate"):
             self.assertFalse([a for a in allowed if ("bin/brain %s" % forbidden) in a], forbidden)
         self.assertEqual(propose[-1], "-p")
