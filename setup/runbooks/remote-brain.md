@@ -288,6 +288,10 @@ BRAIN_BACKUP_REGION=auto
 BRAIN_BACKUP_PREFIX=brain
 BRAIN_BACKUP_ACCESS_KEY_ID=<KEY_ID>
 BRAIN_BACKUP_SECRET_ACCESS_KEY=<SECRET>
+# Optional. The bucket's object-lock window in days (default 3). The restore
+# drill excuses a surplus daily/weekly/monthly point younger than this plus one
+# night, because the bucket refuses to delete it; set it to the bucket's rule.
+BRAIN_BACKUP_LOCK_DAYS=3
 ```
 
 Prove it before trusting it:

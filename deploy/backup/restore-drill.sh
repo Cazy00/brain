@@ -63,22 +63,8 @@ umask 077
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=deploy/backup/lib-s3.sh
 . "$SELF_DIR/lib-s3.sh"
-
-# YYYY-MM-DDTHHMMSSZ -> epoch seconds, or 0 when it cannot be read.
-#
-# Two implementations because this script runs in two places: the VPS (GNU
-# coreutils) and the operator's macOS machine, where the recovery identity
-# lives and the full drill therefore has to run. `date -d` does not exist on
-# BSD, and the failure is silent — it would report every archive as undated and
-# every full drill as never having happened, which is an alarm that cries wolf
-# forever.
-iso_epoch() {
-    [ -n "${1:-}" ] || { printf '0\n'; return; }
-    local out
-    out="$(date -u -d "$(printf '%s' "$1" | sed 's/T\(..\)\(..\)\(..\)Z/ \1:\2:\3/')" +%s 2>/dev/null || true)"
-    [ -n "$out" ] || out="$(date -u -j -f '%Y-%m-%dT%H%M%SZ' "$1" +%s 2>/dev/null || true)"
-    printf '%s\n' "${out:-0}"
-}
+# shellcheck source=deploy/backup/lib-retention.sh
+. "$SELF_DIR/lib-retention.sh"
 
 say()  { printf '%s\n' "$*"; }
 note() { printf '  [-- ] %s\n' "$*"; }
@@ -305,16 +291,29 @@ else
     bad "archive does not begin with an age v1 header"
 fi
 
-# Retention audit. Counts, not contents — this is the check that catches a
-# prune loop that has quietly stopped running or started running twice.
+# Retention audit. Counts and ages, not contents — this is the check that
+# catches a prune loop that has quietly stopped running or started running
+# twice. A surplus point younger than the bucket's object lock is not that: the
+# lock refuses its delete until it lapses (see retention_audit).
+# The window is one setting, in backup.env (s3_load_config above sources that
+# file with `set -a`, so it is in the environment here); snapshot.sh has no copy
+# of it because it simply asks the bucket and logs the refusal.
+LOCK_DAYS="${BRAIN_BACKUP_LOCK_DAYS:-3}"
+case "$LOCK_DAYS" in
+    ''|*[!0-9]*) die 64 "BRAIN_BACKUP_LOCK_DAYS must be a whole number of days, got: $LOCK_DAYS" ;;
+esac
 for pair in "daily 7" "weekly 4" "monthly 12"; do
     set -- $pair
-    n="$(s3_list "$S3_PREFIX/$1/" | grep -vc '\.meta\.json$' || true)"
-    if [ "$n" -gt "$2" ]; then
-        bad "$1: $n recovery points, retention says $2 — pruning is not running"
-    else
-        ok "$1: $n/$2 recovery points"
-    fi
+    rc=0
+    line="$(s3_list "$S3_PREFIX/$1/" | { grep -v '\.meta\.json$' || true; } | retention_audit "$1" "$2" "$LOCK_DAYS" "$START_EPOCH")" || rc=$?
+    case "$line" in
+        bad\ *) bad "${line#bad }" ;;
+        ok\ *)
+            # A failed listing reaches the audit as no keys at all, which reads
+            # as "0 recovery points" and would be reported green.
+            if [ "$rc" -ne 0 ]; then bad "$1: could not list recovery points (rc=$rc)"; else ok "${line#ok }"; fi ;;
+        *)       bad "$1: retention audit gave no verdict (rc=$rc)" ;;
+    esac
 done
 
 # ------------------------------------------------------------------ verify-only exit
