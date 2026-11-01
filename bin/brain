@@ -59,6 +59,14 @@ Commands:
                                    --digest-since (UTC, ...Z) starts the digest
                                    window there instead of at the last
                                    consolidate commit (8 days at most)
+  brain contradictions --json [--state FILE] [--max-pairs N]
+                                   read-only check for two current notes that disagree:
+                                   picks up to 20 candidate pairs (FTS neighbours that
+                                   share a topic or project), has ONE confined judge
+                                   (the `contradict` line in setup/consolidator.conf)
+                                   read them, and ends on one contradiction-result:
+                                   {json} line. Writes nothing in the brain; --state
+                                   (outside it) remembers which pairs were judged
   brain sync [--push]              converge the served folder's main with
                                    origin/main (2.4); --push only pushes main
                                    (the post-commit hook's entry). The one pusher.
@@ -5400,6 +5408,13 @@ CONSOLIDATOR_DEFAULTS = {
                            "alone opts into writes with --permission-mode acceptEdits."),
     "propose_timeout": "1800",
     "audit_timeout": "900",
+    # The judge `brain contradictions` runs: the audit line's confinement, checked by the
+    # same function. Optional in a conf file, since only that command reads it.
+    "contradict": ("claude --model {model} --output-format json -p --safe-mode --restricted "
+                   "--strict-mcp-config "
+                   "--mcp-config '{\"mcpServers\":{}}' --tools Read --permission-prompts none "
+                   "--no-session-persistence"),
+    "contradict_timeout": "900",
 }
 
 
@@ -5528,7 +5543,8 @@ def load_consolidator() -> dict:
     """The one pinned runner: two argv templates, a model, and a timeout each.
 
     Returns {'model', 'model_reason', 'propose' (list), 'audit' (list),
-    'propose_timeout', 'audit_timeout', 'audit_cannot_write', 'source'}. The prompt is NOT in the
+    'propose_timeout', 'audit_timeout', 'audit_cannot_write', 'source', 'contradict' (list, or
+    None when the conf has no such line), 'contradict_timeout'}. The prompt is NOT in the
     argv — callers append it as the final argument, so no prompt text is ever
     interpolated into a shell string.
 
@@ -5605,6 +5621,14 @@ def load_consolidator() -> dict:
             f"{source}: the audit invocation is not confined — {problem}. The auditor "
             "reads one snapshot and nothing else; every flag in the shipped audit line "
             "is what makes that true.")
+    # The judge `brain contradictions` runs is held to the auditor's confinement, by the same
+    # function. A conf without the line still loads: consolidation never reads it.
+    contradict = argv_for("contradict") if conf.get("contradict", "").strip() else None
+    problem = audit_confinement_problem(contradict) if contradict else None
+    if problem:
+        raise ConsolidatorConfigError(
+            f"{source}: the contradict invocation is not confined — {problem}. It reads the "
+            "notes of the pairs it judges and nothing else, with the audit line's confinement.")
     problem = propose_isolation_problem(propose)
     if problem:
         raise ConsolidatorConfigError(
@@ -5633,6 +5657,9 @@ def load_consolidator() -> dict:
         "propose_timeout": seconds("propose_timeout", CONSOLIDATOR_DEFAULTS["propose_timeout"]),
         "audit_timeout": seconds("audit_timeout", CONSOLIDATOR_DEFAULTS["audit_timeout"]),
         "audit_cannot_write": conf["audit_cannot_write"], "source": source,
+        "contradict": contradict,
+        "contradict_timeout": seconds("contradict_timeout",
+                                      CONSOLIDATOR_DEFAULTS["contradict_timeout"]),
     }
 
 
@@ -6012,6 +6039,130 @@ def _audit_branch(argv: list, result: dict) -> int:
         shutil.rmtree(scratch, ignore_errors=True)
     print(f"  audit: {one_line(detail)}")
     return 0 if verdict == "pass" else 1
+
+
+CONTRADICTION_RESULT = "contradiction-result: "
+CONTRADICTION_SNAPSHOT_PREFIX = "brain-contradict-snapshot-"
+
+
+def cmd_contradictions(argv: list) -> int:
+    """`brain contradictions --json [--state FILE] [--max-pairs N]`: does any pair of current
+    notes disagree? Read-only on the brain: nothing is written there, committed or indexed,
+    no git setting is touched, and a --state file inside it is refused.
+
+    brainlib.contradict picks at most 20 candidate pairs (stdlib, no model); ONE confined
+    call, the `contradict` line of setup/consolidator.conf with the audit line's confinement,
+    judges them all from a read-only snapshot holding only those notes. Ends on one
+    `contradiction-result: {json}` line: v, status (ok or error), pairs ({a, b, verdict, why},
+    verdict contradicts, compatible or unclear), and the call's cost_microusd, tokens_in and
+    tokens_out (null when not reported). Exit 0 on ok, 1 on error, 2 on usage. No candidates
+    is ok with no model call. A pair is recorded as judged in --state only when the call
+    succeeded and answered for it."""
+    result = {"v": 1, "status": "error", "pairs": [], "cost_microusd": None,
+              "tokens_in": None, "tokens_out": None}
+    try:
+        return _contradictions(argv, result)
+    finally:
+        print(CONTRADICTION_RESULT + json.dumps(result))
+
+
+def _contradictions(argv: list, result: dict) -> int:
+    import tempfile
+    from brainlib import contradict
+
+    def refuse(why, code=1):
+        print(f"  contradictions: {one_line(why)}", file=sys.stderr)
+        return code
+
+    state_path, limit, args = None, contradict.MAX_PAIRS, list(argv)
+    while args:
+        flag = args.pop(0)
+        if flag == "--json":
+            continue
+        if flag in ("--state", "--max-pairs") and args:
+            value = args.pop(0)
+            if flag == "--state":
+                state_path = Path(value).expanduser().resolve()
+            elif value.isdigit() and int(value) >= 1:
+                limit = min(int(value), contradict.MAX_PAIRS)
+            else:
+                return refuse("--max-pairs takes a whole number of 1 or more", 2)
+            continue
+        return refuse("usage: brain contradictions --json [--state FILE] [--max-pairs N]", 2)
+    if state_path is not None and (state_path == ROOT.resolve()
+                                   or ROOT.resolve() in state_path.parents):
+        return refuse(f"--state {state_path} is inside the brain, which this command never writes")
+    try:
+        state = contradict.read_state(state_path) if state_path else {"judged": {}}
+    except ValueError as exc:
+        return refuse(exc)
+    try:
+        runner = load_consolidator()
+    except ConsolidatorConfigError as exc:
+        return refuse(f"refused — {exc}")
+    if not runner["contradict"]:
+        return refuse(f"{runner['source']} has no `contradict` line, which this command needs")
+    prompt_path = ENGINE / "setup" / "contradiction-prompt.md"
+    if not prompt_path.exists():
+        return refuse("missing setup/contradiction-prompt.md")
+
+    notes = contradict.load_notes(K, ROOT)
+    pairs, next_offset = contradict.select_pairs(
+        notes, contradict.recent_ids(ROOT, notes), state, limit)
+    if not pairs:
+        result["status"] = "ok"
+        return 0
+
+    used = []                                   # each note once, numbered by first use
+    for pair in pairs:
+        for note in pair:
+            if note not in used:
+                used.append(note)
+    number = {id(note): f"n{i + 1:02d}.md" for i, note in enumerate(used)}
+    prompt = (prompt_path.read_text(encoding="utf-8") + "\n## The pairs\n\n"
+              + "\n".join(f"{i}. {number[id(a)]} and {number[id(b)]}"
+                          for i, (a, b) in enumerate(pairs, 1)) + "\n")
+
+    snap = Path(tempfile.mkdtemp(prefix=CONTRADICTION_SNAPSHOT_PREFIX))
+    try:
+        for note in used:
+            (snap / number[id(note)]).write_bytes(note["path"].read_bytes())
+        for item in snap.iterdir():
+            os.chmod(item, 0o400)
+        os.chmod(snap, 0o500)
+        try:
+            run = subprocess.run(
+                list(runner["contradict"]), input=prompt, encoding="utf-8", errors="replace",
+                cwd=str(snap), capture_output=True, timeout=runner["contradict_timeout"])
+        except subprocess.TimeoutExpired:
+            return refuse(f"the judge timed out after {runner['contradict_timeout']}s")
+        except (OSError, subprocess.SubprocessError) as exc:
+            return refuse(f"could not run the judge: {exc!r}")
+    finally:
+        remove_snapshot(snap)
+
+    text, spent = runner_output(run.stdout)
+    add_usage(result, spent)
+    if run.returncode != 0:
+        return refuse(f"the judge exited {run.returncode}: "
+                      f"{(run.stderr or '').strip()[-300:] or 'no stderr'}")
+    verdicts = contradict.parse_verdicts(text, len(pairs))
+    answered = verdicts or {}
+    result["pairs"] = [
+        {"a": a["id"], "b": b["id"], "verdict": answered.get(i, ("unclear", ""))[0],
+         "why": answered.get(i, ("unclear", ""))[1]} for i, (a, b) in enumerate(pairs, 1)]
+    if verdicts is None:
+        return refuse("the judge's answer holds no pairs object; every pair is unclear")
+    result["status"] = "ok"
+    if state_path is not None:
+        try:
+            contradict.write_state(state_path, contradict.record_judged(
+                state, [(a, b, verdicts[i][0]) for i, (a, b) in enumerate(pairs, 1)
+                        if i in verdicts], notes, next_offset))
+        except OSError as exc:
+            result["status"] = "error"
+            return refuse(f"could not write --state: {exc!r}")
+    return 0
 
 
 CONSOLIDATE_RESULT = "consolidate-result: "
@@ -8880,12 +9031,15 @@ def main() -> int:
         _STATE_OVERRIDE = None
         INDEX_DB = state_dir() / "index.db"
         argv = argv[:i] + argv[i + 2:]
-    elif argv[:1] != ["setup"] and not (argv[:1] == ["sessions"] and "--jsonl" in argv):
+    elif argv[:1] not in (["setup"], ["contradictions"]) \
+            and not (argv[:1] == ["sessions"] and "--jsonl" in argv):
         # Skipped for setup. Setup runs out of a throwaway clone of the template and
         # installs the hooks into the DESTINATION, which phase_create does. Here it
         # would mutate a directory that is about to be deleted, and announce it —
         # "brain: installed git hooks" about a temp clone, in the very first output a
         # new user ever sees.
+        # Skipped for `contradictions` too: it writes nothing in the brain, and installing the
+        # hooks is a write to its git configuration.
         # Skipped for `sessions --jsonl` too: it is run as the transcripts' owner,
         # often by a service, against an engine that user cannot write, and it needs
         # no brain at all — it reads transcripts and writes its one file.
@@ -8987,6 +9141,10 @@ def main() -> int:
         return cmd_consolidate(rest)
     if cmd == "audit-branch":
         return cmd_audit_branch(rest)
+    if cmd == "contradictions":
+        # No tree lock either: taking it creates its file in the state directory, and this
+        # command writes nothing in the brain.
+        return cmd_contradictions(rest)
     if cmd == "schedule":
         return cmd_schedule(rest)
     if cmd == "template":

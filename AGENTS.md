@@ -36,10 +36,12 @@ knowledge/
 setup/            templates, runbooks (this system's own docs)
                   consolidate-prompt.md writes notes; audit-prompt.md is the
                   independent, digest-blind, write-less check on that work
+                  contradiction-prompt.md briefs the read-only judge that
+                  `brain contradictions` runs on pairs of current notes
                   consolidator.conf names the ONE agent allowed to run them
 bin/brain         toolbelt: setup | connect | new | capture | search | read |
                   links | recent | supersede | retract | handoff | drain |
-                  index | sessions | consolidate | schedule | template |
+                  index | sessions | consolidate | contradictions | schedule | template |
                   publish | plugin | lint | doctor | logs | stats | reset
                   (`bin/brain --help` is authoritative; doctor reports whether
                   the machinery works, stats whether the KNOWLEDGE still does,
