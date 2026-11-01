@@ -254,6 +254,24 @@ event logs keep more history for troubleshooting: the HTTP server's runtime even
 50 MB per log), up from 5 MB. No data, network or configuration change; upgrading is an
 ordinary image rebuild.
 
+**0.7.0.** `brain contradictions --json [--state FILE] [--max-pairs N]` is a read-only check for
+two current notes that disagree. With no model, it takes each current canonical note's title and
+topics to an in-memory FTS5 search for its three closest current neighbours and keeps the pairs
+that share a topic or a project, at most 20 a run: pairs touching a note changed in the last 7 days
+first, then a slice of the rest that rotates through the corpus from one run to the next. One
+confined call, the new `contradict` line in `setup/consolidator.conf` (the audit line's
+confinement, refused if weaker, read by this command alone), judges all of them from a read-only
+snapshot holding only those notes, and says `contradicts`, `compatible` or `unclear` for each with
+a reason of at most 200 characters. The command ends on one
+`contradiction-result: {"v":1,"status":...,"pairs":[{"a","b","verdict","why"}],"cost_microusd",
+"tokens_in","tokens_out"}` line and exits non-zero on error. It writes no note, commit, git
+setting or index file in the brain, and a `--state` path inside it is refused. `--state`, a
+JSON file kept elsewhere, records each judged pair against both notes' content hashes so it is not
+asked again until one changes, and the rotation cursor (the last pair reached, so the walk resumes
+after it); it is only updated when the call succeeded. Without `--state` every run judges the
+same first pairs, so schedule it with `--state`. Consolidation is unchanged, and a `consolidator.conf` without `contradict` still
+works for it.
+
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
 weights), brute force in pure Python. The two are fused by reciprocal rank,
@@ -349,9 +367,12 @@ trusting.
   plus the link graph). Search by meaning exists only as derived vectors you opt
   into (see above); with `BRAIN_VECTORS` off, the default, the engine is as lexical
   as ever.
-- **No contradiction detection between two current notes.** The system fights
-  staleness structurally — supersede, `review_by`, link validation — but nothing
-  automatically notices that two live notes disagree.
+- **Contradiction detection is a check you run, not a guarantee.** The system fights
+  staleness structurally — supersede, `review_by`, link validation — and since 0.7.0
+  `brain contradictions` looks for two live notes that disagree (see above). It is
+  read-only, looks at no more than 20 pairs a run, and finds only pairs its search
+  surfaces as neighbours that share a topic or project; its judge can be wrong either way,
+  and nothing runs it for you unless you schedule it.
 - **One consolidator, pinned.** Any agent can search, read and capture; the
   weekly curation pass runs on exactly one named agent and model. Retrieval is
   deterministic code and identical everywhere, so the only model-dependent
