@@ -13,7 +13,7 @@ NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 def key(age_hours: float) -> str:
     """A daily object key made `age_hours` before NOW, named the way snapshot.sh names it."""
-    return "brain/daily/brain-%sZ.tar.gz.age" % (NOW - timedelta(hours=age_hours)).strftime("%Y%m%dT%H%M%S")
+    return "brain/daily/brain-%sZ.tar.gz.age" % (NOW - timedelta(hours=age_hours)).strftime("%Y-%m-%dT%H%M%S")
 
 
 def audit(ages_hours, keep=7, lock_days=3, cls="daily"):
@@ -90,6 +90,40 @@ class RestoreDrillTests(unittest.TestCase):
             input="brain/daily/brain-garbage.tar.gz.age\n" + key(1) + "\n",
             capture_output=True, text=True, check=False)
         self.assertEqual(out.returncode, 1, out.stdout)
+
+    def test_the_fixture_uses_the_stamp_format_snapshot_sh_writes(self):
+        stamp = re.search(r"brain-(.*)\.tar\.gz\.age$", key(0)).group(1)
+        self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2}T\d{6}Z$")
+        out = subprocess.run(["bash", "-c", '. "$1"; iso_epoch "$2"', "x", str(RETENTION_LIB), stamp],
+                             capture_output=True, text=True, check=False)
+        self.assertEqual(int(out.stdout), int(NOW.timestamp()))
+
+    def test_a_future_timestamp_is_not_excused(self):
+        rc, _ = audit([-24 * 365] + [24 * d for d in range(7)], keep=7)
+        self.assertEqual(rc, 1)
+
+    def test_a_leading_zero_in_the_window_is_decimal(self):
+        # 010 must be ten days, not octal eight: nine days old passes under ten
+        rc, _ = audit([2, 8, 20, 30, 44, 50, 60, 66, 24 * 9], lock_days="010")
+        self.assertEqual(rc, 0)
+
+    def test_the_setting_in_backup_env_reaches_the_drill(self):
+        """s3_load_config sources the file with `set -a`, which is what makes the
+        drill's ${BRAIN_BACKUP_LOCK_DAYS:-3} see a value written there."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            conf = Path(d) / "backup.env"
+            conf.write_text("BRAIN_BACKUP_ENDPOINT=https://e.example.com\nBRAIN_BACKUP_BUCKET=b\n"
+                            "BRAIN_BACKUP_ACCESS_KEY_ID=k1\nBRAIN_BACKUP_SECRET_ACCESS_KEY=s1\n"
+                            "BRAIN_BACKUP_LOCK_DAYS=1\n")
+            out = subprocess.run(
+                ["bash", "-c", '. "$1"; s3_load_config "$2"; bash -c "echo \\${BRAIN_BACKUP_LOCK_DAYS:-3}"',
+                 "x", str(BACKUP / "lib-s3.sh"), str(conf)],
+                capture_output=True, text=True, check=False, env={"PATH": "/usr/bin:/bin"})
+        self.assertEqual(out.stdout.strip(), "1", out.stderr)
+
+    def test_a_failed_listing_is_not_reported_green(self):
+        self.assertRegex(DRILL.read_text(), r'rc.*-ne 0.*could not list recovery points')
 
     def test_the_drill_uses_the_audit_and_a_documented_default_window(self):
         text = DRILL.read_text()

@@ -295,11 +295,12 @@ fi
 # catches a prune loop that has quietly stopped running or started running
 # twice. A surplus point younger than the bucket's object lock is not that: the
 # lock refuses its delete until it lapses (see retention_audit).
-# The window is one setting, in backup.env; snapshot.sh has no copy of it
-# because it simply asks the bucket and logs the refusal.
+# The window is one setting, in backup.env (s3_load_config above sources that
+# file with `set -a`, so it is in the environment here); snapshot.sh has no copy
+# of it because it simply asks the bucket and logs the refusal.
 LOCK_DAYS="${BRAIN_BACKUP_LOCK_DAYS:-3}"
 case "$LOCK_DAYS" in
-    ''|*[!0-9]*) die 78 "BRAIN_BACKUP_LOCK_DAYS must be a whole number of days, got: $LOCK_DAYS" ;;
+    ''|*[!0-9]*) die 64 "BRAIN_BACKUP_LOCK_DAYS must be a whole number of days, got: $LOCK_DAYS" ;;
 esac
 for pair in "daily 7" "weekly 4" "monthly 12"; do
     set -- $pair
@@ -307,7 +308,10 @@ for pair in "daily 7" "weekly 4" "monthly 12"; do
     line="$(s3_list "$S3_PREFIX/$1/" | { grep -v '\.meta\.json$' || true; } | retention_audit "$1" "$2" "$LOCK_DAYS" "$START_EPOCH")" || rc=$?
     case "$line" in
         bad\ *) bad "${line#bad }" ;;
-        ok\ *)  ok "${line#ok }" ;;
+        ok\ *)
+            # A failed listing reaches the audit as no keys at all, which reads
+            # as "0 recovery points" and would be reported green.
+            if [ "$rc" -ne 0 ]; then bad "$1: could not list recovery points (rc=$rc)"; else ok "${line#ok }"; fi ;;
         *)       bad "$1: retention audit gave no verdict (rc=$rc)" ;;
     esac
 done

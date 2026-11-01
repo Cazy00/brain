@@ -38,7 +38,7 @@ RETENTION_PRUNE_INTERVAL_SECS=86400
 # backups, such as brain-upgrade's pre-upgrade one, outlives the count for a few
 # days. It is a failure only when a SURPLUS point is older than the lock plus one
 # prune interval, because then the lock cannot be why it is still there. An
-# unreadable timestamp counts as old: nothing may excuse a point we cannot date.
+# unreadable or future timestamp counts as old: nothing may excuse a point we cannot date.
 retention_audit() {
     local class="$1" keep="$2" lock_days="$3" now="$4"
     local keys n surplus=0 old=0 key stamp epoch limit
@@ -48,19 +48,21 @@ retention_audit() {
         printf 'ok %s: %s/%s recovery points\n' "$class" "$n" "$keep"
         return 0
     fi
-    limit=$(( lock_days * 86400 + RETENTION_PRUNE_INTERVAL_SECS ))
+    limit=$(( 10#$lock_days * 86400 + RETENTION_PRUNE_INTERVAL_SECS ))
     while IFS= read -r key; do
         [ -n "$key" ] || continue
         [ "$surplus" -lt $((n - keep)) ] || break
         surplus=$((surplus + 1))
         stamp="$(printf '%s' "$key" | sed -n 's|.*/brain-\(.*\)\.tar\.gz\.age$|\1|p')"
         epoch="$(iso_epoch "$stamp")"
-        if [ "$epoch" -le 0 ] || [ $((now - epoch)) -gt "$limit" ]; then
+        # A stamp in the future (this clock behind the one that made it) cannot
+        # be shown to be young, so it is treated like an unreadable one.
+        if [ "$epoch" -le 0 ] || [ "$epoch" -gt $((now + 3600)) ] || [ $((now - epoch)) -gt "$limit" ]; then
             old=$((old + 1))
         fi
     done <<< "$keys"
     if [ "$old" -gt 0 ]; then
-        printf 'bad %s: %s recovery points, retention says %s, and %s of the %s surplus are older than the %s-day lock — pruning is not running\n' \
+        printf 'bad %s: %s recovery points, retention says %s, and %s of the %s surplus are older than the %s-day lock plus one prune night — pruning is not running\n' \
             "$class" "$n" "$keep" "$old" "$surplus" "$lock_days"
         return 1
     fi
