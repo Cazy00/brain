@@ -4714,6 +4714,18 @@ class TemplateTests(unittest.TestCase):
         self.tmp = temp_dir()
         self.repo = make_sandbox(self.tmp.name)
         self.dest = Path(self.tmp.name) / "template"
+        # Pin the publisher: the identity scan derives it from git's user.name /
+        # user.email, and a sandbox has no origin, so without this it falls
+        # through to the machine's GLOBAL git identity. On home that is
+        # "home agent", and `agent` appears in every file the template ships
+        # (I-089). Repo-local config wins over global, so the tests no longer
+        # read the machine's identity at all. The values are a token that
+        # appears nowhere in the shipped tree (ROOT_TOKEN, built by
+        # concatenation so this file does not contain it).
+        for key, value in (("user.name", self.ROOT_TOKEN),
+                           ("user.email", self.ROOT_TOKEN + "@example.invalid")):
+            subprocess.run(["git", "config", key, value], cwd=self.repo,
+                           check=True, capture_output=True)
         # Plant content that must NOT ship: a note, and a vault recipient.
         # Built at runtime: a literal canary here would also live in this test
         # file, which the template legitimately ships, and self-trip the check.
