@@ -16,8 +16,9 @@ def note(stamp, size=500, kind="fact", source="local"):
             "source": source, "targets": []}
 
 
-def correction(stamp, *targets, size=400):
-    item = note(stamp, size=size, kind="correction")
+def correction(stamp, *targets, size=400, source="local", basis="owner-said", retraction=False):
+    item = note(stamp, size=size, kind="correction", source=source)
+    item.update(basis=basis, retraction=retraction)
     item["targets"] = [{"name": name, "size": tsize, "canonical": canonical}
                        for name, tsize, canonical in targets]
     return item
@@ -62,7 +63,7 @@ class SelectBatchTests(unittest.TestCase):
         self.assertLessEqual(budget.files, passsize.BUDGET_FILES)
 
     def test_one_item_is_always_taken_however_large(self):
-        batch = passsize.select_batch([note("01-000000", size=900_000), note("02-000000")])
+        batch = passsize.select_batch([note("01-000000", size=150_000), note("02-000000")])
         self.assertEqual(batch.notes, ["knowledge/inbox/2026-11-01-000000.md"])
 
     def test_corrections_come_first_with_their_targets(self):
@@ -96,11 +97,133 @@ class SelectBatchTests(unittest.TestCase):
             self.assertNotIn(target, batch.allowed)
         self.assertIn(held[0], batch.allowed)
 
-    def test_a_single_correction_over_the_budget_is_still_taken_alone(self):
-        items = [correction("01-000000", ("big-note", 500_000, True)), note("02-000000")]
+    def test_a_single_correction_over_the_budget_is_still_taken_and_a_note_goes_with_it(self):
+        """0.8.0 review finding 2: a correction over the budget is taken alone among the
+        corrections, and a waiting note still goes with it."""
+        items = [correction("01-000000", ("big-note", 500_000, True)), note("02-000000"),
+                 note("03-000000")]
         batch = passsize.select_batch(items)
         self.assertEqual(batch.corrections, ["knowledge/inbox/2026-11-01-000000.md"])
-        self.assertEqual(batch.notes, [])
+        self.assertEqual(batch.notes, ["knowledge/inbox/2026-11-02-000000.md"])
+
+    # -- 0.8.0 review finding 2: a correction the pass leaves never starves the notes --
+
+    def test_a_large_left_behind_drop_box_correction_lets_the_owners_notes_drain(self):
+        bad = correction("01-000000", ("big-note", 30_000, True), source="drop-box")
+        owners = [note(f"02-{i:06d}") for i in range(5)]
+        batch = passsize.select_batch([bad] + owners)
+        self.assertEqual(batch.notes, [n["path"] for n in owners])
+        # It is weighed, not applied: its target's size is not its cost.
+        self.assertLess(batch.chars, passsize.BUDGET_CHARS)
+
+    def test_a_trusted_correction_left_behind_every_pass_still_leaves_notes_a_part(self):
+        stuck = correction("01-000000", ("big-note", 25_000, True))
+        owners = [note(f"02-{i:06d}") for i in range(5)]
+        for _ in range(3):                               # the same inbox, pass after pass
+            batch = passsize.select_batch([stuck] + owners)
+            self.assertEqual(batch.corrections, [stuck["path"]])
+            self.assertTrue(batch.notes, "the owner's notes got no part of the pass")
+
+    def test_corrections_take_at_most_their_share_while_notes_wait(self):
+        fixes = [correction(f"01-{i:06d}") for i in range(12)]
+        owners = [note(f"02-{i:06d}") for i in range(12)]
+        batch = passsize.select_batch(fixes + owners)
+        self.assertLessEqual(len(batch.corrections) * passsize.MIN_ITEM_CHARS,
+                             passsize.BUDGET_CHARS * passsize.CORRECTION_SHARE)
+        self.assertGreaterEqual(len(batch.notes), len(batch.corrections))
+        # With no note waiting they may take the whole budget.
+        alone = passsize.select_batch(fixes)
+        self.assertGreater(len(alone.corrections), len(batch.corrections))
+
+    def test_corrections_the_pass_can_act_on_come_before_the_others(self):
+        items = [correction("01-000000", source="drop-box"),
+                 correction("02-000000", basis="agent-inferred"),
+                 correction("03-000000"),
+                 correction("04-000000", basis="agent-found"),
+                 correction("05-000000", basis="agent-found", retraction=True),
+                 correction("06-000000", retraction=True)]
+        batch = passsize.select_batch(items)
+        order = [p[len("knowledge/inbox/2026-11-"):-len("-000000.md")] for p in batch.corrections]
+        self.assertEqual(order, ["03", "04", "06", "01", "02", "05"])
+
+    def test_only_a_local_correction_holds_the_inbox_note_it_names(self):
+        x, y = "knowledge/inbox/2026-10-01-000000.md", "knowledge/inbox/2026-10-02-000000.md"
+        items = [{"path": p, "size": 100, "kind": "fact", "source": "local", "targets": []}
+                 for p in (x, y)]
+        items += [correction("01-000000", (x, 100, False), basis="agent-inferred"),
+                  correction("02-000000", (y, 100, False), source="drop-box")]
+        batch = passsize.select_batch(items)
+        self.assertNotIn(x, batch.allowed)      # the engine's check would block draining it
+        self.assertNotIn(x, batch.notes)
+        self.assertIn(y, batch.notes)           # a drop box holds nothing back
+
+    # -- 0.8.0 review finding 3: corrections that name the same inbox note go together --
+
+    def shared(self, first_cost):
+        x = "knowledge/inbox/2026-10-01-000000.md"
+        items = [{"path": x, "size": 100, "kind": "fact", "source": "local", "targets": []},
+                 correction("01-000000", (x, 100, False), ("big", 24_000, True)),
+                 correction("01-000001", (x, 100, False))]
+        if first_cost:
+            items.append(correction("00-000000", ("other-big", first_cost, True)))
+        return x, items
+
+    def test_two_corrections_naming_one_note_are_taken_together(self):
+        x, items = self.shared(0)
+        batch = passsize.select_batch(items)
+        self.assertEqual(batch.corrections, ["knowledge/inbox/2026-11-01-000000.md",
+                                             "knowledge/inbox/2026-11-01-000001.md"])
+        self.assertEqual(batch.deferred, [])
+        self.assertIn(x, batch.allowed)
+
+    def test_two_corrections_naming_one_note_are_deferred_together_and_it_is_not_allowed(self):
+        x, items = self.shared(20_000)
+        batch = passsize.select_batch(items)
+        self.assertEqual(batch.corrections, ["knowledge/inbox/2026-11-00-000000.md"])
+        self.assertEqual(batch.deferred, ["knowledge/inbox/2026-11-01-000000.md",
+                                          "knowledge/inbox/2026-11-01-000001.md"])
+        self.assertNotIn(x, batch.allowed)
+        self.assertNotIn(x, batch.notes)
+
+    def test_cut_defers_a_kept_correction_that_shares_a_note_with_one_cut_away(self):
+        x, items = self.shared(0)
+        batch = passsize.select_batch(items + [note("09-000000")])
+        smaller = passsize.cut(batch, 2)          # room for one correction and one note
+        self.assertEqual(smaller.corrections, [])
+        self.assertEqual(smaller.deferred[:2], batch.corrections)
+        self.assertNotIn(x, smaller.allowed)
+        self.assertEqual(smaller.notes, ["knowledge/inbox/2026-11-09-000000.md"])
+
+    def test_cut_keeps_the_deferred_corrections_oldest_first(self):
+        """0.8.0 review finding 8: in the selection's order, not re-sorted as a set."""
+        items = [correction("03-000000"), correction("02-000000", source="drop-box")]
+        batch = passsize.select_batch(items, max_items=1)
+        self.assertEqual(batch.deferred, ["knowledge/inbox/2026-11-02-000000.md"])
+        smaller = passsize.cut(passsize.select_batch(items), 0)
+        self.assertEqual(smaller.deferred, ["knowledge/inbox/2026-11-02-000000.md"])
+        three = [correction("01-000000"), correction("02-000000"), correction("03-000000")]
+        batch = passsize.select_batch(three, max_items=2)
+        self.assertEqual(passsize.cut(batch, 1).deferred,
+                         ["knowledge/inbox/2026-11-02-000000.md",
+                          "knowledge/inbox/2026-11-03-000000.md"])
+
+    # -- 0.8.0 review finding 4: an item no audited pass can drain is set aside --
+
+    def test_an_item_alone_over_the_diff_cap_is_set_aside_and_the_rest_go_on(self):
+        huge = note("01-000000", size=210_000)
+        batch = passsize.select_batch([huge, note("02-000000"), note("03-000000")])
+        self.assertEqual(batch.notes, ["knowledge/inbox/2026-11-02-000000.md",
+                                       "knowledge/inbox/2026-11-03-000000.md"])
+        self.assertNotIn(huge["path"], batch.allowed)
+        self.assertIn("alone over the audit's 200000 diff chars", batch.set_aside[huge["path"]])
+
+    def test_a_path_the_engine_set_aside_is_skipped(self):
+        first = note("01-000000")
+        batch = passsize.select_batch([first, note("02-000000")],
+                                      set_aside={first["path"]: "over caps alone"})
+        self.assertEqual(batch.notes, ["knowledge/inbox/2026-11-02-000000.md"])
+        self.assertEqual(batch.set_aside, {first["path"]: "over caps alone"})
+        self.assertEqual(passsize.cut(batch, 1).set_aside, batch.set_aside)
 
     def test_cut_keeps_the_first_items_and_defers_the_corrections_it_drops(self):
         target = "knowledge/inbox/2026-10-01-000000.md"
