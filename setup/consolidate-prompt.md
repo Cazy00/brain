@@ -24,10 +24,12 @@ replaces one. Nothing else moves or deletes a file: no rm, no mv, no git mv.
 
 Do these in order, respecting every cap:
 
-1. Drain the inbox. Apply CORRECTIONS (below) first, across the WHOLE inbox.
-   Then promote PROJECT OVERVIEWS (below), so the handoffs that follow can
-   name the projects they create.
-   Then, for each other note in knowledge/inbox/ (oldest first, max 40),
+1. Drain the inbox — only what THIS PASS'S BATCH (at the end of this prompt)
+   lists. The engine chose it, oldest first, to fit what the audit can read.
+   Apply the batch's CORRECTIONS (below) first, in its order.
+   Then promote PROJECT OVERVIEWS (below) from the batch's notes, so the
+   handoffs that follow can name the projects they create.
+   Then, for each other note the batch lists (oldest first),
    decide where it belongs — a new canonical note (create via the conventions:
    proper frontmatter, aliases, topics from topics.yaml) or a merge into an
    existing note. Then drain the inbox file. If an item is not actionable
@@ -47,8 +49,8 @@ Do these in order, respecting every cap:
    `handoff_reason: <one line>` to its frontmatter. <project> is the slug of
    a project the brain knows (a knowledge/projects/<project>/ overview): the
    capture's `project:`, or the project it plainly concerns. Unknown project:
-   leave it in the inbox and say so in the commit message. Handoffs do not
-   count toward the 40, and a decision or lesson inside it that outlives the
+   leave it in the inbox and say so in the commit message. Handoffs come
+   only from the batch's notes, and a decision or lesson inside it that outlives the
    project is still promoted as its own note. You never promote, merge or edit
    a note in knowledge/handoff/: a filing job files it in the project's
    records and closes it with a correction (CORRECTIONS).
@@ -63,10 +65,10 @@ Do these in order, respecting every cap:
    not exist, create the note with `bin/brain new project "<project>"
    --topics <a,b>` (topics from topics.yaml), then give it a readable title
    and the overview's content; when it exists, merge into its overview.md.
-   Weigh it by PROVENANCE like any capture. Overviews do not count toward the
-   40; the files they create or change count toward the 30.
+   Weigh it by PROVENANCE like any capture. Overviews come only from the
+   batch's notes; the files they create or change count toward the 30.
    Proposals an earlier pass wrote (`source: session-mining`) follow PROPOSALS
-   below and do not count toward the 40.
+   below and are never in the batch.
    PROVENANCE — every capture carries `source:`, stamped by the endpoint that
    accepted it, and you must read it before you weigh the note.
    - `local` is an owner endpoint: the owner, or an agent working for them.
@@ -99,11 +101,15 @@ Do these in order, respecting every cap:
      2026-07-30) — but every capture since is stamped, so an unstamped note
      with a recent `created:` did not come from `brain capture` and is
      untrusted too.
-   CORRECTIONS — before any other note, read the WHOLE inbox, not only the
-   oldest 40, for `kind: correction` notes, and apply each one to its target
-   first, so an original is never promoted in a pass whose correction lies
-   beyond the cap. Corrections do not count toward the 40; the canonical
-   files they change count toward the 30. A correction names its target by
+   CORRECTIONS — before any other note, apply the corrections the batch
+   lists, in its order, each `kind: correction` note to its target. The engine took first
+   the ones from a trusted source (below), then the others, each oldest first
+   with their targets, and those naming the same inbox note together, while
+   they fit the audit's budget; a correction it deferred stays in the inbox
+   for a later pass, and so does every inbox note it names, so an original is
+   never promoted while its correction waits (the engine checks this before
+   the audit). The canonical files they
+   change count toward the 30. A correction names its target by
    id (a canonical note) or by path (an inbox note, which has no id) and
    quotes the wrong line: "Correction to <target>: <what is true now>" fixes
    it, "Retract <target>: <reason>" says it should not be in the brain.
@@ -131,7 +137,7 @@ Do these in order, respecting every cap:
    A correction whose text starts `Filed <handoff path>` or `Already
    recorded: <handoff path>` (naming where the note now lives) closes a
    handoff: with `source: local`, close that handoff note and drain the
-   correction, before the cap like any other correction.
+   correction, when the batch lists it like any other correction.
    PROPOSALS — for each `source: session-mining` note from an earlier pass:
    promote it only if it is corroborated — by another capture, a canonical
    note, or a later digest entry where the user says it again — and name what
@@ -194,10 +200,11 @@ Do these in order, respecting every cap:
 6. Enrich: add missing aliases to any note you touched.
 
 Hard caps: modify at most 30 canonical files total, plus at most 3 new inbox
-proposals from step 3. If the inbox has more than 40 items (proposals from
-earlier passes, project overviews, handoffs and corrections not counted),
-process the oldest 40 and stop —
-the rest wait for the next pass.
+proposals from step 3. Drain only the inbox notes THIS PASS'S BATCH lists (and
+the inbox notes its corrections name); the rest wait for the next pass. The
+engine measures your change set before any audit: over 30 canonical files or
+200,000 diff characters, it throws the attempt away and reruns the pass with a
+smaller batch, so going past a cap costs the whole attempt.
 
 Finish: run bin/brain lint and fix every error until it exits clean. Commit
 everything as "consolidate: <today's date>" with a body listing what was

@@ -1352,7 +1352,10 @@ class ConsolidateTests(unittest.TestCase):
     # -- E5/E6: idle passes, cost, and one machine-readable result line --
 
     RESULT_KEYS = {"v", "status", "idle", "cost_microusd", "tokens_in", "tokens_out",
-                   "digest_entries", "inbox_before"}
+                   "digest_entries", "inbox_before",
+                   # 0.8.0: the pass's size
+                   "batch", "deferred_corrections", "attempts", "canonical_files", "diff_chars",
+                   "set_aside"}
 
     def result_of(self, completed):
         lines = [l for l in completed.stdout.splitlines() if l.startswith("consolidate-result: ")]
@@ -2008,6 +2011,455 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(missing.returncode, 0, missing.stdout + missing.stderr)
         self.assertIn("WARNING: --digest-from", missing.stdout)
         self.assertTrue(seen.exists(), "the pass did not continue without the directory")
+
+
+    # -- 0.8.0 (I-070): the engine sizes the pass and measures it before any audit --
+
+    def more_captures(self, count):
+        """`count` captures newer than the seed, so a batch has more than one item."""
+        commit_at(self.repo, "more captures", iso_ago(0), *[
+            (f"knowledge/inbox/2026-10-16-{i:06d}-more.md",
+             "---\ncreated: 2026-10-16\nsource: local\nstatus: draft\n---\n\nAnother.\n")
+            for i in range(count)])
+
+    def sized_stub(self, first, second, body_chars=0, first_extra="", second_extra="",
+                   audit_extra=""):
+        """Propose writes `first` canonical reference notes on its first call (one of them
+        `body_chars` longer, when given) and `second` on its second, draining the seed there.
+        Before writing, each call records what it found: the reference notes present, the
+        status and HEAD. Every call is logged; the audit answers PASS."""
+        log = Path(self.tmp.name) / "calls.log"
+        seen = Path(self.tmp.name) / "seen"
+        seen.mkdir(exist_ok=True)
+        counter = Path(self.tmp.name) / "proposes"
+
+        def notes(count, tag, chars=0):
+            if not count:
+                return ":\n"
+            filler = (f"; printf '%0{chars}d\\n' 0 >> knowledge/reference/{tag}-0.md"
+                      if chars else "")
+            return (f"i=0; while [ $i -lt {count} ]; do "
+                    f"printf -- '---\\nid: {tag}-%s\\nkind: reference\\ntitle: {tag} %s\\n"
+                    f"topics: [brain]\\naliases: [{tag} %s]\\ncreated: 2026-11-04\\n"
+                    f"status: current\\n---\\n\\nA fact.\\n' $i $i $i "
+                    f"> knowledge/reference/{tag}-$i.md; i=$((i+1)); done{filler}\n")
+        self.stub_claude(
+            f'case "$*" in *--tools*) echo audit >> {log}; {audit_extra}'
+            'echo "VERDICT: PASS"; exit 0;; esac\n'
+            f'n=$(($(cat {counter} 2>/dev/null || echo 0)+1)); echo $n > {counter}\n'
+            f'echo "propose $n" >> {log}\n'
+            'for last; do :; done\n'
+            f'printf "%s" "$last" > {seen}/prompt.$n\n'
+            f'ls knowledge/reference > {seen}/reference.$n\n'
+            f'git status --porcelain > {seen}/status.$n\n'
+            f'git rev-parse HEAD > {seen}/head.$n\n'
+            f'ls > {seen}/root.$n\n'
+            'if [ $n -eq 1 ]; then\n'
+            + notes(first, "attempt1", body_chars) + first_extra +
+            'else\n'
+            + notes(second, "attempt2") + self.toolbelt("drain", self.SEED).strip()
+            + " > /dev/null\n" + second_extra +
+            'fi\nexit 0')
+        return log, seen
+
+    def calls(self, log):
+        return log.read_text().split() if log.exists() else []
+
+    def batch_paths(self, prompt):
+        block = prompt[prompt.index("THIS PASS'S BATCH"):]
+        return [line[2:] for line in block.splitlines() if line.startswith("- knowledge/")]
+
+    def trunk_head(self):
+        return subprocess.run(["git", "rev-parse", self.trunk], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_an_oversized_attempt_is_discarded_and_rerun_smaller(self):
+        """Plan test 5 (review finding 1): reset --hard + clean -fd, so the second attempt
+        starts on the trunk with none of the first one's files, its own commit included."""
+        self.more_captures(4)
+        log, seen = self.sized_stub(
+            31, 5, first_extra=("echo scratch > scratch-attempt-1.txt\n"
+                                "git add knowledge/reference/attempt1-0.md && "
+                                "git commit -q --no-verify -m 'consolidate: own'\n"))
+        result = self.consolidate()
+        payload = self.result_of(result)
+        self.assertEqual(payload["status"], "committed", result.stdout)
+        self.assertEqual(self.calls(log), ["propose", "1", "propose", "2", "audit"])
+        self.assertEqual((payload["attempts"], payload["batch"]), (2, 2))
+        self.assertEqual(len(self.batch_paths((seen / "prompt.1").read_text())), 5)
+        self.assertEqual(len(self.batch_paths((seen / "prompt.2").read_text())), 2)
+        self.assertNotIn("attempt1", (seen / "reference.2").read_text())
+        self.assertEqual((seen / "status.2").read_text(), "")
+        self.assertNotIn("scratch-attempt-1.txt", (seen / "root.2").read_text())
+        self.assertEqual((seen / "head.2").read_text().strip(), self.trunk_head())
+        self.assertIn("over caps: 31 canonical files", result.stdout)
+        branches = self.branches().split()
+        self.assertEqual(len(branches), 1, branches)
+        count = subprocess.run(["git", "rev-list", "--count", f"{self.trunk}..{branches[0]}"],
+                               cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(count, "1", "the curator takes exactly one commit on the trunk")
+        self.assertEqual(payload["canonical_files"], 5)
+
+    def test_the_cost_of_every_call_is_summed_across_attempts(self):
+        self.more_captures(4)
+        log, _seen = self.sized_stub(31, 5)
+        stub = self.stub_bin / "claude"
+        body = stub.read_text()
+        # Each call answers in JSON: 0.25 for each propose, 0.125 for the audit.
+        body = body.replace('echo "VERDICT: PASS"; exit 0;;',
+                            'echo \'{"result": "VERDICT: PASS", "total_cost_usd": 0.125}\'; '
+                            'exit 0;;')
+        body = body.replace("fi\nexit 0", "fi\necho '{\"result\": \"done\", "
+                                          "\"total_cost_usd\": 0.25}'\nexit 0")
+        stub.write_text(body)
+        payload = self.result_of(self.consolidate())
+        self.assertEqual(payload["status"], "committed")
+        self.assertEqual(payload["cost_microusd"], 625000)
+
+    def over_caps_end(self, result, log, proposes):
+        payload = self.result_of(result)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(payload["status"], "blocked", result.stdout)
+        self.assertNotIn("audit", self.calls(log), "an audit was paid for an oversized pass")
+        self.assertEqual(self.calls(log).count("propose"), proposes)
+        self.assertIn("consolidation DID NOT LAND: over caps:", result.stdout)
+        # 0.8.0 review finding 1: every discarded attempt is saved, the last one included.
+        patches = sorted((self.repo / ".cache" / "over-caps").glob("*.patch"))
+        self.assertEqual(len(patches), proposes, result.stdout)
+        here = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual(here, self.trunk)
+        self.assertEqual(subprocess.run(["git", "status", "--porcelain"], cwd=self.repo,
+                                        capture_output=True, text=True).stdout, "")
+        self.assertEqual(self.branches(), "", "an over-cap pass left a branch behind")
+        self.assertIn("back on the trunk", result.stdout)
+        return payload, patches[-1]
+
+    def test_over_the_caps_twice_ends_blocked_with_a_patch_and_a_clean_trunk(self):
+        """Plan test 6 (review finding 6): no audit, the attempt kept as a patch outside git,
+        and the next run starts clean and runs."""
+        self.more_captures(4)
+        log, _seen = self.sized_stub(31, 31)
+        payload, patch = self.over_caps_end(self.consolidate(), log, 2)
+        self.assertEqual(payload["attempts"], 2)
+        self.assertIn("knowledge/reference/attempt2-30.md", patch.read_text())
+        self.assertEqual(oct(patch.stat().st_mode & 0o777), "0o600")
+        self.stub_runner("VERDICT: PASS")
+        again = self.consolidate()
+        self.assertNotIn("working tree not clean", again.stdout)
+        self.assertEqual(self.result_of(again)["status"], "committed", again.stdout)
+
+    def test_a_batch_of_one_over_the_caps_is_not_retried(self):
+        log, _seen = self.sized_stub(31, 0)
+        payload, _patch = self.over_caps_end(self.consolidate(), log, 1)
+        self.assertEqual((payload["attempts"], payload["batch"]), (1, 1))
+
+    def test_a_diff_over_the_character_cap_with_few_files_is_retried_too(self):
+        """Plan test 7: one canonical file, 210,000 characters of it."""
+        self.more_captures(4)
+        log, _seen = self.sized_stub(1, 2, body_chars=210_000)
+        result = self.consolidate()
+        self.assertIn("over caps: 1 canonical files", result.stdout)
+        self.assertEqual(self.result_of(result)["attempts"], 2, result.stdout)
+
+    def test_over_the_caps_and_failing_lint_still_takes_the_retry(self):
+        """Note 7: the caps are measured first, so lint does not end an oversized attempt."""
+        self.more_captures(4)
+        log, _seen = self.sized_stub(
+            31, 3, first_extra="printf -- '---\\nid: Broken Id\\n---\\n' > "
+                               "knowledge/reference/broken.md\n")
+        result = self.consolidate()
+        payload = self.result_of(result)
+        self.assertEqual((payload["status"], payload["attempts"]), ("committed", 2),
+                         result.stdout)
+        self.assertNotIn("lint rejected", result.stdout)
+
+    def test_a_drain_outside_the_batch_is_blocked_before_the_audit(self):
+        """Plan test 10."""
+        self.more_captures(20)
+        newest = "knowledge/inbox/2026-10-16-000019-more.md"
+        self.blocked(self.toolbelt("drain", self.SEED, newest), "batch check:")
+
+    def test_corrections_over_the_budget_wait_with_the_notes_they_name(self):
+        """Plan test 11 (review finding 5): the first correction is taken alone, the second
+        is deferred and listed as such, and draining what it names is blocked."""
+        big = "x" * 30_000
+        named = "knowledge/inbox/2026-10-16-000000-named.md"
+        commit_at(self.repo, "two big corrections", iso_ago(0),
+                  ("knowledge/reference/big-one.md",
+                   "---\nid: big-one\nkind: reference\ntitle: Big one\ntopics: [brain]\n"
+                   f"aliases: [big one]\ncreated: 2026-07-01\nstatus: current\n---\n\n{big}\n"),
+                  (named, "---\ncreated: 2026-10-16\nsource: local\nstatus: draft\n---\n\n"
+                          "A capture a later correction names.\n"),
+                  self.correction("2026-10-18-070000-fix-big.md",
+                                  "Correction to [[big-one]]: it is smaller."),
+                  self.correction("2026-10-18-080000-fix-named.md",
+                                  f"Correction to {named}: it was 2026-10-15."))
+        seen = Path(self.tmp.name) / "prompt.txt"
+        audited = self.audited_stub(f'for last; do :; done\nprintf "%s" "$last" > {seen}\n'
+                                    + self.toolbelt("drain", named))
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+        self.assertEqual(self.result_of(result)["deferred_corrections"], 1)
+        self.assertFalse(audited.exists())
+        prompt = seen.read_text()
+        block = prompt[prompt.index("THIS PASS'S BATCH"):]
+        self.assertIn("- knowledge/inbox/2026-10-18-070000-fix-big.md", block)
+        deferred = block[block.index("deferred to a later pass"):]
+        self.assertIn("- knowledge/inbox/2026-10-18-080000-fix-named.md", deferred)
+        notes = block[block.index("Notes to drain"):block.index("deferred to a later pass")]
+        self.assertNotIn(named, notes)
+
+    def test_the_sealed_branch_gives_audit_branch_exactly_the_measured_diff(self):
+        """Plan test 13 (review finding 2): the proposer commits part of its work and leaves
+        the rest untracked; the engine's measurements before and after the seal and the diff
+        curator-audit's audit-branch is handed are the same size."""
+        self.more_captures(2)
+        log, _seen = self.sized_stub(
+            2, 0, first_extra=("git add knowledge/reference/attempt1-0.md && "
+                               "git commit -q --no-verify -m 'consolidate: part'\n"))
+        result = self.consolidate()
+        payload = self.result_of(result)
+        self.assertEqual(payload["status"], "committed", result.stdout)
+        measured = re.search(r"measured: (\d+) canonical files, (\d+) diff chars", result.stdout)
+        sealed = re.search(r"sealed: (\d+) canonical files, (\d+) diff chars", result.stdout)
+        self.assertEqual(measured.groups(), sealed.groups())
+        self.assertEqual(int(sealed.group(2)), payload["diff_chars"])
+        heard = Path(self.tmp.name) / "audit-stdin.txt"
+        self.stub_claude(f'case "$*" in *--tools*) cat > {heard}; echo "VERDICT: PASS"; '
+                         'exit 0;; esac\nexit 3')
+        branch = self.branches().split()[-1]
+        # As curator-audit reads it: a checkout of the branch itself.
+        subprocess.run(["git", "checkout", "-q", branch], cwd=self.repo, check=True)
+        audit = self.audit_branch("--branch", branch)
+        self.assertEqual(audit.returncode, 0, audit.stdout + audit.stderr)
+        told = re.search(r"measured by the engine: (\d+) canonical files, (\d+) diff characters",
+                         heard.read_text())
+        self.assertEqual(told.groups(), measured.groups())
+        diff = heard.read_text()
+        start = diff.index("```diff\n") + len("```diff\n")
+        self.assertEqual(len(diff[start:diff.index("\n```\n", start)]), payload["diff_chars"])
+
+    def test_audit_branch_refuses_an_oversized_branch_as_an_error_without_a_model(self):
+        """Plan test 12 (review finding 4): the independent gate keeps the caps itself."""
+        ran = Path(self.tmp.name) / "ran"
+        self.stub_claude(f"touch {ran}\necho 'VERDICT: PASS'\nexit 0")
+        subprocess.run(["git", "checkout", "-q", "-b", "consolidate/2026-11-04"], cwd=self.repo,
+                       check=True)
+        for i in range(31):
+            rel = f"knowledge/reference/many-{i}.md"
+            (self.repo / rel).write_text(self.reference(f"many-{i}")[1], encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "--no-verify", "-m", "consolidate: x"],
+                       cwd=self.repo, check=True)
+        audit = self.audit_branch("--branch", "consolidate/2026-11-04")
+        self.assertEqual(audit.returncode, 1)
+        line = [l for l in audit.stdout.splitlines() if l.startswith("audit-result: ")][-1]
+        self.assertEqual(json.loads(line[len("audit-result: "):])["verdict"], "error")
+        self.assertIn("31 canonical files", audit.stdout)
+        self.assertFalse(ran.exists(), "a model was started for an oversized branch")
+
+    # -- 0.8.0 review fixes --
+
+    def owner_capture(self, text):
+        """A shell line making a CLI capture while the pass runs, as the owner would."""
+        return self.toolbelt("capture", text).strip() + " >/dev/null\n"
+
+    def on_branch(self, branch, needle):
+        return subprocess.run(["git", "grep", "-l", needle, branch, "--", "knowledge"],
+                              cwd=self.repo, capture_output=True, text=True).stdout
+
+    def test_a_capture_written_mid_run_survives_an_over_cap_retry(self):
+        """Review finding 1: the lock is not held while the model runs, so a capture lands in
+        the checkout then. Discarding attempt 1 must not destroy it."""
+        self.more_captures(4)
+        log, seen = self.sized_stub(31, 5, first_extra=self.owner_capture("owner note kept"))
+        result = self.consolidate()
+        payload = self.result_of(result)
+        self.assertEqual(payload["status"], "committed", result.stdout)
+        # Attempt 2 started with it in place, and the pass's commit carries it.
+        branch = self.branches().split()[-1]
+        self.assertTrue(self.on_branch(branch, "owner note kept"), result.stdout)
+        self.assertIn("knowledge/inbox/", (seen / "status.2").read_text())
+        self.assertIn("kept: knowledge/inbox/", result.stdout)
+        # And the discarded attempt was saved before anything was reset, the capture in it.
+        patch = next((self.repo / ".cache" / "over-caps").glob("*-attempt1.patch"))
+        self.assertIn("owner note kept", patch.read_text())
+        self.assertIn("knowledge/reference/attempt1-30.md", patch.read_text())
+
+    def test_a_capture_written_mid_run_survives_an_over_cap_end_and_is_named_next_run(self):
+        self.more_captures(4)
+        log, _seen = self.sized_stub(
+            31, 31, first_extra=(self.owner_capture("owner note kept")
+                                 + "printf '\\000\\001\\002' > blob.bin\n"))
+        result = self.consolidate()
+        payload = self.result_of(result)
+        self.assertEqual(payload["status"], "blocked", result.stdout)
+        self.assertNotIn("audit", self.calls(log))
+        here = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual(here, self.trunk)
+        self.assertEqual(self.branches(), "")
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=self.repo,
+                                capture_output=True, text=True).stdout.splitlines()
+        self.assertEqual(len(status), 1, status)
+        kept = status[0][3:]
+        self.assertTrue(kept.startswith("knowledge/inbox/"), status)
+        self.assertIn("owner note kept", (self.repo / kept).read_text())
+        self.assertFalse((self.repo / "blob.bin").exists(), "the attempt's own file stayed")
+        self.assertIn("kept there uncommitted", result.stdout)
+        first = next((self.repo / ".cache" / "over-caps").glob("*-attempt1.patch")).read_text()
+        self.assertIn("GIT binary patch", first)       # binary-safe, untracked files included
+        again = self.consolidate()
+        self.assertIn("working tree not clean", again.stdout)
+        self.assertIn(kept, again.stdout)
+
+    def test_a_failed_discard_reports_the_real_state_and_the_next_run_names_it(self):
+        """Review finding 5: a proposer that switches branch defeats the discard."""
+        log, _seen = self.sized_stub(31, 0, first_extra="git checkout -q -b elsewhere\n")
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+        self.assertNotIn("back on the trunk", result.stdout)
+        self.assertNotIn("clean trunk", result.stdout)
+        self.assertIn("could NOT be discarded (HEAD is 'elsewhere'", result.stdout)
+        self.assertIn("the checkout is on 'elsewhere' and its tree is NOT clean", result.stdout)
+        again = self.consolidate()
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("working tree not clean", again.stdout)
+        self.assertIn("knowledge/reference/attempt1-", again.stdout)
+        # Committed there instead, the tree is clean: the pass still says where it is, and a
+        # pass started anywhere but the trunk refuses, naming the branch.
+        subprocess.run(["git", "commit", "-q", "--no-verify", "-m", "x"], cwd=self.repo,
+                       check=True)
+        again = self.consolidate()
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("the checkout is on 'elsewhere', not the trunk", again.stdout)
+
+    def test_an_over_caps_patch_never_writes_through_a_planted_file(self):
+        """Review finding 9: a 0644 file or a symlink at the patch's name is replaced, never
+        written through or left with its own mode."""
+        module = load_brain_module()
+        module.ROOT, module.K, module._DEFAULT_BRANCH = (self.repo, self.repo / "knowledge",
+                                                         None)
+        (self.repo / "knowledge" / "reference" / "staged.md").write_text("staged work\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        folder = self.repo / ".cache" / "over-caps"
+        folder.mkdir(parents=True)
+        outside = Path(self.tmp.name) / "outside.txt"
+        # Planted at every name the patch could take.
+        names = ["consolidate-x.patch", "consolidate-x-attempt.patch"]
+        for label in ("a 0644 file", "a symlink"):
+            with self.subTest(label):
+                outside.write_text("untouched\n")
+                for name in names:
+                    (folder / name).unlink(missing_ok=True)
+                    if label == "a symlink":
+                        (folder / name).symlink_to(outside)
+                    else:
+                        (folder / name).write_text("old\n")
+                        (folder / name).chmod(0o644)
+                path, problem = module.save_over_caps_patch("consolidate/x")
+                self.assertIsNone(problem)
+                self.assertFalse(path.is_symlink())
+                self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+                self.assertIn("staged work", path.read_text())
+                self.assertEqual(outside.read_text(), "untouched\n")
+                self.assertEqual([p.name for p in folder.iterdir() if p.name.endswith(".tmp")],
+                                 [])
+
+    def test_a_capture_over_the_diff_cap_is_set_aside_and_the_rest_drain(self):
+        """Review finding 4: a 210,000-character capture can never be drained inside the
+        audit's 200,000; it must not block every later pass."""
+        huge = "knowledge/inbox/2026-10-14-000000-huge.md"
+        commit_at(self.repo, "a huge capture", iso_ago(0),
+                  (huge, "---\ncreated: 2026-10-14\nsource: local\nstatus: draft\n---\n\n"
+                         + "y" * 210_000 + "\n"))
+        dry = self.consolidate_with("--dry-run")
+        self.assertIn(f"would set aside: {huge} — alone over the audit's 200000 diff chars",
+                      dry.stdout)
+        for _ in range(2):
+            audited = self.audited_stub(self.toolbelt("drain", self.SEED))
+            result = self.consolidate()
+            payload = self.result_of(result)
+            self.assertEqual(payload["status"], "committed", result.stdout)
+            self.assertEqual((payload["batch"], payload["set_aside"]), (1, 1))
+            self.assertIn(f"set aside: {huge} — alone over", result.stdout)
+            self.assertTrue(audited.exists())
+            self.back_to_trunk()
+
+    def test_a_note_alone_over_the_caps_is_set_aside_and_attempt_2_takes_the_rest(self):
+        big = "knowledge/inbox/2026-10-14-000000-big.md"
+        commit_at(self.repo, "a big capture", iso_ago(0),
+                  (big, "---\ncreated: 2026-10-14\nsource: local\nstatus: draft\n---\n\n"
+                        + "y" * 30_000 + "\n"))
+        self.more_captures(2)
+        log, seen = self.sized_stub(31, 3)
+        result = self.consolidate()
+        payload = self.result_of(result)
+        self.assertEqual(self.batch_paths((seen / "prompt.1").read_text()), [big])
+        self.assertIn(f"set aside: {big} — over caps alone", result.stdout)
+        self.assertEqual(payload["status"], "committed", result.stdout)
+        self.assertEqual((payload["attempts"], payload["set_aside"]), (2, 1))
+        second = self.batch_paths((seen / "prompt.2").read_text())
+        self.assertIn(self.SEED, second)
+        self.assertNotIn(big, second[:second.index(self.SEED) + 1])
+        self.back_to_trunk()
+        dry = self.consolidate_with("--dry-run")
+        self.assertIn(f"would set aside: {big} — over caps alone", dry.stdout)
+
+    def test_a_left_behind_drop_box_correction_does_not_starve_the_owners_notes(self):
+        """Review finding 2: a drop box's correction naming a large note is weighed, never
+        applied, so it is not at the head of every batch with the whole budget."""
+        commit_at(self.repo, "a big note and a drop-box correction", iso_ago(0),
+                  ("knowledge/reference/big-one.md",
+                   "---\nid: big-one\nkind: reference\ntitle: Big one\ntopics: [brain]\n"
+                   f"aliases: [big one]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+                   + "x" * 30_000 + "\n"),
+                  self.correction("2026-10-01-070000-fix-big.md",
+                                  "Correction to [[big-one]]: it is smaller.",
+                                  source="support-bot"))
+        for _ in range(2):
+            audited = self.audited_stub(self.toolbelt("drain", self.SEED))
+            result = self.consolidate()
+            self.assertIn("1 correction(s) and 1 note(s)", result.stdout)
+            self.assertEqual(self.result_of(result)["status"], "committed", result.stdout)
+            self.assertTrue(audited.exists())
+            self.back_to_trunk()
+
+    def test_an_edit_to_an_inbox_note_outside_the_batch_is_blocked(self):
+        """Review finding 7: rewriting a note the batch does not hold, a deferred correction's
+        text for one, is refused like draining it."""
+        self.more_captures(20)
+        newest = "knowledge/inbox/2026-10-16-000019-more.md"
+        self.blocked(f"echo edited >> {newest}\n", "edited in the inbox")
+
+    def test_a_correction_target_estimate_stays_inside_the_brain(self):
+        """Review finding 6: `..` out of the tree names nothing; an id is found by its id,
+        not by a file name."""
+        outside = Path(self.tmp.name) / "big.md"
+        outside.write_text("z" * 300_000)
+        commit_at(self.repo, "an escaping correction", iso_ago(0), self.correction(
+            "2026-10-01-070000-escape.md",
+            "Correction to knowledge/inbox/../../../big.md: it is smaller."))
+        dry = self.consolidate_with("--dry-run")
+        chars = int(re.search(r"estimated (\d+) diff chars", dry.stdout).group(1))
+        self.assertLess(chars, 300_000, dry.stdout)
+        commit_at(self.repo, "drop it", iso_ago(0),
+                  ("knowledge/inbox/2026-10-01-070000-escape.md", None),
+                  ("knowledge/reference/a-file-name.md",
+                   "---\nid: another-id\nkind: reference\ntitle: Another\ntopics: [brain]\n"
+                   "aliases: [another]\ncreated: 2026-07-01\nstatus: current\n---\n\n"
+                   + "w" * 20_000 + "\n"),
+                  self.correction("2026-10-01-070000-by-id.md",
+                                  "Correction to [[another-id]]: it is smaller."))
+        dry = self.consolidate_with("--dry-run")
+        chars = int(re.search(r"estimated (\d+) diff chars", dry.stdout).group(1))
+        self.assertGreater(chars, 4 * 20_000, dry.stdout)
+
+    def test_the_dry_run_names_the_batch(self):
+        self.more_captures(3)
+        dry = self.consolidate_with("--dry-run")
+        self.assertIn("would batch: 0 correction(s) and 4 note(s)", dry.stdout)
 
 
 class SessionDigestTests(unittest.TestCase):
@@ -6852,11 +7304,11 @@ class ConsolidationAuditTests(unittest.TestCase):
 
     def test_a_diff_larger_than_one_argument_is_still_audited(self):
         """The real spawn, with a stand-in `claude` that reports what reached it: a staged diff
-        of 300 KiB (past Linux's 128 KiB per argument, inside the 200,000-character cap's
-        truncation) is audited, not refused by the kernel."""
+        of about 150,000 characters (past Linux's 128 KiB per argument, inside the
+        200,000-character cap) is audited, not refused by the kernel."""
         (self.repo / "knowledge" / "inbox" / "big.md").write_text(
             "---\ncreated: 2026-10-22\nstatus: draft\n---\n\nمتين — café\n"
-            + ("a long line of text\n" * 15000), encoding="utf-8")
+            + ("a long line of text\n" * 7500), encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
         stub = Path(self.tmp.name) / "claude"
         # It answers only when more than one argument's worth (128 KiB) reached its stdin.
@@ -6869,6 +7321,37 @@ class ConsolidationAuditTests(unittest.TestCase):
         runner = dict(self.runner, audit=[str(stub), *self.runner["audit"][1:]])
         verdict, detail = self.module.audit_changes(runner)
         self.assertEqual(verdict, "pass", detail)
+
+    def test_a_change_set_over_either_cap_is_an_error_and_starts_no_model(self):
+        """0.8.0 (review finding 4): never truncated and never handed to a model, and `error`
+        rather than `block`, so the curator does not park itself on a size."""
+        self.module.subprocess.run = self.fake_claude("VERDICT: PASS")
+        (self.repo / "knowledge" / "inbox" / "huge.md").write_text(
+            "---\ncreated: 2026-11-04\nstatus: draft\n---\n\n" + "x" * 210_000 + "\n",
+            encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
+        verdict, detail = self.module.audit_changes(self.runner)
+        self.assertEqual(verdict, "error")
+        self.assertIn("0 canonical files", detail)
+        self.assertIn("over the audit limit", detail)
+        subprocess.run(["git", "rm", "-q", "--cached", "knowledge/inbox/huge.md"],
+                       cwd=self.repo, check=True)
+        for i in range(31):
+            (self.repo / "knowledge" / "reference" / f"many-{i}.md").write_text(
+                f"---\nid: many-{i}\nkind: reference\ntitle: many {i}\ntopics: [brain]\n"
+                f"aliases: [many]\ncreated: 2026-11-04\nstatus: current\n---\n\nA fact.\n",
+                encoding="utf-8")
+        subprocess.run(["git", "add", "knowledge/reference"], cwd=self.repo, check=True)
+        verdict, detail = self.module.audit_changes(self.runner)
+        self.assertEqual(verdict, "error")
+        self.assertIn("31 canonical files", detail)
+        self.assertEqual(self.calls, [], "a model was started for an oversized change set")
+
+    def test_the_auditor_is_told_the_measured_size(self):
+        self.stage_a_change()
+        self.module.subprocess.run = self.fake_claude("VERDICT: PASS")
+        self.module.audit_changes(self.runner)
+        self.assertIn("NOTE: measured by the engine: 0 canonical files", self.inputs[0])
 
     def test_auditor_gets_no_write_permission(self):
         """The proposer runs with --permission-mode acceptEdits. If the auditor
@@ -7102,17 +7585,20 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
                        "a project's own records", "decision or lesson"):
             self.assertIn(phrase, rule)
 
-    def test_the_drain_applies_corrections_first_across_the_whole_inbox(self):
-        """An original promoted in the same pass as its own correction, because the
-        correction sat beyond the 40-item cap, would be served as settled. Corrections are
-        read from the whole inbox and applied first, by where their target is now."""
+    def test_the_drain_applies_the_batchs_corrections_first(self):
+        """An original promoted in the same pass as its own correction would be served as
+        settled. 0.8.0: the engine lists the corrections a pass applies, oldest first within
+        the audit's budget, and holds back every note a deferred correction names; the pass
+        applies the listed ones first, by where their target is now."""
         text = self.flat("consolidate-prompt.md")
         drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
-        self.assertIn("Apply CORRECTIONS (below) first, across the WHOLE inbox", drain)
+        self.assertIn("Apply the batch's CORRECTIONS (below) first, in its order", drain)
         rule = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
-        for phrase in ("the WHOLE inbox", "not only the oldest 40", "beyond the cap",
-                       "do not count toward the 40",
-                       "the canonical files they change count toward the 30",
+        for phrase in ("apply the corrections the batch lists, in its order",
+                       "a correction it deferred stays in the inbox",
+                       "so does every inbox note it names",
+                       "never promoted while its correction waits",
+                       "The canonical files they change count toward the 30",
                        # the target is still in the inbox
                        "still in the inbox", "a retraction deletes both notes",
                        "only the corrected content",
@@ -7125,7 +7611,9 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
                        "a retraction only with `source: local` and `basis: owner-said`"):
             self.assertIn(phrase, rule)
         caps = text[text.index("Hard caps"):text.index("Finish:")]
-        self.assertIn("corrections not counted", caps)
+        self.assertIn("the inbox notes its corrections name", caps)
+        for stale in ("the WHOLE inbox", "oldest 40", "toward the 40"):
+            self.assertNotIn(stale, text)
         finish = text[text.index("Finish:"):]
         self.assertIn("what it became", finish)
 
@@ -7169,23 +7657,24 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
                        "`handoff_reason: <one line>`",
                        "a decision or lesson inside it", "Unknown project",
                        "leave it in the inbox and say so in the commit message",
-                       "do not count toward the 40", "never promote"):
+                       "only from the batch's notes", "never promote"):
             self.assertIn(phrase, rule)
         corrections = drain[drain.index("CORRECTIONS —"):drain.index("PROPOSALS —")]
         for phrase in ("`Filed <handoff path>`", "`Already recorded: <handoff path>`",
                        "close that handoff note"):
             self.assertIn(phrase, corrections)
 
-    def test_the_caps_are_40_notes_and_30_canonical_files_for_both_sides(self):
-        """Owner, 2026-10-22: 40 notes a pass. Measured 2026-10-21: the 15-file cap, not the
-        20-note cap, stopped the pass (18 notes), so the file cap doubles with it; the auditor
-        blocks on the same number, so it moves too."""
+    def test_the_engine_chooses_the_batch_and_both_sides_keep_the_30_file_cap(self):
+        """0.8.0 (I-070): the engine chooses the batch against the audit's input limit and
+        lists it; the prompt no longer says how many. The 30-file cap stays on both sides:
+        the engine measures it, and the auditor's clause is the second backstop."""
         text = self.flat("consolidate-prompt.md")
         caps = text[text.index("Hard caps"):text.index("Finish:")]
-        for phrase in ("at most 30 canonical files", "more than 40 items", "the oldest 40"):
+        for phrase in ("at most 30 canonical files", "THIS PASS'S BATCH",
+                       "200,000 diff characters", "smaller batch"):
             self.assertIn(phrase, caps)
-        self.assertIn("(oldest first, max 40)", text)
-        for stale in ("max 20", "toward the 20", "oldest 20", "toward the 15", "at most 15"):
+        for stale in ("max 40", "more than 40 items", "the oldest 40", "max 20",
+                      "toward the 20", "oldest 20", "toward the 15", "at most 15"):
             self.assertNotIn(stale, text)
         audit = self.flat("audit-prompt.md")
         self.assertIn("more than 30 modified canonical files", audit)
@@ -7198,12 +7687,13 @@ class ConsolidationPromptRulesTests(unittest.TestCase):
         for."""
         text = self.flat("consolidate-prompt.md")
         drain = text[text.index("1. Drain the inbox"):text.index("2. Promote from the journal")]
-        self.assertLess(drain.index("Then promote PROJECT OVERVIEWS"), drain.index("max 40"))
+        self.assertLess(drain.index("Then promote PROJECT OVERVIEWS"),
+                        drain.index("for each other note the batch lists"))
         rule = drain[drain.index("PROJECT OVERVIEWS —"):drain.index("PROVENANCE —")]
         for phrase in ("ONE overview per project", "knowledge/projects/<project>/overview.md",
                        "never its status", "exactly the slug",
                        "`bin/brain new project \"<project>\" --topics <a,b>`", "merge into its overview.md",
-                       "PROVENANCE", "do not count toward the 40", "count toward the 30"):
+                       "PROVENANCE", "only from the batch's notes", "count toward the 30"):
             self.assertIn(phrase, rule)
 
     def test_only_the_owners_own_correction_retracts(self):
