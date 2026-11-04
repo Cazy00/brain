@@ -1751,6 +1751,96 @@ class ConsolidateTests(unittest.TestCase):
         self.blocked(self.toolbelt("drain", self.SEED), "corrections are applied first")
         self.assertTrue((self.repo / self.SEED).exists(), name)
 
+    # -- 0.8.1 (I-070): a correction's inbox target is part of the batch --
+
+    LIVE_TARGET = "knowledge/inbox/2026-11-02-024027-decision-owner-2026-11-02-b43-s-soak-gat.md"
+    LIVE_FIX = "2026-11-02-024043-correction-to-inbox-2026-11-02-024027-de.md"
+
+    def inbox_target_case(self, named_as):
+        """The live case of 2026-11-04: an owner's decision and a later correction naming it
+        `named_as`. The proposer records the prompt and drains both."""
+        commit_at(self.repo, "a decision and its correction", iso_ago(0),
+                  (self.LIVE_TARGET, "---\ncreated: 2026-11-02\nsource: local\n"
+                                     "kind: decision\nbasis: owner-said\nstatus: draft\n---\n\n"
+                                     "B43's soak gate is seven days.\n"),
+                  self.correction(self.LIVE_FIX,
+                                  f"Correction to {named_as}: the soak gate is three days."))
+        seen = Path(self.tmp.name) / "prompt.txt"
+        return seen, (f'for last; do :; done\nprintf "%s" "$last" > {seen}\n'
+                      + self.toolbelt("drain", self.LIVE_TARGET, "knowledge/inbox/" + self.LIVE_FIX))
+
+    def assert_named_in_the_batch(self, seen):
+        block = seen.read_text()
+        block = block[block.index("THIS PASS'S BATCH"):]
+        named = block[block.index("Inbox notes those corrections name"):]
+        self.assertIn(f"- {self.LIVE_TARGET}", named[:named.index("Notes to drain")])
+
+    def test_a_correction_naming_an_inbox_note_by_its_inbox_id_drains_both(self):
+        """The live failure of 2026-11-04 17:53Z: the batch check refused every pass."""
+        stem = self.LIVE_TARGET.rsplit("/", 1)[-1][:-3]
+        seen, body = self.inbox_target_case(f"inbox-{stem}")
+        dry = self.consolidate_with("--dry-run")
+        self.assertIn("would batch: 1 correction(s) and 1 note(s)", dry.stdout)
+        self.committed(body)
+        self.assert_named_in_the_batch(seen)
+
+    def test_a_correction_naming_an_inbox_note_by_its_path_drains_both(self):
+        seen, body = self.inbox_target_case(self.LIVE_TARGET)
+        self.committed(body)
+        self.assert_named_in_the_batch(seen)
+
+    def test_an_inbox_id_marks_its_note_and_holds_it_while_the_correction_waits(self):
+        """Corrections are applied first, whichever way they name an inbox note."""
+        stem = self.LIVE_TARGET.rsplit("/", 1)[-1][:-3]
+        _seen, _body = self.inbox_target_case(f"inbox-{stem}")
+        self.blocked(self.toolbelt("drain", self.LIVE_TARGET), "corrections are applied first")
+        self.assertTrue((self.repo / self.LIVE_TARGET).exists())
+
+    def test_a_deferred_correction_keeps_the_inbox_note_its_id_names(self):
+        big = "x" * 30_000
+        named = "knowledge/inbox/2026-10-16-000000-named.md"
+        commit_at(self.repo, "two big corrections", iso_ago(0),
+                  ("knowledge/reference/big-one.md",
+                   "---\nid: big-one\nkind: reference\ntitle: Big one\ntopics: [brain]\n"
+                   f"aliases: [big one]\ncreated: 2026-07-01\nstatus: current\n---\n\n{big}\n"),
+                  (named, "---\ncreated: 2026-10-16\nsource: local\nstatus: draft\n---\n\n"
+                          "A capture a later correction names.\n"),
+                  self.correction("2026-10-18-070000-fix-big.md",
+                                  "Correction to [[big-one]]: it is smaller."),
+                  self.correction("2026-10-18-080000-fix-named.md",
+                                  "Correction to inbox-2026-10-16-000000-named: it was 2026-10-15."))
+        seen = Path(self.tmp.name) / "prompt.txt"
+        self.blocked(f'for last; do :; done\nprintf "%s" "$last" > {seen}\n'
+                     + self.toolbelt("drain", named), "corrections are applied first")
+        block = seen.read_text()
+        block = block[block.index("THIS PASS'S BATCH"):]
+        deferred = block[block.index("deferred to a later pass"):]
+        self.assertIn("- knowledge/inbox/2026-10-18-080000-fix-named.md", deferred)
+        self.assertNotIn(named, block[:block.index("deferred to a later pass")])
+        self.assertTrue((self.repo / named).exists())
+
+    def test_an_inbox_id_that_escapes_or_names_no_file_allows_nothing(self):
+        """`..` or a `/` in an inbox id, or an id with no such file: no crash and no target, so
+        nothing beyond the corrections themselves is costed, listed or allowed."""
+        outside = Path(self.tmp.name) / "secret.md"
+        outside.write_text("s" * 300_000)
+        fixes = ["2026-10-01-070000-escape.md", "2026-10-01-070001-dots.md",
+                 "2026-10-01-070002-missing.md"]
+        commit_at(self.repo, "odd inbox ids", iso_ago(0),
+                  self.correction(fixes[0], "Correction to inbox-x/../../../secret: smaller."),
+                  self.correction(fixes[1], "Correction to inbox-2026..x: it is smaller."),
+                  self.correction(fixes[2], "Correction to inbox-2026-10-01-999999-gone: gone."))
+        dry = self.consolidate_with("--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertIn("would batch: 3 correction(s) and 1 note(s)", dry.stdout)
+        chars = int(re.search(r"estimated (\d+) diff chars", dry.stdout).group(1))
+        self.assertLess(chars, 300_000, dry.stdout)
+        seen = Path(self.tmp.name) / "prompt.txt"
+        self.committed(f'for last; do :; done\nprintf "%s" "$last" > {seen}\n'
+                       + self.toolbelt("drain", *("knowledge/inbox/" + f for f in fixes)))
+        self.assertNotIn("Inbox notes those corrections name", seen.read_text())
+        self.assertTrue(outside.exists())
+
     def test_a_retraction_needs_the_owners_own_words_from_an_owner_endpoint(self):
         """Review B4(b): an untrusted correction must never remove a capture or a note."""
         for label, source, basis in (("a drop box", "support-bot", "owner-said"),
@@ -2334,6 +2424,23 @@ class ConsolidateTests(unittest.TestCase):
         again = self.consolidate()
         self.assertEqual(again.returncode, 1)
         self.assertIn("the checkout is on 'elsewhere', not the trunk", again.stdout)
+
+    def test_a_failed_discard_names_where_the_attempt_is_and_where_the_checkout_ends(self):
+        """Fix check of review finding 5: the proposer switches branch and commits there, so
+        the tree is clean and the run ends on the trunk; the report says both."""
+        self.sized_stub(31, 0, first_extra=("git checkout -q -b elsewhere\ngit add -A\n"
+                                            "git commit -q --no-verify -m attempt\n"))
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+        commit = subprocess.run(["git", "rev-parse", "--short", "elsewhere"], cwd=self.repo,
+                                capture_output=True, text=True).stdout.strip()
+        self.assertIn(f"it is left on 'elsewhere' at {commit}", result.stdout)
+        self.assertIn(f"the checkout is on '{self.trunk}' and its tree is clean; the next pass "
+                      "can start", result.stdout)
+        self.assertIn(f"you are on branch: {self.trunk}", result.stdout)
+        here = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual(here, self.trunk)
 
     def test_an_over_caps_patch_never_writes_through_a_planted_file(self):
         """Review finding 9: a 0644 file or a symlink at the patch's name is replaced, never

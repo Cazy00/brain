@@ -239,6 +239,41 @@ class SelectBatchTests(unittest.TestCase):
         self.assertEqual(len(none_left), 1)
 
 
+class NamedTargetTests(unittest.TestCase):
+    """0.8.1: the inbox notes a batch's corrections name are part of the batch."""
+
+    TARGET = "knowledge/inbox/2026-11-02-024027-decision.md"
+
+    def test_a_taken_correction_brings_its_inbox_target(self):
+        items = [note("02-024027-decision", size=600),
+                 correction("02-024043-fix", (self.TARGET, 600, False))]
+        batch = passsize.select_batch(items)
+        self.assertEqual(batch.corrections, ["knowledge/inbox/2026-11-02-024043-fix.md"])
+        self.assertEqual(batch.named, [self.TARGET])
+        self.assertIn(self.TARGET, batch.allowed)
+        self.assertNotIn(self.TARGET, batch.notes)
+        self.assertEqual(batch.chars, passsize._cost(400 + 600))
+        kept = passsize.cut(batch, 1)
+        self.assertEqual((kept.corrections, kept.named), (batch.corrections, [self.TARGET]))
+
+    def test_a_deferred_correction_keeps_its_inbox_target_held(self):
+        items = [correction("01-000000", ("knowledge/reference/big.md", 30_000, True)),
+                 correction("02-024043-fix", (self.TARGET, 600, False)),
+                 note("02-024027-decision", size=600), note("03-000000")]
+        batch = passsize.select_batch(items)
+        self.assertEqual(batch.deferred, ["knowledge/inbox/2026-11-02-024043-fix.md"])
+        self.assertEqual(batch.named, [])
+        self.assertNotIn(self.TARGET, batch.allowed)
+        self.assertNotIn(self.TARGET, batch.notes)
+
+    def test_an_untrusted_correction_names_nothing_it_may_drain(self):
+        items = [note("02-024027-decision"),
+                 correction("02-024043-fix", (self.TARGET, 600, False), basis="agent-inferred")]
+        batch = passsize.select_batch(items)
+        self.assertEqual(batch.named, [])
+        self.assertNotIn(self.TARGET, batch.allowed)
+
+
 class RetrySizeTests(unittest.TestCase):
 
     def test_over_the_character_cap_with_no_canonical_file_is_sized_by_characters(self):
