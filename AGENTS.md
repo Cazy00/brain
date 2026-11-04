@@ -172,9 +172,10 @@ done, and a stale "still open" is read back as true.
 
 **Asked to change or delete a note, never answer that you cannot.** Find it
 with `brain search` (`--scope all` reaches the inbox) or `brain recent` — an
-inbox note has only a path, a canonical note an id or its path — and capture
-a `kind: correction` (`basis: owner-said` when the request is the user's)
-that names that id or path and quotes the wrong line, in one of two forms:
+inbox note has its path and the `inbox-<file stem>` id that `remember` and
+`recall` give it, a canonical note an id or its path — and capture a
+`kind: correction` (`basis: owner-said` when the request is the user's) that
+names that id or path and quotes the wrong line, in one of two forms:
 `Correction to <id or path>: <what is true now>`, or
 `Retract <id or path>: it should not be in the brain — <the reason>`.
 Never repeat a credential or a person's private details in it: describe what
@@ -419,7 +420,11 @@ What a pass does with it, and what it reports:
   the inbox goes on without it: a note whose own size is over 200,000
   characters always, and a note that went over the caps alone for 7 days
   (`over-caps/set-aside.json` in the state directory). A set-aside note makes
-  no pass run. A pass that removes or edits an inbox note outside its batch
+  no pass run. A correction the pass could act on that names a set-aside note
+  is deferred and waits with it: draining that note is a change set no
+  audited pass carries, and the deferred correction still holds it back, so
+  the proposer is told to leave both. A pass that removes or edits an inbox
+  note outside its batch
   (other than a proposal, or a note a listed correction names) is blocked
   before the audit.
 - **Size.** The audit reads at most 30 canonical files and 200,000 diff
@@ -432,11 +437,14 @@ What a pass does with it, and what it reports:
   discard keeps every inbox and journal file the proposer did not create (a
   capture made meanwhile, a hand edit) and writes it back, uncommitted. Over
   again, the pass ends `blocked` (`over caps: …`) and the checkout is back on
-  the trunk with no branch. A discard that fails says where the checkout
-  really is, and a pass refuses to start off the trunk or over an unclean
-  tree, naming what is there. The sealed commit is
-  measured once more before the audit, and the audit itself refuses an
-  oversized change set as `error`, with no model, `audit-branch` included.
+  the trunk with no branch. A discard that fails says where the attempt is
+  (its patch once the reset ran, else the branch and commit holding it) and
+  where the checkout ends; a failed pass names every commit the trunk gained
+  while it ran, which no audit saw, and says the next pass must not start
+  from it. A pass refuses to start off the trunk or over an unclean tree,
+  naming what is there. The sealed commit is measured once more before the
+  audit, and the audit itself refuses an oversized change set as `error`,
+  with no model, `audit-branch` included.
 - **Corrections first.** The batch takes `kind: correction` notes before any
   other note: first those the pass can act on (`source: local` with `basis:
   owner-said`, or `agent-found` for a correction that is not a retraction, or
@@ -446,8 +454,14 @@ What a pass does with it, and what it reports:
   a correction a pass leaves in the inbox never starves the owner's notes; one
   the pass cannot act on is weighed by its own size. A correction that does
   not fit waits for a later pass, and so does every inbox note a local one
-  names, so an original is never promoted while its correction waits. A correction to a canonical note supersedes it, a retraction archives
-  it with `brain retract`, and one to an inbox note drains both. Each
+  names, so an original is never promoted while its correction waits. A
+  correction names an inbox note by its path or by its `inbox-<file stem>` id
+  (what `remember` and `recall` call it); either way that note is part of the
+  batch, listed to the proposer and costed with its correction, and only
+  while it is a file in the inbox: a lead naming an inbox id with no such file
+  falls through to the links and paths in the text. A correction to a
+  canonical note supersedes it, a retraction archives it with
+  `brain retract`, and one to an inbox note drains both. Each
   consolidate commit names every drained inbox path and what it became, which
   is how a later correction finds a target that has moved. A pass moves or
   deletes a note only through `drain`, `handoff`, `retract` and `supersede`.

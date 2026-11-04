@@ -110,9 +110,12 @@ Do these in order, respecting every cap:
    never promoted while its correction waits (the engine checks this before
    the audit). The canonical files they
    change count toward the 30. A correction names its target by
-   id (a canonical note) or by path (an inbox note, which has no id) and
-   quotes the wrong line: "Correction to <target>: <what is true now>" fixes
-   it, "Retract <target>: <reason>" says it should not be in the brain.
+   id (a canonical note) or by path (an inbox note, which has no note id;
+   `remember` and `recall` call it `inbox-<file stem>`, and that names the
+   same inbox note) and quotes the wrong line: "Correction to <target>:
+   <what is true now>" fixes it, "Retract <target>: <reason>" says it should
+   not be in the brain. The inbox notes the batch's corrections name are
+   listed with the batch; drain each with its correction.
    Source trust comes first: apply a correction only when it has `source:
    local` AND either `basis: owner-said` or `basis: agent-found` citing its
    evidence, and a retraction only with `source: local` and `basis:
