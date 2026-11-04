@@ -289,6 +289,17 @@ budget while notes wait; a discard saves the attempt first and keeps what arrive
 ran (no `git clean`); a note no audited pass can drain is set aside, not retried at the head of
 every pass.
 
+**0.8.1.** A correction's inbox target is part of the batch (I-070). On 2026-11-04 a correction
+named an inbox note by its `inbox-<stem>` id, the form `remember` and `recall` hand out; the
+engine resolved only paths and canonical ids, so the batch never allowed the target, the
+proposer rightly drained both, and the batch check refused every pass. The engine now resolves
+`inbox-<stem>` to `knowledge/inbox/<stem>.md` (a canonical note with that id keeps it; a `/` or
+`..` in the id names nothing) everywhere it reads a correction's targets, keeps an inbox target
+only while it is a regular file in the inbox, and lists the targets of the batch's corrections
+to the proposer as part of the batch; a deferred correction still holds its target back. A
+discard that fails now reports where the attempt is left and where the checkout really ends.
+No interface changes.
+
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
 weights), brute force in pure Python. The two are fused by reciprocal rank,

@@ -446,7 +446,10 @@ What a pass does with it, and what it reports:
   a correction a pass leaves in the inbox never starves the owner's notes; one
   the pass cannot act on is weighed by its own size. A correction that does
   not fit waits for a later pass, and so does every inbox note a local one
-  names, so an original is never promoted while its correction waits. A correction to a canonical note supersedes it, a retraction archives
+  names, so an original is never promoted while its correction waits. A correction names an
+  inbox note by its path or by its `inbox-<file stem>` id (what `remember` and `recall` call
+  it); either way that note is part of the batch, listed to the proposer and costed with its
+  correction, and only while it is a file in the inbox. A correction to a canonical note supersedes it, a retraction archives
   it with `brain retract`, and one to an inbox note drains both. Each
   consolidate commit names every drained inbox path and what it became, which
   is how a later correction finds a target that has moved. A pass moves or
