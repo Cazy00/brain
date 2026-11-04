@@ -272,6 +272,19 @@ after it); it is only updated when the call succeeded. Without `--state` every r
 same first pairs, so schedule it with `--state`. Consolidation is unchanged, and a `consolidator.conf` without `contradict` still
 works for it.
 
+**0.8.0.** Consolidation passes fit their audit (I-070). The engine chooses each pass's batch
+(`brainlib/passsize.py`: oldest first, corrections first with the notes they name, at most 15
+items within an estimated 100,000 diff characters and 20 canonical files) and lists it to the
+proposer, in place of the prompt's "oldest 40". Before lint or any other check it stages
+everything and measures the change set; over 30 canonical files or 200,000 diff characters it
+pays for no audit, discards the attempt (`git reset --hard`, `git clean -fd`) and reruns the
+proposer once with a smaller batch, else ends `blocked` with the attempt saved as a patch under
+the state directory's `over-caps/` and a clean trunk. A pass that drains an inbox note outside its
+batch is blocked before the audit. `audit_changes`, and so `brain audit-branch`, refuses an
+oversized change set as `error` with no model call, where it used to truncate it and ask the model
+to block. `consolidate-result` gains `batch`, `deferred_corrections`, `attempts`,
+`canonical_files` and `diff_chars`; its statuses and every command's interface are unchanged.
+
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
 weights), brute force in pure Python. The two are fused by reciprocal rank,

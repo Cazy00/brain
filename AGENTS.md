@@ -409,9 +409,27 @@ What a pass does with it, and what it reports:
   `--digest-since <UTC instant, Z>` instead, still capped at 8 days.
   `consolidate --digest-from DIR` adds the digest.v1 files in DIR and one
   level below it to this account's own transcripts.
-- **Corrections first.** The pass reads the WHOLE inbox for `kind: correction`
-  notes and applies them before draining the oldest 40 (they do not count
-  toward that cap), so an original is never promoted while its correction
+- **Batch.** The engine chooses what a pass drains and lists it to the
+  proposer path by path (`brainlib/passsize.py`): oldest first, at most 15
+  items, within an estimated 100,000 diff characters and 20 canonical files,
+  half and two thirds of what the audit takes. Session-mining proposals are
+  never in it. A pass that removes an inbox note outside its batch (other
+  than a proposal, or a note a listed correction names) is blocked before the
+  audit.
+- **Size.** The audit reads at most 30 canonical files and 200,000 diff
+  characters. Before anything else checks it, the engine stages everything
+  and measures the change set; over a cap it pays for no audit, throws the
+  attempt away (`git reset --hard` to the trunk and `git clean -fd`) and runs
+  the proposer once more with a smaller batch. Over again, or over with a
+  batch of one, the pass ends `blocked` (`over caps: …`), the attempt is saved
+  as a patch under the state directory's `over-caps/` (the newest 5 kept) and
+  the checkout is left on a clean trunk with no branch. The sealed commit is
+  measured once more before the audit, and the audit itself refuses an
+  oversized change set as `error`, with no model, `audit-branch` included.
+- **Corrections first.** The batch takes `kind: correction` notes before any
+  other note, oldest first with the notes they name, while they fit its
+  budget; one that does not fit waits for a later pass, and so does every
+  inbox note it names, so an original is never promoted while its correction
   waits. A correction to a canonical note supersedes it, a retraction archives
   it with `brain retract`, and one to an inbox note drains both. Each
   consolidate commit names every drained inbox path and what it became, which
@@ -434,7 +452,12 @@ What a pass does with it, and what it reports:
 - **Result.** Every pass ends on one line, `consolidate-result: {json}`:
   `{"v":1, "status": "idle|committed|no_changes|blocked|failed", "idle",
   "cost_microusd", "tokens_in", "tokens_out", "digest_entries",
-  "inbox_before"}`. Cost and tokens are propose plus audit, read from the
+  "inbox_before", "batch", "deferred_corrections", "attempts",
+  "canonical_files", "diff_chars"}`. The last five (0.8.0) are the items in
+  the attempt that ended the run, the corrections left for a later pass, the
+  proposer runs, and the last measurement of the change set; `null` (and
+  `attempts` 0) when no proposer ran. Cost and tokens are every proposer run
+  plus the audit, read from the
   runner's `--output-format json` answer, and `null` when it answers in plain
   text. `brain audit-branch` ends the same way, on `audit-result: {"v":1,
   "verdict": "pass|block|error", "cost_microusd", "tokens_in", "tokens_out"}`.
