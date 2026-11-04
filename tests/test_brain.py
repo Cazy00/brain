@@ -2442,6 +2442,83 @@ class ConsolidateTests(unittest.TestCase):
                               capture_output=True, text=True).stdout.strip()
         self.assertEqual(here, self.trunk)
 
+    # -- 0.8.1 review fixes 1 and 2: a failed discard reports where the ATTEMPT is --
+
+    def test_a_failed_discard_whose_attempt_is_on_the_trunk_says_the_next_pass_must_not_start(self):
+        """Review finding 1: the proposer commits on the trunk itself, then over the caps on a
+        branch of its own. The tree is clean and the checkout ends on the trunk, but the trunk
+        carries an unaudited commit the next pass would start from."""
+        self.sized_stub(31, 0, first_extra=(
+            f"git checkout -q {self.trunk}\ngit add -A\n"
+            "git commit -q --no-verify -m attempt-on-trunk\n"
+            "git checkout -q -b elsewhere\n"
+            "i=0; while [ $i -lt 31 ]; do echo x > knowledge/reference/more-$i.md; "
+            "i=$((i+1)); done\ngit add -A\ngit commit -q --no-verify -m more\n"))
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+        on_trunk = subprocess.run(["git", "rev-parse", "--short", self.trunk], cwd=self.repo,
+                                  capture_output=True, text=True).stdout.strip()
+        self.assertIn("could NOT be discarded (HEAD is 'elsewhere'", result.stdout)
+        self.assertIn(f"the checkout is on '{self.trunk}' and its tree is clean; the trunk "
+                      f"'{self.trunk}' carries 1 commit(s) no audit saw ({on_trunk}), so the "
+                      "next pass must not start", result.stdout)
+        self.assertNotIn("the next pass can start", result.stdout)
+
+    def test_any_failed_pass_names_a_commit_the_trunk_gained_during_it(self):
+        """Review finding 1, the other way to reach it: the attempt committed on the trunk
+        and stayed there, so the pass fails before any measurement."""
+        self.sized_stub(31, 0, first_extra=(f"git checkout -q {self.trunk}\ngit add -A\n"
+                                            "git commit -q --no-verify -m attempt\n"))
+        result = self.consolidate()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        commit = subprocess.run(["git", "rev-parse", "--short", self.trunk], cwd=self.repo,
+                                capture_output=True, text=True).stdout.strip()
+        self.assertIn(f"the trunk '{self.trunk}' gained 1 commit(s) during this pass that no "
+                      f"audit saw ({commit})", result.stdout)
+
+    def git_wrapper(self, body):
+        """A `git` first on the engine's PATH: `body` (sh) runs first, then the real git."""
+        real = shutil.which("git") or "/usr/bin/git"
+        wrapper = self.stub_bin / "git"
+        wrapper.write_text(f"#!/bin/sh\n{body}\nexec {real} \"$@\"\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+
+    def test_a_discard_that_worked_but_could_not_check_out_the_trunk_names_the_patch(self):
+        """Review finding 2(a): the reset ran, so the attempt is in its patch, not on HEAD."""
+        self.sized_stub(31, 0)
+        self.git_wrapper(f'if [ "$1 $2 $3" = "checkout -q {self.trunk}" ]; then '
+                         'echo "fatal: held" >&2; exit 128; fi')
+        result = self.consolidate()
+        self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+        patch = next((self.repo / ".cache" / "over-caps").glob("*-attempt1.patch"))
+        branch = self.branches().split()[-1]
+        self.assertIn(f"could NOT be discarded (could not check out '{self.trunk}'): it is saved "
+                      f"as {patch} and reset off the pass's branch {branch}", result.stdout)
+        self.assertNotIn("left on '?'", result.stdout)
+        self.assertIn("the next pass can start", result.stdout)
+
+    def test_a_discard_whose_write_back_failed_names_the_patch_not_the_branch(self):
+        """Review finding 2(b): a capture lands mid-run and cannot be written back after the
+        reset. The attempt is in the patch; the branch is at the trunk and holds none of it."""
+        inbox = self.repo / "knowledge" / "inbox"
+        self.sized_stub(31, 0, first_extra=self.owner_capture("owner note kept"))
+        self.git_wrapper('if [ "$1 $2 $3" = "reset -q --hard" ]; then '
+                         f'{shutil.which("git") or "/usr/bin/git"} "$@" || exit $?; '
+                         'chmod a-w knowledge/inbox; exit 0; fi')
+        try:
+            result = self.consolidate()
+        finally:
+            inbox.chmod(0o755)
+        self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
+        patch = next((self.repo / ".cache" / "over-caps").glob("*-attempt1.patch"))
+        self.assertIn("owner note kept", patch.read_text())
+        branch = self.branches().split()[-1]
+        self.assertIn("could NOT be discarded (could not write back knowledge/inbox/",
+                      result.stdout)
+        self.assertIn(f"it is saved as {patch} and reset off the pass's branch {branch}",
+                      result.stdout)
+        self.assertNotIn(f"left on '{branch}'", result.stdout)
+
     def test_an_over_caps_patch_never_writes_through_a_planted_file(self):
         """Review finding 9: a 0644 file or a symlink at the patch's name is replaced, never
         written through or left with its own mode."""

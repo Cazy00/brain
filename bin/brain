@@ -6731,28 +6731,31 @@ def discard_attempt(branch: str, batch, label: str):
     4. The files of step 2 are written back, uncommitted, as a capture on a pass's branch
        leaves them.
 
-    Returns (patch path or None, [kept paths], error or None)."""
+    Returns (patch path or None, [kept paths], error or None, reset): `reset` is True once
+    step 3 has run, so the attempt is no longer on any branch, only in the patch."""
     trunk = default_branch()
     with repo_lock():
         here = git("rev-parse", "--abbrev-ref", "HEAD")
         if here != branch:
-            return None, [], f"HEAD is {one_line(here)!r}, not the pass's branch {branch!r}"
+            return (None, [], f"HEAD is {one_line(here)!r}, not the pass's branch {branch!r}",
+                    False)
         done = subprocess.run(["git", "add", "-A"], cwd=ROOT, capture_output=True, text=True)
         if done.returncode != 0:
-            return None, [], f"git add failed: {one_line(done.stderr)[-200:]}"
+            return None, [], f"git add failed: {one_line(done.stderr)[-200:]}", False
         patch, problem = save_over_caps_patch(branch, label)
         if problem:
-            return None, [], f"the attempt could not be saved, so it is not discarded: {problem}"
+            return (None, [], f"the attempt could not be saved, so it is not discarded: "
+                              f"{problem}", False)
         try:
             kept = kept_from_attempt(batch)
         except RuntimeError as exc:
-            return patch, [], str(exc)
+            return patch, [], str(exc), False
         done = subprocess.run(["git", "reset", "-q", "--hard", trunk], cwd=ROOT,
                               capture_output=True, text=True)
         if done.returncode != 0:
-            return patch, [], f"git reset failed: {one_line(done.stderr)[-200:]}"
+            return patch, [], f"git reset failed: {one_line(done.stderr)[-200:]}", False
         if git("status", "--porcelain", "--untracked-files=no").strip():
-            return patch, [], "the tracked tree is not clean after the reset"
+            return patch, [], "the tracked tree is not clean after the reset", True
         for rel, raw in kept:
             try:
                 target = ROOT / rel
@@ -6760,8 +6763,8 @@ def discard_attempt(branch: str, batch, label: str):
                 target.write_bytes(raw)
             except OSError as exc:
                 return patch, [r for r, _ in kept], (f"could not write back {one_line(rel)} "
-                                                     f"({exc!r}); it is in {patch}")
-    return patch, [rel for rel, _raw in kept], None
+                                                     f"({exc!r}); it is in {patch}"), True
+    return patch, [rel for rel, _raw in kept], None, True
 
 
 OVER_CAPS_KEEP = 5
@@ -7145,6 +7148,9 @@ def _consolidate(argv: list, result: dict) -> int:
         branch = f"consolidate/{today}"
         if git("branch", "--list", branch):
             branch = f"{branch}-{time.strftime('%H%M')}"
+        # The trunk the pass is audited against: a commit the trunk gains after this is one
+        # no audit saw, and the next pass would start from it (the failed-discard report).
+        base = git("rev-parse", trunk)
         subprocess.run(["git", "checkout", "-b", branch], cwd=ROOT, check=True)
     print(f"brain consolidate: running {runner['propose'][0]} ({runner['model']}) "
           f"on branch {branch} (runner pinned in {runner['source']})…")
@@ -7291,17 +7297,25 @@ def _consolidate(argv: list, result: dict) -> int:
             return None, False, sealed, changed, True
         return None, False, None, changed, True
 
-    over, over_end, discard_problem, kept, left_on = None, None, None, [], None
+    over, over_end, discard_problem, kept, attempt_at, saved = None, None, None, [], None, None
 
     def discard(number):
         """Discard attempt `number`, saved first; report what was saved and kept. When it
-        fails, `left_on` is where the attempt really is: HEAD's branch and commit, read
-        then, before the end of the run may check out anything else."""
-        nonlocal kept, left_on
-        patch, kept_now, problem = discard_attempt(branch, batch, f"attempt{number}")
-        if problem:
-            left_on = (git("rev-parse", "--abbrev-ref", "HEAD") or "?",
-                       git("rev-parse", "--short", "HEAD") or "?")
+        fails, `attempt_at` says where the ATTEMPT is, not where HEAD ends: in the patch once
+        the reset ran (the branch no longer holds it), else on HEAD's branch and commit,
+        read then, before the end of the run may check out anything else."""
+        nonlocal kept, attempt_at, saved
+        patch, kept_now, problem, reset = discard_attempt(branch, batch, f"attempt{number}")
+        saved = patch
+        if problem and reset:
+            attempt_at = f"saved as {patch} and reset off the pass's branch {branch}"
+        elif problem:
+            where = git("rev-parse", "--abbrev-ref", "HEAD") or "?"
+            attempt_at = (f"left on {one_line(where)!r} at "
+                          f"{one_line(git('rev-parse', '--short', 'HEAD') or '?')}"
+                          + (f", saved too as {patch}" if patch else "")
+                          + (f", and the pass's branch {branch} is left too"
+                             if where != branch else ""))
         print(f"  attempt {number} saved for inspection: {patch}" if patch
               else f"  attempt {number} NOT saved")
         kept = kept_now
@@ -7357,7 +7371,11 @@ def _consolidate(argv: list, result: dict) -> int:
                     subprocess.run(["git", "branch", "-q", "-D", branch], cwd=ROOT,
                                    capture_output=True)
                 else:
+                    # The discard itself worked: the attempt is in its patch, and the branch
+                    # left behind holds nothing of it.
                     discard_problem = f"could not check out {default_branch()!r}"
+                    attempt_at = (f"saved as {saved} and reset off the "
+                                  f"pass's branch {branch}")
         over_end = "failed" if discard_problem else "clean"
         break
 
@@ -7401,6 +7419,14 @@ def _consolidate(argv: list, result: dict) -> int:
     if failure:
         result["status"] = "blocked" if blocked else "failed"
         print(f"consolidation DID NOT LAND: {one_line(failure)}")
+        # The next pass starts from the trunk's tip: a commit the trunk gained during this
+        # pass (an attempt that committed there) is one no audit saw, and it would carry on.
+        gained = git("rev-list", "--abbrev-commit", f"{base}..{trunk}").split() \
+            if base else ["?"]
+        if gained:
+            print(f"  the trunk {trunk!r} gained {len(gained)} commit(s) during this pass that "
+                  f"no audit saw ({', '.join(gained[:5])}): take them off it before the next "
+                  "pass")
         if over_end == "clean":
             print("nothing was pushed or audited; the attempt is kept as a patch (above) and "
                   "the checkout is back on the trunk"
@@ -7411,17 +7437,17 @@ def _consolidate(argv: list, result: dict) -> int:
             # really is decides whether the next pass can start.
             here = git("rev-parse", "--abbrev-ref", "HEAD") or "?"
             clean = not git("status", "--porcelain").strip()
-            ready = clean and here == default_branch()
-            where, commit = left_on or ("?", "?")
+            ready = clean and here == trunk and not gained
             print(f"nothing was pushed or audited; the attempt could NOT be discarded "
-                  f"({one_line(discard_problem)}): it is left on {one_line(where)!r} at "
-                  f"{one_line(commit)}"
-                  + (f", and the pass's branch {branch} is left too" if where != branch else "")
+                  f"({one_line(discard_problem)}): it is {attempt_at or 'somewhere unknown'}"
                   + f"; the checkout is on {one_line(here)!r} and its tree is "
                   + ("clean" if clean else "NOT clean")
-                  + ("; the next pass can start" if ready else
+                  + (f"; the trunk {trunk!r} carries {len(gained)} commit(s) no audit saw "
+                     f"({', '.join(gained[:5])}), so the next pass must not start until they "
+                     f"are taken off it" if gained else "")
+                  + ("; the next pass can start" if ready else "" if gained else
                      f". The next pass refuses to start until it is back on "
-                     f"{default_branch()!r} with a clean tree"))
+                     f"{trunk!r} with a clean tree"))
         else:
             print(f"nothing was pushed; the work is left on {branch} for inspection"
                   + (" (committed there, not pushed)" if committed else ""))
