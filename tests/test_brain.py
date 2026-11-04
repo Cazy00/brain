@@ -1841,6 +1841,65 @@ class ConsolidateTests(unittest.TestCase):
         self.assertNotIn("Inbox notes those corrections name", seen.read_text())
         self.assertTrue(outside.exists())
 
+    def containment_case(self, named_as, link=None):
+        """A correction naming `named_as`; `link`, when given, is an inbox symlink to a big
+        file outside knowledge/. Neither may be costed, listed or allowed."""
+        outside = Path(self.tmp.name) / "outside.md"
+        outside.write_text("---\ncreated: 2026-10-01\nsource: local\nstatus: draft\n---\n\n"
+                           + "s" * 300_000 + "\n")
+        if link:
+            (self.repo / link).symlink_to(outside)
+        fix = "2026-10-01-070000-contain.md"
+        commit_at(self.repo, "a correction naming a path out of the inbox", iso_ago(0),
+                  self.correction(fix, f"Correction to {named_as}: it is smaller."))
+        dry = self.consolidate_with("--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        chars = int(re.search(r"estimated (\d+) diff chars", dry.stdout).group(1))
+        self.assertLess(chars, 300_000, dry.stdout)
+        seen = Path(self.tmp.name) / "prompt.txt"
+        # Only the prompt matters here: lint refuses a symlink in knowledge/ at the end anyway.
+        self.audited_stub(f'for last; do :; done\nprintf "%s" "$last" > {seen}\n'
+                          + self.toolbelt("drain", "knowledge/inbox/" + fix))
+        try:
+            self.consolidate()
+        finally:
+            self.back_to_trunk()
+        block = seen.read_text()
+        block = block[block.rindex("THIS PASS'S BATCH"):]
+        self.assertNotIn("Inbox notes those corrections name", block)
+        self.assertEqual(outside.read_text().count("s" * 300_000), 1, "the outside file changed")
+        return block
+
+    def test_an_inbox_symlink_a_correction_names_is_no_target(self):
+        """0.8.1 review note 5: inbox_target's symlink branch, read by batch_items. The link
+        points into the inbox's own folder, so only the symlink test refuses it; one out of
+        knowledge/ is refused as well."""
+        module = load_brain_module()
+        module.ROOT, module.K = self.repo, self.repo / "knowledge"
+        outside = Path(self.tmp.name) / "outside.md"
+        outside.write_text("s" * 40_000)
+        real = "knowledge/inbox/2026-10-01-000001-real.md"
+        (self.repo / real).write_text("---\ncreated: 2026-10-01\nsource: local\n"
+                                      "status: draft\n---\n\n" + "r" * 40_000 + "\n")
+        links = {"knowledge/inbox/2026-10-01-000000-in.md": self.repo / real,
+                 "knowledge/inbox/2026-10-01-000002-out.md": outside}
+        for i, (link, to) in enumerate(links.items()):
+            (self.repo / link).symlink_to(to)
+            (self.repo / "knowledge" / "inbox" / f"2026-10-02-00000{i}-fix.md").write_text(
+                self.correction("x", f"Correction to {link}: it is smaller.")[1])
+            self.assertIsNone(module.inbox_target(link), link)
+        self.assertEqual(module.inbox_target(real), real)
+        fixes = [i for i in module.batch_items() if i["kind"] == "correction"]
+        self.assertEqual(len(fixes), 2)
+        self.assertEqual([i["targets"] for i in fixes], [[], []])
+
+    def test_a_dot_dot_path_out_of_the_inbox_a_correction_names_allows_nothing(self):
+        """0.8.1 review note 5: a path-form `..` that resolves outside the inbox."""
+        rel = os.path.relpath(Path(self.tmp.name) / "outside.md", self.repo / "knowledge" / "inbox")
+        named = "knowledge/inbox/" + rel
+        self.assertIn("..", named)
+        self.containment_case(named)
+
     def test_a_retraction_of_a_set_aside_note_waits_with_it_and_the_prompt_says_one_thing(self):
         """0.8.1 review finding 4: the note alone over the audit's diff cap stays set aside and
         its retraction is deferred; the proposer is never told both to drain and to leave it."""

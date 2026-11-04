@@ -426,6 +426,34 @@ class RecallTests(CorpusCase):
         self.assertEqual((tight["results"], tight["dropped_count"]), ([], len(full["results"])))
 
 
+class FactCorrectionMarkerTests(CorpusCase):
+    """0.8.1 review note 8: a correction that names a fact by its `inbox-<stem>` id, as a
+    [[link]] or as its lead, marks that fact in recall's facts arm and in delta. The
+    pending corrections are keyed by the inbox path; the facts arm looks them up by it."""
+
+    def test_an_inbox_id_correction_marks_the_fact_in_recall_and_delta(self):
+        _e, saved = verb("remember", fact="The bench is 90cm wide.", provenance="owner said so",
+                         entity="widgets/bench")
+        self.assertTrue(saved["id"].startswith("inbox-"), saved)
+        inbox = self.corpus.root / "knowledge" / "inbox"
+        fixes = []
+        for name, text in (("2099-01-01-000000-link-fix.md",
+                            f"The bench in [[{saved['id']}]] is 80cm, not 90cm."),
+                           ("2099-01-01-000001-lead-fix.md",
+                            f"Correction to {saved['id']}: the bench is 80cm.")):
+            (inbox / name).write_text(
+                "---\ncreated: 2026-11-04\nsource: local\nkind: correction\n"
+                f"basis: owner-said\nstatus: draft\n---\n\n{text}\n", encoding="utf-8")
+            fixes.append(f"knowledge/inbox/{name}")
+        marker = "[correction pending — %s]" % ", ".join(fixes)
+        _e, found = verb("recall", entity="widgets/bench")
+        fact = [f for f in found["facts"] if f["fact_id"] == saved["id"]][0]
+        self.assertIn(marker, fact["markers"])
+        _e, delta = verb("delta", since="1970-01-01T00:00:00Z")
+        fact = [f for f in delta["facts"] if f["fact_id"] == saved["id"]][0]
+        self.assertIn(marker, fact["markers"])
+
+
 class DeltaTests(CorpusCase):
     def test_a_walk_in_one_call(self):
         _e, delta = verb("delta", since="1970-01-01T00:00:00Z")
