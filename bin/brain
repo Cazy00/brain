@@ -5370,7 +5370,6 @@ def cmd_sessions(argv: list) -> int:
     return 0
 
 
-
 CONSOLIDATOR_CONF = "setup/consolidator.conf"
 # Today's behaviour, verbatim, for a clone whose conf file is missing. Not a
 # fallback for a BROKEN conf — a present-but-invalid file is a refusal, because
