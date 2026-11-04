@@ -274,6 +274,44 @@ class NamedTargetTests(unittest.TestCase):
         self.assertNotIn(self.TARGET, batch.allowed)
 
 
+class SetAsideTargetTests(unittest.TestCase):
+    """0.8.1 review finding 4: a set-aside note a trusted correction names gets one
+    instruction. It stays set aside and the correction is deferred with it."""
+
+    def check(self, batch, target, fix):
+        self.assertIn(target, batch.set_aside)
+        self.assertIn(fix, batch.deferred)
+        self.assertNotIn(fix, batch.corrections)
+        self.assertNotIn(target, batch.named)
+        self.assertNotIn(target, batch.allowed)
+        self.assertNotIn(target, batch.items)
+        kept = passsize.cut(batch, 1)
+        self.assertNotIn(target, kept.allowed)
+        self.assertIn(fix, kept.deferred)
+
+    def test_a_retraction_of_a_note_alone_over_the_diff_cap_waits_with_it(self):
+        huge = note("01-000000", size=210_000)
+        fix = correction("02-000000", (huge["path"], 210_000, False), retraction=True)
+        batch = passsize.select_batch([huge, fix, note("03-000000")])
+        self.check(batch, huge["path"], fix["path"])
+        self.assertEqual(batch.notes, ["knowledge/inbox/2026-11-03-000000.md"])
+
+    def test_a_correction_of_a_note_the_engine_set_aside_waits_with_it(self):
+        first = note("01-000000")
+        fix = correction("02-000000", (first["path"], 500, False))
+        partner = correction("02-000001", (first["path"], 500, False), basis="agent-found")
+        batch = passsize.select_batch([first, fix, partner, note("03-000000")],
+                                      set_aside={first["path"]: "over caps alone"})
+        self.check(batch, first["path"], fix["path"])
+        self.assertIn(partner["path"], batch.deferred)
+
+    def test_a_correction_whose_target_is_not_set_aside_is_taken(self):
+        first = note("01-000000")
+        fix = correction("02-000000", (first["path"], 500, False))
+        batch = passsize.select_batch([first, fix])
+        self.assertEqual((batch.corrections, batch.named), ([fix["path"]], [first["path"]]))
+
+
 class RetrySizeTests(unittest.TestCase):
 
     def test_over_the_character_cap_with_no_canonical_file_is_sized_by_characters(self):

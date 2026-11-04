@@ -28,6 +28,12 @@ Contract (versioned with the engine):
   name that the pass drains with them: in `allowed`, costed with their correction, and listed
   to the proposer; a target's `name` is the note's inbox path, whichever way the correction
   wrote it (bin/brain resolves an `inbox-<stem>` id and drops a name that is no inbox file).
+  A correction the pass could apply that names a set-aside note is deferred with its group
+  (0.8.1): the note stays set aside, never in `named` or `allowed`, and the correction waits
+  for it. Draining the note is the change set no audited pass carries (it is alone over the
+  diff cap, or went over the caps alone), so taking it with its correction would put the
+  pass over the caps too; deferred, the correction still holds the note back, and both come
+  back together once the note leaves set-aside.
 - `cut(batch, n)` -> the first n items, corrections first but at least one note when the
   batch has one and n > 1; a correction cut away is deferred with the corrections that
   share an inbox note with it.
@@ -74,7 +80,7 @@ class Batch:
         taken = set(self.corrections) | set(self.notes)
         self.named = [t for t in dict.fromkeys(
             t for p in self.corrections if trusted(by_path[p]) for t in _inbox_targets(by_path[p]))
-            if t in self.allowed and t not in taken]
+            if t in self.allowed and t not in taken and t not in self.set_aside]
 
     @property
     def items(self):
@@ -179,6 +185,9 @@ def select_batch(items, max_items=MAX_ITEMS, budget_chars=BUDGET_CHARS,
 
     stopped = False
     for group in _groups(corrections):
+        if any(t in parked for i in group if trusted(i) for t in _inbox_targets(i)):
+            deferred.extend(group)               # it waits for the note it names
+            continue
         c = sum(_correction_cost(i)[0] for i in group)
         f = sum(_correction_cost(i)[1] for i in group)
         if stopped or not fits(c, f, len(group), share):

@@ -1841,6 +1841,29 @@ class ConsolidateTests(unittest.TestCase):
         self.assertNotIn("Inbox notes those corrections name", seen.read_text())
         self.assertTrue(outside.exists())
 
+    def test_a_retraction_of_a_set_aside_note_waits_with_it_and_the_prompt_says_one_thing(self):
+        """0.8.1 review finding 4: the note alone over the audit's diff cap stays set aside and
+        its retraction is deferred; the proposer is never told both to drain and to leave it."""
+        huge = "knowledge/inbox/2026-10-01-000000-huge.md"
+        fix = "knowledge/inbox/2026-10-18-070000-retract-huge.md"
+        commit_at(self.repo, "a huge capture and its retraction", iso_ago(0),
+                  (huge, "---\ncreated: 2026-10-01\nsource: local\nstatus: draft\n---\n\n"
+                         + "h" * 210_000 + "\n"),
+                  self.correction(fix.rsplit("/", 1)[-1],
+                                  "Retract inbox-2026-10-01-000000-huge: pasted by mistake."))
+        seen = Path(self.tmp.name) / "prompt.txt"
+        self.committed(f'for last; do :; done\nprintf "%s" "$last" > {seen}\n'
+                       + self.toolbelt("drain", self.SEED))
+        block = seen.read_text()
+        block = block[block.index("THIS PASS'S BATCH"):]
+        self.assertEqual(block.count(huge), 1, block)
+        self.assertNotIn("Inbox notes those corrections name", block)
+        deferred = block[block.index("deferred to a later pass"):block.index("set aside")]
+        self.assertIn(f"- {fix}", deferred)
+        self.assertIn(f"- {huge}", block[block.index("set aside"):])
+        self.assertTrue((self.repo / huge).exists())
+        self.assertTrue((self.repo / fix).exists())
+
     def test_a_retraction_needs_the_owners_own_words_from_an_owner_endpoint(self):
         """Review B4(b): an untrusted correction must never remove a capture or a note."""
         for label, source, basis in (("a drop box", "support-bot", "owner-said"),
