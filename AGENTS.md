@@ -314,8 +314,9 @@ A filing job files each note in its project's records, then closes it with a
 `Filed <handoff path>` or `Already recorded: <handoff path>`, naming where it
 now lives (repository and record path, and the PR or commit). The next pass
 removes the handoff note (`bin/brain handoff --close <handoff-path>`) and
-drains the correction (`bin/brain drain`), before the inbox cap; the owner's
-own retraction may remove one too. A
+drains the correction (`bin/brain drain`), as a correction of the batch,
+which takes the corrections it can act on first; the owner's own retraction
+may remove one too. A
 handoff note older than 14 days with no closing correction stays, and `doctor`
 goes RED: the filing job is not running. `doctor` and `stats` count handoff
 notes per project.
@@ -413,24 +414,39 @@ What a pass does with it, and what it reports:
   proposer path by path (`brainlib/passsize.py`): oldest first, at most 15
   items, within an estimated 100,000 diff characters and 20 canonical files,
   half and two thirds of what the audit takes. Session-mining proposals are
-  never in it. A pass that removes an inbox note outside its batch (other
-  than a proposal, or a note a listed correction names) is blocked before the
-  audit.
+  never in it. A note no audited pass can drain is set aside, printed as
+  `set aside: <path> — <reason>` and counted in the result, and the rest of
+  the inbox goes on without it: a note whose own size is over 200,000
+  characters always, and a note that went over the caps alone for 7 days
+  (`over-caps/set-aside.json` in the state directory). A set-aside note makes
+  no pass run. A pass that removes or edits an inbox note outside its batch
+  (other than a proposal, or a note a listed correction names) is blocked
+  before the audit.
 - **Size.** The audit reads at most 30 canonical files and 200,000 diff
   characters. Before anything else checks it, the engine stages everything
-  and measures the change set; over a cap it pays for no audit, throws the
-  attempt away (`git reset --hard` to the trunk and `git clean -fd`) and runs
-  the proposer once more with a smaller batch. Over again, or over with a
-  batch of one, the pass ends `blocked` (`over caps: …`), the attempt is saved
-  as a patch under the state directory's `over-caps/` (the newest 5 kept) and
-  the checkout is left on a clean trunk with no branch. The sealed commit is
+  and measures the change set; over a cap it pays for no audit, saves the
+  attempt as a binary patch under the state directory's `over-caps/` (mode
+  0600, the newest 5 kept), throws it away (`git reset --hard` to the trunk)
+  and runs the proposer once more with a smaller batch, or without a note
+  that went over alone. The lock is not held while the model runs, so a
+  discard keeps every inbox and journal file the proposer did not create (a
+  capture made meanwhile, a hand edit) and writes it back, uncommitted. Over
+  again, the pass ends `blocked` (`over caps: …`) and the checkout is back on
+  the trunk with no branch. A discard that fails says where the checkout
+  really is, and a pass refuses to start off the trunk or over an unclean
+  tree, naming what is there. The sealed commit is
   measured once more before the audit, and the audit itself refuses an
   oversized change set as `error`, with no model, `audit-branch` included.
 - **Corrections first.** The batch takes `kind: correction` notes before any
-  other note, oldest first with the notes they name, while they fit its
-  budget; one that does not fit waits for a later pass, and so does every
-  inbox note it names, so an original is never promoted while its correction
-  waits. A correction to a canonical note supersedes it, a retraction archives
+  other note: first those the pass can act on (`source: local` with `basis:
+  owner-said`, or `agent-found` for a correction that is not a retraction, or
+  a `forget`), then the others, each oldest first with the notes they name.
+  Corrections that name the same inbox note go together. While notes wait,
+  corrections take at most half the budget and at least one note goes too, so
+  a correction a pass leaves in the inbox never starves the owner's notes; one
+  the pass cannot act on is weighed by its own size. A correction that does
+  not fit waits for a later pass, and so does every inbox note a local one
+  names, so an original is never promoted while its correction waits. A correction to a canonical note supersedes it, a retraction archives
   it with `brain retract`, and one to an inbox note drains both. Each
   consolidate commit names every drained inbox path and what it became, which
   is how a later correction finds a target that has moved. A pass moves or
@@ -453,10 +469,10 @@ What a pass does with it, and what it reports:
   `{"v":1, "status": "idle|committed|no_changes|blocked|failed", "idle",
   "cost_microusd", "tokens_in", "tokens_out", "digest_entries",
   "inbox_before", "batch", "deferred_corrections", "attempts",
-  "canonical_files", "diff_chars"}`. The last five (0.8.0) are the items in
-  the attempt that ended the run, the corrections left for a later pass, the
-  proposer runs, and the last measurement of the change set; `null` (and
-  `attempts` 0) when no proposer ran. Cost and tokens are every proposer run
+  "canonical_files", "diff_chars", "set_aside"}`. The last six (0.8.0) are
+  the items in the attempt that ended the run, the corrections left for a
+  later pass, the proposer runs, the last measurement of the change set, and
+  the inbox notes set aside; `null` (and `attempts` 0) when no proposer ran. Cost and tokens are every proposer run
   plus the audit, read from the
   runner's `--output-format json` answer, and `null` when it answers in plain
   text. `brain audit-branch` ends the same way, on `audit-result: {"v":1,

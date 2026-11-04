@@ -277,13 +277,17 @@ works for it.
 items within an estimated 100,000 diff characters and 20 canonical files) and lists it to the
 proposer, in place of the prompt's "oldest 40". Before lint or any other check it stages
 everything and measures the change set; over 30 canonical files or 200,000 diff characters it
-pays for no audit, discards the attempt (`git reset --hard`, `git clean -fd`) and reruns the
+pays for no audit, discards the attempt (`git reset --hard`) and reruns the
 proposer once with a smaller batch, else ends `blocked` with the attempt saved as a patch under
 the state directory's `over-caps/` and a clean trunk. A pass that drains an inbox note outside its
 batch is blocked before the audit. `audit_changes`, and so `brain audit-branch`, refuses an
 oversized change set as `error` with no model call, where it used to truncate it and ask the model
 to block. `consolidate-result` gains `batch`, `deferred_corrections`, `attempts`,
-`canonical_files` and `diff_chars`; its statuses and every command's interface are unchanged.
+`canonical_files`, `diff_chars` and `set_aside`; its statuses and every command's interface are
+unchanged. After review: corrections the pass can act on come first and take at most half the
+budget while notes wait; a discard saves the attempt first and keeps what arrived while the model
+ran (no `git clean`); a note no audited pass can drain is set aside, not retried at the head of
+every pass.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder

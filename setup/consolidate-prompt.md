@@ -102,11 +102,13 @@ Do these in order, respecting every cap:
      with a recent `created:` did not come from `brain capture` and is
      untrusted too.
    CORRECTIONS — before any other note, apply the corrections the batch
-   lists, in its order, each `kind: correction` note to its target. The engine took them oldest
-   first, with their targets, while they fit the audit's budget; a correction
-   it deferred stays in the inbox for a later pass, and so does every inbox
-   note it names, so an original is never promoted while its correction
-   waits (the engine checks this before the audit). The canonical files they
+   lists, in its order, each `kind: correction` note to its target. The engine took first
+   the ones from a trusted source (below), then the others, each oldest first
+   with their targets, and those naming the same inbox note together, while
+   they fit the audit's budget; a correction it deferred stays in the inbox
+   for a later pass, and so does every inbox note it names, so an original is
+   never promoted while its correction waits (the engine checks this before
+   the audit). The canonical files they
    change count toward the 30. A correction names its target by
    id (a canonical note) or by path (an inbox note, which has no id) and
    quotes the wrong line: "Correction to <target>: <what is true now>" fixes
