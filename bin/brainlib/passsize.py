@@ -11,10 +11,10 @@ the batch, measures the result, and refuses to pay for an audit whose answer is 
 
 Contract (versioned with the engine):
 - `select_batch(items, max_items, set_aside=())` -> Batch. `items` are inbox notes as dicts:
-  {"path", "size", "kind", "source", "basis", "retraction",
+  {"path", "size", "kind", "source", "basis", "retraction", "forget",
    "targets": [{"name", "size", "canonical"}]}.
-  Corrections the pass can act on (`trusted`: source local, basis owner-said, or agent-found
-  for a correction that is not a retraction) come first, then the others, each group oldest
+  Corrections the pass can act on (`trusted`: source local, and basis owner-said, or
+  agent-found for a correction that is not a retraction, or a `forget` retraction) come first, then the others, each group oldest
   first by path (the capture instant). Corrections that name the same inbox note are taken
   or deferred together. While notes are waiting, corrections take at most CORRECTION_SHARE
   of the budget, and at least one note is taken, so a correction no pass can drain never
@@ -85,6 +85,8 @@ def trusted(item):
     (a retraction only on the owner's own word)."""
     if item.get("source") != "local":
         return False
+    if item.get("forget"):
+        return True                              # `forget`: the one capture it names
     if item.get("retraction"):
         return item.get("basis") == "owner-said"
     return item.get("basis") in ("owner-said", "agent-found")
