@@ -1352,7 +1352,9 @@ class ConsolidateTests(unittest.TestCase):
     # -- E5/E6: idle passes, cost, and one machine-readable result line --
 
     RESULT_KEYS = {"v", "status", "idle", "cost_microusd", "tokens_in", "tokens_out",
-                   "digest_entries", "inbox_before"}
+                   "digest_entries", "inbox_before",
+                   # 0.8.0: the pass's size
+                   "batch", "deferred_corrections", "attempts", "canonical_files", "diff_chars"}
 
     def result_of(self, completed):
         lines = [l for l in completed.stdout.splitlines() if l.startswith("consolidate-result: ")]

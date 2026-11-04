@@ -117,6 +117,7 @@ capture).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -191,7 +192,7 @@ def state_dir() -> Path:
 # file is also exec'd directly by tests/test_brain.py's load_brain_module(),
 # where sys.path[0] belongs to the test runner, not to this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from brainlib import locks, osbackend, provenance, served, vectors, verbs
+from brainlib import locks, osbackend, passsize, provenance, served, vectors, verbs
 # The note contract lives in brainlib/notes.py so that `brain publish` — which
 # decides what a customer may see — applies the SAME rules as lint, rather than
 # a second copy of them that drifts. Imported by name, so every call site in
@@ -5369,7 +5370,7 @@ def cmd_sessions(argv: list) -> int:
     return 0
 
 
-AUDIT_MAX_DIFF_CHARS = 200_000
+AUDIT_MAX_DIFF_CHARS = passsize.DIFF_CHARS_CAP   # the auditor's input limit, one place
 
 CONSOLIDATOR_CONF = "setup/consolidator.conf"
 # Today's behaviour, verbatim, for a clone whose conf file is missing. Not a
@@ -5869,19 +5870,24 @@ def audit_changes(runner: dict, timeout: int = None, usage: dict = None) -> tupl
         return "error", f"could not read the staged diff to audit it: {diff_error}"
     if not diff.strip():
         return "pass", "no staged changes to audit"
-    truncated = len(diff) > AUDIT_MAX_DIFF_CHARS
-    if truncated:
-        # Not silently trimmed: the caps in the consolidation prompt make a diff
-        # this large abnormal on its own, and auditing a fraction of a change set
-        # while reporting a pass would be worse than not auditing at all.
-        diff = diff[:AUDIT_MAX_DIFF_CHARS]
+    # 0.8.0: what is over the caps is refused before any model starts, never truncated.
+    # Auditing a fraction of a change set while reporting a pass would be worse than not
+    # auditing at all, and asking a model to block on size pays for an answer already known.
+    # `error`, not `block`: an oversized diff is no judgement of its content, and the curator
+    # records an audit block (which parks it) only on `block`. audit-branch comes through
+    # here too, so the independent gate refuses an oversized branch even if the engine's own
+    # check before the seal had a bug.
+    measured, measure_error = measure_staged(diff)
+    if measure_error:
+        return "error", f"could not measure the staged change set: {measure_error}"
+    if passsize.over_caps(measured):
+        return "error", (f"{passsize.caps_line(measured)}: over the audit limit; not audited")
 
     prompt = (prompt_path.read_text(encoding="utf-8")
-              + "\n\n```diff\n" + diff + "\n```\n")
-    if truncated:
-        prompt += ("\nNOTE: this diff was TRUNCATED at "
-                   f"{AUDIT_MAX_DIFF_CHARS} characters — it exceeds what a pass "
-                   "respecting its own caps can produce. Block on that alone.\n")
+              + "\n\n```diff\n" + diff + "\n```\n"
+              + f"\nNOTE: measured by the engine: {measured['canonical_files']} canonical "
+              f"files, {measured['diff_chars']} diff characters (caps "
+              f"{passsize.CANONICAL_FILES_CAP} / {passsize.DIFF_CHARS_CAP}).\n")
 
     snap, omitted, snap_error = audit_snapshot(stale_after=max(2 * timeout, 3600))
     if snap_error:
@@ -5980,7 +5986,7 @@ def open_pull_request(branch: str, trunk: str, title: str, body: str,
     return 1
 
 
-def propose_prompt(text: str, today: str = "") -> str:
+def propose_prompt(text: str, today: str = "", batch=None) -> str:
     """In a split layout the working directory holds only the notes; the protocol (AGENTS.md)
     and the toolbelt (bin/brain) live in the engine. Say where, so the pass can follow them.
 
@@ -5994,6 +6000,8 @@ def propose_prompt(text: str, today: str = "") -> str:
         # The date the engine checks proposals against (proposal_problems), said outright.
         text = (f"Today's date for this pass is {today}: use it for `created:`, for "
                 f"`expires:` ({PROPOSAL_DAYS} days later) and in the commit.\n\n" + text)
+    if batch is not None:
+        text = text.rstrip("\n") + "\n" + batch_block(batch)
     if ROOT == ENGINE:
         return text
     return (f"Where things are: the working directory holds this brain's notes. The engine is at "
@@ -6027,9 +6035,6 @@ AUDIT_RESULT = "audit-result: "
 
 
 def _audit_branch(argv: list, result: dict) -> int:
-    import shutil
-    import tempfile
-
     if len(argv) != 2 or argv[0] != "--branch" or not re.fullmatch(r"[A-Za-z0-9._/-]+", argv[1]):
         print("usage: brain audit-branch --branch NAME")
         return 2
@@ -6042,24 +6047,38 @@ def _audit_branch(argv: list, result: dict) -> int:
     except ConsolidatorConfigError as exc:
         print(f"  audit: refused — {one_line(exc)}")
         return 1
+    with branch_index(ref) as load_error:
+        if load_error:
+            print(f"  audit: could not read {argv[1]!r}: {one_line(load_error)[-200:]}")
+            return 1
+        verdict, detail = audit_changes(runner, usage=result)
+        result["verdict"] = verdict
+    print(f"  audit: {one_line(detail)}")
+    return 0 if verdict == "pass" else 1
+
+
+@contextlib.contextmanager
+def branch_index(ref: str):
+    """For the duration, git's index is a private one holding `ref`'s tree, so the staged diff
+    is the branch's against the trunk and the checkout's own index stays untouched. Yields
+    None, or the error that kept the tree from loading. `audit-branch` audits through it, and
+    a consolidation pass measures its sealed commit through it: one mechanism, so the engine
+    measures exactly what curator-audit receives."""
+    import shutil
+    import tempfile
+
     scratch = tempfile.mkdtemp(prefix="brain-audit-index-")
     previous = os.environ.get("GIT_INDEX_FILE")
     os.environ["GIT_INDEX_FILE"] = str(Path(scratch) / "index")
     try:
         loaded = subprocess.run(["git", "read-tree", ref], cwd=ROOT, capture_output=True, text=True)
-        if loaded.returncode != 0:
-            print(f"  audit: could not read {argv[1]!r}: {one_line(loaded.stderr or '')[-200:]}")
-            return 1
-        verdict, detail = audit_changes(runner, usage=result)
-        result["verdict"] = verdict
+        yield None if loaded.returncode == 0 else (loaded.stderr or "git read-tree failed")
     finally:
         if previous is None:
             os.environ.pop("GIT_INDEX_FILE", None)
         else:
             os.environ["GIT_INDEX_FILE"] = previous
         shutil.rmtree(scratch, ignore_errors=True)
-    print(f"  audit: {one_line(detail)}")
-    return 0 if verdict == "pass" else 1
 
 
 CONTRADICTION_RESULT = "contradiction-result: "
@@ -6497,6 +6516,158 @@ def correction_problems():
     return None
 
 
+def measure_staged(diff=None):
+    """(passsize measurement, None) of the staged change set against the trunk, or (None,
+    error). `diff` is the text already read by staged_diff_vs_main(), when the caller has it:
+    the measurement is of exactly what the auditor is handed."""
+    if diff is None:
+        diff, error = staged_diff_vs_main()
+        if error:
+            return None, error
+    run = subprocess.run(["git", "diff", "--cached", "-M", "--name-status", "-z",
+                          default_branch()], cwd=ROOT, capture_output=True)
+    if run.returncode != 0:
+        return None, (run.stderr.decode("utf-8", "replace").strip()[-200:]
+                      or f"git diff exited {run.returncode}")
+    rows = passsize.parse_name_status_z(run.stdout)
+    if rows is None:
+        return None, "git diff answered in a shape the measurement cannot read"
+    return passsize.measure(rows, diff), None
+
+
+def correction_target_size(name: str):
+    """(size in characters, canonical?) of a note a correction names, for the batch estimate:
+    a `knowledge/...` path as it is, an id as a canonical note (0 when it cannot be found)."""
+    if name.startswith("knowledge/"):
+        parts = name.split("/")
+        canonical = len(parts) >= 3 and parts[1] in CANONICAL
+        path = ROOT / name
+    else:
+        canonical, path = True, None
+        for folder in CANONICAL:
+            hit = next(iter(sorted((K / folder).rglob(f"{name}.md"))), None)
+            if hit is not None:
+                path = hit
+                break
+    try:
+        size = len(path.read_text(encoding="utf-8", errors="replace")) if path else 0
+    except OSError:
+        size = 0
+    return size, canonical
+
+
+def batch_items() -> list:
+    """The inbox as passsize.select_batch reads it: per note its path, size, kind and source,
+    and for a correction the notes it names (correction_targets, and a `forget` retraction's
+    one capture), with their sizes."""
+    is_known = known_note_ids()
+    items = []
+    for path in sorted((K / "inbox").glob("*.md")):
+        text = read_text(path)
+        fm = parse_frontmatter(text)[0] or {}
+        item = {"path": str(path.relative_to(ROOT)), "size": len(text),
+                "kind": str(fm.get("kind") or ""), "source": str(fm.get("source") or ""),
+                "targets": []}
+        if item["kind"] == "correction":
+            body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
+            names = correction_targets(body, is_known)
+            if forget_target(fm):
+                names.append(forget_target(fm))
+            for name in dict.fromkeys(names):
+                size, canonical = correction_target_size(name)
+                item["targets"].append({"name": name, "size": size, "canonical": canonical})
+        items.append(item)
+    return items
+
+
+def batch_block(batch) -> str:
+    """THIS PASS'S BATCH, appended to the proposer's prompt: what the engine chose to fit the
+    audit's input, path by path."""
+    lines = ["", "THIS PASS'S BATCH — chosen by the engine to fit the audit's limit "
+             f"({len(batch)} item(s); it is the only inbox work of this pass):", ""]
+    lines.append("Corrections to apply first, in this order:")
+    lines += [f"- {p}" for p in batch.corrections] or ["- (none)"]
+    lines.append("")
+    lines.append("Notes to drain, oldest first:")
+    lines += [f"- {p}" for p in batch.notes] or ["- (none)"]
+    lines.append("")
+    if batch.deferred:
+        lines.append(f"{len(batch.deferred)} correction(s) are deferred to a later pass. Leave "
+                     "them in the inbox, and every inbox note they name, untouched:")
+        lines += [f"- {p}" for p in batch.deferred]
+        lines.append("")
+    lines.append("Drain, promote, merge or hand off no other inbox note, except a "
+                 "session-mining proposal under PROPOSALS and an inbox note a listed "
+                 "correction names. The engine checks this before the audit.")
+    return "\n".join(lines) + "\n"
+
+
+def batch_problems(batch):
+    """The first inbox note the staged change set removes (drained, promoted, merged or handed
+    off) that the batch does not allow, or None. Allowed: the batch's corrections and notes,
+    the inbox notes those corrections name, and session-mining proposals (promoted on
+    corroboration, deleted once expired). Read from the trunk, what was there before."""
+    rows, error = staged_name_status("knowledge/inbox")
+    if error:
+        return f"could not read the change set ({one_line(error)})"
+    trunk = default_branch()
+    for status, rel in rows:
+        if not status.startswith("D") or rel in batch.allowed:
+            continue
+        raw = git_blob(f"{trunk}:{rel}")
+        fm = (parse_frontmatter(raw.decode("utf-8-sig", "replace"))[0] or {}) if raw else {}
+        if str(fm.get("source") or "") == "session-mining":
+            continue
+        return (f"{one_line(rel)} was removed from the inbox but is not in this pass's batch — "
+                "a pass drains only the notes the engine listed")
+    return None
+
+
+def discard_attempt(branch: str):
+    """Throw an attempt away completely, under the lock: the branch goes back to the trunk
+    (`reset --hard`, so a commit the proposer or the seal made goes too), and every untracked
+    file goes (`clean -fd`; ignored files such as the digest stay). `git checkout` would carry
+    staged and untracked work across. The tree was verified clean before the branch was cut,
+    so nothing untracked is anyone else's. Returns an error, or None."""
+    trunk = default_branch()
+    with repo_lock():
+        here = git("rev-parse", "--abbrev-ref", "HEAD")
+        if here != branch:
+            return f"HEAD is {one_line(here)!r}, not the pass's branch {branch!r}"
+        for args in (["reset", "-q", "--hard", trunk], ["clean", "-fdq"]):
+            done = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True)
+            if done.returncode != 0:
+                return f"git {args[0]} failed: {one_line(done.stderr)[-200:]}"
+        if git("status", "--porcelain").strip():
+            return "the tree is not clean after the reset"
+    return None
+
+
+OVER_CAPS_KEEP = 5
+
+
+def save_over_caps_patch(branch: str):
+    """(path, None) of the attempt saved as a patch in the state dir, outside git, or (None,
+    error). Only the newest OVER_CAPS_KEEP are kept."""
+    folder = state_dir() / "over-caps"
+    run = subprocess.run(["git", "diff", "--binary", "--cached", default_branch()], cwd=ROOT,
+                         capture_output=True)
+    if run.returncode != 0:
+        return None, one_line(run.stderr.decode("utf-8", "replace"))[-200:] or "git diff failed"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / (branch.replace("/", "-") + ".patch")
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(run.stdout)
+        kept = sorted(folder.glob("*.patch"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in kept[OVER_CAPS_KEEP:]:
+            old.unlink()
+    except OSError as exc:
+        return None, repr(exc)
+    return target, None
+
+
 def seal_pass(today: str, until: str):
     """Make the pass's final commit, carrying `Digest-until: <until>` (when the digest was
     collected; nothing when there was none). Staged work is committed as
@@ -6626,7 +6797,12 @@ def cmd_consolidate(argv: list) -> int:
     for whatever schedules it — idle, committed, no_changes, blocked or failed (AGENTS.md,
     "Consolidation"). A dry run is not a pass and prints none."""
     result = {"v": 1, "status": "failed", "idle": False, "cost_microusd": None,
-              "tokens_in": None, "tokens_out": None, "digest_entries": 0, "inbox_before": 0}
+              "tokens_in": None, "tokens_out": None, "digest_entries": 0, "inbox_before": 0,
+              # 0.8.0, null until a proposer ran: the items in the attempt that ended the run,
+              # the corrections left for a later pass, the proposer runs, and the last
+              # measurement of the change set.
+              "batch": None, "deferred_corrections": None, "attempts": 0,
+              "canonical_files": None, "diff_chars": None}
     try:
         return _consolidate(argv, result)
     finally:
@@ -6719,6 +6895,10 @@ def _consolidate(argv: list, result: dict) -> int:
               f"({'--digest-since' if digest_since else 'the last consolidation'}, "
               f"at most {DIGEST_DAYS} days)")
         print(f"would decide: {decision}")
+        batch = passsize.select_batch(batch_items())
+        print(f"would batch: {len(batch.corrections)} correction(s) and {len(batch.notes)} "
+              f"note(s), {len(batch.deferred)} correction(s) deferred; estimated "
+              f"{batch.chars} diff chars, {batch.files} canonical files")
         print(f"model:  {runner['model']} — {runner['model_reason']}")
         print(f"prompt: {prompt_path}")
         print(f"audit:  {audit_path}"
@@ -6750,12 +6930,17 @@ def _consolidate(argv: list, result: dict) -> int:
             print("missing setup/audit-prompt.md — the audit gate cannot run, and an "
                   "unaudited pass must not reach the remote")
             return 1
+        # 0.8.0: the engine chooses the batch, against the audit's input limit (passsize).
+        batch = passsize.select_batch(batch_items())
         branch = f"consolidate/{today}"
         if git("branch", "--list", branch):
             branch = f"{branch}-{time.strftime('%H%M')}"
         subprocess.run(["git", "checkout", "-b", branch], cwd=ROOT, check=True)
     print(f"brain consolidate: running {runner['propose'][0]} ({runner['model']}) "
           f"on branch {branch} (runner pinned in {runner['source']})…")
+    print(f"  batch: {len(batch.corrections)} correction(s) and {len(batch.notes)} note(s), "
+          f"{len(batch.deferred)} correction(s) deferred; estimated {batch.chars} diff chars, "
+          f"{batch.files} canonical files")
 
     # Materialize the session digest BEFORE handing over: the model runs
     # headless and cannot approve reads outside the repo.
@@ -6781,91 +6966,153 @@ def _consolidate(argv: list, result: dict) -> int:
     # or wrote garbage still got its work committed AND pushed, and the closing
     # message claimed the consolidation had landed either way.
     failure = None
+    blocked = False
     runner_name = runner["propose"][0]
     # The proposer can write files in the checkout, the git directory included. Its config,
     # hooks and info are put back before the engine runs git again, and a pass that touched
     # them lands nothing: that code would run as this user, after the audit.
     git_dir = Path(git("rev-parse", "--absolute-git-dir", check=True))
     control = git_control_snapshot(git_dir)
-    try:
-        run = subprocess.run(
-            [*runner["propose"],
-             propose_prompt(prompt_path.read_text(encoding="utf-8"), today=today)],
-            cwd=ROOT, text=True, capture_output=True, timeout=runner["propose_timeout"],
-            stdin=subprocess.DEVNULL,
-        )
-        text, usage = runner_output(run.stdout)
-        add_usage(result, usage)
-        # The model's own words, every line behind "  | ": nothing it writes can start a
-        # line of this output, so it cannot forge the result line a scheduler reads.
-        print(quoted(text[-2000:]) if text else quoted("(no output)"))
-        if run.returncode != 0:
-            failure = (f"{runner_name} exited {run.returncode}: "
-                       f"{(run.stderr or '').strip()[-300:] or 'no stderr'}")
-    except subprocess.TimeoutExpired:
-        failure = f"{runner_name} timed out after {runner['propose_timeout']}s"
-    except (OSError, subprocess.SubprocessError) as exc:
-        failure = f"could not run {runner_name}: {exc!r}"
-    touched = restore_git_control(git_dir, control)
-    if touched:
-        failure = (f"the proposer changed git control files ({', '.join(touched)}); "
-                   f"they are restored and nothing lands")
 
-    dirty = bool(git("status", "--porcelain").strip())
-    lint_out = io.StringIO()
-    try:
-        # Lint names the files the model wrote, so its report is quoted like the model's.
-        with contextlib.redirect_stdout(lint_out):
-            lint_code = lint()
-    except Exception as exc:
-        lint_code = 1
-        failure = failure or f"lint crashed on the consolidated tree: {exc!r}"
-    if lint_out.getvalue().strip():
-        print(quoted(lint_out.getvalue()))
-    if lint_code != 0 and failure is None:
-        failure = "lint rejected the consolidated tree"
+    def attempt():
+        """One proposer run and everything up to the seal. Returns (failure, blocked, over,
+        changed, committed): `over` is the measurement when the change set is over a cap,
+        which is the one outcome the caller may retry."""
+        failure = None
+        try:
+            run = subprocess.run(
+                [*runner["propose"],
+                 propose_prompt(prompt_path.read_text(encoding="utf-8"), today=today,
+                                batch=batch)],
+                cwd=ROOT, text=True, capture_output=True, timeout=runner["propose_timeout"],
+                stdin=subprocess.DEVNULL,
+            )
+            text, usage = runner_output(run.stdout)
+            add_usage(result, usage)
+            # The model's own words, every line behind "  | ": nothing it writes can start a
+            # line of this output, so it cannot forge the result line a scheduler reads.
+            print(quoted(text[-2000:]) if text else quoted("(no output)"))
+            if run.returncode != 0:
+                failure = (f"{runner_name} exited {run.returncode}: "
+                           f"{(run.stderr or '').strip()[-300:] or 'no stderr'}")
+        except subprocess.TimeoutExpired:
+            failure = f"{runner_name} timed out after {runner['propose_timeout']}s"
+        except (OSError, subprocess.SubprocessError) as exc:
+            failure = f"could not run {runner_name}: {exc!r}"
+        touched = restore_git_control(git_dir, control)
+        if touched:
+            failure = (f"the proposer changed git control files ({', '.join(touched)}); "
+                       f"they are restored and nothing lands")
+        # A runner that failed is not retried (size does not explain it), nor one that touched
+        # git control files (a security refusal: a second run is a second go at it).
+        if failure:
+            return failure, False, None, False, False
 
-    # Stage loose work FIRST, then measure the change set against main rather
-    # than against the working tree. Two reasons, both load-bearing:
-    #  - new canonical notes are UNTRACKED, so an unstaged `git diff main` shows
-    #    the single most important thing to audit as nothing at all;
-    #  - the consolidation prompt tells the proposer to commit its own output, so
-    #    a clean tree is the DOCUMENTED happy path. Gating the audit on a dirty
-    #    tree would skip it exactly when work was done.
-    if failure is None and dirty:
+        # Stage EVERYTHING first, then measure the change set against the trunk rather than
+        # the working tree: new canonical notes are untracked, and the prompt tells the
+        # proposer to commit its own output, so a clean tree is the documented happy path. The
+        # staged index is what the seal commits and what both audits receive.
         with repo_lock():
             subprocess.run(["git", "add", "-A"], cwd=ROOT, capture_output=True)
-    staged, staged_error = staged_diff_vs_main()
-    if staged_error and failure is None:
-        failure = f"could not diff the branch against main: {staged_error}"
-    changed = bool(staged.strip())
+        staged, staged_error = staged_diff_vs_main()
+        if staged_error:
+            return f"could not diff the branch against main: {staged_error}", False, None, \
+                False, False
+        changed = bool(staged.strip())
+        # 0.8.0: the caps are measured FIRST, before lint and every other check, so an
+        # oversized attempt always takes the retry path.
+        if changed:
+            measured, error = measure_staged(staged)
+            if error:
+                return f"could not measure the change set: {error}", False, None, changed, False
+            result.update(measured)
+            if passsize.over_caps(measured):
+                return None, False, measured, changed, False
 
-    blocked = False
-    # The proposal rules are mechanical, so they are checked as code before any auditor is
-    # spent on them; the prompt states them too.
-    if failure is None and changed:
-        problem = proposal_problems(today)
-        if problem:
-            failure, blocked = f"proposal check: {problem}", True
-    if failure is None and changed:
-        problem = handoff_problems(today)
-        if problem:
-            failure, blocked = f"handoff check: {problem}", True
-    if failure is None and changed:
-        problem = correction_problems()
-        if problem:
-            failure, blocked = f"correction check: {problem}", True
+        lint_out = io.StringIO()
+        try:
+            # Lint names the files the model wrote, so its report is quoted like the model's.
+            with contextlib.redirect_stdout(lint_out):
+                lint_code = lint()
+        except Exception as exc:
+            lint_code = 1
+            failure = f"lint crashed on the consolidated tree: {exc!r}"
+        if lint_out.getvalue().strip():
+            print(quoted(lint_out.getvalue()))
+        if lint_code != 0 and failure is None:
+            failure = "lint rejected the consolidated tree"
+        if failure:
+            return failure, False, None, changed, False
+        if not changed:
+            return None, False, None, False, False
 
-    # The pass's final commit, made BEFORE the audit so the audit sees what will be pushed,
-    # and carrying `Digest-until:` — when the digest was collected — for the next window.
-    committed = pushed = False
-    if failure is None and changed:
+        # The proposal rules are mechanical, so they are checked as code before any auditor
+        # is spent on them; the prompt states them too.
+        for label, check in (("proposal check", lambda: proposal_problems(today)),
+                             ("handoff check", lambda: handoff_problems(today)),
+                             ("correction check", correction_problems),
+                             ("batch check", lambda: batch_problems(batch))):
+            problem = check()
+            if problem:
+                return f"{label}: {problem}", True, None, changed, False
+
+        # The pass's final commit, made BEFORE the audit so the audit sees what will be
+        # pushed, and carrying `Digest-until:` — when the digest was collected — for the next
+        # window.
         problem = seal_pass(today, digest_until)
         if problem:
-            failure = f"commit rejected: {problem}"
-        else:
-            committed = True
+            return f"commit rejected: {problem}", False, None, changed, False
+        # Measured again on the sealed commit, through the same private index audit-branch
+        # reads it with: what curator-audit will be handed. The seal changes no tree, so this
+        # is never over unless something broke; if it is, the over-cap path discards it.
+        with branch_index(f"refs/heads/{branch}") as load_error:
+            sealed, error = (None, load_error) if load_error else measure_staged()
+        if error:
+            return f"could not measure the sealed commit: {one_line(error)}", False, None, \
+                changed, True
+        result.update(sealed)
+        if passsize.over_caps(sealed):
+            return None, False, sealed, changed, True
+        return None, False, None, changed, True
 
+    over, over_end = None, False
+    for number in (1, 2):
+        result.update(attempts=number, batch=len(batch),
+                      deferred_corrections=len(batch.deferred))
+        failure, blocked, over, changed, committed = attempt()
+        if over is None:
+            break
+        print(f"  over caps: {passsize.caps_line(over)}")
+        if number == 1 and len(batch) > 1:
+            problem = discard_attempt(branch)
+            if problem:
+                failure = f"could not discard the oversized attempt: {problem}"
+                break
+            size = passsize.retry_size(len(batch), over["canonical_files"], over["diff_chars"])
+            batch = passsize.cut(batch, size)
+            print(f"  attempt 1 discarded; attempt 2 with a batch of {len(batch)}")
+            continue
+        # Over again, or a batch of 1 already: blocked, no audit. The attempt is kept as a
+        # patch for inspection and the checkout goes back to a clean trunk, so the next run
+        # inherits nothing.
+        failure, blocked, changed, committed, over_end = (
+            f"over caps: {passsize.caps_line(over)} with a batch of {len(batch)}; not audited",
+            True, False, False, True)
+        patch, problem = save_over_caps_patch(branch)
+        print(f"  attempt saved for inspection: {patch}" if patch
+              else f"  attempt NOT saved: {problem}")
+        problem = discard_attempt(branch)
+        if problem:
+            print(f"  could not discard the attempt: {one_line(problem)}")
+        else:
+            with repo_lock():
+                subprocess.run(["git", "checkout", "-q", default_branch()], cwd=ROOT,
+                               capture_output=True)
+                subprocess.run(["git", "branch", "-q", "-D", branch], cwd=ROOT,
+                               capture_output=True)
+        break
+
+    pushed = False
     audit_detail = ""
     if failure is None and changed:
         audit_usage = {}
@@ -6905,8 +7152,12 @@ def _consolidate(argv: list, result: dict) -> int:
     if failure:
         result["status"] = "blocked" if blocked else "failed"
         print(f"consolidation DID NOT LAND: {one_line(failure)}")
-        print(f"nothing was pushed; the work is left on {branch} for inspection"
-              + (" (committed there, not pushed)" if committed else ""))
+        if over_end:
+            print("nothing was pushed or audited; the attempt is kept as a patch (above) and "
+                  "the checkout is back on a clean trunk")
+        else:
+            print(f"nothing was pushed; the work is left on {branch} for inspection"
+                  + (" (committed there, not pushed)" if committed else ""))
         if uncommitted:
             print("  (staged but not committed — inspect with: git diff --cached main)")
         print(f"you are on branch: {here}")
