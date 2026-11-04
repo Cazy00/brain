@@ -3595,14 +3595,33 @@ def known_note_ids():
     return is_known
 
 
+# An inbox note's id, as `remember` and `recall` hand it out: `inbox-` + its file stem. One
+# path component, never `..`: it names `knowledge/inbox/<stem>.md` and nothing outside it.
+INBOX_ID_RE = re.compile(r"inbox-([a-z0-9][a-z0-9._-]*)")
+
+
+def inbox_id_path(word: str, is_known=None):
+    """`knowledge/inbox/<stem>.md` for an inbox id (`inbox-<stem>`), else None. A canonical
+    note whose id happens to start with `inbox-` keeps it: an id that exists is that note."""
+    m = INBOX_ID_RE.fullmatch(word)
+    if not m or ".." in m.group(1):
+        return None
+    if is_known is not None and ID_RE.fullmatch(word) and is_known(word):
+        return None
+    return f"knowledge/inbox/{m.group(1)}.md"
+
+
 def correction_target(word: str, is_known=None):
-    """One named target, normalised: a `knowledge/...md` path, or a note id. A bare word
-    is an id only when it is written as a [[link]] or is a note that exists; anything
-    else ("the", "note") names nothing."""
+    """One named target, normalised: a `knowledge/...md` path, or a note id. An inbox id
+    (`inbox-<stem>`) is the inbox note's path. A bare word is an id only when it is written
+    as a [[link]] or is a note that exists; anything else ("the", "note") names nothing."""
     linked = "[[" in word
     word = word.strip("`'\"()[]<>*,;:.")
     if CORRECTION_PATH_RE.fullmatch(word):
         return word if word.startswith("knowledge/") else "knowledge/" + word
+    inbox = inbox_id_path(word, is_known)
+    if inbox:
+        return inbox
     if ID_RE.fullmatch(word) and (linked or (is_known is not None and is_known(word))):
         return word
     return None
@@ -3624,7 +3643,8 @@ def correction_targets(body: str, is_known=None) -> list:
             return [target]
     found = [f for f in (correction_target(m.group(0))
                          for m in CORRECTION_PATH_RE.finditer(body)) if f]
-    found += [l for l in extract_links(body) if ID_RE.fullmatch(l)]
+    found += [inbox_id_path(l, is_known) or l for l in extract_links(body)
+              if ID_RE.fullmatch(l) or inbox_id_path(l)]
     return list(dict.fromkeys(found))
 
 
@@ -6561,10 +6581,24 @@ def correction_target_size(name: str, index=None):
     return size, canonical
 
 
+def inbox_target(name: str):
+    """The inbox note a correction names by its path (an inbox id is already one), as
+    `knowledge/inbox/<file>`, or None when that is no regular file directly in the inbox:
+    resolved first (resolve_note_path), so `..` or a symlink out of the inbox names
+    nothing the batch could allow."""
+    real = resolve_note_path(name)
+    inbox = (K / "inbox").resolve()
+    if real is None or real.parent != inbox or (ROOT / name).is_symlink():
+        return None
+    return f"knowledge/inbox/{real.name}"
+
+
 def batch_items() -> list:
     """The inbox as passsize.select_batch reads it: per note its path, size, kind, source and
     basis, and for a correction whether it is a retraction and the notes it names
-    (correction_targets, and a `forget` retraction's one capture), with their sizes."""
+    (correction_targets, and a `forget` retraction's one capture), with their sizes. An
+    inbox note it names, by path or by `inbox-` id, is a target only while it is a file in
+    the inbox (inbox_target)."""
     is_known = known_note_ids()
     index = None
     items = []
@@ -6582,7 +6616,10 @@ def batch_items() -> list:
             names = correction_targets(body, is_known)
             if forget_target(fm):
                 names.append(forget_target(fm))
-            for name in dict.fromkeys(names):
+            for name in dict.fromkeys(inbox_target(n) if n.startswith("knowledge/inbox/")
+                                      else n for n in names):
+                if name is None:
+                    continue                     # no such inbox note: nothing to drain
                 if not name.startswith("knowledge/") and index is None:
                     try:
                         index = MetaIndex()
@@ -6602,6 +6639,11 @@ def batch_block(batch) -> str:
     lines.append("Corrections to apply first, in this order:")
     lines += [f"- {p}" for p in batch.corrections] or ["- (none)"]
     lines.append("")
+    if batch.named:
+        lines.append("Inbox notes those corrections name — part of this batch: apply the "
+                     "correction to each and drain it with its correction:")
+        lines += [f"- {p}" for p in batch.named]
+        lines.append("")
     lines.append("Notes to drain, oldest first:")
     lines += [f"- {p}" for p in batch.notes] or ["- (none)"]
     lines.append("")
@@ -7108,7 +7150,8 @@ def _consolidate(argv: list, result: dict) -> int:
           f"on branch {branch} (runner pinned in {runner['source']})…")
     print(f"  batch: {len(batch.corrections)} correction(s) and {len(batch.notes)} note(s), "
           f"{len(batch.deferred)} correction(s) deferred; estimated {batch.chars} diff chars, "
-          f"{batch.files} canonical files")
+          f"{batch.files} canonical files"
+          + (f"; {len(batch.named)} inbox note(s) the corrections name" if batch.named else ""))
     result["set_aside"] = len(batch.set_aside)
     for rel, reason in batch.set_aside.items():
         print(f"  set aside: {one_line(rel)} — {one_line(reason)}")
@@ -7248,12 +7291,17 @@ def _consolidate(argv: list, result: dict) -> int:
             return None, False, sealed, changed, True
         return None, False, None, changed, True
 
-    over, over_end, discard_problem, kept = None, None, None, []
+    over, over_end, discard_problem, kept, left_on = None, None, None, [], None
 
     def discard(number):
-        """Discard attempt `number`, saved first; report what was saved and kept."""
-        nonlocal kept
+        """Discard attempt `number`, saved first; report what was saved and kept. When it
+        fails, `left_on` is where the attempt really is: HEAD's branch and commit, read
+        then, before the end of the run may check out anything else."""
+        nonlocal kept, left_on
         patch, kept_now, problem = discard_attempt(branch, batch, f"attempt{number}")
+        if problem:
+            left_on = (git("rev-parse", "--abbrev-ref", "HEAD") or "?",
+                       git("rev-parse", "--short", "HEAD") or "?")
         print(f"  attempt {number} saved for inspection: {patch}" if patch
               else f"  attempt {number} NOT saved")
         kept = kept_now
@@ -7359,12 +7407,19 @@ def _consolidate(argv: list, result: dict) -> int:
                   + (f", with {len(kept)} file(s) written during the run kept there "
                      "uncommitted (above)" if kept else ", clean"))
         elif over_end == "failed":
+            # Read now, not at startup or before the end's checkout: where the checkout
+            # really is decides whether the next pass can start.
+            here = git("rev-parse", "--abbrev-ref", "HEAD") or "?"
             clean = not git("status", "--porcelain").strip()
             ready = clean and here == default_branch()
+            where, commit = left_on or ("?", "?")
             print(f"nothing was pushed or audited; the attempt could NOT be discarded "
-                  f"({one_line(discard_problem)}): the checkout is on {here!r} and its tree is "
+                  f"({one_line(discard_problem)}): it is left on {one_line(where)!r} at "
+                  f"{one_line(commit)}"
+                  + (f", and the pass's branch {branch} is left too" if where != branch else "")
+                  + f"; the checkout is on {one_line(here)!r} and its tree is "
                   + ("clean" if clean else "NOT clean")
-                  + (f"; the pass's branch {branch} is left for inspection" if ready else
+                  + ("; the next pass can start" if ready else
                      f". The next pass refuses to start until it is back on "
                      f"{default_branch()!r} with a clean tree"))
         else:

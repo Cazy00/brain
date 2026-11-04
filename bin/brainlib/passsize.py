@@ -1,4 +1,4 @@
-"""The size of a consolidation pass (engine 0.8.0): choose its batch, measure its change set.
+"""The size of a consolidation pass (engine 0.8.1): choose its batch, measure its change set.
 
 One job, and pure: no git, no files, no model. `bin/brain` reads the inbox and the staged
 change set and hands them here as data; this module decides what fits the auditor's input.
@@ -24,7 +24,10 @@ Contract (versioned with the engine):
   first. Session-mining proposals are never in a batch. An item whose own size alone is
   over DIFF_CHARS_CAP (draining it is a diff that size), and every path in `set_aside`, is
   set aside: in `Batch.set_aside`, never in the batch. At least one item is taken whenever
-  there is one to take.
+  there is one to take. `Batch.named` (0.8.1) lists the inbox notes the batch's corrections
+  name that the pass drains with them: in `allowed`, costed with their correction, and listed
+  to the proposer; a target's `name` is the note's inbox path, whichever way the correction
+  wrote it (bin/brain resolves an `inbox-<stem>` id and drops a name that is no inbox file).
 - `cut(batch, n)` -> the first n items, corrections first but at least one note when the
   batch has one and n > 1; a correction cut away is deferred with the corrections that
   share an inbox note with it.
@@ -55,7 +58,8 @@ class Batch:
     order the proposer is given them; `allowed` is every inbox path the attempt may remove
     (the batch, and the inbox notes its corrections name, never one a deferred correction
     names); `deferred` are the corrections left for a later pass, `set_aside` the items no
-    audited pass can drain, with their reason."""
+    audited pass can drain, with their reason; `named` the inbox notes the corrections name,
+    drained with them."""
 
     def __init__(self, corrections, notes, deferred, allowed, chars, files, by_path,
                  set_aside=None):
@@ -67,6 +71,10 @@ class Batch:
         self.chars = chars
         self.files = files
         self.set_aside = dict(set_aside or {})
+        taken = set(self.corrections) | set(self.notes)
+        self.named = [t for t in dict.fromkeys(
+            t for p in self.corrections if trusted(by_path[p]) for t in _inbox_targets(by_path[p]))
+            if t in self.allowed and t not in taken]
 
     @property
     def items(self):
