@@ -7026,6 +7026,7 @@ def _consolidate(argv: list, result: dict) -> int:
             if error:
                 return f"could not measure the change set: {error}", False, None, changed, False
             result.update(measured)
+            print(f"  measured: {passsize.caps_line(measured)}")
             if passsize.over_caps(measured):
                 return None, False, measured, changed, False
 
@@ -7071,6 +7072,7 @@ def _consolidate(argv: list, result: dict) -> int:
             return f"could not measure the sealed commit: {one_line(error)}", False, None, \
                 changed, True
         result.update(sealed)
+        print(f"  sealed: {passsize.caps_line(sealed)}")
         if passsize.over_caps(sealed):
             return None, False, sealed, changed, True
         return None, False, None, changed, True
