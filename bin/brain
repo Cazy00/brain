@@ -6584,7 +6584,10 @@ def batch_items() -> list:
                 names.append(forget_target(fm))
             for name in dict.fromkeys(names):
                 if not name.startswith("knowledge/") and index is None:
-                    index = MetaIndex()
+                    try:
+                        index = MetaIndex()
+                    except Exception:
+                        index = None             # correction_target_size retries, and copes
                 size, canonical = correction_target_size(name, index)
                 item["targets"].append({"name": name, "size": size, "canonical": canonical})
         items.append(item)
