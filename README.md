@@ -296,9 +296,12 @@ proposer rightly drained both, and the batch check refused every pass. The engin
 `inbox-<stem>` to `knowledge/inbox/<stem>.md` (a canonical note with that id keeps it; a `/` or
 `..` in the id names nothing) everywhere it reads a correction's targets, keeps an inbox target
 only while it is a regular file in the inbox, and lists the targets of the batch's corrections
-to the proposer as part of the batch; a deferred correction still holds its target back. A
-discard that fails now reports where the attempt is left and where the checkout really ends.
-No interface changes.
+to the proposer as part of the batch; a deferred correction still holds its target back. An
+`inbox-<stem>` lead with no such file falls through to the text's links and paths, as before.
+A correction that names a set-aside note is deferred and waits with it, so the proposer is told
+one thing. A discard that fails reports where the attempt is (its patch once the reset ran,
+else the branch and commit holding it) and where the checkout ends, and a failed pass names any
+commit the trunk gained while it ran, which no audit saw. No interface changes.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
