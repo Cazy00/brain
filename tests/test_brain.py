@@ -2455,7 +2455,7 @@ class ConsolidateTests(unittest.TestCase):
         self.assertIn("knowledge/inbox/", (seen / "status.2").read_text())
         self.assertIn("kept: knowledge/inbox/", result.stdout)
         # And the discarded attempt was saved before anything was reset, the capture in it.
-        patch = next((self.repo / ".cache" / "over-caps").glob("*-attempt1.patch"))
+        patch = next((self.repo.resolve() / ".cache" / "over-caps").glob("*-attempt1.patch"))
         self.assertIn("owner note kept", patch.read_text())
         self.assertIn("knowledge/reference/attempt1-30.md", patch.read_text())
 
@@ -2572,7 +2572,7 @@ class ConsolidateTests(unittest.TestCase):
                          'echo "fatal: held" >&2; exit 128; fi')
         result = self.consolidate()
         self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
-        patch = next((self.repo / ".cache" / "over-caps").glob("*-attempt1.patch"))
+        patch = next((self.repo.resolve() / ".cache" / "over-caps").glob("*-attempt1.patch"))
         branch = self.branches().split()[-1]
         self.assertIn(f"could NOT be discarded (could not check out '{self.trunk}'): it is saved "
                       f"as {patch} and reset off the pass's branch {branch}", result.stdout)
@@ -2592,7 +2592,7 @@ class ConsolidateTests(unittest.TestCase):
         finally:
             inbox.chmod(0o755)
         self.assertEqual(self.result_of(result)["status"], "blocked", result.stdout)
-        patch = next((self.repo / ".cache" / "over-caps").glob("*-attempt1.patch"))
+        patch = next((self.repo.resolve() / ".cache" / "over-caps").glob("*-attempt1.patch"))
         self.assertIn("owner note kept", patch.read_text())
         branch = self.branches().split()[-1]
         self.assertIn("could NOT be discarded (could not write back knowledge/inbox/",
