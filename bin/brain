@@ -5370,7 +5370,6 @@ def cmd_sessions(argv: list) -> int:
     return 0
 
 
-AUDIT_MAX_DIFF_CHARS = passsize.DIFF_CHARS_CAP   # the auditor's input limit, one place
 
 CONSOLIDATOR_CONF = "setup/consolidator.conf"
 # Today's behaviour, verbatim, for a clone whose conf file is missing. Not a
