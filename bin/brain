@@ -3633,19 +3633,29 @@ def correction_targets(body: str, is_known=None) -> list:
     A lead at the start of the text names the one target: a handoff's closing lead
     ("Filed <path>", "Already recorded: <path>"), else "Correction to X" or
     "Retract X". Without a lead that names a note, only the [[links]] and note paths in
-    the text are targets — never a word that merely follows "retract" in prose."""
+    the text are targets — never a word that merely follows "retract" in prose.
+
+    A lead written as an inbox id (`inbox-<stem>`) names that inbox note only while it is
+    a file there, or when the text names nothing else: before 0.8.1 such a word was no
+    target at all, and "Correction to inbox-capture-policy: [[capture-policy]] says X"
+    corrects the canonical note it links."""
     if is_known is None:
         is_known = known_note_ids()
+    unfiled = None
     for lead_re in (HANDOFF_CLOSE_RE, CORRECTION_LEAD_RE):
         lead = lead_re.match(body)
         target = correction_target(lead.group(1), is_known) if lead else None
+        if target and unfiled is None and not (ROOT / target).is_file() \
+                and target == inbox_id_path(lead.group(1).strip("`'\"()[]<>*,;:."), is_known):
+            unfiled = target                     # an inbox id with no such file: read on
+            continue
         if target:
             return [target]
     found = [f for f in (correction_target(m.group(0))
                          for m in CORRECTION_PATH_RE.finditer(body)) if f]
     found += [inbox_id_path(l, is_known) or l for l in extract_links(body)
               if ID_RE.fullmatch(l) or inbox_id_path(l)]
-    return list(dict.fromkeys(found))
+    return list(dict.fromkeys(found)) or ([unfiled] if unfiled else [])
 
 
 def pending_corrections() -> dict:

@@ -3646,6 +3646,41 @@ class PendingCorrectionTests(unittest.TestCase):
         hit = [h for h in hits if h["id"] == "vendor-limits"][0]
         self.assertEqual(hit["corrections_pending"], [path])
 
+    def test_an_inbox_id_lead_that_names_no_file_falls_through_to_the_body(self):
+        """0.8.1 review finding 3: before 0.8.1 an unknown `inbox-<word>` lead was no target,
+        so the [[link]] in the body was; it must still be, and still carry the marker."""
+        path = self.capture("2026-10-18-0600-fix.md",
+                            "Correction to inbox-vendor-limits: [[vendor-limits]] says 500, it "
+                            "is 800.")
+        read = run_brain("read", "vendor-limits", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", read.stdout)
+        module = load_brain_module()
+        known = {"vendor-limits"}.__contains__
+        self.assertEqual(module.correction_targets(
+            "Correction to inbox-vendor-limits: [[vendor-limits]] says 500.", is_known=known),
+            ["vendor-limits"])
+        self.assertEqual(module.correction_targets(
+            "Correction to inbox-2026-10-17-gone: see knowledge/reference/x.md.", is_known=known),
+            ["knowledge/reference/x.md"])
+        # Naming nothing else, the id still names its inbox path (a note since moved is found
+        # through the consolidate commits).
+        self.assertEqual(module.correction_targets(
+            "Correction to inbox-2026-10-17-gone: it was 2026-10-16.", is_known=known),
+            ["knowledge/inbox/2026-10-17-gone.md"])
+
+    def test_an_inbox_id_lead_whose_file_exists_names_only_it(self):
+        (self.inbox / "2026-10-17-0900-limit.md").write_text(
+            inbox_note(source="local", kind="fact").replace(
+                "A note.", "The vendor rate limit is 500 requests per minute."),
+            encoding="utf-8")
+        path = self.capture("2026-10-18-0600-fix.md",
+                            "Correction to inbox-2026-10-17-0900-limit: [[vendor-limits]] is "
+                            "right, this capture is not.")
+        read = run_brain("read", "knowledge/inbox/2026-10-17-0900-limit.md", repo=self.repo)
+        self.assertIn(f"[correction pending — {path}]", read.stdout)
+        read = run_brain("read", "vendor-limits", repo=self.repo)
+        self.assertNotIn("correction pending", read.stdout)
+
     def test_the_named_targets_are_read_from_the_lead_first(self):
         module = load_brain_module()
         known = {"vendor-limits", "pricing-2026", "alpha-note", "beta-note"}
