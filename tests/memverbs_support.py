@@ -89,11 +89,12 @@ def make_corpus(parent) -> Path:
                  ["config", "user.email", "sandbox@example.invalid"],
                  ["config", "user.name", "Sandbox"],
                  ["config", "gc.auto", "0"],
-                 # What `brain` would set itself on its first command; set here so the
-                 # "installed git hooks" notice never leads a command's output.
-                 ["config", "core.hooksPath", str(ENGINE / ".githooks")],
                  ["add", "-A"],
-                 ["commit", "-q", "-m", "fixture corpus"]):
+                 ["commit", "-q", "-m", "fixture corpus"],
+                 # What `brain` would set itself on its first command; set here so the
+                 # "installed git hooks" notice never leads a command's output. After the
+                 # fixture commit, so that commit does not fire the post-commit hook.
+                 ["config", "core.hooksPath", str(ENGINE / ".githooks")]):
         git(root, *args)
     # The commit above must not move the mtimes the walk is ordered by.
     for rel, _text, mtime in NOTES:
@@ -112,8 +113,12 @@ class Corpus(object):
         self.root = make_corpus(self.tmp.name)
         self.state = Path(self.tmp.name) / "state"
         self.state.mkdir()
-        self._saved = {k: os.environ.get(k) for k in ("BRAIN_DATA_ROOT", "BRAIN_STATE_DIR")}
+        self._saved = {k: os.environ.get(k) for k in ("BRAIN_DATA_ROOT", "BRAIN_STATE_DIR", "BRAIN_SYNC_PUSH")}
         os.environ["BRAIN_DATA_ROOT"] = str(self.root)
+        # The post-commit hook reindexes in a background subshell that can outlive the
+        # test and recreate `<tmp>/state` after it is removed. BRAIN_SYNC_PUSH makes
+        # the hook run to completion before the commit returns.
+        os.environ["BRAIN_SYNC_PUSH"] = "1"
         os.environ["BRAIN_STATE_DIR"] = str(self.state)
 
     def close(self):

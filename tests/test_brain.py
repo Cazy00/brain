@@ -50,10 +50,18 @@ def temp_dir():
 
 
 def cleanup_temp(tmp):
-    try:
-        tmp.cleanup()
-    except OSError:
-        pass
+    """Remove the sandbox, and keep removing it while the detached post-commit job
+    (see temp_dir) is still writing: ignore_cleanup_errors alone leaves the half-emptied
+    folder behind when that job wins the race."""
+    for _attempt in range(20):
+        try:
+            tmp.cleanup()
+        except OSError:
+            pass
+        shutil.rmtree(tmp.name, ignore_errors=True)
+        if not os.path.exists(tmp.name):
+            return
+        time.sleep(0.25)
 
 
 def run_brain(*args, repo=None, env=None):
