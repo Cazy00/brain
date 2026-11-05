@@ -119,9 +119,13 @@ class RemoteBrain(object):
         self.state_dir = base / "state"
         self.state_dir.mkdir()
         self._saved_env = {k: os.environ.get(k)
-                           for k in ("BRAIN_DATA_ROOT", "BRAIN_STATE_DIR")}
+                           for k in ("BRAIN_DATA_ROOT", "BRAIN_STATE_DIR", "BRAIN_SYNC_PUSH")}
         os.environ["BRAIN_DATA_ROOT"] = str(self.data_root)
         os.environ["BRAIN_STATE_DIR"] = str(self.state_dir)
+        # A capture's post-commit hook reindexes in a background subshell that can
+        # outlive the test and recreate `<tmp>/state` once it is removed; this makes
+        # the hook finish before the commit returns.
+        os.environ["BRAIN_SYNC_PUSH"] = "1"
 
         jwks = access.JwksCache(TEAM, opener=lambda url: (
             json.dumps(jwks_document()).encode("utf-8"), 300))
