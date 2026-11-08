@@ -7004,6 +7004,28 @@ def review_debt() -> list:
     return due
 
 
+_PUSH_REFUSED_RE = re.compile(
+    r"permission to .{0,200} denied|permission denied|insufficient permission|"
+    r"write access to repository not granted|\b403\b|access denied|"
+    r"denied to |not allowed to push|read-only", re.IGNORECASE)
+
+
+def push_failure_note(stderr, branch) -> str:
+    """The tail of the "committed" line when the branch is not on the remote. Only a push the
+    remote REFUSED FOR LACK OF RIGHTS is the intended layout (the engine runs as an account
+    that cannot push, and the account that opens the PR does): that says so. Every other
+    failure (no remote, expired credentials, no network, a rejected ref) stays PUSH FAILED,
+    with git's own reason."""
+    reason = one_line(stderr)
+    cmd = "git push -u origin " + branch
+    if _PUSH_REFUSED_RE.search(reason):
+        return (" — not pushed from this account (the remote refused it for lack of push "
+                "rights, as intended when another account pushes; that account pushes the "
+                f"branch, else run: {cmd})")
+    why = f" ({reason[-300:]})" if reason else ""
+    return f" — PUSH FAILED{why}, run: {cmd}"
+
+
 def cmd_consolidate(argv: list) -> int:
     """`brain consolidate`: one pass, ending on exactly one `consolidate-result: {json}` line
     for whatever schedules it — idle, committed, no_changes, blocked or failed (AGENTS.md,
@@ -7397,6 +7419,7 @@ def _consolidate(argv: list, result: dict) -> int:
         break
 
     pushed = False
+    push_error = ""
     audit_detail = ""
     if failure is None and changed:
         audit_usage = {}
@@ -7419,6 +7442,7 @@ def _consolidate(argv: list, result: dict) -> int:
         # honest check either way.
         pushed = push.returncode == 0
         if not pushed:
+            push_error = push.stderr
             local = git("rev-parse", branch)
             remote = git("rev-parse", f"origin/{branch}")
             pushed = bool(local) and local == remote
@@ -7478,9 +7502,7 @@ def _consolidate(argv: list, result: dict) -> int:
         return 0
     result["status"] = "committed"
     print(f"consolidation committed on {branch} (never on main)"
-          + ("" if pushed else " — not pushed from this account (the engine holds no push "
-                               "rights by design; the account that opens the PR pushes the "
-                               "branch, else run: git push -u origin " + branch + ")"))
+          + ("" if pushed else push_failure_note(push_error, branch)))
     print(f"review:  git diff main...{branch}")
     if "--open-pr" in argv:
         if not pushed:

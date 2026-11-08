@@ -1328,17 +1328,58 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(len(refs), 1, refs)
         self.assertTrue(refs[0].startswith("refs/heads/consolidate/"), refs)
 
-    def test_an_unpushed_branch_says_the_engine_holds_no_push_rights_not_that_a_push_failed(self):
+    def test_a_push_the_remote_refuses_for_lack_of_rights_is_not_called_a_failure(self):
         """I-148: on home the engine runs as an account with no push rights by design and
         another account pushes the bundle, so "PUSH FAILED" sent readers to a failure that is
-        not one. The branch is committed, the pass succeeds, and the line says what is true."""
-        self.stub_runner("VERDICT: PASS")                 # no remote: the push cannot happen
+        not one. The remote refuses the push for lack of rights; the branch is committed, the
+        pass succeeds, and the line says what is true."""
+        remote = self.with_remote()
+        hook = remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho 'remote: Permission to brain.git denied to agent.' >&2\n"
+                        "exit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+        self.stub_runner("VERDICT: PASS")
         result = self.consolidate_with()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("PUSH FAILED", result.stdout)
         self.assertIn("not pushed from this account", result.stdout)
-        self.assertIn("no push rights by design", result.stdout)
+        self.assertIn("lack of push rights", result.stdout)
         self.assertIn("git push -u origin consolidate/", result.stdout)
+
+    def test_any_other_push_failure_still_says_push_failed_with_its_reason(self):
+        """No remote at all is a misconfiguration, not a layout: it must not be called by
+        design. The line names git's own reason."""
+        self.stub_runner("VERDICT: PASS")                 # no remote: the push cannot happen
+        result = self.consolidate_with()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PUSH FAILED", result.stdout)
+        self.assertIn("origin", result.stdout.split("PUSH FAILED", 1)[1].split("\n", 1)[0])
+        self.assertNotIn("by design", result.stdout)
+        self.assertNotIn("lack of push rights", result.stdout)
+        self.assertIn("git push -u origin consolidate/", result.stdout)
+
+    def test_push_failure_note_tells_a_refusal_for_rights_from_every_other_failure(self):
+        ns = {}
+        src = (ROOT / "bin" / "brain").read_text(encoding="utf-8")
+        start = src.index("_PUSH_REFUSED_RE = ")
+        end = src.index("def cmd_consolidate(")
+        exec("import re\ndef one_line(t):\n    return ' '.join(str(t).split())\n"
+             + src[start:end], ns)
+        note = ns["push_failure_note"]
+        for refused in ("remote: Permission to Cazy00/brain.git denied to agent.\nfatal: unable "
+                        "to access 'https://github.com/x/': The requested URL returned error: 403",
+                        "git@github.com: Permission denied (publickey).",
+                        "error: insufficient permission for adding an object to repository "
+                        "database ./objects"):
+            self.assertIn("lack of push rights", note(refused, "b"), refused)
+            self.assertNotIn("PUSH FAILED", note(refused, "b"), refused)
+        for failed in ("fatal: 'origin' does not appear to be a git repository",
+                       "fatal: Authentication failed for 'https://github.com/x/'",
+                       "ssh: Could not resolve hostname github.com",
+                       "! [rejected] b -> b (non-fast-forward)",
+                       ""):
+            self.assertIn("PUSH FAILED", note(failed, "b"), failed)
+            self.assertNotIn("by design", note(failed, "b"), failed)
 
     def test_open_pr_opens_the_pull_request_with_gh(self):
         self.with_remote()
