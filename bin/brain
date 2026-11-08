@@ -6128,14 +6128,17 @@ def cmd_contradictions(argv: list) -> int:
     succeeded and answered for it."""
     result = {"v": 1, "status": "error", "pairs": [], "cost_microusd": None,
               "tokens_in": None, "tokens_out": None}
+    # What the judge really answered, apart from the result's placeholders: a pair it skipped,
+    # or every pair of an answer with no pairs object, is `unclear` in `pairs` and not judged.
+    tally = {"asked": 0, "answered": {}}
     try:
-        return _contradictions(argv, result)
+        return _contradictions(argv, result, tally)
     finally:
         # The pass's log keeps lines, not the JSON: one human line says how the check ended.
-        pairs = result["pairs"]
-        verdicts = [p.get("verdict") for p in pairs]
+        verdicts = [v for v, _why in tally["answered"].values()]
         # On stderr, like the refusals: stdout stays the one result line its readers parse.
-        print(f"  contradictions: ended {result['status']}, {len(pairs)} pairs judged, "
+        print(f"  contradictions: ended {result['status']}, {tally['asked']} pairs asked, "
+              f"{len(verdicts)} answered, "
               f"{verdicts.count('contradicts')} contradict, {verdicts.count('compatible')} "
               f"compatible, {verdicts.count('unclear')} unclear", file=sys.stderr)
         print(CONTRADICTION_RESULT + json.dumps(result))
@@ -6154,7 +6157,7 @@ def _inside_brain(path: Path) -> bool:
     return False
 
 
-def _contradictions(argv: list, result: dict) -> int:
+def _contradictions(argv: list, result: dict, tally: dict) -> int:
     import tempfile
     from brainlib import contradict
 
@@ -6204,6 +6207,7 @@ def _contradictions(argv: list, result: dict) -> int:
         result["status"] = "ok"
         return 0
 
+    tally["asked"] = len(pairs)
     used = []                                   # each note once, numbered by first use
     for pair in pairs:
         for note in pair:
@@ -6240,6 +6244,7 @@ def _contradictions(argv: list, result: dict) -> int:
                       f"{(run.stderr or '').strip()[-300:] or 'no stderr'}")
     verdicts = contradict.parse_verdicts(text, len(pairs))
     answered = verdicts or {}
+    tally["answered"] = answered
     result["pairs"] = [
         {"a": a["id"], "b": b["id"], "verdict": answered.get(i, ("unclear", ""))[0],
          "why": answered.get(i, ("unclear", ""))[1]} for i, (a, b) in enumerate(pairs, 1)]
