@@ -273,7 +273,7 @@ same first pairs, so schedule it with `--state`. Consolidation is unchanged, and
 works for it.
 
 **0.8.0.** Consolidation passes fit their audit (I-070). The engine chooses each pass's batch
-(`brainlib/passsize.py`: oldest first, corrections first with the notes they name, at most 15
+(`brainlib/passsize.py`: oldest first, corrections first with the notes they name, at most 25
 items within an estimated 100,000 diff characters and 20 canonical files) and lists it to the
 proposer, in place of the prompt's "oldest 40". Before lint or any other check it stages
 everything and measures the change set; over 30 canonical files or 200,000 diff characters it

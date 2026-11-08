@@ -527,6 +527,14 @@ class CommandTests(CommandCase):
         self.assertTrue(all(len(p["why"]) <= 200 for p in out["pairs"]))
         self.assertEqual((out["cost_microusd"], out["tokens_in"], out["tokens_out"]),
                          (12300, 150, 20))
+        # I-148: the end is one human line in the log, with the outcome and the counts; stdout
+        # stays the one result line.
+        verdicts = [p["verdict"] for p in out["pairs"]]
+        (ended,) = [l for l in run.stderr.splitlines() if "contradictions: ended" in l]
+        self.assertEqual(ended.strip(), (
+            f"contradictions: ended ok, {len(verdicts)} pairs judged, "
+            f"{verdicts.count('contradicts')} contradict, {verdicts.count('compatible')} "
+            f"compatible, {verdicts.count('unclear')} unclear"))
         # One call, from a read-only directory that holds only the pair notes.
         (call,) = self.calls()
         self.assertEqual(call["cwd"] == str(self.data), False)
@@ -551,6 +559,7 @@ class CommandTests(CommandCase):
         out = self.result_of(run)
         self.assertEqual((out["status"], out["pairs"], out["cost_microusd"]), ("ok", [], None))
         self.assertEqual(self.calls(), [])
+        self.assertIn("contradictions: ended ok, 0 pairs judged, 0 contradict", run.stderr)
 
     def test_a_state_file_inside_the_brain_is_refused(self):
         for inside in (self.data / "state.json", self.data / "knowledge" / "state.json",

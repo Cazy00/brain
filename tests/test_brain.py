@@ -1328,6 +1328,18 @@ class ConsolidateTests(unittest.TestCase):
         self.assertEqual(len(refs), 1, refs)
         self.assertTrue(refs[0].startswith("refs/heads/consolidate/"), refs)
 
+    def test_an_unpushed_branch_says_the_engine_holds_no_push_rights_not_that_a_push_failed(self):
+        """I-148: on home the engine runs as an account with no push rights by design and
+        another account pushes the bundle, so "PUSH FAILED" sent readers to a failure that is
+        not one. The branch is committed, the pass succeeds, and the line says what is true."""
+        self.stub_runner("VERDICT: PASS")                 # no remote: the push cannot happen
+        result = self.consolidate_with()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("PUSH FAILED", result.stdout)
+        self.assertIn("not pushed from this account", result.stdout)
+        self.assertIn("no push rights by design", result.stdout)
+        self.assertIn("git push -u origin consolidate/", result.stdout)
+
     def test_open_pr_opens_the_pull_request_with_gh(self):
         self.with_remote()
         trunk = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,

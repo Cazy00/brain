@@ -49,8 +49,13 @@ DIFF_CHARS_CAP = 200_000
 
 BUDGET_CHARS = DIFF_CHARS_CAP // 2          # half the hard cap
 BUDGET_FILES = 20                            # two thirds of 30
-MAX_ITEMS = 15
-MIN_ITEM_CHARS = 7_000                       # 11-04: 5,000+ diff chars a note, rounded up
+MAX_ITEMS = 25                               # I-148: 15 left the inbox growing (54, 47, 51, 71)
+MIN_ITEM_CHARS = 4_000                       # I-148: passes measured 3,400-4,900 diff chars a note
+# With these, plain notes stop at BUDGET_FILES / FILES_PER_NOTE = 23 (the file estimate binds
+# before the 25 cap and before the 25 the character floor allows). Worst case the code lets
+# through: 23 notes costed at the floor = 92,000 estimated chars; the audit takes 200,000, so a
+# note may really change 8,695 chars (1.8x the largest measured) before the batch is over the
+# cap. Over it anyway, the engine measures, discards and reruns smaller (retry_size).
 CHARS_PER_CHAR = 4                           # the deletion, the promoted body, its Sources
 FILES_PER_NOTE = 0.85                        # 10-21: 0.83 canonical files a note
 FILES_PER_CANONICAL_TARGET = 2               # a supersede: the successor and the archived note

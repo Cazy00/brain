@@ -6131,6 +6131,13 @@ def cmd_contradictions(argv: list) -> int:
     try:
         return _contradictions(argv, result)
     finally:
+        # The pass's log keeps lines, not the JSON: one human line says how the check ended.
+        pairs = result["pairs"]
+        verdicts = [p.get("verdict") for p in pairs]
+        # On stderr, like the refusals: stdout stays the one result line its readers parse.
+        print(f"  contradictions: ended {result['status']}, {len(pairs)} pairs judged, "
+              f"{verdicts.count('contradicts')} contradict, {verdicts.count('compatible')} "
+              f"compatible, {verdicts.count('unclear')} unclear", file=sys.stderr)
         print(CONTRADICTION_RESULT + json.dumps(result))
 
 
@@ -7471,7 +7478,9 @@ def _consolidate(argv: list, result: dict) -> int:
         return 0
     result["status"] = "committed"
     print(f"consolidation committed on {branch} (never on main)"
-          + ("" if pushed else " — PUSH FAILED, run: git push -u origin " + branch))
+          + ("" if pushed else " — not pushed from this account (the engine holds no push "
+                               "rights by design; the account that opens the PR pushes the "
+                               "branch, else run: git push -u origin " + branch + ")"))
     print(f"review:  git diff main...{branch}")
     if "--open-pr" in argv:
         if not pushed:
