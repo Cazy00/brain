@@ -64,6 +64,12 @@ class SelectBatchTests(unittest.TestCase):
         measured_worst_per_note = 4_900
         self.assertLess(len(worst) * measured_worst_per_note, passsize.DIFF_CHARS_CAP * 0.6)
         self.assertGreater(passsize.DIFF_CHARS_CAP / len(worst), 1.7 * measured_worst_per_note)
+        # The file cap is the tighter one: the estimate times 1.5 (a note touching 1.28 files,
+        # for the measured 0.83 mean) is still under the audit's 30.
+        self.assertLessEqual(worst.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        self.assertLessEqual(len(worst) * passsize.FILES_PER_NOTE * 1.5,
+                             passsize.CANONICAL_FILES_CAP)
+        self.assertLess(passsize.FILES_PER_NOTE * 1.5, 1.3)         # 1.275 files a note
         # No mix of corrections and notes costs more estimated chars than the budget (plus the
         # one item taken whatever it costs), so the estimate is never above half the cap.
         mixed = passsize.select_batch(
@@ -71,6 +77,19 @@ class SelectBatchTests(unittest.TestCase):
             + [note(f"02-{i:06d}", size=1) for i in range(30)])
         self.assertLessEqual(mixed.chars, passsize.BUDGET_CHARS)
         self.assertLessEqual(len(mixed), passsize.MAX_ITEMS)
+        self.assertLessEqual(mixed.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        # Corrections that each drain an inbox note with them cannot widen the batch past the
+        # file estimate: every inbox note leaving the inbox is costed as a note (I-148 review).
+        draining = passsize.select_batch(
+            [correction(f"01-{i:06d}", (f"knowledge/inbox/2026-11-02-{i:06d}.md", 500, False))
+             for i in range(30)]
+            + [note(f"02-{i:06d}", size=1) for i in range(30)]
+            + [note(f"03-{i:06d}", size=500) for i in range(30)])
+        self.assertLessEqual(draining.files, passsize.BUDGET_FILES + 0.0)
+        self.assertLessEqual(draining.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        # (The corrections themselves are deleted, not promoted: they cost no canonical file.)
+        promoted = len(draining.notes) + len(draining.named)
+        self.assertLessEqual(promoted, int(passsize.BUDGET_FILES / passsize.FILES_PER_NOTE))
 
     def test_the_item_cap_stops_the_selection(self):
         # With the default budget the file estimate (23 notes) stops small notes before the
@@ -115,7 +134,7 @@ class SelectBatchTests(unittest.TestCase):
         items = [{"path": p, "size": 200, "kind": "fact", "source": "local", "targets": []}
                  for p in held]
         # Each correction names one inbox note and one canonical note of 20,000 chars:
-        # max(7,000, 4 x 20,600) = 82,400 chars and 2 files, so only one fits the budget.
+        # max(4,000, 4 x 20,600) = 82,400 chars and 2 files, so only one fits the budget.
         for i, target in enumerate(held):
             items.append(correction(f"02-{i:06d}", (target, 200, False),
                                     ("some-canonical-note", 20_000, True), size=400))

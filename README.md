@@ -273,7 +273,7 @@ same first pairs, so schedule it with `--state`. Consolidation is unchanged, and
 works for it.
 
 **0.8.0.** Consolidation passes fit their audit (I-070). The engine chooses each pass's batch
-(`brainlib/passsize.py`: oldest first, corrections first with the notes they name, at most 25
+(`brainlib/passsize.py`: oldest first, corrections first with the notes they name, at most 15
 items within an estimated 100,000 diff characters and 20 canonical files) and lists it to the
 proposer, in place of the prompt's "oldest 40". Before lint or any other check it stages
 everything and measures the change set; over 30 canonical files or 200,000 diff characters it
@@ -302,6 +302,20 @@ A correction that names a set-aside note is deferred and waits with it, so the p
 one thing. A discard that fails reports where the attempt is (its patch once the reset ran,
 else the branch and commit holding it) and where the checkout ends, and a failed pass names any
 commit the trunk gained while it ran, which no audit saw. No interface changes.
+
+**0.8.2.** A pass takes more of the inbox (I-148). The inbox kept growing (54, 47, 51, 71 notes
+from 2026-11-05 to 11-08) because the 15-item cap and the 7,000-char floor a note was costed at
+limited a pass to about 14 notes, while real passes change 3,400-4,900 diff chars a note. The
+batch is now at most 25 items with a 4,000-char floor; the file estimate (0.85 a note against
+20 files) binds first, at 23 plain notes, whose estimate is 92,000 chars against the audit's
+200,000 and 19.55 files against its 30 (a note may really touch 1.3 files, 1.5x the measured
+0.83). An inbox note drained with its correction is costed as a note in files, so corrections
+cannot widen the batch past the same estimate. `brain contradictions` ends with one human line
+on stderr saying how the check ended: pairs asked, pairs the judge answered, and the verdicts of
+those. `consolidate` no longer calls every unpushed branch a failure when the remote refused
+the push for lack of rights (the engine runs as an account that cannot push, and the account
+that opens the PR pushes the branch): that says so; any other push failure stays `PUSH FAILED`,
+with git's own reason. No interface changes.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
