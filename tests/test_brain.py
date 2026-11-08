@@ -2368,8 +2368,9 @@ class ConsolidateTests(unittest.TestCase):
 
     def test_a_drain_outside_the_batch_is_blocked_before_the_audit(self):
         """Plan test 10."""
-        self.more_captures(20)
-        newest = "knowledge/inbox/2026-10-16-000019-more.md"
+        # More captures than any batch holds (at most passsize.MAX_ITEMS = 25, 23 by the file estimate).
+        self.more_captures(30)
+        newest = "knowledge/inbox/2026-10-16-000029-more.md"
         self.blocked(self.toolbelt("drain", self.SEED, newest), "batch check:")
 
     def test_corrections_over_the_budget_wait_with_the_notes_they_name(self):
@@ -2715,8 +2716,8 @@ class ConsolidateTests(unittest.TestCase):
     def test_an_edit_to_an_inbox_note_outside_the_batch_is_blocked(self):
         """Review finding 7: rewriting a note the batch does not hold, a deferred correction's
         text for one, is refused like draining it."""
-        self.more_captures(20)
-        newest = "knowledge/inbox/2026-10-16-000019-more.md"
+        self.more_captures(30)
+        newest = "knowledge/inbox/2026-10-16-000029-more.md"
         self.blocked(f"echo edited >> {newest}\n", "edited in the inbox")
 
     def test_a_correction_target_estimate_stays_inside_the_brain(self):
