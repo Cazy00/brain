@@ -317,6 +317,23 @@ the push for lack of rights (the engine runs as an account that cannot push, and
 that opens the PR pushes the branch): that says so; any other push failure stays `PUSH FAILED`,
 with git's own reason. No interface changes.
 
+**0.8.3.** The share never splits the owner's corrections. On 2026-11-08 four corrections the
+pass could act on described one change (an inbox decision cutting a list, its correction, and
+the two canonical notes it touched), an estimated 76,000 chars together. The half-budget share
+took three and deferred the fourth; the proposer drained the decision, left the note the
+deferred correction names current, and the audit blocked the pass, twice, on the same
+selection. Now, when two or more groups of corrections the pass can act on (none with a
+drop-box, `agent-inferred` or agent-found-retraction member) fit the whole budget together,
+beside the oldest waiting note's count, chars and files, they all go; the notes get that note
+and whatever budget is left, so the estimate stays within the budget. Otherwise the share
+applies as before, and a correction the pass cannot act on is always held to it. A drop-box
+correction no longer joins the group of a correction that names the same inbox note (it holds
+nothing back). The over-caps retry keeps that set whole, cutting notes first, or defers all of
+it. Known limit: corrections are grouped by the inbox notes they name, not the canonical ones,
+because a group always goes whole and the first one whatever it costs; when the owner's
+corrections are over the budget together, two that change one canonical note can still be
+split by the share. No interface changes.
+
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
 weights), brute force in pure Python. The two are fused by reciprocal rank,

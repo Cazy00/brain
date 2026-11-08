@@ -1,4 +1,4 @@
-"""The size of a consolidation pass (engine 0.8.1): choose its batch, measure its change set.
+"""The size of a consolidation pass (engine 0.8.3): choose its batch, measure its change set.
 
 One job, and pure: no git, no files, no model. `bin/brain` reads the inbox and the staged
 change set and hands them here as data; this module decides what fits the auditor's input.
@@ -14,14 +14,20 @@ Contract (versioned with the engine):
   {"path", "size", "kind", "source", "basis", "retraction", "forget",
    "targets": [{"name", "size", "canonical"}]}.
   Corrections the pass can act on (`trusted`: source local, and basis owner-said, or
-  agent-found for a correction that is not a retraction, or a `forget` retraction) come first, then the others, each group oldest
-  first by path (the capture instant). Corrections that name the same inbox note are taken
-  or deferred together. While notes are waiting, corrections take at most CORRECTION_SHARE
-  of the budget, and at least one note is taken, so a correction no pass can drain never
-  starves the owner's notes. An untrusted correction is costed by its own size (it changes
-  no target) and holds back only what a local one holds. The rest are deferred, and no note
-  a deferred local correction names is taken or allowed. Then notes fill the budget, oldest
-  first. Session-mining proposals are never in a batch. An item whose own size alone is
+  agent-found for a correction that is not a retraction, or a `forget` retraction) come
+  first, then the others, each group oldest first by path (the capture instant). Local
+  corrections that name the same inbox note are taken or deferred together. While notes are
+  waiting, corrections take at most CORRECTION_SHARE of the budget, and at least one note
+  is taken, so a correction no pass can drain never starves the owner's notes. One
+  exception (0.8.3): when two or more groups of trusted corrections (no untrusted member,
+  none waiting for a set-aside note) fit the whole budget together, beside the oldest
+  waiting note's count, chars and files, they are all taken (`Batch.together`), and the
+  notes get that note and whatever budget is left; the share never splits one change
+  across passes. Untrusted corrections, and any group with one, keep the share, counted
+  with everything already taken. An untrusted correction is costed by its own size (it
+  changes no target) and holds back only what a local one holds. The rest are deferred, and
+  no note a deferred local correction names is taken or allowed. Then notes fill the budget,
+  oldest first. Session-mining proposals are never in a batch. An item whose own size alone is
   over DIFF_CHARS_CAP (draining it is a diff that size), and every path in `set_aside`, is
   set aside: in `Batch.set_aside`, never in the batch. At least one item is taken whenever
   there is one to take. `Batch.named` (0.8.1) lists the inbox notes the batch's corrections
@@ -35,8 +41,9 @@ Contract (versioned with the engine):
   pass over the caps too; deferred, the correction still holds the note back, and both come
   back together once the note leaves set-aside.
 - `cut(batch, n)` -> the first n items, corrections first but at least one note when the
-  batch has one and n > 1; a correction cut away is deferred with the corrections that
-  share an inbox note with it.
+  batch has one and n > 1; the together set is kept whole (notes cut first) or deferred
+  whole (0.8.3); any other correction cut away is deferred with the corrections that share
+  an inbox note with it.
 - `retry_size(n, files, chars)` -> the smaller batch for a second attempt.
 - `measure(rows, diff)` -> {"canonical_files", "diff_chars"}; `over_caps(measured)` -> bool.
 - `parse_name_status_z(raw)` reads `git diff --name-status -z -M` output into rows.
@@ -62,6 +69,10 @@ MIN_ITEM_CHARS = 4_000                       # I-148: passes measured 3,400-4,90
 #     over it. This is the tighter margin, and the one tests/test_passsize.py pins (1.5x). An
 #     inbox note drained with its correction counts FILES_PER_NOTE too, so corrections cannot
 #     widen the batch past the same estimate.
+#   corrections taken together past the share (0.8.3) must fit the budget beside the oldest
+#     waiting note's own cost, count and files, and the notes after it fill only what is
+#     left, so a batch's estimate is never past BUDGET_CHARS or BUDGET_FILES on that account
+#     either; only the one item taken whatever it costs (a batch's first) can be.
 # Over a cap anyway, the engine measures, discards and reruns smaller (retry_size).
 CHARS_PER_CHAR = 4                           # the deletion, the promoted body, its Sources
 FILES_PER_NOTE = 0.85                        # 10-21: 0.83 canonical files a note
@@ -77,11 +88,13 @@ class Batch:
     (the batch, and the inbox notes its corrections name, never one a deferred correction
     names); `deferred` are the corrections left for a later pass, `set_aside` the items no
     audited pass can drain, with their reason; `named` the inbox notes the corrections name,
-    drained with them."""
+    drained with them; `together` (0.8.3) the corrections taken past the share because all
+    the pass can act on fit together, which `cut` keeps whole or defers whole."""
 
     def __init__(self, corrections, notes, deferred, allowed, chars, files, by_path,
-                 set_aside=None):
+                 set_aside=None, together=()):
         self.by_path = by_path
+        self.together = list(together)
         self.corrections = list(corrections)
         self.notes = list(notes)
         self.deferred = list(deferred)
@@ -142,27 +155,38 @@ def _holds(item):
     return _inbox_targets(item) if item.get("source") == "local" else []
 
 
+def _links(item):
+    """What ties a correction to others in one group: a local correction's inbox targets. One
+    the pass applies drains the note, and one it leaves holds the note back, so corrections
+    naming one inbox note go together or not at all. A drop-box correction is weighed, never
+    applied, and holds nothing, so it ties to nothing. Canonical targets tie nothing: a
+    group always goes whole and the first one whatever it costs, so ten corrections of one
+    large canonical note would be one batch far over the caps that every retry defers whole.
+    Outside the together set, two corrections of one canonical note may still be split by
+    the share (README, 0.8.3)."""
+    return list(_inbox_targets(item)) if item.get("source") == "local" else []
+
+
 def _groups(corrections):
-    """Corrections in order, joined into groups that share an inbox target: applying one of
-    a group drains the note the others name, so they go into a batch together or not at
-    all. Each group sits at the place of its first member."""
+    """Corrections in order, joined into groups that share a link (`_links`): they go into a
+    batch together or not at all. Each group sits at the place of its first member."""
     groups, owner = [], {}
     for item in corrections:
-        hits = [owner[t] for t in _inbox_targets(item) if t in owner]
+        hits = [owner[t] for t in _links(item) if t in owner]
         if hits:
             group = hits[0]
             for other in hits[1:]:
                 if other is not group:
                     group.extend(other)
                     for member in other:
-                        for t in _inbox_targets(member):
+                        for t in _links(member):
                             owner[t] = group
                     groups.remove(other)
         else:
             group = []
             groups.append(group)
         group.append(item)
-        for t in _inbox_targets(item):
+        for t in _links(item):
             owner[t] = group
     return groups
 
@@ -199,9 +223,49 @@ def select_batch(items, max_items=MAX_ITEMS, budget_chars=BUDGET_CHARS,
             return True                          # at least one item, whatever it costs
         return chars + c <= budget_chars * part and files + f <= budget_files * part
 
+    groups = [(g, any(t in parked for i in g if trusted(i) for t in _inbox_targets(i)))
+              for g in _groups(corrections)]
+    # The owner's corrections often change one fact in several notes (an inbox decision, its
+    # correction, the canonical notes it touches), and nothing in their targets says so. The
+    # share is there so corrections a pass leaves cannot starve the notes; it must not cut
+    # between corrections the pass can act on when all of them fit the whole budget, because
+    # a pass that applies half of one change leaves two current notes that disagree, and the
+    # audit blocks it (2026-11-08). Only groups of trusted corrections ride together; a group
+    # with an untrusted member, and every untrusted correction, keeps the share. While notes
+    # wait the together set must leave room for the oldest of them (its count, chars and
+    # files), so the notes always get that note and whatever budget is left, and the batch
+    # estimate stays within the budget the worst-case argument above rests on. One group is
+    # never split by the share (the first item always goes), so a lone group needs no rule.
+    together = [g for g, waits in groups if not waits and all(trusted(i) for i in g)]
+    room_c, room_f, room_n = budget_chars, budget_files, max_items
+    if waiting:
+        room_c -= _cost(waiting[0].get("size") or 0)
+        room_f -= FILES_PER_NOTE
+        room_n -= 1
+    if len(together) < 2 \
+            or sum(len(g) for g in together) > room_n \
+            or sum(_correction_cost(i)[0] for g in together for i in g) > room_c \
+            or sum(_correction_cost(i)[1] for g in together for i in g) > room_f:
+        together = []
+
+    def take(group, c, f):
+        nonlocal chars, files
+        for item in group:
+            taken.append(item["path"])
+            allowed.add(item["path"])
+            if trusted(item):
+                allowed.update(_inbox_targets(item))
+        chars, files = chars + c, files + f
+
+    for group in together:
+        take(group, sum(_correction_cost(i)[0] for i in group),
+             sum(_correction_cost(i)[1] for i in group))
+    together_paths = list(taken)
     stopped = False
-    for group in _groups(corrections):
-        if any(t in parked for i in group if trusted(i) for t in _inbox_targets(i)):
+    for group, waits in groups:
+        if any(group is g for g in together):
+            continue
+        if waits:
             deferred.extend(group)               # it waits for the note it names
             continue
         c = sum(_correction_cost(i)[0] for i in group)
@@ -210,12 +274,7 @@ def select_batch(items, max_items=MAX_ITEMS, budget_chars=BUDGET_CHARS,
             stopped = True
             deferred.extend(group)
             continue
-        for item in group:
-            taken.append(item["path"])
-            allowed.add(item["path"])
-            if trusted(item):
-                allowed.update(_inbox_targets(item))
-        chars, files = chars + c, files + f
+        take(group, c, f)
     held = ({t for item in deferred for t in _holds(item)}
             | {t for p in taken for t in _holds(by_path[p]) if not trusted(by_path[p])})
     batch_corrections = list(taken)
@@ -234,23 +293,30 @@ def select_batch(items, max_items=MAX_ITEMS, budget_chars=BUDGET_CHARS,
         allowed.add(path)
         chars, files = chars + c, files + f
     return Batch(batch_corrections, notes, [i["path"] for i in deferred], allowed - held,
-                 int(chars), round(files, 2), by_path, parked)
+                 int(chars), round(files, 2), by_path, parked, together_paths)
 
 
 def cut(batch, n):
     """The first `n` items of `batch`: corrections first, but at least one note when the
-    batch has notes and n > 1. A correction cut away is deferred, with every kept correction
-    that shares an inbox note with it, and no inbox note a deferred local correction names is
-    allowed. The deferred list keeps the selection's order, oldest first."""
+    batch has notes and n > 1. The together set (0.8.3) is kept whole when it fits in `n`,
+    with notes cut first to make room, and deferred whole when it does not: the retry is the
+    pass's last attempt, and half of one change is what the audit blocks. Any other
+    correction cut away is deferred, with every kept correction it shares a link with, and
+    no inbox note a deferred local correction names is allowed. The deferred list keeps the
+    selection's order, oldest first."""
     by_path = batch.by_path
     n = max(1, n)
-    room = n - (1 if batch.notes and n > 1 else 0)
-    corrections = batch.corrections[:room]
+    together = [p for p in batch.together if p in batch.corrections]
+    whole = together if len(together) <= n else []
+    rest = [p for p in batch.corrections if p not in together]
+    free = n - len(whole)
+    room = free - (1 if batch.notes and (free > 1 or (whole and free == 1)) else 0)
+    corrections = whole + rest[:max(0, room)]
     notes = batch.notes[:n - len(corrections)]
     cut_away = [p for p in batch.corrections if p not in corrections]
     while True:
-        shared = {t for p in cut_away for t in _inbox_targets(by_path[p])}
-        joined = [p for p in corrections if set(_inbox_targets(by_path[p])) & shared]
+        shared = {t for p in cut_away for t in _links(by_path[p])}
+        joined = [p for p in corrections if set(_links(by_path[p])) & shared]
         if not joined:
             break
         corrections = [p for p in corrections if p not in joined]
@@ -268,8 +334,8 @@ def cut(batch, n):
     for path in notes:
         allowed.add(path)
         chars, files = chars + _cost(by_path[path].get("size") or 0), files + FILES_PER_NOTE
-    return Batch(corrections, notes, deferred, allowed - held,
-                 int(chars), round(files, 2), by_path, batch.set_aside)
+    return Batch(corrections, notes, deferred, allowed - held, int(chars), round(files, 2),
+                 by_path, batch.set_aside, [p for p in whole if p in corrections])
 
 
 def retry_size(n, files, chars):
