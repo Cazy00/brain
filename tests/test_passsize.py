@@ -41,13 +41,64 @@ class SelectBatchTests(unittest.TestCase):
         self.assertEqual(batch.notes, ["knowledge/inbox/2026-11-02-000000.md"])
         self.assertNotIn("knowledge/inbox/2026-11-01-000000.md", batch.allowed)
 
+    def test_the_batch_constants_are_pinned(self):
+        """I-148: 7,000 / 15 left the inbox growing (54, 47, 51, 71 from 2026-11-05 to 11-08),
+        because real passes change 3,400-4,900 chars a note. Changing these is a review."""
+        self.assertEqual((passsize.MIN_ITEM_CHARS, passsize.MAX_ITEMS), (4_000, 25))
+        self.assertEqual((passsize.BUDGET_CHARS, passsize.BUDGET_FILES), (100_000, 20))
+        self.assertEqual((passsize.DIFF_CHARS_CAP, passsize.CANONICAL_FILES_CAP), (200_000, 30))
+
+    def test_the_worst_case_batch_stays_under_the_audit_with_margin(self):
+        """The largest batch the code lets through, from any inbox: notes too small to cost
+        more than the floor, with room in every budget. The file estimate binds first (23
+        notes), so the 25-item cap and the 25 the character floor allows are never reached
+        by plain notes; and 23 notes at the 4,900 chars the busiest pass measured are
+        112,700 chars, far under 200,000, which a note must really change 8,695 chars to
+        reach."""
+        worst = passsize.select_batch([note(f"01-{i:06d}", size=1) for i in range(100)])
+        self.assertEqual(len(worst), int(passsize.BUDGET_FILES / passsize.FILES_PER_NOTE))
+        self.assertEqual(len(worst), 23)
+        self.assertEqual(worst.chars, 23 * passsize.MIN_ITEM_CHARS)
+        self.assertLessEqual(worst.chars, passsize.BUDGET_CHARS)
+        self.assertLessEqual(worst.files, passsize.BUDGET_FILES)
+        measured_worst_per_note = 4_900
+        self.assertLess(len(worst) * measured_worst_per_note, passsize.DIFF_CHARS_CAP * 0.6)
+        self.assertGreater(passsize.DIFF_CHARS_CAP / len(worst), 1.7 * measured_worst_per_note)
+        # The file cap is the tighter one: the estimate times 1.5 (a note touching 1.28 files,
+        # for the measured 0.83 mean) is still under the audit's 30.
+        self.assertLessEqual(worst.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        self.assertLessEqual(len(worst) * passsize.FILES_PER_NOTE * 1.5,
+                             passsize.CANONICAL_FILES_CAP)
+        self.assertLess(passsize.FILES_PER_NOTE * 1.5, 1.3)         # 1.275 files a note
+        # No mix of corrections and notes costs more estimated chars than the budget (plus the
+        # one item taken whatever it costs), so the estimate is never above half the cap.
+        mixed = passsize.select_batch(
+            [correction(f"01-{i:06d}") for i in range(30)]
+            + [note(f"02-{i:06d}", size=1) for i in range(30)])
+        self.assertLessEqual(mixed.chars, passsize.BUDGET_CHARS)
+        self.assertLessEqual(len(mixed), passsize.MAX_ITEMS)
+        self.assertLessEqual(mixed.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        # Corrections that each drain an inbox note with them cannot widen the batch past the
+        # file estimate: every inbox note leaving the inbox is costed as a note (I-148 review).
+        draining = passsize.select_batch(
+            [correction(f"01-{i:06d}", (f"knowledge/inbox/2026-11-02-{i:06d}.md", 500, False))
+             for i in range(30)]
+            + [note(f"02-{i:06d}", size=1) for i in range(30)]
+            + [note(f"03-{i:06d}", size=500) for i in range(30)])
+        self.assertLessEqual(draining.files, passsize.BUDGET_FILES + 0.0)
+        self.assertLessEqual(draining.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        # (The corrections themselves are deleted, not promoted: they cost no canonical file.)
+        promoted = len(draining.notes) + len(draining.named)
+        self.assertLessEqual(promoted, int(passsize.BUDGET_FILES / passsize.FILES_PER_NOTE))
+
     def test_the_item_cap_stops_the_selection(self):
-        # With the default budget the 7,000-char floor stops small notes at 14 first
-        # (14 x 7,000 = 98,000): the 15-item cap is the backstop behind it.
+        # With the default budget the file estimate (23 notes) stops small notes before the
+        # 25 the 4,000-char floor allows, and the 25-item cap is the backstop behind both.
         self.assertEqual(len(passsize.select_batch([note(f"01-{i:06d}") for i in range(40)])),
-                         passsize.BUDGET_CHARS // passsize.MIN_ITEM_CHARS)
+                         min(passsize.BUDGET_CHARS // passsize.MIN_ITEM_CHARS,
+                             int(passsize.BUDGET_FILES / passsize.FILES_PER_NOTE)))
         batch = passsize.select_batch([note(f"01-{i:06d}") for i in range(40)],
-                                      budget_chars=10 ** 9)
+                                      budget_chars=10 ** 9, budget_files=10 ** 9)
         self.assertEqual(len(batch), passsize.MAX_ITEMS)
 
     def test_the_character_budget_stops_the_selection(self):
@@ -83,7 +134,7 @@ class SelectBatchTests(unittest.TestCase):
         items = [{"path": p, "size": 200, "kind": "fact", "source": "local", "targets": []}
                  for p in held]
         # Each correction names one inbox note and one canonical note of 20,000 chars:
-        # max(7,000, 4 x 20,600) = 82,400 chars and 2 files, so only one fits the budget.
+        # max(4,000, 4 x 20,600) = 82,400 chars and 2 files, so only one fits the budget.
         for i, target in enumerate(held):
             items.append(correction(f"02-{i:06d}", (target, 200, False),
                                     ("some-canonical-note", 20_000, True), size=400))
@@ -125,8 +176,8 @@ class SelectBatchTests(unittest.TestCase):
             self.assertTrue(batch.notes, "the owner's notes got no part of the pass")
 
     def test_corrections_take_at_most_their_share_while_notes_wait(self):
-        fixes = [correction(f"01-{i:06d}") for i in range(12)]
-        owners = [note(f"02-{i:06d}") for i in range(12)]
+        fixes = [correction(f"01-{i:06d}") for i in range(30)]
+        owners = [note(f"02-{i:06d}") for i in range(30)]
         batch = passsize.select_batch(fixes + owners)
         self.assertLessEqual(len(batch.corrections) * passsize.MIN_ITEM_CHARS,
                              passsize.BUDGET_CHARS * passsize.CORRECTION_SHARE)

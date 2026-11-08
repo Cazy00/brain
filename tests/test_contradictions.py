@@ -161,6 +161,8 @@ for n, left, right in re.findall(r"^(\\d+)\\. (n\\d+\\.md) and (n\\d+\\.md)$", p
     clash = a and b and a[0] == b[0] and a[1] != b[1]
     pairs.append({{"n": int(n), "verdict": "contradicts" if clash else "compatible",
                   "why": ("different values for " + a[0] + " " * 5 + "x" * 300) if clash else "they fit"}})
+if mode == "partial":
+    pairs = [p for p in pairs if p["n"] % 2 == 1]       # the judge skips the even pairs
 print(json.dumps({{"result": "notes read\\n" + json.dumps({{"pairs": pairs}}),
                   "total_cost_usd": 0.0123, "usage": {{"input_tokens": 100,
                   "cache_read_input_tokens": 50, "output_tokens": 20}}}}))
@@ -527,6 +529,14 @@ class CommandTests(CommandCase):
         self.assertTrue(all(len(p["why"]) <= 200 for p in out["pairs"]))
         self.assertEqual((out["cost_microusd"], out["tokens_in"], out["tokens_out"]),
                          (12300, 150, 20))
+        # I-148: the end is one human line in the log, with the outcome and the counts; stdout
+        # stays the one result line.
+        verdicts = [p["verdict"] for p in out["pairs"]]
+        (ended,) = [l for l in run.stderr.splitlines() if "contradictions: ended" in l]
+        self.assertEqual(ended.strip(), (
+            f"contradictions: ended ok, {len(verdicts)} pairs asked, {len(verdicts)} answered, "
+            f"{verdicts.count('contradicts')} contradict, {verdicts.count('compatible')} "
+            f"compatible, {verdicts.count('unclear')} unclear"))
         # One call, from a read-only directory that holds only the pair notes.
         (call,) = self.calls()
         self.assertEqual(call["cwd"] == str(self.data), False)
@@ -551,6 +561,7 @@ class CommandTests(CommandCase):
         out = self.result_of(run)
         self.assertEqual((out["status"], out["pairs"], out["cost_microusd"]), ("ok", [], None))
         self.assertEqual(self.calls(), [])
+        self.assertIn("contradictions: ended ok, 0 pairs asked, 0 answered, 0 contradict", run.stderr)
 
     def test_a_state_file_inside_the_brain_is_refused(self):
         for inside in (self.data / "state.json", self.data / "knowledge" / "state.json",
@@ -650,7 +661,25 @@ class CommandTests(CommandCase):
                 if mode == "garbage":
                     self.assertTrue(out["pairs"])
                     self.assertEqual({p["verdict"] for p in out["pairs"]}, {"unclear"})
+                    # The placeholders are not judgments: none was answered, none is unclear.
+                    (ended,) = [l for l in run.stderr.splitlines() if "contradictions: ended" in l]
+                    self.assertEqual(ended.strip(), (
+                        f"contradictions: ended error, {len(out['pairs'])} pairs asked, "
+                        "0 answered, 0 contradict, 0 compatible, 0 unclear"))
                 self.assertFalse(self.state.exists())
+
+    def test_a_pair_the_judge_skipped_is_asked_but_not_answered(self):
+        run = self.run_command(mode="partial")
+        out = self.result_of(run)
+        self.assertEqual(out["status"], "ok")
+        asked = len(out["pairs"])
+        answered = (asked + 1) // 2
+        self.assertGreater(asked, answered)
+        self.assertEqual(sum(1 for p in out["pairs"] if p["verdict"] == "unclear"),
+                         asked - answered)
+        (ended,) = [l for l in run.stderr.splitlines() if "contradictions: ended" in l]
+        self.assertIn(f"{asked} pairs asked, {answered} answered", ended)
+        self.assertTrue(ended.endswith("0 unclear"), ended)
 
     def test_more_than_twenty_asked_is_twenty(self):
         crowd = Path(self.tmp.name) / "crowd"

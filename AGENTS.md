@@ -412,7 +412,7 @@ What a pass does with it, and what it reports:
   `consolidate --digest-from DIR` adds the digest.v1 files in DIR and one
   level below it to this account's own transcripts.
 - **Batch.** The engine chooses what a pass drains and lists it to the
-  proposer path by path (`brainlib/passsize.py`): oldest first, at most 15
+  proposer path by path (`brainlib/passsize.py`): oldest first, at most 25
   items, within an estimated 100,000 diff characters and 20 canonical files,
   half and two thirds of what the audit takes. Session-mining proposals are
   never in it. A note no audited pass can drain is set aside, printed as
