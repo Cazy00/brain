@@ -24,6 +24,26 @@ def correction(stamp, *targets, size=400, source="local", basis="owner-said", re
     return item
 
 
+DECISION_220043Z = "knowledge/inbox/2026-11-07-193022.md"
+
+
+def shape_220043z(notes=40, note_size=1_000):
+    """The inbox of the 2026-11-08 220043Z pass: four owner corrections about one change (an
+    inbox decision, its correction, the two canonical notes it touches), about 76,000
+    estimated chars and 4.85 files together, and the owner's notes waiting behind them."""
+    items = [{"path": DECISION_220043Z, "size": 1_500, "kind": "decision", "source": "local",
+              "targets": []},
+             correction("07-193554", (DECISION_220043Z, 1_500, False), size=1_300),
+             correction("08-045025", size=1_200, basis="agent-found"),
+             correction("09-020031", ("merge-gate", 3_800, True), size=1_500),
+             correction("09-020035", ("five-item", 8_500, True), size=1_200)]
+    return items + [note(f"10-{i:06d}", size=note_size) for i in range(notes)]
+
+
+SHAPE_CORRECTIONS = [f"knowledge/inbox/2026-11-{s}.md"
+                     for s in ("07-193554", "08-045025", "09-020031", "09-020035")]
+
+
 class SelectBatchTests(unittest.TestCase):
 
     def test_an_empty_inbox_gives_an_empty_batch(self):
@@ -189,24 +209,160 @@ class SelectBatchTests(unittest.TestCase):
     # -- 0.8.3: the share never splits the owner's corrections when all of them fit --
 
     def test_trusted_corrections_that_fit_the_budget_together_are_never_split_by_the_share(self):
-        # 2026-11-08 220043Z: four owner corrections about one fact (an inbox decision, its
-        # correction, the two canonical notes it changes), about 76,000 estimated chars.
-        # The 50,000 share took three and deferred the fourth; the proposer drained the
-        # decision, left the note the deferred one corrects current, and the audit blocked.
-        decision = "knowledge/inbox/2026-11-07-193022.md"
-        items = [{"path": decision, "size": 1_500, "kind": "decision", "source": "local",
-                  "targets": []},
-                 correction("07-193554", (decision, 1_500, False), size=1_300),
-                 correction("08-045025", size=1_200, basis="agent-found"),
-                 correction("09-020031", ("merge-gate", 3_800, True), size=1_500),
-                 correction("09-020035", ("five-item", 8_500, True), size=1_200)]
-        items += [note(f"10-{i:06d}", size=1_000) for i in range(40)]
-        batch = passsize.select_batch(items)
+        # 2026-11-08 220043Z: the 50,000 share took three and deferred the fourth; the
+        # proposer drained the decision, left the note the deferred one corrects current, and
+        # the audit blocked.
+        batch = passsize.select_batch(shape_220043z())
         self.assertEqual(batch.deferred, [])
-        self.assertEqual(len(batch.corrections), 4)
-        self.assertIn(decision, batch.named)
+        self.assertEqual(batch.corrections, SHAPE_CORRECTIONS)
+        self.assertEqual(batch.together, SHAPE_CORRECTIONS)
+        self.assertIn(DECISION_220043Z, batch.named)
         self.assertGreaterEqual(len(batch.notes), 1)
-        self.assertLessEqual(batch.chars, passsize.BUDGET_CHARS + passsize.MIN_ITEM_CHARS)
+        self.assertLessEqual(batch.chars, passsize.BUDGET_CHARS)
+        self.assertLessEqual(batch.files, passsize.BUDGET_FILES)
+
+    # -- 0.8.3 review 1: untrusted corrections keep the share and never ride together --
+
+    def test_a_drop_box_correction_naming_the_decision_does_not_split_the_owners_change(self):
+        # Before: it joined the group of 193554 (they name one inbox note), the mixed group
+        # was held to the share, and the trusted group behind it was deferred.
+        loud = correction("07-200000", (DECISION_220043Z, 1_500, False), size=9_000,
+                          source="drop-box")
+        batch = passsize.select_batch(shape_220043z() + [loud])
+        self.assertEqual(batch.corrections, SHAPE_CORRECTIONS)
+        self.assertEqual(batch.deferred, [loud["path"]])       # weighed under the share
+        self.assertNotIn(loud["path"], batch.together)
+        self.assertLessEqual(batch.chars, passsize.BUDGET_CHARS)
+
+    def test_a_trusted_group_behind_the_share_is_taken_when_a_mixed_group_is_not(self):
+        # The reviewer's case: an earlier trusted group over half the budget, then a group
+        # with a drop-box member, then the rest of the owner's change.
+        d = "knowledge/inbox/2026-11-07-000000.md"
+        items = [{"path": d, "size": 1_500, "kind": "decision", "source": "local",
+                  "targets": []},
+                 correction("01-000000", ("canon-a", 12_000, True)),
+                 correction("02-000000", (d, 1_500, False), ("canon-b", 1_000, True)),
+                 correction("03-000000", (d, 1_500, False), source="drop-box")]
+        items += [note(f"10-{i:06d}") for i in range(5)]
+        batch = passsize.select_batch(items)
+        self.assertNotIn("knowledge/inbox/2026-11-02-000000.md", batch.deferred)
+        self.assertEqual(batch.deferred, ["knowledge/inbox/2026-11-03-000000.md"])
+
+    def test_an_untrusted_local_correction_keeps_its_group_under_the_share(self):
+        # An agent-inferred correction and an agent-found retraction of the decision hold it
+        # back, so its group goes whole or not at all, and only under the share; the rest of
+        # the owner's change still goes together.
+        guess = correction("07-200000", (DECISION_220043Z, 1_500, False),
+                           basis="agent-inferred")
+        unsure = correction("07-200001", (DECISION_220043Z, 1_500, False),
+                            basis="agent-found", retraction=True)
+        batch = passsize.select_batch(shape_220043z() + [guess, unsure])
+        mixed = [SHAPE_CORRECTIONS[0], guess["path"], unsure["path"]]
+        self.assertEqual(batch.together, SHAPE_CORRECTIONS[1:])
+        self.assertEqual(batch.corrections, SHAPE_CORRECTIONS[1:])
+        self.assertEqual(sorted(batch.deferred), sorted(mixed))
+        self.assertNotIn(DECISION_220043Z, batch.allowed)
+        self.assertNotIn(DECISION_220043Z, batch.notes)
+
+    # -- 0.8.3 review 2: waiting notes always get the oldest of them, and what is left --
+
+    def test_the_together_set_leaves_the_oldest_waiting_note_its_room(self):
+        batch = passsize.select_batch(shape_220043z())
+        oldest = "knowledge/inbox/2026-11-10-000000.md"
+        self.assertEqual(batch.notes[0], oldest)
+        # 76,000 for the corrections, 4,000 a note: the notes get the 24,000 left, 6 notes.
+        self.assertEqual(len(batch.notes), 6)
+        self.assertEqual(batch.chars, 76_000 + 6 * 4_000)
+
+    def test_the_together_set_never_takes_the_room_of_the_oldest_waiting_note(self):
+        # A first note costing 26,000 does not fit beside the 76,000: the share applies again,
+        # and the notes get half the budget, as before 0.8.3.
+        items = shape_220043z(notes=0) + [note("10-000000", size=6_500)]
+        items += [note(f"10-{i:06d}") for i in range(1, 10)]
+        batch = passsize.select_batch(items)
+        self.assertEqual(batch.together, [])
+        self.assertTrue(batch.deferred)
+        self.assertEqual(batch.notes[0], "knowledge/inbox/2026-11-10-000000.md")
+        # With no note waiting the corrections need no room left for one.
+        alone = passsize.select_batch(shape_220043z(notes=0))
+        self.assertEqual((alone.corrections, alone.deferred), (SHAPE_CORRECTIONS, []))
+
+    def test_twenty_five_corrections_that_fill_the_budget_still_leave_a_note(self):
+        b = passsize.select_batch([correction(f"01-{i:06d}") for i in range(25)]
+                                  + [note(f"02-{i:06d}") for i in range(5)])
+        self.assertTrue(b.notes)
+        self.assertLessEqual(len(b), passsize.MAX_ITEMS)
+        self.assertLessEqual(b.chars, passsize.BUDGET_CHARS)
+        # The shape plus 21 small corrections is 25 corrections: over the room, so the share.
+        more = passsize.select_batch(shape_220043z(notes=5)
+                                     + [correction(f"09-1{i:05d}") for i in range(21)])
+        self.assertTrue(more.notes)
+        self.assertEqual(more.together, [])
+
+    def test_a_lone_trusted_correction_left_behind_never_takes_the_whole_budget(self):
+        # One group is never split by the share, so it gets no together rule: a correction
+        # the proposer keeps leaving takes the share, and the notes keep half every pass.
+        stuck = correction("01-000000", ("big-note", 8_000, True))
+        owners = [note(f"02-{i:06d}") for i in range(30)]
+        batch = passsize.select_batch([stuck] + owners)
+        self.assertEqual(batch.together, [])
+        self.assertGreaterEqual(len(batch.notes) * passsize.MIN_ITEM_CHARS,
+                                passsize.BUDGET_CHARS * (1 - passsize.CORRECTION_SHARE)
+                                - passsize.MIN_ITEM_CHARS)
+
+    # -- 0.8.3 review 3: the worst-case estimate stays within the budget --
+
+    def test_corrections_taken_together_never_put_the_estimate_past_the_budget(self):
+        # Ten owner corrections of one canonical note each are 20 estimated files: with a
+        # note waiting they do not fit beside it, so the share applies (before: 20.85).
+        ten = [correction(f"01-{i:06d}", (f"canon-{i}", 1, True)) for i in range(10)]
+        batch = passsize.select_batch(ten + [note("09-000000")])
+        self.assertLessEqual(batch.files, passsize.BUDGET_FILES)
+        self.assertLessEqual(batch.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        nine = passsize.select_batch(ten[:9] + [note(f"09-{i:06d}", size=1) for i in range(9)])
+        self.assertEqual(len(nine.together), 9)
+        self.assertLessEqual(nine.files, passsize.BUDGET_FILES)
+        self.assertLessEqual(nine.files * 1.5, passsize.CANONICAL_FILES_CAP)
+        self.assertLessEqual(nine.chars, passsize.BUDGET_CHARS)
+        shaped = passsize.select_batch(shape_220043z(note_size=1))
+        self.assertLessEqual(shaped.chars, passsize.BUDGET_CHARS)
+        self.assertLessEqual(shaped.files * 1.5, passsize.CANONICAL_FILES_CAP)
+
+    # -- 0.8.3 review 4: the over-caps retry keeps the together set whole or defers it --
+
+    def test_cut_keeps_the_together_set_whole_and_cuts_notes_first(self):
+        batch = passsize.select_batch(shape_220043z(notes=6))
+        self.assertEqual(len(batch), 10)
+        smaller = passsize.cut(batch, passsize.retry_size(len(batch), 8, 250_000))
+        self.assertEqual(passsize.retry_size(len(batch), 8, 250_000), 4)
+        self.assertEqual(smaller.corrections, SHAPE_CORRECTIONS)
+        self.assertEqual(smaller.together, SHAPE_CORRECTIONS)
+        self.assertEqual(smaller.deferred, [])
+        self.assertEqual(smaller.notes, [])
+        five = passsize.cut(batch, 5)
+        self.assertEqual((five.corrections, len(five.notes)), (SHAPE_CORRECTIONS, 1))
+
+    def test_cut_defers_the_whole_together_set_when_it_does_not_fit(self):
+        batch = passsize.select_batch(shape_220043z(notes=6))
+        smaller = passsize.cut(batch, 3)
+        self.assertEqual(smaller.corrections, [])
+        self.assertEqual(smaller.deferred, SHAPE_CORRECTIONS)
+        self.assertNotIn(DECISION_220043Z, smaller.allowed)
+        self.assertEqual(len(smaller.notes), 3)
+
+    # -- 0.8.3 review 7: corrections of one canonical note are not grouped by it --
+
+    def test_corrections_of_one_canonical_note_tie_only_through_the_together_set(self):
+        # Inside the together set they go together; outside it the share may split them, as
+        # README says, because a group goes whole and the first one whatever it costs.
+        same = [correction("09-020031", ("merge-gate", 3_800, True), size=1_500),
+                correction("09-020032", ("merge-gate", 3_800, True), size=1_500)]
+        batch = passsize.select_batch(shape_220043z()[:4] + same + shape_220043z()[5:])
+        self.assertEqual(batch.deferred, [])
+        big = [correction(f"01-{i:06d}", ("big", 20_000, True)) for i in range(3)]
+        split = passsize.select_batch(big + [note(f"02-{i:06d}") for i in range(5)])
+        self.assertEqual(split.corrections, [big[0]["path"]])
+        self.assertEqual(split.deferred, [b["path"] for b in big[1:]])
 
     def test_trusted_corrections_over_the_budget_together_still_take_only_their_share(self):
         fixes = [correction(f"01-{i:06d}", ("big", 3_000, True)) for i in range(10)]

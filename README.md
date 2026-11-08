@@ -322,9 +322,17 @@ pass could act on described one change (an inbox decision cutting a list, its co
 the two canonical notes it touched), an estimated 76,000 chars together. The half-budget share
 took three and deferred the fourth; the proposer drained the decision, left the note the
 deferred correction names current, and the audit blocked the pass, twice, on the same
-selection. Now, when every correction the pass can act on fits the whole budget (chars, files
-and items), they all go and notes fill what is left; otherwise the share applies as before, and
-a correction the pass cannot act on is always held to it. No interface changes.
+selection. Now, when two or more groups of corrections the pass can act on (none with a
+drop-box, `agent-inferred` or agent-found-retraction member) fit the whole budget together,
+beside the oldest waiting note's count, chars and files, they all go; the notes get that note
+and whatever budget is left, so the estimate stays within the budget. Otherwise the share
+applies as before, and a correction the pass cannot act on is always held to it. A drop-box
+correction no longer joins the group of a correction that names the same inbox note (it holds
+nothing back). The over-caps retry keeps that set whole, cutting notes first, or defers all of
+it. Known limit: corrections are grouped by the inbox notes they name, not the canonical ones,
+because a group always goes whole and the first one whatever it costs; when the owner's
+corrections are over the budget together, two that change one canonical note can still be
+split by the share. No interface changes.
 
 **What `recall` does with them.** The keyword list is `brain_search`'s ranking; the
 vector list is the 10 best notes with a chunk above the floor (cosine times the same folder
