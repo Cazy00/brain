@@ -1,4 +1,4 @@
-"""The size of a consolidation pass (engine 0.8.1): choose its batch, measure its change set.
+"""The size of a consolidation pass (engine 0.8.3): choose its batch, measure its change set.
 
 One job, and pure: no git, no files, no model. `bin/brain` reads the inbox and the staged
 change set and hands them here as data; this module decides what fits the auditor's input.
@@ -18,7 +18,8 @@ Contract (versioned with the engine):
   first by path (the capture instant). Corrections that name the same inbox note are taken
   or deferred together. While notes are waiting, corrections take at most CORRECTION_SHARE
   of the budget, and at least one note is taken, so a correction no pass can drain never
-  starves the owner's notes. An untrusted correction is costed by its own size (it changes
+  starves the owner's notes; but when every correction the pass can act on fits the whole
+  budget together (0.8.3), they are all taken, so the share never splits one change. An untrusted correction is costed by its own size (it changes
   no target) and holds back only what a local one holds. The rest are deferred, and no note
   a deferred local correction names is taken or allowed. Then notes fill the budget, oldest
   first. Session-mining proposals are never in a batch. An item whose own size alone is
@@ -199,14 +200,30 @@ def select_batch(items, max_items=MAX_ITEMS, budget_chars=BUDGET_CHARS,
             return True                          # at least one item, whatever it costs
         return chars + c <= budget_chars * part and files + f <= budget_files * part
 
+    groups = [(g, any(t in parked for i in g if trusted(i) for t in _inbox_targets(i)))
+              for g in _groups(corrections)]
+    # The owner's corrections often change one fact in several notes (an inbox decision, its
+    # correction, the canonical notes it touches). The share is there so corrections a pass
+    # leaves cannot starve the notes; when every correction the pass can act on fits the
+    # whole budget, the share must not cut between them: a pass that applies half of one
+    # change leaves two current notes that disagree, and the audit blocks it (2026-11-08).
+    actable = [i for g, waits in groups if not waits for i in g if trusted(i)]
+    if actable and len(actable) <= max_items \
+            and sum(_correction_cost(i)[0] for i in actable) <= budget_chars \
+            and sum(_correction_cost(i)[1] for i in actable) <= budget_files:
+        trusted_share = 1.0
+    else:
+        trusted_share = share
+
     stopped = False
-    for group in _groups(corrections):
-        if any(t in parked for i in group if trusted(i) for t in _inbox_targets(i)):
+    for group, waits in groups:
+        if waits:
             deferred.extend(group)               # it waits for the note it names
             continue
         c = sum(_correction_cost(i)[0] for i in group)
         f = sum(_correction_cost(i)[1] for i in group)
-        if stopped or not fits(c, f, len(group), share):
+        part = trusted_share if all(trusted(i) for i in group) else share
+        if stopped or not fits(c, f, len(group), part):
             stopped = True
             deferred.extend(group)
             continue

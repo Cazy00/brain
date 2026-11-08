@@ -452,7 +452,10 @@ What a pass does with it, and what it reports:
   Corrections that name the same inbox note go together. While notes wait,
   corrections take at most half the budget and at least one note goes too, so
   a correction a pass leaves in the inbox never starves the owner's notes; one
-  the pass cannot act on is weighed by its own size. A correction that does
+  the pass cannot act on is weighed by its own size. When every correction the
+  pass can act on fits the whole budget together, they all go, and the half
+  share never splits them (0.8.3): applying half of one change leaves two
+  current notes that disagree. A correction that does
   not fit waits for a later pass, and so does every inbox note a local one
   names, so an original is never promoted while its correction waits. A
   correction names an inbox note by its path or by its `inbox-<file stem>` id

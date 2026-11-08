@@ -186,6 +186,44 @@ class SelectBatchTests(unittest.TestCase):
         alone = passsize.select_batch(fixes)
         self.assertGreater(len(alone.corrections), len(batch.corrections))
 
+    # -- 0.8.3: the share never splits the owner's corrections when all of them fit --
+
+    def test_trusted_corrections_that_fit_the_budget_together_are_never_split_by_the_share(self):
+        # 2026-11-08 220043Z: four owner corrections about one fact (an inbox decision, its
+        # correction, the two canonical notes it changes), about 76,000 estimated chars.
+        # The 50,000 share took three and deferred the fourth; the proposer drained the
+        # decision, left the note the deferred one corrects current, and the audit blocked.
+        decision = "knowledge/inbox/2026-11-07-193022.md"
+        items = [{"path": decision, "size": 1_500, "kind": "decision", "source": "local",
+                  "targets": []},
+                 correction("07-193554", (decision, 1_500, False), size=1_300),
+                 correction("08-045025", size=1_200, basis="agent-found"),
+                 correction("09-020031", ("merge-gate", 3_800, True), size=1_500),
+                 correction("09-020035", ("five-item", 8_500, True), size=1_200)]
+        items += [note(f"10-{i:06d}", size=1_000) for i in range(40)]
+        batch = passsize.select_batch(items)
+        self.assertEqual(batch.deferred, [])
+        self.assertEqual(len(batch.corrections), 4)
+        self.assertIn(decision, batch.named)
+        self.assertGreaterEqual(len(batch.notes), 1)
+        self.assertLessEqual(batch.chars, passsize.BUDGET_CHARS + passsize.MIN_ITEM_CHARS)
+
+    def test_trusted_corrections_over_the_budget_together_still_take_only_their_share(self):
+        fixes = [correction(f"01-{i:06d}", ("big", 3_000, True)) for i in range(10)]
+        owners = [note(f"02-{i:06d}") for i in range(30)]
+        batch = passsize.select_batch(fixes + owners)
+        self.assertTrue(batch.deferred)
+        self.assertLessEqual(len(batch.corrections) * 4 * 3_400,
+                             passsize.BUDGET_CHARS * passsize.CORRECTION_SHARE)
+
+    def test_an_untrusted_correction_still_takes_only_the_share(self):
+        fixes = [correction(f"01-{i:06d}", source="drop-box", size=3_000) for i in range(8)]
+        owners = [note(f"02-{i:06d}") for i in range(30)]
+        batch = passsize.select_batch(fixes + owners)
+        self.assertLessEqual(len(batch.corrections) * 12_000,
+                             passsize.BUDGET_CHARS * passsize.CORRECTION_SHARE)
+        self.assertTrue(batch.deferred)
+
     def test_corrections_the_pass_can_act_on_come_before_the_others(self):
         items = [correction("01-000000", source="drop-box"),
                  correction("02-000000", basis="agent-inferred"),
