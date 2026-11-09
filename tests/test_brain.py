@@ -3790,39 +3790,45 @@ class PendingCorrectionTests(unittest.TestCase):
         hit = [h for h in hits if h["id"] == "vendor-limits"][0]
         self.assertEqual(hit["corrections_pending"], [path])
 
-    def test_the_owners_correction_supersedes_the_note_at_read_time(self):
-        """H39 F2: the correction is an overlay from the moment it is captured: search, read
-        and the recall record show its text over the note, before any pass applies it."""
-        path = self.capture("2026-10-18-0600-fix.md",
-                            "Correction to vendor-limits: the limit is 800 requests per minute.")
-        lead = "SUPERSEDED by the owner's correction, in effect now"
-        out = self.search()
-        self.assertIn(f"[correction pending — {path}]", self.line_for(out, "vendor-limits.md"))
-        self.assertIn(lead, out)
-        self.assertIn("the limit is 800 requests per minute.", out)
-        read = run_brain("read", "vendor-limits", repo=self.repo)
-        self.assertIn(lead, read.stdout)
-        self.assertIn("800 requests per minute", read.stdout.split("\n\n")[0])
+    def overlay(self):
+        """The vendor-limits hit's `correction`, and its recall record."""
         hits = json_payload(run_brain("search", "vendor rate limit", "--json",
                                       repo=self.repo).stdout)["hits"]
         hit = [h for h in hits if h["id"] == "vendor-limits"][0]
-        self.assertEqual(hit["correction"],
-                         "Correction to vendor-limits: the limit is 800 requests per minute.")
-        verbs = load_brain_module().verbs
-        record = verbs.page_record(hit, "vendor rate limit")
-        self.assertEqual((record["trust"], record["correction"]), ("not_current", hit["correction"]))
+        return hit.get("correction"), load_brain_module().verbs.page_record(hit, "vendor rate limit")
+
+    def test_recall_carries_the_owners_correction_text(self):
+        """H39 F2: the record gains the optional `correction` key; its trust and every text
+        answer stay as they were, since the marker already flags the note."""
+        before_search, before_read = self.search(), run_brain("read", "vendor-limits",
+                                                               repo=self.repo).stdout
+        self.assertEqual(self.overlay()[0], None)
+        text = "Correction to vendor-limits: the limit is 800 requests per minute."
+        path = self.capture("2026-10-18-0600-fix.md", text)
+        correction, record = self.overlay()
+        self.assertEqual(correction, text)
+        self.assertEqual((record["trust"], record["correction"]), ("current", text))
+        out = self.search()
+        self.assertIn(f"[correction pending — {path}]", self.line_for(out, "vendor-limits.md"))
+        self.assertNotIn("800 requests", out)
+        self.assertEqual(out.replace(f" [correction pending — {path}]", ""), before_search)
+        read = run_brain("read", "vendor-limits", repo=self.repo).stdout
+        self.assertNotIn("800 requests", read)
+        self.assertIn("waits for the next consolidation", read)
+        self.assertNotIn("waits for the next consolidation", before_read)
+
+    def test_a_note_with_no_correction_has_no_key(self):
+        self.assertNotIn("correction", self.overlay()[1])
 
     def test_the_newest_correction_the_pass_would_apply_wins(self):
         self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: 800 per minute.")
         self.capture("2026-10-18-0700-fix.md", "Correction to vendor-limits: 900 per minute.")
         self.capture("2026-10-18-0800-fix.md", "Correction to vendor-limits: 1 per minute.",
                      basis="agent-inferred")
-        out = self.search()
-        self.assertIn("900 per minute", out)
-        self.assertNotIn("Correction to vendor-limits: 1 per minute", out)
+        self.assertEqual(self.overlay()[0], "Correction to vendor-limits: 900 per minute.")
 
-    def test_only_a_correction_the_pass_would_apply_overlays(self):
-        """The marker stays for every local correction; the overlay follows the batch's own
+    def test_only_a_correction_the_pass_would_apply_gives_its_text(self):
+        """The marker stays for every local correction; the text follows the batch's own
         rule (passsize.trusted): a retraction only on the owner's word, and nothing private."""
         for basis, body, extra in (
                 ("agent-inferred", "Correction to vendor-limits: 9000.", {}),
@@ -3831,18 +3837,15 @@ class PendingCorrectionTests(unittest.TestCase):
             for f in self.inbox.glob("*.md"):
                 f.unlink()
             path = self.capture("2026-10-18-0600-fix.md", body, basis=basis, **extra)
-            out = self.search()
-            self.assertIn(f"[correction pending — {path}]", out, basis)
-            self.assertNotIn("SUPERSEDED", out, basis)
-            read = run_brain("read", "vendor-limits", repo=self.repo)
-            self.assertIn("waits for the next consolidation", read.stdout, basis)
+            self.assertIn(f"[correction pending — {path}]", self.search(), basis)
+            correction, record = self.overlay()
+            self.assertEqual(correction, None, basis)
+            self.assertNotIn("correction", record, basis)
 
-    def test_the_owners_retraction_overlays_too(self):
-        self.capture("2026-10-18-0600-retract.md",
-                     "Retract vendor-limits: it should not be in the brain — a client's figure.")
-        out = self.search()
-        self.assertIn("SUPERSEDED by the owner's correction", out)
-        self.assertIn("Retract vendor-limits: it should not be in the brain", out)
+    def test_the_owners_retraction_gives_its_text_too(self):
+        text = "Retract vendor-limits: it should not be in the brain — a client's figure."
+        self.capture("2026-10-18-0600-retract.md", text)
+        self.assertEqual(self.overlay()[0], text)
 
     def test_an_inbox_id_lead_that_names_no_file_falls_through_to_the_body(self):
         """0.8.1 review finding 3: before 0.8.1 an unknown `inbox-<word>` lead was no target,

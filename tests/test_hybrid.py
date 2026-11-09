@@ -537,9 +537,26 @@ class RolloutTests(HybridCase):
         self.assertEqual(self.fake.embedded_texts("search_query: "), [])
 
 
+# 0.8.4 (H39 F2) added one optional key to a recall record: the text of the owner's pending
+# correction to that note. The corpus holds one, so it is the only bytes a 0.5.0 answer lacks.
+CORRECTION = "Correction to widget-glossary: a cog is a smaller wheel with fewer teeth."
+CORRECTION_KEY = ', "correction": ' + json.dumps(CORRECTION, ensure_ascii=False)
+
+
+def without_correction(tool, text):
+    """`text` with the 0.8.4 `correction` key taken out of each recall record that carries
+    it, after checking it sits on exactly the records of the note it names."""
+    if not tool.startswith("recall"):
+        return text
+    for record in json.loads(text).get("results", []):
+        named = record["path"] == "knowledge/reference/widget-glossary.md"
+        assert record.get("correction") == (CORRECTION if named else None), record
+    return text.replace(CORRECTION_KEY, "")
+
+
 class KeywordIdentityTests(HybridCase):
     """Keyword answers are the 0.5.0 answers, byte for byte, whatever BRAIN_VECTORS says
-    and whether or not vectors exist."""
+    and whether or not vectors exist (the one later optional key aside)."""
 
     def test_keyword_answers_equal_the_recorded_0_5_0_ones(self):
         golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
@@ -555,7 +572,7 @@ class KeywordIdentityTests(HybridCase):
                         if tool == "recall_default" and mode == "on":
                             continue         # on: hybrid IS the default (or says it degraded)
                         with self.subTest(built=built, mode=mode, query=key, tool=tool):
-                            self.assertEqual(got[key][tool], text)
+                            self.assertEqual(without_correction(tool, got[key][tool]), text)
 
 
 if __name__ == "__main__":

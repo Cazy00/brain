@@ -748,8 +748,7 @@ def trust_of(hit: dict) -> str:
         return "provisional"
     if hit.get("folder") == "journal":
         return "journal"
-    if hit.get("folder") == "handoff" or (hit.get("status") not in (None, "", "current")) \
-            or hit.get("correction"):
+    if hit.get("folder") == "handoff" or (hit.get("status") not in (None, "", "current")):
         return "not_current"
     if hit.get("stale"):
         return "stale"

@@ -357,14 +357,13 @@ the same answer. `BRAIN_VERB_WORKER=off` switches it off. The embedder's speed i
 rest: give `llama-server` as many threads (`-t`) as its CPU quota; more threads than
 cores makes every query slower, not faster.
 
-**0.8.4.** The owner's correction takes effect at read time (B45 H39 F2). A pending
-correction that the next pass would apply (`source: local`, `owner-said`, or `agent-found` for
-anything but a retraction; not private) is an overlay on the note it names: `search` prints its
-text under the hit after `SUPERSEDED by the owner's correction, in effect now`, `read` prints it
-in the warning, and `recall` gives it as the record's `correction`, with trust `not_current`.
-The newest such correction wins. Before, an agent was shown the old note with a marker and had
-to open the inbox to learn what was true. The `[correction pending]` marker and consolidation
-are unchanged. Interface: one optional `correction` key in recall's records and search's JSON.
+**0.8.4.** Recall shows the owner's pending correction (B45 H39 F2). A record whose note a
+correction names that the next pass would apply (`source: local`, and `owner-said`, or
+`agent-found` for anything but a retraction; never a private capture) carries that
+correction's text, the newest such one, as the optional `correction` key; `search --json` hits
+carry it too. Before, an agent saw only the `[correction pending]` marker and had to open the
+inbox to learn what was true. The record's `trust`, every text answer, the marker and
+consolidation are unchanged.
 
 ## How it stays true
 

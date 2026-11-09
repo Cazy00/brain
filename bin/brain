@@ -3300,7 +3300,9 @@ def _decorate(db, hits: list) -> None:
         pending = pending_corrections()
         for h in hits:
             h["corrections_pending"] = corrections_naming(pending, h["id"], h["path"])
-            h["correction"] = correction_overlay(h["corrections_pending"])
+            overlay = correction_overlay(h["corrections_pending"])
+            if overlay:
+                h["correction"] = overlay
 
 
 def do_search(query: str, scope: str = "canonical", limit: int = 8, exclude=()) -> dict:
@@ -3849,16 +3851,16 @@ def correction_marker(names: list) -> str:
     return f" [correction pending — {', '.join(names)}]" if names else ""
 
 
-OVERLAY_LEAD = "SUPERSEDED by the owner's correction, in effect now (consolidation makes it permanent): "
 # One line of a correction's text is enough to answer from; the marker names the file.
 OVERLAY_CHARS = 400
 
 
 def correction_overlay(names: list):
     """The text of the newest of `names` that the next pass would apply (the batch's own
-    `passsize.trusted` rule), on one line, or None. It overrides the note it names from the
-    moment it is captured, so an answer never waits for consolidation. A private capture
-    gives no text: its path is all a remote caller may see of it."""
+    `passsize.trusted` rule), on one line, or None. Recall's record carries it as the optional
+    `correction` key, so an agent reads what is true without opening the inbox; the note's
+    trust and every text answer stay as they were (the marker already flags the note). A
+    private capture gives no text: its path is all a remote caller may see of it."""
     for rel in reversed(names):
         try:
             text = read_text(ROOT / rel)
@@ -3890,8 +3892,9 @@ def hit_markers(h: dict) -> list:
         marks.append(f"[status: {h['status']}]")
     if h.get("stale"):
         marks.append(f"[STALE — review_by {h['review_by']} passed]")
-    if h.get("corrections_pending"):
-        marks.append(correction_marker(h["corrections_pending"]).lstrip())
+    names = h.get("corrections_pending") or []
+    if names:
+        marks.append(f"[correction pending — {', '.join(names)}]")
     return marks
 
 
@@ -3906,8 +3909,6 @@ def format_hits(result: dict) -> str:
     for i, h in enumerate(result["hits"], 1):
         tag = "".join(" " + mark for mark in hit_markers(h))
         lines.append(f"{i}. {h['path']} — {h['title']} ({h['kind']}, {h['created'] or 'n/a'}){tag}")
-        if h.get("correction"):
-            lines.append(f"   {OVERLAY_LEAD}{h['correction']}")
         if h["snippet"]:
             lines.append(f"   {h['snippet']}")
     if result["more"]:
@@ -4329,10 +4330,7 @@ def cmd_read(argv: list) -> int:
               "before relying on it.")
     names = corrections_naming(pending_corrections(), wanted, *chain, current_id,
                                *member_paths)
-    overlay = correction_overlay(names)
-    if overlay:
-        print(f"WARNING:{correction_marker(names)} — {OVERLAY_LEAD}{overlay}")
-    elif names:
+    if names:
         print(f"WARNING:{correction_marker(names)} — a correction to this note waits for "
               "the next consolidation; read it before relying on this note.")
     # Backlinks: the context a lone note body cannot carry — what else in the
