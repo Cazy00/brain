@@ -748,7 +748,8 @@ def trust_of(hit: dict) -> str:
         return "provisional"
     if hit.get("folder") == "journal":
         return "journal"
-    if hit.get("folder") == "handoff" or (hit.get("status") not in (None, "", "current")):
+    if hit.get("folder") == "handoff" or (hit.get("status") not in (None, "", "current")) \
+            or hit.get("correction"):
         return "not_current"
     if hit.get("stale"):
         return "stale"
@@ -780,6 +781,8 @@ def page_record(hit: dict, query: str) -> dict:
     for key in ("handoff_to", "handoff_at", "handoff_reason"):
         if key in hit:
             out[key] = hit[key]
+    if hit.get("correction"):
+        out["correction"] = hit["correction"]     # the owner's, in effect before the pass
     return out
 
 
