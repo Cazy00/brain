@@ -3855,23 +3855,50 @@ def correction_marker(names: list) -> str:
 OVERLAY_CHARS = 400
 
 
+def trust_item(fm: dict, body: str) -> dict:
+    """What `passsize` weighs of one correction: its source and basis, whether it is a
+    `forget`, and whether it is a retraction. `batch_items` and `correction_overlay` both
+    read it from here, so the overlay can never apply a rule other than the batch's."""
+    forget = bool(forget_target(fm))
+    return {"source": str(fm.get("source") or ""), "basis": str(fm.get("basis") or ""),
+            "forget": forget, "retraction": bool(RETRACT_LEAD_RE.match(body)) or forget}
+
+
 def correction_overlay(names: list):
     """The text of the newest of `names` that the next pass would apply (the batch's own
-    `passsize.trusted` rule), on one line, or None. Recall's record carries it as the optional
-    `correction` key, so an agent reads what is true without opening the inbox; the note's
-    trust and every text answer stay as they were (the marker already flags the note). A
-    private capture gives no text: its path is all a remote caller may see of it."""
-    for rel in reversed(names):
+    `passsize.trusted` rule), on one line, or None. Newest means latest `captured_at` (the file's
+    mtime when it has none), then file name, whatever order `names` lists them in. Recall's
+    record carries it as the optional `correction` key, so an agent reads what is true without
+    opening the inbox; the note's trust and every text answer stay as they were (the marker
+    already flags the note). A text longer than OVERLAY_CHARS is cut and says so, with the
+    inbox path that holds the rest.
+
+    None, so the marker alone sends the agent to the inbox, when any named capture cannot be
+    read (it might be the newest), and when the newest one the pass would apply is private:
+    its path is all a remote caller may see of it, and an older correction is not what is
+    true. Privacy is `verbs.Capture.private`, the one rule the facts arm and the pages arm
+    already share."""
+    found = []
+    for rel in names:
+        path = ROOT / rel
         try:
-            text = read_text(ROOT / rel)
+            text = read_text(path)
+            mtime = path.stat().st_mtime
         except OSError:
-            continue
+            return None
         fm = parse_frontmatter(text)[0] or {}
         body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
-        item = {"source": fm.get("source"), "basis": fm.get("basis"),
-                "forget": bool(forget_target(fm)), "retraction": bool(RETRACT_LEAD_RE.match(body))}
-        if passsize.trusted(item) and str(fm.get("visibility") or "").strip().lower() != "private":
-            return " ".join(body.split())[:OVERLAY_CHARS] or None
+        cap = verbs.Capture(path.name, mtime, verbs.split_note(text)[0], body)
+        found.append((cap.at_ms, cap.name, rel, cap, fm, body))
+    for _at, _name, rel, cap, fm, body in sorted(found, key=lambda f: f[:2], reverse=True):
+        if not passsize.trusted(trust_item(fm, body)):
+            continue
+        if cap.private:
+            return None
+        line = " ".join(body.split())
+        if len(line) > OVERLAY_CHARS:
+            line = f"{line[:OVERLAY_CHARS].rstrip()} … [cut — the full text is in {rel}]"
+        return line or None
     return None
 
 
@@ -6660,8 +6687,8 @@ def batch_items() -> list:
                 "targets": []}
         if item["kind"] == "correction":
             body = "\n".join(text.splitlines()[fm.get("_end_line", 0):])
-            item["forget"] = bool(forget_target(fm))
-            item["retraction"] = bool(RETRACT_LEAD_RE.match(body)) or item["forget"]
+            trust = trust_item(fm, body)
+            item.update(forget=trust["forget"], retraction=trust["retraction"])
             names = correction_targets(body, is_known)
             if forget_target(fm):
                 names.append(forget_target(fm))

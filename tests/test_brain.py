@@ -3827,6 +3827,59 @@ class PendingCorrectionTests(unittest.TestCase):
                      basis="agent-inferred")
         self.assertEqual(self.overlay()[0], "Correction to vendor-limits: 900 per minute.")
 
+    def test_the_newest_by_capture_time_wins_whether_it_names_the_id_or_the_path(self):
+        """Review F1: the id-named corrections list before the path-named ones, so list order
+        is not age; the capture time (then the file name) is."""
+        self.capture("2026-10-18-0600-fix.md",
+                     "Correction to knowledge/reference/vendor-limits.md: 800 per minute.",
+                     captured_at="2026-10-18T06:00:00Z")
+        self.capture("2026-10-18-0700-fix.md", "Correction to vendor-limits: 900 per minute.",
+                     captured_at="2026-10-18T07:00:00Z")
+        self.assertEqual(self.overlay()[0], "Correction to vendor-limits: 900 per minute.")
+        # And by captured_at, not by a file name that sorts the other way.
+        self.capture("2026-10-18-0900-fix.md", "Correction to vendor-limits: 700 per minute.",
+                     captured_at="2026-10-18T05:00:00Z")
+        self.assertEqual(self.overlay()[0], "Correction to vendor-limits: 900 per minute.")
+
+    def test_a_long_correction_is_cut_and_says_where_the_rest_is(self):
+        """Review F2."""
+        body = "Correction to vendor-limits: " + "the limit is 800. " * 60
+        path = self.capture("2026-10-18-0600-fix.md", body)
+        text = self.overlay()[0]
+        self.assertIn("…", text)
+        self.assertTrue(text.endswith(f"[cut — the full text is in {path}]"), text)
+        self.assertLess(len(text), len(" ".join(body.split())))
+        short = "Correction to vendor-limits: 800."
+        self.capture("2026-10-18-0700-fix.md", short)
+        self.assertEqual(self.overlay()[0], short)
+
+    def test_a_private_key_in_any_case_gives_no_text(self):
+        """Review F3: the one privacy rule verbs.Capture owns — a capital letter, a quoted
+        value or padding does not step around it."""
+        for line in ("Visibility: private", "visibility: 'Private'", 'VISIBILITY:  "private" '):
+            for f in self.inbox.glob("*.md"):
+                f.unlink()
+            key, value = line.split(":", 1)
+            self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: 800.",
+                         **{key: value.strip()})
+            self.assertEqual(self.overlay()[0], None, line)
+            self.assertNotIn("correction", self.overlay()[1], line)
+
+    def test_a_newer_private_correction_does_not_let_an_older_one_speak(self):
+        self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: 800 per minute.")
+        self.capture("2026-10-18-0700-fix.md", "Correction to vendor-limits: 900 per minute.",
+                     visibility="private")
+        self.assertEqual(self.overlay()[0], None)
+
+    def test_an_unreadable_correction_gives_no_text(self):
+        """Review F5: it may be the newest, so no older one is presented as current."""
+        path = self.capture("2026-10-18-0600-fix.md", "Correction to vendor-limits: 800.")
+        module = load_brain_module()
+        module.ROOT = self.repo
+        self.assertEqual(module.correction_overlay([path]), "Correction to vendor-limits: 800.")
+        self.assertIsNone(module.correction_overlay(
+            [path, "knowledge/inbox/2026-10-18-0800-gone.md"]))
+
     def test_only_a_correction_the_pass_would_apply_gives_its_text(self):
         """The marker stays for every local correction; the text follows the batch's own
         rule (passsize.trusted): a retraction only on the owner's word, and nothing private."""

@@ -543,14 +543,14 @@ CORRECTION = "Correction to widget-glossary: a cog is a smaller wheel with fewer
 CORRECTION_KEY = ', "correction": ' + json.dumps(CORRECTION, ensure_ascii=False)
 
 
-def without_correction(tool, text):
+def without_correction(case, tool, text):
     """`text` with the 0.8.4 `correction` key taken out of each recall record that carries
     it, after checking it sits on exactly the records of the note it names."""
     if not tool.startswith("recall"):
         return text
     for record in json.loads(text).get("results", []):
         named = record["path"] == "knowledge/reference/widget-glossary.md"
-        assert record.get("correction") == (CORRECTION if named else None), record
+        case.assertEqual(record.get("correction"), CORRECTION if named else None, record)
     return text.replace(CORRECTION_KEY, "")
 
 
@@ -572,7 +572,7 @@ class KeywordIdentityTests(HybridCase):
                         if tool == "recall_default" and mode == "on":
                             continue         # on: hybrid IS the default (or says it degraded)
                         with self.subTest(built=built, mode=mode, query=key, tool=tool):
-                            self.assertEqual(without_correction(tool, got[key][tool]), text)
+                            self.assertEqual(without_correction(self, tool, got[key][tool]), text)
 
 
 if __name__ == "__main__":
