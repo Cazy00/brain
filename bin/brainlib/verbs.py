@@ -780,6 +780,8 @@ def page_record(hit: dict, query: str) -> dict:
     for key in ("handoff_to", "handoff_at", "handoff_reason"):
         if key in hit:
             out[key] = hit[key]
+    if hit.get("correction"):
+        out["correction"] = hit["correction"]     # the owner's, in effect before the pass
     return out
 
 

@@ -368,7 +368,13 @@ as the reason the rule is satisfied.
    `[correction pending — <inbox path>]` by search, read and recent (computed
    from the inbox at query time; only a `source: local` correction counts).
    Read the correction before answering from the note, and never present the
-   note as settled.
+   note as settled. For the newest correction (by `captured_at`) the next pass
+   would apply (the batch's own trust rule, never a private capture) a recall
+   page record carries its text as `correction`, so you need not open the
+   inbox to read it, unless the text ends `[cut — the full text is in <path>]`:
+   then read that inbox note. The key is on page records only: a fact record
+   (`scope: "all"`, `entity`) and a `delta` record carry the marker alone, so
+   open the inbox for those. No key, with a marker, means open the inbox.
 7. When you answer from a note, cite it by path so the answer is auditable.
 
 ## Consolidation — the one pinned runner

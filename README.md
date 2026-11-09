@@ -357,6 +357,16 @@ the same answer. `BRAIN_VERB_WORKER=off` switches it off. The embedder's speed i
 rest: give `llama-server` as many threads (`-t`) as its CPU quota; more threads than
 cores makes every query slower, not faster.
 
+**0.8.4.** Recall shows the owner's pending correction (B45 H39 F2). A record whose note a
+correction names that the next pass would apply (`source: local`, and `owner-said`, or
+`agent-found` for anything but a retraction; never a private capture) carries that
+correction's text, the newest such one by `captured_at`, as the optional `correction` key
+(cut at 400 characters with a `[cut — the full text is in <path>]` tail; absent when the
+newest one is private or a named capture cannot be read); `search --json` hits carry it too.
+Only page records have it: a fact record and a `delta` record carry the marker alone. Before, an agent saw only the `[correction pending]` marker and had to open the
+inbox to learn what was true. The record's `trust`, every text answer, the marker and
+consolidation are unchanged.
+
 ## How it stays true
 
 | Mechanism | What it prevents |
