@@ -367,8 +367,12 @@ as the reason the rule is satisfied.
 6b. A note that a correction still waiting in the inbox names is marked
    `[correction pending — <inbox path>]` by search, read and recent (computed
    from the inbox at query time; only a `source: local` correction counts).
-   Read the correction before answering from the note, and never present the
-   note as settled.
+   A correction the next pass would apply (the batch's own trust rule) is an
+   overlay: search and read print its text after `SUPERSEDED by the owner's
+   correction, in effect now`, and recall gives it as `correction` with trust
+   `not_current`. Answer from that text; consolidation only makes it permanent.
+   Any other pending correction: read it first, and never present the note as
+   settled.
 7. When you answer from a note, cite it by path so the answer is auditable.
 
 ## Consolidation — the one pinned runner
